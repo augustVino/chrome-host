@@ -1,0 +1,16 @@
+{
+  "identifier": "popover",
+  "description": "托盘 Popover 窗口（P3）：事件订阅 + 打开主窗口 / 自隐藏的窗口操作",
+  "windows": [
+    "popover"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:window:allow-hide",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-size",
+    "clipboard-manager:allow-write-text"
+  ]
+}

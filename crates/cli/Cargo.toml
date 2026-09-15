@@ -1,0 +1,22 @@
+[package]
+name = "chrome-host-cli"
+version = "0.1.0"
+edition = "2021"
+description = "chrome-host CLI — Developer-first Chrome Runtime Control Interface"
+
+[[bin]]
+name = "chrome-host"        # PRD cli.md §26：产品入口命令名
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+comfy-table = "7"
+
+[dev-dependencies]
+# 契约测试用 fixture server（与 src-tauri 同版本，复用编译缓存）
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

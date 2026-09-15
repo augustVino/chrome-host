@@ -1,0 +1,10 @@
+[workspace]
+members = ["src-tauri", "crates/cli"]
+resolver = "2"
+
+# 工作区级 release 配置：与 src-tauri 原有 [profile.release] 保持一致。
+# workspace 下只有根清单的 profile 生效；src-tauri 内的副本暂留（本任务不动
+# src-tauri，后续任务应删除成员内副本以消除 cargo 的 "profiles ignored" 警告）。
+[profile.release]
+strip = true
+lto = true

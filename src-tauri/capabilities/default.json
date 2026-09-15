@@ -1,0 +1,18 @@
+{
+  "identifier": "default",
+  "description": "主窗口默认能力（P0 最小集，事件与窗口基础操作）",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "clipboard-manager:allow-write-text",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
+    "dialog:allow-open",
+    "opener:allow-reveal-item-in-dir",
+    "updater:default",
+    "process:allow-restart"
+  ]
+}

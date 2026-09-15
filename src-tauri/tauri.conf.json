@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "chrome-host",
+  "version": "0.1.2",
+  "identifier": "com.chromehost.dev",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "Chrome Host",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "extensions"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgzNUM2OTEyMDZGNzExRDYKUldUV0VmY0dFbWxjZytiU0RhMHoxeG1GQW14djZjenRTT3JjLzZvakFZMHJZNEx1Y0VBUnVkMGcK",
+      "endpoints": [
+        "https://github.com/augustVino/chrome-host/releases/latest/download/latest.json"
+      ]
+    }
+  },
+  "mainBinaryName": "chrome-host-app"
+}

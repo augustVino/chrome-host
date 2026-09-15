@@ -1,0 +1,10 @@
+pub mod environments;
+pub mod extensions;
+pub mod error;
+pub mod health;
+pub mod instances;
+pub mod kernel;
+pub mod login_profiles;
+pub mod mcp;
+pub mod settings;
+pub mod server;
