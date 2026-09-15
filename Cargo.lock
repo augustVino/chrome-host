@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "chrome-host"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "axum",
  "chrono",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "chrome-host-cli"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "axum",
  "clap",
