@@ -141,3 +141,7 @@ pnpm tauri dev        # 开发（watcher 自动重编译）
 cd src-tauri && cargo test   # Rust 单测
 bash scripts/smoke.sh # 冒烟（需应用运行中；可选 HOSTS_SOURCE=<hosts 源 URL> 验证 hosts 注入）
 ```
+
+## License
+
+[MIT](LICENSE)

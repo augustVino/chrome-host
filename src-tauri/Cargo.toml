@@ -3,6 +3,7 @@ name = "chrome-host"
 version = "0.1.5"
 description = "Browser Runtime Manager for Humans and AI Agents"
 edition = "2021"
+license = "MIT"
 
 # GUI 的 cargo 产物名用 -app 后缀：workspace 下 CLI crate（crates/cli）已占用
 # `chrome-host` 作为 PRD §26 规定的产品入口命令名，同名 bin 会 output collision
