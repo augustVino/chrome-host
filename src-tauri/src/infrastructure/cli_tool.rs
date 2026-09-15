@@ -60,8 +60,8 @@ fn candidate_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// 默认安装目标：/usr/local/bin/chrome-host
-#[cfg(not(windows))]
+/// 默认安装目标：/usr/local/bin/chrome-host（仅 unix 调用方会真正使用；
+/// Windows 上 install/uninstall 在触碰该路径前已提前返回，保留定义以保证跨平台编译）
 fn default_link_path() -> PathBuf {
     PathBuf::from("/usr/local/bin").join(link_file_name())
 }
