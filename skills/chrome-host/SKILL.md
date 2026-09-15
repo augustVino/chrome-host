@@ -44,7 +44,7 @@ chrome-host status
 
 ## 主工作流：用户指定环境排查问题
 
-典型指令："用 qa27645 帮我打开 xxx 页面看看"。按以下顺序推进，每步都有明确分支：
+典型指令："用 qa12345 帮我打开 xxx 页面看看"。按以下顺序推进，每步都有明确分支：
 
 ### 1. 列环境，判断环境是否存在
 
@@ -56,7 +56,7 @@ chrome-host env list --json
 - **不存在** → 向用户确认是否新建，以及 hosts 配置源地址（返回 hosts 格式文本的 http(s) URL，qa 环境通常需要）：
 
 ```bash
-chrome-host env create qa27645 --hosts-source-url "https://.../hosts" --quiet   # 输出 env id
+chrome-host env create qa12345 --hosts-source-url "https://.../hosts" --quiet   # 输出 env id
 ```
 
 不传 `--hosts-source-url` 则不做 hosts 注入——域名解析将与本机一致，qa 域名可能指向错误地址。**用户没提 hosts 源而要访问内部域名时，主动问一句。**
@@ -85,7 +85,7 @@ URL 必须以 http:// 或 https:// 开头——CLI 本地校验，非法输入 e
 
 判断依据：页面跳到登录页 / 统一认证，或用户任务本身依赖登录态。此时：
 
-1. **停下来明确告知用户**："已在 qa27645 环境的 Chrome 实例中打开登录页，请在弹出的浏览器窗口完成登录，登录后告诉我。"
+1. **停下来明确告知用户**："已在 qa12345 环境的 Chrome 实例中打开登录页，请在弹出的浏览器窗口完成登录，登录后告诉我。"
 2. **等待用户回复**，不要轮询猜测，更不要尝试自动填表单——环境隔离 profile 中没有用户凭据，自动登录必然失败且可能触发风控。
 3. 用户确认后，验证登录结果：`chrome-host instance tabs <insId> --json` 看 URL 是否已离开登录页，或移交 chrome-cdp 后用 `snap` 确认页面内容。
 
