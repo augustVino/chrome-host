@@ -1,5 +1,11 @@
 //! 平台差异：窗口唤出（focus 的 CDP 失败失败回退路径）
 //!          + 进程重关联扫描（reconcile 判死前的 pid 漂移修正）
+//!          + 开机自启 plist 自愈（autostart）
+
+mod autostart;
+
+#[cfg_attr(debug_assertions, allow(unused_imports))] // 仅 release 由 main.rs 使用
+pub use autostart::heal_stale_plist;
 
 use std::path::Path;
 

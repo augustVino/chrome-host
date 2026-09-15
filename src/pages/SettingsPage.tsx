@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { api, errorText } from '../api/client';
 import { copyText } from '../lib/clipboard';
 import { useStore } from '../store';
 import { btnGhost, btnPrimary, inputCls } from '../components/ui';
+import { confirm } from '../components/confirm';
 import { disable as autostartDisable, enable as autostartEnable, isEnabled as autostartIsEnabled } from '@tauri-apps/plugin-autostart';
 import {
   checkExplicitly,
@@ -20,6 +22,16 @@ const STAGE_LABEL: Record<string, string> = {
   cancelled: '已取消',
 };
 
+/** 后端 cli_tool_status 命令返回值（camelCase 序列化） */
+type CliToolStatus = {
+  bundled: boolean;
+  sidecarPath: string | null;
+  installSupported: boolean;
+  installedPath: string | null;
+  symlinkTarget: string | null;
+  upToDate: boolean;
+};
+
 export default function SettingsPage() {
   const { kernel, kernelProgress, fetchKernel, showToast, settings, fetchSettings, updateSettings } = useStore();
   const [busy, setBusy] = useState(false);
@@ -32,6 +44,9 @@ export default function SettingsPage() {
   /** 默认起始页本地草稿：加载后从 settings 同步；空串合法（= about:blank） */
   const [startUrl, setStartUrl] = useState<string | null>(null);
   const [savingStartUrl, setSavingStartUrl] = useState(false);
+  /** CLI 工具状态：null=读取中（invoke 失败也保持 null，仅灰显） */
+  const [cliTool, setCliTool] = useState<CliToolStatus | null>(null);
+  const [cliBusy, setCliBusy] = useState(false);
 
   useEffect(() => {
     if (settings && startUrl === null) setStartUrl(settings.defaultStartUrl);
@@ -76,6 +91,49 @@ export default function SettingsPage() {
       setApiUp(false);
     }
   }, []);
+
+  const fetchCliTool = useCallback(() => {
+    invoke<CliToolStatus>('cli_tool_status')
+      .then(setCliTool)
+      .catch(() => setCliTool(null));
+  }, []);
+
+  const installCli = useCallback(async () => {
+    setCliBusy(true);
+    try {
+      setCliTool(await invoke<CliToolStatus>('cli_tool_install'));
+      showToast('ok', '命令行工具已安装，终端里即可使用 chrome-host 命令');
+    } catch (e) {
+      showToast('err', String(e));
+    } finally {
+      setCliBusy(false);
+    }
+  }, [showToast]);
+
+  const uninstallCli = useCallback(async () => {
+    const ok = await confirm({
+      title: '卸载命令行工具',
+      message: [
+        `将从 ${cliTool?.installedPath ?? '/usr/local/bin'} 移除 chrome-host 链接。`,
+        '不影响应用内 CLI 本体，之后可随时重新安装。',
+      ],
+      confirmText: '卸载',
+    });
+    if (!ok) return;
+    setCliBusy(true);
+    try {
+      setCliTool(await invoke<CliToolStatus>('cli_tool_uninstall'));
+      showToast('ok', '命令行工具已卸载');
+    } catch (e) {
+      showToast('err', String(e));
+    } finally {
+      setCliBusy(false);
+    }
+  }, [cliTool?.installedPath, showToast]);
+
+  useEffect(() => {
+    fetchCliTool();
+  }, [fetchCliTool]);
 
   useEffect(() => {
     fetchKernel();
@@ -304,6 +362,54 @@ export default function SettingsPage() {
               }`}
             />
           </button>
+        </div>
+      </section>
+
+      {/* 命令行工具（CLI 随应用打包，symlink 安装到 PATH） */}
+      <section className="mb-4 rounded-xl border border-hairline bg-white p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="text-sm font-medium text-ink">命令行工具（chrome-host CLI）</h2>
+            <p className="mt-0.5 text-xs text-ink-3">
+              在终端与脚本中使用 chrome-host 命令管理环境与实例。安装即在
+              /usr/local/bin 创建指向应用内 CLI 的链接，可能需要管理员授权；
+              CLI 版本随应用升级自动同步。
+            </p>
+            {cliTool?.installedPath && (
+              <p className="mt-1 text-[11px] text-ink-3">
+                {cliTool.upToDate ? '已安装：' : '已存在：'}
+                <span className="font-mono">{cliTool.installedPath}</span>
+                {cliTool.upToDate ? ' ✓' : ''}
+              </p>
+            )}
+            {!cliTool?.upToDate && cliTool?.symlinkTarget && (
+              <p className="mt-1 text-[11px] text-amber-600">
+                链接指向 <span className="font-mono">{cliTool.symlinkTarget}</span>（旧版本或已失效），安装后可修复
+              </p>
+            )}
+          </div>
+          {cliTool === null ? (
+            <span className="shrink-0 text-xs text-ink-3">—</span>
+          ) : !cliTool.bundled ? (
+            <span className="shrink-0 text-xs text-ink-3">CLI 未随应用打包</span>
+          ) : !cliTool.installSupported ? (
+            <span className="shrink-0 text-xs text-ink-3">请手动将 CLI 加入 PATH</span>
+          ) : cliTool.upToDate ? (
+            <button className={btnGhost} disabled={cliBusy} onClick={uninstallCli}>
+              卸载
+            </button>
+          ) : (
+            <div className="flex shrink-0 gap-2">
+              {cliTool.installedPath && (
+                <button className={btnGhost} disabled={cliBusy} onClick={uninstallCli}>
+                  卸载
+                </button>
+              )}
+              <button className={btnPrimary} disabled={cliBusy} onClick={installCli}>
+                {cliBusy ? '处理中…' : cliTool.installedPath ? '修复' : '安装'}
+              </button>
+            </div>
+          )}
         </div>
       </section>
 

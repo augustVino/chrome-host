@@ -4,9 +4,9 @@
   "version": "0.1.6",
   "identifier": "com.chromehost.dev",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "node scripts/build-cli-sidecar.mjs && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "node scripts/build-cli-sidecar.mjs && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -35,6 +35,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/chrome-host-cli"
     ],
     "resources": [
       "extensions"

@@ -5,11 +5,9 @@
 ## 核心能力
 
 - **环境与实例**：环境 = 一份配置（可选 hosts 配置源 + keepAlive）；实例 = 该环境的一次隔离运行（独立 user-data-dir + CDP 端口）
-- **登录态快照（Login Profile）**：用母本目录打开浏览器登录 → 停机捕获 → 之后创建的实例自动克隆登录态；快照可刷新/重置
+- **登录态快照（Login Profile）**：母本浏览器登录 → 捕获快照 → 之后创建的实例自动克隆登录态；快照可刷新/重置
 - **hosts 注入**：实例启动时从 hosts 配置源现拉最新配置，经 `--host-resolver-rules` 进程级注入，不改系统 hosts
-- **托盘常驻**（macOS 原生材质 Popover + 三平台 native 菜单）：不开主窗口完成 New Instance / Focus / Stop
-- **Agent API**：`http://127.0.0.1:17890/api/v1` REST 全量管理（详见下方速查），专为 AI Agent / 自动化设计；另有内嵌 MCP server（`/mcp`，见下文）
-- **Developer Mode**：设置开启后展示 PID / CDP 端口 / Profile 目录等技术字段
+- **多入口共享服务层**：GUI / Agent API（REST）/ MCP / CLI 四个入口，同一套业务契约，专为 AI Agent 与自动化设计
 - **keepAlive**：环境级开关；实例异常退出自动重启，60s 窗口内连续崩溃 3 次自动熔断
 
 ## 快速开始
@@ -21,111 +19,29 @@ pnpm tauri dev
 
 首次启动自动下载 Chrome for Testing 131（pinned，双镜像）；内核状态见 Settings 页。
 
-## Agent API 速查
+## 命令行工具（CLI）
 
-仅绑定 `127.0.0.1`。错误格式 `{ "error": { "code", "message" } }`，前端与 AI 依赖 `code` 而非 `message`。
+CLI 内置于桌面应用（v0.1.7 起），**不随安装自动可用，需在应用内开启一次**：
 
-**📖 完整接入指南（全部端点请求/响应形状 / 错误码总表 / 接入注意事项）：[AGENT-API.md](AGENT-API.md)**
+1. 打开 chrome-host → **设置 → 命令行工具 → 安装**
+2. 应用在 `/usr/local/bin` 创建指向应用内 CLI 的 `chrome-host` 链接（需要管理员授权）
 
-```text
-# Environments
-GET    /api/v1/environments                          环境列表（含运行摘要）
-POST   /api/v1/environments                          创建环境
-GET    /api/v1/environments/:id                      详情
-PATCH  /api/v1/environments/:id                      部分更新（name/hostsSourceUrl/icon/startupArgs/keepAlive）
-DELETE /api/v1/environments/:id                      删除（运行中 → 409）
-GET    /api/v1/environments/:id/status               运行时摘要
-GET    /api/v1/environments/:id/activity?limit=50    Activity 事件流
+> 使用前提：chrome-host 桌面应用需处于运行状态（含托盘常驻）——CLI 是 Agent API 的薄客户端，应用未运行时所有命令返回 exit 8。AI Agent / CI 接入请先跑 `chrome-host status` 探活。
 
-# Login Profile（登录态快照）
-GET    /api/v1/environments/:id/login-profile        视图（惰性创建）
-POST   /api/v1/environments/:id/login-profile/launch 打开登录浏览器
-POST   /api/v1/environments/:id/login-profile/capture 捕获快照（浏览器运行中 → 409）
-POST   /api/v1/environments/:id/login-profile/reset   重置快照
+开发者从源码安装：`cargo install --path crates/cli`
 
-# Instances
-POST   /api/v1/environments/:id/instances            创建并启动
-GET    /api/v1/instances/:id                         详情
-DELETE /api/v1/instances/:id                         删除（运行中 → 409）
-GET    /api/v1/instances/:id/status                  状态
-POST   /api/v1/instances/:id/start|stop|restart      生命周期
-POST   /api/v1/instances/:id/focus                   唤出窗口
-GET    /api/v1/instances/:id/cdp                     CDP endpoint（含 WebSocket URL）
-GET    /api/v1/instances/:id/tabs                    标签页列表（page）
-POST   /api/v1/instances/:id/tabs                    新建标签页 { "url": "https://…" }
-POST   /api/v1/instances/:id/navigate                导航（new+close 组合近似，丢旧页历史）
+**📖 完整接入指南（命令参考 / Exit Code 契约 / AI Agent 与 CI 接入范式 / 故障排查）：[CLI.md](CLI.md)**
 
-# Settings / Kernel
-GET|PUT /api/v1/settings                             应用设置（developerMode）
-GET    /api/v1/kernel/status                         内核状态
-POST   /api/v1/kernel/download | /kernel/cancel      内核下载管理
-```
+## AI 接入（Agent API / MCP）
 
-应用内 Settings → Agent API 页提供可交互的 API Explorer。
+REST 与 MCP 均只绑定 `127.0.0.1:17890`，随应用启动：
 
-## MCP（AI 客户端接入）
-
-应用内嵌 MCP over Streamable HTTP server（随 app 启动，与 REST 同端口）。**📖 完整接入指南（24 个工具的输入输出 / 错误语义 / 编排闭环 / 各客户端配置）：[MCP.md](MCP.md)**
+- **Agent API**：`http://127.0.0.1:17890/api/v1` → **📖 [AGENT-API.md](AGENT-API.md)**（全部端点请求/响应形状 / 错误码总表）
+- **MCP**：`http://127.0.0.1:17890/mcp` → **📖 [MCP.md](MCP.md)**（工具清单 / 各客户端配置），Claude Code 一行接入：
 
 ```bash
 claude mcp add --transport http chrome-host http://127.0.0.1:17890/mcp
 ```
-
-Claude Desktop（`claude_desktop_config.json`）：
-
-```json
-{
-  "mcpServers": {
-    "chrome-host": {
-      "type": "http",
-      "url": "http://127.0.0.1:17890/mcp"
-    }
-  }
-}
-```
-
-24 个 tools：内核状态 / 环境 CRUD / keepAlive / 活动流 / 实例生命周期 / 标签页 / CDP endpoint / 登录态（get/launch/capture/reset）/ 扩展管理。业务错误以 `isError` + `{code, message, status}` 结构化透传给 AI。零 node 依赖；app 未启动时 MCP 不可达。
-
-## CLI（命令行入口）
-
-`chrome-host` CLI 是 GUI / MCP 之外的第三个入口：独立 binary（不依赖 Tauri），作为 Agent API 的薄客户端与 GUI/MCP 共享同一服务层，面向开发者终端与 AI Agent / CI 脚本。
-
-**📖 完整接入指南（命令参考 / Exit Code 契约 / Agent 接入范式 / 故障排查）：[CLI.md](CLI.md)**
-
-```bash
-cargo install --path crates/cli
-```
-
-快速上手：
-
-```bash
-chrome-host env create demo                       # 创建环境，输出 id
-chrome-host instance create <env_id> --quiet      # 创建即启动（首次可能阻塞内核下载），输出 id
-chrome-host instance cdp <ins_id> --json | jq .port
-chrome-host instance open <ins_id> https://example.com
-chrome-host instance stop <ins_id>
-chrome-host instance delete <ins_id> --yes        # 运行中实例自动 stop→delete
-chrome-host env delete <env_id> --yes
-```
-
-Exit Code 契约（agent 依赖退出码而非解析文案）：
-
-| Exit | 语义 |
-|---|---|
-| 0 | 成功 |
-| 1 | 一般错误（协议破坏、未知 5xx、doctor 存在失败项） |
-| 2 | 参数错误（clap 解析失败、`--json --quiet` 互斥、非 TTY 危险操作缺 `--yes`、本地校验失败） |
-| 3 | 目标资源不存在（`*_NOT_FOUND`） |
-| 4 | 资源已存在（预留，当前服务端无此码） |
-| 5 | 运行时状态冲突 / 运行时错误（409 冲突族、内核/启动/CDP 500 族） |
-| 6 | 权限拒绝（内置扩展锁定 `EXTENSION_SYSTEM_LOCKED`） |
-| 7 | 请求校验失败（400 族） |
-| 8 | 服务不可达（Agent API 连接拒绝 / 超时） |
-| 9 | CLI 侧等待超时（预留） |
-
-- `CHROME_HOST_API_URL`：Agent API 基地址的环境变量回退（默认 `http://127.0.0.1:17890`，优先级低于 `--api-url`），为 headless / 远程接入预留
-- `--json` 输出纯 JSON（错误体 `{"error":{"code","message"}}` 也走 stdout）；`--quiet` 仅输出主实体 id 供 `$(...)` 捕获；`--verbose` 向 stderr 追加请求诊断（不含 query 与敏感内容）
-- 前提：chrome-host 桌面应用需运行中（含托盘常驻），CLI 可达性与之一致；无 GUI 场景（headless daemon）见 P1 规划
 
 ## 已知边界（FAQ）
 
@@ -137,9 +53,9 @@ Exit Code 契约（agent 依赖退出码而非解析文案）：
 ## 开发
 
 ```bash
-pnpm tauri dev        # 开发（watcher 自动重编译）
-cd src-tauri && cargo test   # Rust 单测
-bash scripts/smoke.sh # 冒烟（需应用运行中；可选 HOSTS_SOURCE=<hosts 源 URL> 验证 hosts 注入）
+pnpm tauri dev                # 开发（beforeDevCommand 自动构建 CLI sidecar 到 src-tauri/binaries/）
+cd src-tauri && cargo test    # Rust 单测
+bash scripts/smoke.sh         # 冒烟（需应用运行中；可选 HOSTS_SOURCE=<hosts 源 URL> 验证 hosts 注入）
 ```
 
 ## License

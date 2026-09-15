@@ -1,4 +1,5 @@
 pub mod cdp;
+pub mod cli_tool;
 pub mod db;
 pub mod extension;
 pub mod hosts;

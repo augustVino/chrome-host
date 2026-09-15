@@ -32,6 +32,17 @@ use infrastructure::paths::AppPaths;
 use infrastructure::process::DefaultProcessManager;
 use infrastructure::settings;
 
+/// 本机集成自愈（仅 release）：应用升级换包后修复失效的自启 plist 与 PATH 符号链接。
+/// dev 模式跳过，避免把用户生产配置指到 target/debug。
+#[cfg(not(debug_assertions))]
+fn startup_self_heal(app: &tauri::AppHandle) {
+    infrastructure::platform::heal_stale_plist(app);
+    infrastructure::cli_tool::heal_stale_link();
+}
+
+#[cfg(debug_assertions)]
+fn startup_self_heal(_app: &tauri::AppHandle) {}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -236,6 +247,9 @@ fn main() {
             }
 
             // Agent API（axum，127.0.0.1:17890；端口占用时降级禁用）
+            // （自愈放在启动收尾：失败仅记日志，不阻塞主流程）
+            startup_self_heal(&handle);
+
             let api_state = ApiState {
                 env_service,
                 instance_service,
@@ -256,6 +270,11 @@ fn main() {
 
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![
+            infrastructure::cli_tool::cli_tool_status,
+            infrastructure::cli_tool::cli_tool_install,
+            infrastructure::cli_tool::cli_tool_uninstall,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -16,7 +16,7 @@ Chrome Host 是桌面应用（Tauri），本 skill 通过其官方命令行入�
 ## 前提与自检
 
 1. 桌面应用 Chrome Host 运行中（含托盘常驻）——CLI 是它的客户端，应用不在则一切不可用。
-2. CLI 已安装：`command -v chrome-host`。缺失则告知用户安装方式（仓库内 `cargo install --path crates/cli`）。
+2. CLI 已安装：`command -v chrome-host`。缺失则引导用户在应用内安装：**设置 → 命令行工具 → 安装**（创建 /usr/local/bin/chrome-host 链接，需管理员授权；v0.1.7 起 CLI 随应用内置，无需 cargo install）。
 
 ## 第零步：健康检查
 

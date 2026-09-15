@@ -36,15 +36,21 @@
 
 ## 安装
 
-```bash
-# 从源码安装（需要 Rust 工具链）
-cargo install --path crates/cli
+**方式一：随桌面应用（推荐）**
 
-# 验证
-chrome-host --version
+v0.1.7 起 CLI 随桌面应用打包：打开 **设置 → 命令行工具 → 安装**，应用会在 `/usr/local/bin` 创建指向应用内 CLI 的符号链接（需要管理员授权）。CLI 版本随应用升级自动同步；升级后若链接失效，同页一键修复。
+
+**方式二：从源码安装（开发者）**
+
+```bash
+cargo install --path crates/cli
 ```
 
-> 预编译分发（brew / winget / 直接下载）在规划中，发布后补充此节。
+验证：
+
+```bash
+chrome-host --version
+```
 
 ## 快速上手
 
