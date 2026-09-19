@@ -47,7 +47,9 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, CliError> {
     // 基地址解析：flag > 环境变量 > 默认（GlobalArgs::api_url）；
     // 构造失败（TLS 后端等环境级问题）→ CliError::Local → exit 2。
     // verbose：--verbose 时 client.send() 向 stderr 输出请求摘要行。
-    let client = AgentClient::new(&globals.api_url())?.with_verbose(globals.verbose);
+    let client = AgentClient::new(&globals.api_url())?
+        .with_verbose(globals.verbose)
+        .with_token(globals.token());
     match cli.command.as_ref() {
         Some(Commands::Env { command }) => {
             cli::env::run(command, globals, &client).map(|_| ExitCode::SUCCESS)

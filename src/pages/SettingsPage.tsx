@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { api, errorText } from '../api/client';
+import type { RemoteAccessStatus } from '../api/types';
 import { copyText } from '../lib/clipboard';
 import { useStore } from '../store';
 import { btnGhost, btnPrimary, inputCls } from '../components/ui';
@@ -47,10 +48,37 @@ export default function SettingsPage() {
   /** CLI 工具状态：null=读取中（invoke 失败也保持 null，仅灰显） */
   const [cliTool, setCliTool] = useState<CliToolStatus | null>(null);
   const [cliBusy, setCliBusy] = useState(false);
+  /** 远程接入：SSH 目标本地草稿（加载后从 settings 同步，点保存才 PUT） */
+  const [remoteTarget, setRemoteTarget] = useState<string | null>(null);
+  const [savingRemote, setSavingRemote] = useState(false);
+  /** 隧道实时状态：页面挂载期间 5s 轮询；null = 未加载 */
+  const [remoteStatus, setRemoteStatus] = useState<RemoteAccessStatus | null>(null);
 
   useEffect(() => {
     if (settings && startUrl === null) setStartUrl(settings.defaultStartUrl);
   }, [settings, startUrl]);
+
+  useEffect(() => {
+    if (settings && remoteTarget === null) setRemoteTarget(settings.remoteAccessSshTarget);
+  }, [settings, remoteTarget]);
+
+  // 隧道状态轮询：挂载期间每 5s（cleanup 清 interval）；失败静默保持上次值
+  useEffect(() => {
+    let alive = true;
+    const poll = () =>
+      api
+        .getRemoteStatus()
+        .then((s) => {
+          if (alive) setRemoteStatus(s as RemoteAccessStatus);
+        })
+        .catch(() => {});
+    poll();
+    const timer = setInterval(poll, 5000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, []);
 
   const saveStartUrl = useCallback(async () => {
     if (startUrl === null) return;
@@ -79,6 +107,40 @@ export default function SettingsPage() {
       showToast('err', `开机自启设置失败：${String(e)}`);
     }
   }, [autoStart, showToast]);
+
+  const saveRemoteTarget = useCallback(async () => {
+    if (remoteTarget === null) return;
+    setSavingRemote(true);
+    await updateSettings({ remoteAccessSshTarget: remoteTarget.trim() });
+    setSavingRemote(false);
+  }, [remoteTarget, updateSettings]);
+
+  const toggleRemote = useCallback(() => {
+    // 错误（如目标为空 400）由 store.updateSettings 统一 Toast
+    updateSettings({ remoteAccessEnabled: !settings?.remoteAccessEnabled });
+  }, [settings, updateSettings]);
+
+  const rotateToken = useCallback(async () => {
+    const ok = await confirm({
+      title: '轮换访问令牌',
+      message: ['现有令牌立即失效，使用旧令牌的远程客户端将全部掉线，需更新配置后重连。'],
+      confirmText: '轮换',
+    });
+    if (!ok) return;
+    try {
+      await api.rotateRemoteToken();
+      await fetchSettings();
+      showToast('ok', '访问令牌已轮换');
+    } catch (e) {
+      showToast('err', errorText(e));
+    }
+  }, [fetchSettings, showToast]);
+
+  const copyToken = useCallback(async () => {
+    if (!settings?.remoteAccessToken) return;
+    await copyText(settings.remoteAccessToken);
+    showToast('ok', '令牌已复制');
+  }, [settings, showToast]);
 
   const checkApi = useCallback(async () => {
     try {
@@ -293,6 +355,99 @@ export default function SettingsPage() {
             />
           </button>
         </div>
+      </section>
+
+      {/* 远程接入（云桌面 / CI）：单端口 SSH 隧道 + Bearer 鉴权 + CDP 会话代理（方案 v2） */}
+      <section className="mb-4 rounded-xl border border-hairline bg-white p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-medium text-ink">远程接入（云桌面 / CI）</h2>
+            <p className="mt-0.5 text-xs text-ink-3">
+              仅转发 Agent API 端口到目标机器（SSH 隧道，应用自动守护）；远程访问需持访问令牌，
+              实例 CDP 由会话代理提供，不开放额外端口。
+            </p>
+          </div>
+          <button
+            role="switch"
+            aria-checked={settings?.remoteAccessEnabled ?? false}
+            className={`relative h-5 w-9 shrink-0 rounded-full transition ${
+              settings?.remoteAccessEnabled ? 'bg-status-running' : 'bg-status-stopped'
+            }`}
+            onClick={toggleRemote}
+          >
+            <span
+              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${
+                settings?.remoteAccessEnabled ? 'left-[18px]' : 'left-0.5'
+              }`}
+            />
+          </button>
+        </div>
+        <div className="mt-3 flex gap-2">
+          <input
+            className={`${inputCls} flex-1`}
+            value={remoteTarget ?? ''}
+            onChange={(e) => setRemoteTarget(e.target.value)}
+            placeholder="user@host 或 ~/.ssh/config 别名"
+            disabled={remoteTarget === null}
+          />
+          <button
+            className={btnPrimary}
+            disabled={
+              remoteTarget === null ||
+              savingRemote ||
+              remoteTarget.trim() === (settings?.remoteAccessSshTarget ?? '')
+            }
+            onClick={saveRemoteTarget}
+          >
+            {savingRemote ? '保存中…' : '保存'}
+          </button>
+        </div>
+        {settings && settings.remoteAccessEnabled && settings.remoteAccessToken && (
+          <div className="mt-3 flex items-center gap-2 text-xs">
+            <span className="shrink-0 text-ink-2">访问令牌：</span>
+            <span className="truncate font-mono text-ink" title={settings.remoteAccessToken}>
+              {settings.remoteAccessToken}
+            </span>
+            <button className={`${btnGhost} shrink-0`} onClick={copyToken}>
+              复制
+            </button>
+            <button className={`${btnGhost} shrink-0`} onClick={rotateToken}>
+              轮换
+            </button>
+          </div>
+        )}
+        {remoteStatus && (
+          <div className="mt-3 flex items-center gap-2 text-xs">
+            {!remoteStatus.enabled ? (
+              <>
+                <span className="size-2 shrink-0 rounded-full bg-status-stopped" />
+                <span className="text-ink-3">未启用</span>
+              </>
+            ) : remoteStatus.state === 'connected' ? (
+              <>
+                <span className="size-2 shrink-0 rounded-full bg-status-running" />
+                <span className="text-run-text">已连接 {remoteStatus.target}</span>
+              </>
+            ) : (
+              <>
+                <span className="size-2 shrink-0 animate-pulse rounded-full bg-status-starting" />
+                <span className="text-ink-2">
+                  {remoteStatus.state === 'connecting'
+                    ? '连接中…'
+                    : `重连中（第 ${remoteStatus.restarts} 次）`}
+                </span>
+                {remoteStatus.state === 'reconnecting' && remoteStatus.lastError && (
+                  <span
+                    className="truncate text-status-error"
+                    title={remoteStatus.lastError}
+                  >
+                    {remoteStatus.lastError}
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+        )}
       </section>
 
       {/* 应用更新 */}

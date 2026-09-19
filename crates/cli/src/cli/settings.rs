@@ -83,6 +83,9 @@ fn settings_kv_pairs(s: &AppSettingsView) -> Vec<(String, String)> {
         ("envLabelPosition".into(), s.env_label_position.clone()),
         ("envLabelColor".into(), s.env_label_color.clone()),
         ("defaultStartUrl".into(), s.default_start_url.clone()),
+        ("remoteAccessEnabled".into(), s.remote_access_enabled.to_string()),
+        ("remoteAccessSshTarget".into(), s.remote_access_ssh_target.clone()),
+        ("remoteAccessToken".into(), s.remote_access_token.clone()),
     ]
 }
 

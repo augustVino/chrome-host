@@ -122,7 +122,7 @@ export const useStore = create<AppStore>((set, get) => ({
     }
   },
 
-  updateSettings: async (patch: { developerMode?: boolean; envLabelPosition?: string; envLabelColor?: string; defaultStartUrl?: string }) => {
+  updateSettings: async (patch: { developerMode?: boolean; envLabelPosition?: string; envLabelColor?: string; defaultStartUrl?: string; remoteAccessEnabled?: boolean; remoteAccessSshTarget?: string }) => {
     try {
       set({ settings: (await api.updateSettings(patch)) as AppSettings });
     } catch (e) {

@@ -44,6 +44,9 @@ pub struct AgentClient {
     base_url: String,
     /// verbose 开关（`--verbose`）：true 时每次请求向 stderr 追加一行摘要。
     verbose: bool,
+    /// 远程访问令牌（`--token` / `CHROME_HOST_TOKEN`）：Some 时注入
+    /// `Authorization: Bearer`。send() 此前无任何 header 注入路径，此为新增。
+    token: Option<String>,
     /// 常规操作客户端（30s 总超时）。
     default_http: reqwest::blocking::Client,
     /// 长操作客户端（无总超时）。
@@ -62,6 +65,7 @@ impl AgentClient {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             verbose: false,
+            token: None,
             default_http: Self::build_http(true)?,
             long_op_http: Self::build_http(false)?,
         })
@@ -73,6 +77,15 @@ impl AgentClient {
     /// tests/contract.rs 走裸 [`AgentClient::new`] 不受影响。
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    /// 令牌注入：消费式 builder，main.rs 以 `globals.token()` 注入
+    /// （`AgentClient::new(...)?.with_verbose(...).with_token(...)`）。
+    /// Some 时所有请求携带 `Authorization: Bearer <token>`（远程接入的 17891
+    /// 鉴权监听器要求）；None = 本地直连语义，不注入。
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
         self
     }
 
@@ -125,6 +138,9 @@ impl AgentClient {
         // 移动，verbose 行在响应后还要用
         let method_str = method.to_string();
         let mut request = http.request(method, format!("{}{}", self.base_url, path));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
         if let Some(json) = body {
             request = request.json(&json);
         }

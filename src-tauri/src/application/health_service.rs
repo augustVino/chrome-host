@@ -19,6 +19,8 @@ use crate::infrastructure::db::repositories::instance_repository::InstanceReposi
 use crate::infrastructure::kernel::KernelManager;
 use crate::infrastructure::paths::AppPaths;
 
+use super::tunnel::{TunnelService, LOCAL_LANDING_PORT, REMOTE_PORT};
+
 /// 单项检查结果
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,9 +61,11 @@ pub struct HealthService {
     ins_repo: Arc<InstanceRepository>,
     extensions: Arc<ExtensionRepository>,
     app_version: String,
+    tunnel: Arc<TunnelService>,
 }
 
 impl HealthService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: DbPool,
         kernel: Arc<KernelManager>,
@@ -70,8 +74,9 @@ impl HealthService {
         ins_repo: Arc<InstanceRepository>,
         extensions: Arc<ExtensionRepository>,
         app_version: String,
+        tunnel: Arc<TunnelService>,
     ) -> Self {
-        HealthService { pool, kernel, paths, env_repo, ins_repo, extensions, app_version }
+        HealthService { pool, kernel, paths, env_repo, ins_repo, extensions, app_version, tunnel }
     }
 
     /// 产出健康快照。各项检查独立执行、不短路（doctor 要一次给出全部问题）
@@ -81,6 +86,7 @@ impl HealthService {
             self.check_kernel(),
             self.check_directories(),
             self.check_extensions(),
+            self.check_remote_access(),
         ];
         let ok = checks.iter().all(|c| c.ok);
         HealthReport { version: self.app_version.clone(), ok, checks, counts: self.counts() }
@@ -213,6 +219,44 @@ impl HealthService {
         }
     }
 
+    /// 远程接入：disabled → ok（未启用）；connected → ok（含目标）；
+    /// 其余（connecting / reconnecting）→ 不 ok 并给出排查建议，
+    /// 使 `chrome-host doctor` 能报出隧道故障（方案 §4.5）
+    fn check_remote_access(&self) -> HealthCheck {
+        let st = self.tunnel.status();
+        if !st.enabled {
+            return HealthCheck {
+                name: "remote_access".into(),
+                ok: true,
+                detail: "未启用".into(),
+                suggestion: None,
+            };
+        }
+        match st.state.as_str() {
+            "connected" => HealthCheck {
+                name: "remote_access".into(),
+                ok: true,
+                detail: format!(
+                    "SSH 隧道已连接: {}（目标机 {REMOTE_PORT} → 本机 {LOCAL_LANDING_PORT}）",
+                    st.target
+                ),
+                suggestion: None,
+            },
+            state => HealthCheck {
+                name: "remote_access".into(),
+                ok: false,
+                detail: format!(
+                    "隧道状态 {state}: {}（重连 {} 次）",
+                    st.last_error.unwrap_or_default(),
+                    st.restarts
+                ),
+                suggestion: Some(
+                    "检查 SSH 目标可达性与密钥配置（BatchMode 免交互）；持续失败可在设置页关闭后重新开启".into(),
+                ),
+            },
+        }
+    }
+
     /// 资源计数：仓储读取失败按 0 处理（计数是附加信息，不应让整份报告失败）
     fn counts(&self) -> Counts {
         let environments = self.env_repo.list().map(|v| v.len()).unwrap_or(0) as u64;
@@ -324,6 +368,7 @@ mod tests {
             Arc::new(InstanceRepository::new(pool.clone())),
             Arc::new(ExtensionRepository::new(pool.clone())),
             "0.0.0-test".into(),
+            Arc::new(TunnelService::with_sink(Arc::new(|_: &str| {}))),
         );
         (svc, pool)
     }

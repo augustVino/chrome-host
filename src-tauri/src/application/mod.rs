@@ -8,3 +8,4 @@ pub mod profile_service;
 pub mod reconciler;
 pub mod settings_service;
 pub mod tray;
+pub mod tunnel;

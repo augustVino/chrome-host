@@ -25,6 +25,8 @@ const ERROR_TEXT: Record<string, string> = {
   EXTENSION_SYSTEM_LOCKED: '系统扩展不可修改',
   EXTENSION_NOT_FOUND: '扩展不存在',
   INVALID_REQUEST: '请求参数不合法',
+  UNAUTHORIZED: '远程访问令牌缺失或不正确（Bearer token）',
+  REMOTE_ACCESS_TARGET_INVALID: 'SSH 目标不能为空，且不能以 - 开头或包含空白字符',
 };
 
 export function errorText(e: unknown): string {
@@ -84,8 +86,12 @@ export const api = {
 
   // settings
   getSettings: () => request('/settings'),
-  updateSettings: (body: { developerMode?: boolean; envLabelPosition?: string; envLabelColor?: string; defaultStartUrl?: string }) =>
+  updateSettings: (body: { developerMode?: boolean; envLabelPosition?: string; envLabelColor?: string; defaultStartUrl?: string; remoteAccessEnabled?: boolean; remoteAccessSshTarget?: string }) =>
     request('/settings', { method: 'PUT', body: JSON.stringify(body) }),
+
+  // remote access
+  getRemoteStatus: () => request('/remote-access/status'),
+  rotateRemoteToken: () => request<{ token: string }>('/remote-access/token', { method: 'POST' }),
 
   // activity
   getActivity: (envId: string, limit = 50) =>

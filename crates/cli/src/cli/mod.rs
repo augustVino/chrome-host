@@ -32,6 +32,10 @@ pub const DEFAULT_API_URL: &str = "http://127.0.0.1:17890";
 /// headless daemon 与集成测试的预留接入点（计划 §2.1）。
 pub const ENV_API_URL: &str = "CHROME_HOST_API_URL";
 
+/// `--token` 缺省时的环境变量回退名：远程接入（经隧道连 17891 监听器）时的
+/// Bearer 凭证。本地直连 17890 无需设置。
+pub const ENV_TOKEN: &str = "CHROME_HOST_TOKEN";
+
 /// CLI 根命令。
 #[derive(Debug, Parser)]
 #[command(
@@ -40,7 +44,7 @@ pub const ENV_API_URL: &str = "CHROME_HOST_API_URL";
     about = "chrome-host 命令行 — Developer-first Chrome Runtime Control Interface",
     // 无子命令声明时 bare 调用打印帮助并按 clap 默认退出（帮助 2 / --help 0），绝不静默空跑
     arg_required_else_help = true,
-    after_help = "环境变量:\n  CHROME_HOST_API_URL  Agent API 基地址回退（优先级低于 --api-url，默认 http://127.0.0.1:17890）"
+    after_help = "环境变量:\n  CHROME_HOST_API_URL  Agent API 基地址回退（优先级低于 --api-url，默认 http://127.0.0.1:17890）\n  CHROME_HOST_TOKEN    远程访问令牌（经 SSH 隧道接入时需要；优先级低于 --token，本地直连无需）"
 )]
 pub struct Cli {
     /// 全局参数：flatten 在根上，位于子命令名之前。
@@ -134,6 +138,12 @@ pub struct GlobalArgs {
     /// 解析顺序见 [`GlobalArgs::api_url`]；环境变量回退在 after_help 中说明。
     #[arg(long, hide = true, value_name = "URL")]
     pub api_url: Option<String>,
+
+    /// 远程访问令牌（Bearer）。隐藏出帮助正文；经 SSH 隧道接入（目标机 127.0.0.1:17890
+    /// → 本机 17891 鉴权监听器）时必需，本地直连无需。
+    /// 解析顺序与 --api-url 同构：flag > 环境变量 > 不携带。
+    #[arg(long, hide = true, value_name = "TOKEN")]
+    pub token: Option<String>,
 }
 
 impl GlobalArgs {
@@ -146,6 +156,15 @@ impl GlobalArgs {
             .clone()
             .or_else(|| std::env::var(ENV_API_URL).ok())
             .unwrap_or_else(|| DEFAULT_API_URL.to_string())
+    }
+
+    /// 解析最终令牌：flag > 环境变量 > 不携带（空串视为未设置）。
+    /// None = 不注入 Authorization 头（本地直连语义，服务端不校验）。
+    pub fn token(&self) -> Option<String> {
+        self.token
+            .clone()
+            .or_else(|| std::env::var(ENV_TOKEN).ok())
+            .filter(|t| !t.trim().is_empty())
     }
 }
 
@@ -211,6 +230,7 @@ mod tests {
             no_color: false,
             yes,
             api_url: None,
+            token: None,
         }
     }
 

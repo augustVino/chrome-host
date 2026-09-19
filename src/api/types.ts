@@ -95,8 +95,27 @@ export interface AppSettings {
   developerMode: boolean;
   envLabelPosition: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
   envLabelColor: 'red' | 'blue' | 'green' | 'purple';
-  /** 全局默认起始页（空 = 打开 about:blank） */
+  /** 全局默认起始页（空 = about:blank） */
   defaultStartUrl: string;
+  /** 远程接入：开启 = 应用守护 SSH 隧道（仅转发 17890） */
+  remoteAccessEnabled: boolean;
+  /** SSH 目标（user@host 或 ~/.ssh/config 别名） */
+  remoteAccessSshTarget: string;
+  /** 远程访问令牌（首次开启自动生成；隧道落地监听器 Bearer 校验用） */
+  remoteAccessToken: string;
+}
+
+/** 远程接入隧道状态（GET /remote-access/status） */
+export interface RemoteAccessStatus {
+  enabled: boolean;
+  target: string;
+  state: 'disabled' | 'connecting' | 'connected' | 'reconnecting';
+  lastError: string | null;
+  /** 进入当前状态的时刻（epoch ms） */
+  since: number;
+  pid: number | null;
+  /** 重连次数（本次 enabled 会话累计） */
+  restarts: number;
 }
 
 /** Login Profiles 页行 */
