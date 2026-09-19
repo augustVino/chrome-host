@@ -116,7 +116,11 @@ struct Shared {
     /// 进程组 id（= 包裹层 sh 的 pid，process_group(0) 使其为组长）
     pgid: Mutex<Option<u32>>,
     /// socketpair 的 app 侧：持有即存活前提；drop 触发包裹层 EOF 杀链
+    #[cfg(unix)]
     pipe: Mutex<Option<std::os::unix::net::UnixStream>>,
+    /// 非 unix 平台无 socketpair，占位保字段形态（恒 None）
+    #[cfg(not(unix))]
+    pipe: Mutex<Option<()>>,
     shutdown: AtomicBool,
     stderr_ring: Mutex<Vec<u8>>,
     /// 守护的子进程程序名（生产 "ssh"；测试注入 sleep 等）
@@ -288,9 +292,9 @@ impl TunnelService {
         self.notify.notify_one();
         let pgid = *self.shared.pgid.lock().unwrap();
         if let Some(p) = pgid {
-            signal_group(p as i32, libc::SIGTERM);
+            signal_group(p as i32, SIG_TERM);
             std::thread::sleep(Duration::from_millis(200));
-            signal_group(p as i32, libc::SIGKILL);
+            signal_group(p as i32, SIG_KILL);
         }
         *self.shared.pipe.lock().unwrap() = None;
         let mut c = self.shared.current.lock().unwrap();
@@ -530,11 +534,11 @@ fn spawn_wrapped(
 fn terminate_child(shared: &Shared, child: &mut std::process::Child) {
     let pgid = *shared.pgid.lock().unwrap();
     if let Some(p) = pgid {
-        signal_group(p as i32, libc::SIGTERM);
+        signal_group(p as i32, SIG_TERM);
     }
     let _ = child.wait(); // TERM 后组员（cat/ssh）退出，sh 收尾随即退出
     if let Some(p) = pgid {
-        signal_group(p as i32, libc::SIGKILL);
+        signal_group(p as i32, SIG_KILL);
     }
     kill_tracked(shared);
 }
@@ -644,6 +648,17 @@ fn remote_stale_cleanup(target: &str) {
         Err(e) => tracing::warn!("[tunnel] 远端自愈会话建立失败: {e}"),
     }
 }
+
+/// TERM/KILL 信号常量：libc 仅在 unix 目标可用（Cargo.toml cfg 门控），
+/// Windows 侧占位值走 no-op signal_group
+#[cfg(unix)]
+const SIG_TERM: libc::c_int = libc::SIGTERM;
+#[cfg(unix)]
+const SIG_KILL: libc::c_int = libc::SIGKILL;
+#[cfg(not(unix))]
+const SIG_TERM: i32 = 0;
+#[cfg(not(unix))]
+const SIG_KILL: i32 = 9;
 
 #[cfg(unix)]
 fn signal_group(pgid: i32, sig: libc::c_int) {
