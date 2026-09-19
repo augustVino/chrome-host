@@ -29,15 +29,22 @@
 
 ## 数据目录与备份
 
-全部数据集中在应用数据目录：
+全部数据集中在应用数据目录（Tauri 标准位置，按平台）：
+
+| 平台 | 路径 |
+|---|---|
+| macOS | `~/Library/Application Support/com.chromehost.dev/` |
+| Linux | `~/.config/com.chromehost.dev/` |
+| Windows | `%APPDATA%\com.chromehost.dev\` |
+
+目录内容：
 
 ```
-~/Library/Application Support/com.chromehost.dev/
-├── manager.db                      # 数据库（环境/实例/扩展/设置/事件）
-├── kernel/chrome-for-testing/      # 浏览器内核
-└── environments/<envId>/
-    ├── login-profile/              # 登录态母本与快照
-    └── instances/<insId>/          # 各实例独立 profile
+manager.db                      # 数据库（环境/实例/扩展/设置/事件）
+kernel/chrome-for-testing/      # 浏览器内核
+environments/<envId>/
+├── login-profile/              # 登录态母本与快照
+└── instances/<insId>/          # 各实例独立 profile
 ```
 
 **备份 / 迁移到新机器** = 退出应用后整目录拷贝。旧版本数据迁移见下方 FAQ（`scripts/migrate-legacy.js`）。

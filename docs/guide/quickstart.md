@@ -4,7 +4,7 @@
 
 **方式一：下载发布版（推荐）**
 
-从 [GitHub Releases](https://github.com/augustVino/chrome-host/releases) 下载最新版。
+从 [GitHub Releases](https://github.com/augustVino/chrome-host/releases) 下载最新版：macOS（`.dmg`）、Linux（`.deb` / `.rpm` / `.AppImage`）、Windows（`setup.exe`）均有提供。
 
 **方式二：源码运行（开发者）**
 
