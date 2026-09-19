@@ -7,6 +7,11 @@ Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no
 - Chrome (or Chromium, Brave, Edge, Vivaldi) launched with `--remote-debugging-port=9222`
 - Node.js 22+ (uses built-in WebSocket and fetch)
 - To use a different port or host, set `CDP_PORT` and/or `CDP_HOST` environment variables
+- chrome-host session proxy mode (remote/cloud-desktop access): set `CDP_BASE` to the URL
+  printed by `chrome-host instance cdp-session <id> --quiet` (e.g.
+  `http://127.0.0.1:17890/cdp/<ins>/<sid>`). Only the `/json/version` entry point changes;
+  `webSocketDebuggerUrl` is rewritten server-side, so all commands work unchanged.
+  Sessions expire after 30 min → re-issue via `cdp-session` (404 SESSION_NOT_FOUND).
 
 ## Commands
 

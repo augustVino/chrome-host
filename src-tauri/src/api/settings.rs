@@ -23,6 +23,10 @@ pub struct UpdateSettingsBody {
     pub env_label_color: Option<String>,
     #[serde(rename = "defaultStartUrl")]
     pub default_start_url: Option<String>,
+    #[serde(rename = "remoteAccessEnabled")]
+    pub remote_access_enabled: Option<bool>,
+    #[serde(rename = "remoteAccessSshTarget")]
+    pub remote_access_ssh_target: Option<String>,
 }
 
 /// PUT /api/v1/settings（部分更新：只更新传入字段）
@@ -30,14 +34,18 @@ pub async fn put(
     State(state): State<ApiState>,
     Json(body): Json<UpdateSettingsBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let view = state
-        .settings_service
-        .update(
-            body.developer_mode,
-            body.env_label_position,
-            body.env_label_color,
-            body.default_start_url,
-        )?;
+    let view = state.settings_service.update(
+        body.developer_mode,
+        body.env_label_position,
+        body.env_label_color,
+        body.default_start_url,
+        body.remote_access_enabled,
+        body.remote_access_ssh_target,
+    )?;
+    // 编排点（方案 §4.1）：全项目唯一 settings 写路径，PUT 成功即收敛隧道。
+    // 薄壳编排两个服务，不引入 SettingsService → TunnelService 依赖
+    state
+        .tunnel
+        .apply(view.remote_access_enabled, &view.remote_access_ssh_target);
     Ok(Json(json!(view)))
 }
-

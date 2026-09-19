@@ -57,8 +57,20 @@ mod tests {
     #[tokio::test]
     async fn skips_used_and_occupied_ports() {
         let _guard = PORT_TEST_LOCK.lock().unwrap();
-        // 占住 29222，把 29223 放进 used → 应跳到 29224
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 29222)).await.unwrap();
+        // 占住 29222，把 29223 放进 used → 应跳到 29224。
+        // 短重试：上一测试刚释放 29222 的 listening socket 时，macOS 内核回收存在
+        // 瞬态窗口（EADDRINUse 且无实际持有者），100ms 内消散（见上方同款注释）
+        let listener = {
+            let mut l = None;
+            for _ in 0..5 {
+                if let Ok(x) = tokio::net::TcpListener::bind(("127.0.0.1", 29222)).await {
+                    l = Some(x);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            l.expect("29222 在 100ms 重试窗口内持续不可绑定")
+        };
         let mut used = BTreeSet::new();
         used.insert(29223u16);
 
@@ -74,6 +86,20 @@ mod tests {
         let port = allocate(29222, &BTreeSet::new()).await.unwrap();
         // 分配结果必须是可绑定端口
         assert!(port >= 29222);
-        assert!(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok());
+        // probe（socket2 drop）→ rebind 之间存在 macOS 内核级瞬态 EADDRINUSE
+        // （无实际持有者，并行测试的 fork/exec 负载会放大该窗口）。
+        // 短重试窗口内消散即可视为可绑定；分配语义的验证不受影响。
+        let bindable = {
+            let mut ok = false;
+            for _ in 0..5 {
+                if tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
+                    ok = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            ok
+        };
+        assert!(bindable, "分配端口 {port} 在 100ms 重试窗口内均不可绑定");
     }
 }

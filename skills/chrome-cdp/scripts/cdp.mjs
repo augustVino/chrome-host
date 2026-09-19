@@ -36,6 +36,17 @@ function sockPath(targetId) {
 }
 
 async function getWsUrl() {
+  // CDP_BASE：chrome-host 会话代理模式（http://host:port/cdp/<ins>/<sid>）。
+  // 设置后仅改此处的 /json/version 入口；webSocketDebuggerUrl 由服务端改写为
+  // 指向代理的 ws://host/cdp/...，下游连接自然走代理，无需其他改动。
+  const base = process.env.CDP_BASE;
+  if (base) {
+    const res = await fetch(`${base.replace(/\/+$/, '')}/json/version`);
+    if (!res.ok) throw new Error(`Cannot reach CDP proxy at ${base} (${res.status}) — session may have expired (30min); re-issue via chrome-host instance cdp-session`);
+    const { webSocketDebuggerUrl } = await res.json();
+    if (!webSocketDebuggerUrl) throw new Error(`No webSocketDebuggerUrl in /json/version response from ${base}`);
+    return webSocketDebuggerUrl;
+  }
   const host = process.env.CDP_HOST || '127.0.0.1';
   const port = process.env.CDP_PORT || '9222';
   const res = await fetch(`http://${host}:${port}/json/version`);

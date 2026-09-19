@@ -250,6 +250,24 @@ pub struct AppSettingsView {
     pub env_label_color: String,
     /// 全局默认起始页（空 = 打开 about:blank）
     pub default_start_url: String,
+    /// 远程接入（v2 新增；旧版应用无此字段 → serde default 保证 CLI 兼容不破）
+    #[serde(default)]
+    pub remote_access_enabled: bool,
+    #[serde(default)]
+    pub remote_access_ssh_target: String,
+    #[serde(default)]
+    pub remote_access_token: String,
+}
+
+/// 来源：POST /api/v1/instances/{id}/cdp/sessions（v2 远程接入）。
+/// baseUrl 为代理路径前缀，客户端拼上自身可达的 scheme://host:port 使用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CdpSessionView {
+    pub session_id: String,
+    pub base_url: String,
+    /// 过期时刻（epoch ms）
+    pub expires_at: i64,
 }
 
 /// 来源：src-tauri/src/domain/login_profile.rs `LoginProfileStatus`（snake_case 全集 4 变体）。

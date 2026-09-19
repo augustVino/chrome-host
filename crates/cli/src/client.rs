@@ -27,7 +27,7 @@ use crate::error::CliError;
 use crate::model::{
     AppEvent, AppSettingsView, CdpEndpoint, CdpTarget, CftStatus, Environment, EnvironmentSummary,
     EnvStatus, Extension, HealthReport, Instance, InstanceStatusView, InstanceView,
-    KernelCancelResult, KernelDownloadResult, LoginProfileRow, LoginProfileView,
+    KernelCancelResult, KernelDownloadResult, LoginProfileRow, LoginProfileView, CdpSessionView,
 };
 
 /// TCP 连接超时：API 绑定本机回环地址，3s 足够；连不上即按「服务不可达」（exit 8）。
@@ -44,6 +44,9 @@ pub struct AgentClient {
     base_url: String,
     /// verbose 开关（`--verbose`）：true 时每次请求向 stderr 追加一行摘要。
     verbose: bool,
+    /// 远程访问令牌（`--token` / `CHROME_HOST_TOKEN`）：Some 时注入
+    /// `Authorization: Bearer`。send() 此前无任何 header 注入路径，此为新增。
+    token: Option<String>,
     /// 常规操作客户端（30s 总超时）。
     default_http: reqwest::blocking::Client,
     /// 长操作客户端（无总超时）。
@@ -62,6 +65,7 @@ impl AgentClient {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             verbose: false,
+            token: None,
             default_http: Self::build_http(true)?,
             long_op_http: Self::build_http(false)?,
         })
@@ -71,8 +75,22 @@ impl AgentClient {
     /// （`AgentClient::new(...)?.with_verbose(globals.verbose)`）。true 时每次请求
     /// 向 stderr 追加一行请求摘要（见模块注释「verbose 纪律」）；默认 false，
     /// tests/contract.rs 走裸 [`AgentClient::new`] 不受影响。
+    /// 基地址只读访问（cdp-session 组合完整代理 URL：base + baseUrl 路径）。
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    /// 令牌注入：消费式 builder，main.rs 以 `globals.token()` 注入
+    /// （`AgentClient::new(...)?.with_verbose(...).with_token(...)`）。
+    /// Some 时所有请求携带 `Authorization: Bearer <token>`（远程接入的 17891
+    /// 鉴权监听器要求）；None = 本地直连语义，不注入。
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
         self
     }
 
@@ -125,6 +143,9 @@ impl AgentClient {
         // 移动，verbose 行在响应后还要用
         let method_str = method.to_string();
         let mut request = http.request(method, format!("{}{}", self.base_url, path));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
         if let Some(json) = body {
             request = request.json(&json);
         }
@@ -395,6 +416,17 @@ impl AgentClient {
         Self::decode(self.send(
             Method::GET,
             &format!("/api/v1/instances/{id}/cdp"),
+            None,
+            false,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/cdp/sessions —— 发放 CDP 会话（30 分钟有效）。
+    /// 远程（经隧道 17891）需 Bearer token；本地直连免鉴权。
+    pub fn instance_cdp_session(&self, id: &str) -> Result<CdpSessionView, CliError> {
+        Self::decode(self.send(
+            Method::POST,
+            &format!("/api/v1/instances/{id}/cdp/sessions"),
             None,
             false,
         ))

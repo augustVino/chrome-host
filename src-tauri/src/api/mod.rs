@@ -1,3 +1,5 @@
+pub mod auth;
+pub mod cdp_proxy;
 pub mod environments;
 pub mod extensions;
 pub mod error;
@@ -6,5 +8,6 @@ pub mod instances;
 pub mod kernel;
 pub mod login_profiles;
 pub mod mcp;
+pub mod remote_access;
 pub mod settings;
 pub mod server;

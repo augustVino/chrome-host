@@ -32,6 +32,10 @@ impl ExitCode {
     /// 本码（命令层 ExitCode，不经 CliError —— Local 会误映射 2，与 doctor
     /// 同路径）。契约值 0–9 冻结（下方测试逐值断言）。
     pub const TIMEOUT: ExitCode = ExitCode(9);
+    /// 未授权（401 UNAUTHORIZED）：远程接入令牌缺失/错误。**隧道与应用均在线**，
+    /// 仅凭证问题——与 exit 8（不可达）形成三态诊断。0–9 冻结契约的**追加**项，
+    /// 不改变既有语义（v2 远程接入方案 §8）。
+    pub const UNAUTHORIZED: ExitCode = ExitCode(10);
 
     pub fn as_u8(self) -> u8 {
         self.0
@@ -72,6 +76,7 @@ fn from_api(status: u16, code: &str) -> ExitCode {
             return ExitCode::ALREADY_EXISTS;
         }
         return match status {
+            401 => ExitCode::UNAUTHORIZED,
             403 => ExitCode::PERMISSION,
             404 => ExitCode::NOT_FOUND,
             409 => ExitCode::RUNTIME,
@@ -147,6 +152,12 @@ mod tests {
                 "418 未知 4xx 兜底",
                 api(418, "SOME_FUTURE_CODE"),
                 ExitCode::VALIDATION,
+            ),
+            // —— Api 401：未授权 → 10（远程接入令牌缺失/错误；应用与隧道均在线）——
+            (
+                "401 UNAUTHORIZED",
+                api(401, "UNAUTHORIZED"),
+                ExitCode::UNAUTHORIZED,
             ),
             // —— Api 403 → 6 ——
             (

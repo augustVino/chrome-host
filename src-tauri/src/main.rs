@@ -6,11 +6,12 @@ mod domain;
 mod error;
 mod infrastructure;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tauri::{Manager, WebviewUrl};
 
 use api::server::ApiState;
+use application::cdp_session::CdpSessionService;
 use application::environment_service::EnvironmentService;
 use application::extension_service::ExtensionService;
 use application::health_service::HealthService;
@@ -21,6 +22,7 @@ use application::activity::Activity;
 use application::reconciler::Reconciler;
 use application::settings_service::SettingsService;
 use application::tray::{self, TrayState};
+use application::tunnel::TunnelService;
 use error::AppError;
 use infrastructure::db::client::DbPool;
 use infrastructure::db::repositories::environment_repository::EnvironmentRepository;
@@ -51,7 +53,13 @@ fn main() {
         )
         .init();
 
-    tauri::Builder::default()
+    // 退出钩子通道：tauri 2 的 build() 不执行 setup（延迟到 run()），
+    // app.state() 在此处取不到 managed state——改用 OnceLock 从 setup 传出 Arc，
+    // 与 tauri 生命周期解耦，exit 路径同步可用
+    let tunnel_slot: Arc<OnceLock<Arc<TunnelService>>> = Arc::new(OnceLock::new());
+    let tunnel_slot_for_setup = tunnel_slot.clone();
+
+    let app = tauri::Builder::default()
         // 单实例保护：二次启动时唤起已有实例的主窗口并退出当前进程。
         // 必须最先注册；否则双开时后者 API 永久禁用（端口已被前者占用），行为令人困惑
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -74,7 +82,7 @@ fn main() {
         // updater 自动更新（检查/下载/安装）+ 安装后 relaunch
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
 
             // 路径 + 数据库
@@ -98,6 +106,20 @@ fn main() {
             // 应用服务（reconciler 先行，env/instance 服务共享）
             let activity = Arc::new(Activity::new(handle.clone(), service_pool.clone()));
             activity.cleanup(); // app_events 超 5000 条清理旧行
+
+            // 远程接入隧道监督器（先于 health 构造：check_remote_access 依赖）。
+            // 同时注册进 managed state：退出钩子在 setup 闭包外经 app.state 取用
+            let tunnel = Arc::new(TunnelService::new(
+                activity.clone(),
+                paths.root.clone(),
+            ));
+            // 同时写入退出钩子通道（见 main 尾部 tunnel_slot 说明）
+            let _ = tunnel_slot_for_setup.set(tunnel.clone());
+
+            // CDP 会话服务（token 下级凭证：单实例作用域 + TTL；后台清扫过期项）
+            let sessions = Arc::new(CdpSessionService::new(activity.clone()));
+            sessions.start_sweeper();
+
             let reconciler = Arc::new(Reconciler::new(
                 ins_repo.clone(),
                 process.clone(),
@@ -141,6 +163,7 @@ fn main() {
                 ins_repo.clone(),
                 Arc::new(ExtensionRepository::new(service_pool.clone())),
                 app_version,
+                tunnel.clone(),
             ));
             let env_service = Arc::new(EnvironmentService::new(
                 env_repo.clone(),
@@ -250,6 +273,15 @@ fn main() {
             // （自愈放在启动收尾：失败仅记日志，不阻塞主流程）
             startup_self_heal(&handle);
 
+            // 远程接入：按持久化配置收敛隧道（apply 幂等；disabled 时仅记录状态，
+            // 不启动监督任务）。托盘常驻（--hidden）模式下同样生效。
+            // 读配置须在 settings_service move 进 ApiState 之前
+            let settings_view = settings_service.get()?;
+            tunnel.apply(
+                settings_view.remote_access_enabled,
+                &settings_view.remote_access_ssh_target,
+            );
+
             let api_state = ApiState {
                 env_service,
                 instance_service,
@@ -259,12 +291,28 @@ fn main() {
                 activity,
                 health,
                 kernel,
-                app: handle,
+                tunnel: tunnel.clone(),
+                sessions: sessions.clone(),
+                app: handle.clone(),
             };
-            tauri::async_runtime::spawn(async move {
-                let started = api::server::serve(api_state).await;
-                if !started {
-                    tracing::warn!("Agent API 未启动，可在释放端口后重启应用");
+            tauri::async_runtime::spawn({
+                let state = api_state.clone();
+                async move {
+                    let started = api::server::serve(state).await;
+                    if !started {
+                        tracing::warn!("Agent API 未启动，可在释放端口后重启应用");
+                    }
+                }
+            });
+            tauri::async_runtime::spawn({
+                let state = api_state;
+                async move {
+                    let started = api::server::serve_remote(state).await;
+                    if !started {
+                        tracing::warn!(
+                            "远程接入监听器（17891）未启动，远程访问不可用；本地功能不受影响"
+                        );
+                    }
                 }
             });
 
@@ -275,6 +323,19 @@ fn main() {
             infrastructure::cli_tool::cli_tool_install,
             infrastructure::cli_tool::cli_tool_uninstall,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // 退出钩子：ExitRequested（含托盘 Quit）→ 同步终止隧道子进程。
+    // 必须显式杀：进程退出不连带杀独立进程组的子进程，孤儿 ssh 会持续占用
+    // 目标机转发端口，下次启动 ExitOnForwardFailure 必然死循环（方案 §4.6）
+    let tunnel_slot = tunnel_slot;
+    app.run(move |_app_handle, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+            tracing::info!("应用退出：终止远程接入隧道");
+            if let Some(tunnel) = tunnel_slot.get() {
+                tunnel.shutdown();
+            }
+        }
+    });
 }

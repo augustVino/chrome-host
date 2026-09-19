@@ -8,7 +8,7 @@
 
 - [连接配置](#连接配置)
 - [通用行为约定](#通用行为约定)
-- [工具总览（24 个）](#工具总览24-个)
+- [工具总览（25 个）](#工具总览25-个)
 - [内核](#内核)
 - [环境](#环境)
 - [实例](#实例)
@@ -44,6 +44,12 @@ Claude Desktop（`claude_desktop_config.json`）：
 
 其他支持 Streamable HTTP 的 MCP 客户端（Cursor、Cline 等）同理：类型 HTTP、地址 `http://127.0.0.1:17890/mcp`。
 
+远程接入（云桌面，经 SSH 隧道）：客户端需携带访问令牌——
+
+```bash
+claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-host http://127.0.0.1:17890/mcp
+```
+
 > 握手后 server name = `chrome-host`，版本随应用包版本。协议细节（initialize/会话/SSE/版本协商）由 rmcp 官方 SDK 处理，客户端无需关心。
 
 ## 通用行为约定
@@ -59,13 +65,13 @@ Claude Desktop（`claude_desktop_config.json`）：
 4. **内核未装时 `create_instance` 会阻塞于首次下载**（约 150MB）——复杂任务先调 `kernel_status` 预判。
 5. 扩展启停只影响**之后启动的实例**；实例创建非幂等（每次新增一个）。
 
-## 工具总览（24 个）
+## 工具总览（25 个）
 
 | 分组 | 工具 |
 |---|---|
 | 内核（1） | `kernel_status` |
 | 环境（6） | `list_environments` · `create_environment` · `delete_environment` · `set_keep_alive` · `stop_all_for_environment` · `activity` |
-| 实例（8） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` |
+| 实例（9） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
 | 登录态（1） | `login_profile`（action: get / launch / capture / reset） |
 | 扩展（5） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` |
@@ -101,6 +107,7 @@ Claude Desktop（`claude_desktop_config.json`）：
 | `stop_instance` | `instanceId` | 优雅终止 Chrome 进程 |
 | `restart_instance` | `instanceId` | stop + start，hosts 重新拉取 |
 | `delete_instance` | `instanceId` | 删除实例（运行中 → 409，须先停止） |
+| `create_cdp_session` | `instanceId` | 发放 CDP 会话（远程/代理访问用，30 分钟有效）→ `{ sessionId, baseUrl, expiresAt }`。远程客户端以 baseUrl 代理访问 CDP（`/json/version` 与 `/devtools/*` WS，webSocketDebuggerUrl 已改写）；本地直连场景优先 `get_cdp` |
 | `get_cdp` | `instanceId` | CDP endpoint（含 WebSocket URL，可直接连 Chrome DevTools Protocol 做页面自动化） |
 
 ## 标签页

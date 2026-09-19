@@ -16,7 +16,7 @@ use super::output::{OutputCtx, TableRow};
 use super::GlobalArgs;
 use crate::client::AgentClient;
 use crate::error::CliError;
-use crate::model::{CdpEndpoint, CdpTarget, Instance, InstanceStatus, InstanceStatusView, InstanceView};
+use crate::model::{CdpEndpoint, CdpSessionView, CdpTarget, Instance, InstanceStatus, InstanceStatusView, InstanceView};
 
 /// instance 子命令树。
 #[derive(Debug, Subcommand)]
@@ -112,6 +112,13 @@ pub enum InstanceCommands {
         id: String,
     },
 
+    /// 发放 CDP 会话（远程/代理访问用，30 分钟有效）；--quiet 输出完整代理 URL
+    #[command(about = "发放 CDP 会话（远程/代理访问用，30 分钟有效）；--quiet 输出完整代理 URL")]
+    CdpSession {
+        /// 实例 id
+        id: String,
+    },
+
     /// 删除实例（同时删除其 profile 数据；运行中实例会先停止）
     #[command(about = "删除实例（同时删除其 profile 数据；运行中实例会先停止）")]
     Delete {
@@ -144,6 +151,7 @@ pub fn run(
         }
         InstanceCommands::Focus { id } => focus(globals, client, id),
         InstanceCommands::Cdp { id } => cdp(globals, client, id),
+        InstanceCommands::CdpSession { id } => cdp_session(globals, client, id),
         InstanceCommands::Delete { id, yes } => delete(globals, client, id, *yes),
     }
 }
@@ -420,6 +428,43 @@ fn cdp(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliEr
         serde_json::to_value(&endpoint).expect("纯数据 DTO 的序列化不会失败"),
     );
     Ok(())
+}
+
+/// `chrome-host instance cdp-session <id>`：发放 CDP 会话。
+/// **quiet 新契约**：输出完整代理 URL（base + baseUrl 路径，供 `CDP_BASE=$(...)` 直接捕获；
+/// render_kv 的 quiet 对单对象无冻结语义，此处按变更类命令 print_id 先例显式定义）。
+/// json 模式在服务端 DTO 基础上补 fullUrl 字段，与 kv 无信息差。
+fn cdp_session(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let view = client.instance_cdp_session(id)?;
+    let full_url = format!("{}{}", client.base_url(), view.base_url);
+    if out.quiet {
+        out.print_id(&full_url);
+        return Ok(());
+    }
+    let mut value = serde_json::to_value(&view).expect("纯数据 DTO 的序列化不会失败");
+    value["fullUrl"] = serde_json::Value::String(full_url);
+    out.render_kv(
+        &[
+            ("sessionId".into(), view.session_id.clone()),
+            ("baseUrl".into(), view.base_url.clone()),
+            ("expiresAt".into(), view.expires_at.to_string()),
+            (
+                "expiresInMin".into(),
+                ((view.expires_at - chrono_now_ms()) / 60_000).to_string(),
+            ),
+        ],
+        value,
+    );
+    Ok(())
+}
+
+/// 当前时刻（epoch ms）。CLI 侧只为呈现「剩余分钟」，精度无要求。
+fn chrono_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 /// cdp 的单对象 kv：键名与 `CdpEndpoint` JSON 字段一致（两模式无信息差）。

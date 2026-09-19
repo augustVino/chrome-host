@@ -225,6 +225,7 @@ mod tests {
             no_color: false,
             yes: false,
             api_url: None,
+            token: None,
         }
     }
 

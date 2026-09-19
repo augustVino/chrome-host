@@ -322,6 +322,18 @@ impl ChromeHostMcp {
         run(|| self.state.instance_service.get_cdp(&a.instance_id)).await
     }
 
+    #[tool(description = "发放实例的 CDP 会话（远程/代理访问用，30 分钟有效）：返回 sessionId 与 baseUrl。远程客户端以 baseUrl 代理访问 CDP（GET /json/version 与 /devtools/* WebSocket，webSocketDebuggerUrl 已改写指向代理）；本地直连场景优先 get_cdp。实例须运行中（否则 409）")]
+    async fn create_cdp_session(
+        &self,
+        Parameters(a): Parameters<InstanceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| async {
+            self.state.instance_service.require_cdp_port(&a.instance_id).await?;
+            Ok(self.state.sessions.create(&a.instance_id))
+        })
+        .await
+    }
+
     // ── 标签页 ──────────────────────────────────────────────────────────
 
     #[tool(description = "列出实例的全部页面标签（id/url/title，仅 page 类型）")]

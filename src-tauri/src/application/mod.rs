@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod cdp_session;
 pub mod environment_service;
 pub mod extension_service;
 pub mod health_service;
@@ -8,3 +9,4 @@ pub mod profile_service;
 pub mod reconciler;
 pub mod settings_service;
 pub mod tray;
+pub mod tunnel;

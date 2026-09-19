@@ -23,10 +23,10 @@
 
 | 项 | 值 |
 |---|---|
-| Base URL | `http://127.0.0.1:17890`（**仅回环绑定**，无任何改绑公网的配置项） |
+| Base URL | 本地 `http://127.0.0.1:17890`；远程接入另设隧道落地监听器 `127.0.0.1:17891`（同路由集 + Bearer 鉴权，见 [远程接入](#远程接入--remote-access)）。**均仅回环绑定**，无任何改绑公网的配置项 |
 | 编码 | 请求/响应均为 `application/json`；字段 camelCase |
 | 时间戳 | 均为 Unix epoch **毫秒**（`i64`） |
-| 鉴权 | 无（回环地址即信任边界；不要将端口暴露到网络） |
+| 鉴权 | 17890 无鉴权（本机回环即信任边界）；17891 全路由要求 `Authorization: Bearer <token>`（`/cdp/` 会话路径除外——会话 key 即凭证） |
 | 幂等性 | `POST .../instances` 与 `POST .../open` **非幂等**——每次调用新增一个实例 |
 | 版本要求 | `GET /api/v1/instances` 与 `GET /api/v1/health` 为 v0.1.5+ 新增；其余端点历史版本可用 |
 
@@ -172,6 +172,7 @@
 | `GET /api/v1/instances/{id}/tabs` | 页面标签列表（仅 `type: "page"`） |
 | `POST /api/v1/instances/{id}/tabs` | 新开标签页并导航。请求体 `{ "url": "https://…" }`（须含协议） |
 | `POST /api/v1/instances/{id}/navigate` | 导航既有标签页。请求体 `{ "tabId": "...", "url": "..." }`（new+close 组合近似，旧页历史丢失） |
+| `POST /api/v1/instances/{id}/cdp/sessions` | **发放 CDP 会话**（远程/代理访问用，`201`）：`{ sessionId, baseUrl, expiresAt }`，30 分钟有效。实例须运行中（否则 409）。经 17891 访问需 Bearer token |
 
 ```json
 // GET .../cdp 响应
@@ -213,8 +214,11 @@
 
 ```json
 { "developerMode": true, "envLabelPosition": "top-right",
-  "envLabelColor": "#FF4D4F", "defaultStartUrl": "https://example.com" }
+  "envLabelColor": "#FF4D4F", "defaultStartUrl": "https://example.com",
+  "remoteAccessEnabled": false, "remoteAccessSshTarget": "", "remoteAccessToken": "" }
 ```
+
+远程接入三字段（v0.2+）：`remoteAccessEnabled` 开关（开启 ⇒ `remoteAccessSshTarget` 恒非空，服务端校验）；`remoteAccessToken` 只读呈现（首次开启自动生成，轮换走 `POST /api/v1/remote-access/token`，不接受 PUT 写入）。
 
 ## Kernel — 内核
 
@@ -253,12 +257,44 @@ Chrome for Testing，**pinned 单版本策略**（不支持自定义路径/系�
 
 各项检查独立执行不短路；失败项 `ok: false` 且 `suggestion` 给出建议动作。
 
+## 远程接入（Remote Access）
+
+面向云桌面 / 远程机器上的 AI Agent：应用守护一条 SSH 反向隧道（唯一转发
+`-R 17890 → 本机 17891`），远程机器上的客户端访问**自己的** `127.0.0.1:17890`
+即等价于访问本机 API。凭证两级：
+
+| 层 | 凭证 | 作用域 |
+|---|---|---|
+| 控制面（REST / MCP） | Bearer token（Settings 页生成/轮换） | 全部 API |
+| 数据面（CDP 代理 `/cdp/*`） | 会话 key（URL 路径内） | 单实例 + 30 分钟 |
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/v1/remote-access/status` | 隧道实时状态：`{ enabled, target, state: disabled/connecting/connected/reconnecting, lastError, since, pid, restarts }` |
+| `POST /api/v1/remote-access/token` | 轮换访问令牌（旧令牌立即失效；同时清空全部活跃 CDP 会话） |
+| `POST /api/v1/instances/{id}/cdp/sessions` | 发放 CDP 会话（见 Instances 节） |
+| `GET /cdp/{ins}/{sid}/json*`、`WS /cdp/{ins}/{sid}/devtools/*` | CDP 会话代理（白名单端点；变更类不代理） |
+
+远程探活三态（CLI 退出码）：连接拒绝 = 隧道断或应用停（exit 8）；`401 UNAUTHORIZED` = **隧道与应用均在线**、仅凭证问题（CLI exit 10）；正常 = exit 0。
+
+典型远程闭环（目标机器上）：
+
+```bash
+export CHROME_HOST_TOKEN=<Settings 页令牌>
+chrome-host status                                          # exit 0 = 隧道+应用在线
+chrome-host instance cdp-session <ins_id> --quiet           # 输出代理 URL
+CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <target>
+```
+
 ## 错误码总表
 
 | HTTP | code | 场景 |
 |---|---|---|
-| 400 | `INVALID_REQUEST` | 请求体校验失败 |
+| 400 | `INVALID_REQUEST` | 请求体校验失败（含非代理端点访问 `/cdp/*`） |
 | 400 | `HOSTS_SOURCE_INVALID` | hosts 配置源 URL 非法 |
+| 400 | `REMOTE_ACCESS_TARGET_INVALID` | 开启远程接入时 SSH 目标缺失/非法（含空白、`-` 开头、超长；已开启时置空） |
+| 401 | `UNAUTHORIZED` | 17891 访问缺少/错误 Bearer token（隧道与应用均在线的信号） |
+| 404 | `SESSION_NOT_FOUND` | CDP 会话不存在或已过期（30 分钟），或实例与会话不匹配 |
 | 403 | `EXTENSION_SYSTEM_LOCKED` | 内置扩展不可启停/移除 |
 | 404 | `ENVIRONMENT_NOT_FOUND` / `INSTANCE_NOT_FOUND` / `EXTENSION_NOT_FOUND` / `LOGIN_PROFILE_NOT_FOUND` | 资源不存在 |
 | 409 | `ENVIRONMENT_HAS_RUNNING_INSTANCES` | 删环境前须 stop-all |
@@ -276,5 +312,5 @@ Chrome for Testing，**pinned 单版本策略**（不支持自定义路径/系�
 2. **`POST .../instances` 非幂等**——重试前先 `GET /instances/{id}` 或按环境列表判重，否则会堆积实例。
 3. **409 是状态机信号**——按语义处理（先 stop 再删、先关浏览器再 capture），不是可盲目重试的错误。
 4. **创建实例可能长阻塞**——内核下载（首次约 150MB）+ CDP 就绪等待（≤10s）；集成方设置作业级超时。
-5. **CORS 现状为放行任意 Origin**——本机任意网页在浏览器内可访问此 API（CSRF 面）。请勿将 17890 端口做端口转发/容器映射暴露到本机之外。
+5. **CORS 现状为放行任意 Origin**——本机任意网页在浏览器内可访问此 API（CSRF 面）。请勿将 17890/17891 端口做端口转发/容器映射暴露到本机之外；远程接入只经应用自身守护的 SSH 隧道（目标机器回环 ≡ 本机回环，与手工隧道同语义）。
 6. **前端即第一接入方**——chrome-host GUI 自身全部走这套 API（Tauri IPC 只做窗口/托盘壳），遇到行为疑问可直接参照前端 `src/api/` 的调用方式。

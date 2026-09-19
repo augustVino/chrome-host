@@ -168,3 +168,16 @@ pub async fn delete(
     state.instance_service.delete(&id).await?;
     Ok(Json(json!({ "ok": true })))
 }
+
+/// POST /api/v1/instances/{id}/cdp/sessions —— 发放 CDP 会话（方案 §7.1）。
+/// 17891 上需 Bearer token；会话 key 是 token 的下级凭证（单实例作用域 + 30 分钟），
+/// 用于 /cdp/{ins}/{sid}/* 代理路径（含 WS，无法携带 header）。
+pub async fn create_cdp_session(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    // 发放前置：实例须运行中（404/409 语义与 get_cdp 一致）
+    state.instance_service.require_cdp_port(&id).await?;
+    let view = state.sessions.create(&id);
+    Ok((StatusCode::CREATED, Json(json!(view))))
+}

@@ -239,6 +239,33 @@ CLI 错误行格式 `[CODE] message（HTTP status）`，CODE 与服务端错误�
 
 应用启动时若 17890 被其他进程占用，Agent API 会降级禁用——此时表现就是健康检查一直 exit 8。提示用户重启应用即可。
 
+## 远程接入（云桌面 / 远程机器场景）
+
+应用内置「远程接入」：守护一条 SSH 反向隧道（仅转发 17890 → 本机 17891 鉴权监听器），
+远程机器访问**自己的** `127.0.0.1:17890` 即等价于访问本机 API。CLI 默认地址零改动。
+
+前提与约定：
+
+1. **令牌**：远程调用需 `export CHROME_HOST_TOKEN=<令牌>`（Mac 端 chrome-host
+   Settings 页「远程接入」复制）；缺失/错误 → **exit 10（`UNAUTHORIZED`）**——
+   注意这同时证明隧道与应用都在线，只是凭证问题，别误判为服务不可达。
+2. **三态诊断**（远程探活的标准分支）：
+   - 连接拒绝 → exit 8：隧道断或应用停，请用户到 Mac 端检查（agent 无法远程修隧道）；
+   - exit 10 → 仅令牌问题：核对 `CHROME_HOST_TOKEN`，或请用户在 Settings 页轮换后重发；
+   - exit 0 → 一切正常。
+3. **CDP 自动化走会话代理**（远程拿不到实例真实端口，也别依赖它）：
+
+```bash
+CDP_BASE=$(chrome-host instance cdp-session <insId> --quiet)   # 30 分钟有效
+CDP_BASE=$CDP_BASE <chrome-cdp-skill>/scripts/cdp.mjs list
+CDP_BASE=$CDP_BASE <chrome-cdp-skill>/scripts/cdp.mjs shot <target>
+```
+
+   会话过期（404 `SESSION_NOT_FOUND`）→ 重新 `cdp-session` 即可，无需重建实例。
+   `get_cdp`/`instance cdp` 返回的直连端口仅 Mac 本地有效。
+4. 隧道状态可在 Mac 端查：`curl 127.0.0.1:17890/api/v1/remote-access/status`
+   或 `chrome-host doctor`（remote_access 检查项）。
+
 ## 安全与边界
 
 - **扩展只引用已注册资源**：`extension add` 需显式注册（服务端校验 manifest），没有任何"按任意路径加载扩展"的入口。Agent 不应尝试绕过——这是有意设计的安全边界（任意路径 = 任意代码执行）。

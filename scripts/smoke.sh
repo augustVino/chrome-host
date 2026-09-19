@@ -206,6 +206,40 @@ check "$CODE" "200" "实例已删除"
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$BASE/environments/$ENV_ID")
 check "$CODE" "200" "环境已删除（含 login profile 级联）"
 
+# ── [10.5] CDP 会话代理（v0.2+ 远程接入数据面；本地即可验证）─────────────
+# 可选环境变量 REMOTE_TOKEN：设置时额外经 17891 鉴权监听器验证 Bearer 三态
+echo "[10.5/10] CDP 会话代理（sessions + /cdp 白名单 + 负路径）"
+RA_ENV=$(curl -s -X POST "$BASE/environments" -H 'content-type: application/json' -d '{"name":"smoke-cdp-proxy"}' | jqpy "d['id']")
+RA_INS=$(curl -s --max-time 120 -X POST "$BASE/environments/$RA_ENV/instances" | jqpy "d['id']")
+SID=$(curl -s -X POST "$BASE/instances/$RA_INS/cdp/sessions" | jqpy "d['sessionId']")
+SEXP=$(curl -s -X POST "$BASE/instances/$RA_INS/cdp/sessions" | jqpy "d['expiresAt'] > 0")
+check "$SEXP" "True" "会话发放（expiresAt 有效）"
+# 代理路径不走 /api/v1 前缀，直连 17890 根路径
+WSURL=$(curl -s "http://127.0.0.1:17890/cdp/$RA_INS/$SID/json/version" | jqpy "d['webSocketDebuggerUrl'].startswith('ws://127.0.0.1:17890/cdp/')")
+check "$WSURL" "True" "代理 /json/version 且 WS URL 已改写"
+CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:17890/cdp/$RA_INS/00000000-0000-0000-0000-000000000000/json/list")
+check "$CODE" "404" "伪造会话 → 404 SESSION_NOT_FOUND"
+CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:17890/cdp/$RA_INS/$SID/json/new")
+check "$CODE" "400" "变更类端点不代理 → 400"
+curl -s -X POST "$BASE/instances/$RA_INS/stop" > /dev/null
+CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/instances/$RA_INS/cdp/sessions")
+check "$CODE" "409" "实例停止后发放 → 409"
+curl -s -X DELETE "$BASE/instances/$RA_INS" > /dev/null
+curl -s -X DELETE "$BASE/environments/$RA_ENV" > /dev/null
+ok "代理冒烟资源已清理"
+
+if [ -n "${REMOTE_TOKEN:-}" ]; then
+  echo "[10.6/10] 17891 鉴权监听器（REMOTE_TOKEN 已提供）"
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:17891/api/v1/settings")
+  check "$CODE" "401" "无 token → 401"
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $REMOTE_TOKEN" "http://127.0.0.1:17891/api/v1/settings")
+  check "$CODE" "200" "正确 token → 200"
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer wrong" "http://127.0.0.1:17891/api/v1/settings")
+  check "$CODE" "401" "错误 token → 401"
+else
+  echo "[10.6/10] 跳过（可选：REMOTE_TOKEN=<令牌> 时验证 17891 三态）"
+fi
+
 echo
 echo "结果: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = "0" ]
