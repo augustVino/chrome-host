@@ -27,9 +27,16 @@ export default defineConfig({
           text: '指南',
           items: [
             { text: '快速开始', link: '/guide/quickstart' },
+            { text: '单环境闭环演练', link: '/guide/walkthrough' },
             { text: '核心概念', link: '/guide/concepts' },
             { text: '日常使用', link: '/guide/daily' },
+            { text: 'AI Agent Skills', link: '/guide/skills' },
+            { text: '远程接入（规划中）', link: '/guide/remote-access' },
           ],
+        },
+        {
+          text: '开发',
+          items: [{ text: '开发指南', link: '/guide/develop' }],
         },
       ],
       '/reference/': [

@@ -27,6 +27,21 @@
 
 排障时先看活动流，再跑 `chrome-host doctor`。
 
+## 数据目录与备份
+
+全部数据集中在应用数据目录：
+
+```
+~/Library/Application Support/com.chromehost.dev/
+├── manager.db                      # 数据库（环境/实例/扩展/设置/事件）
+├── kernel/chrome-for-testing/      # 浏览器内核
+└── environments/<envId>/
+    ├── login-profile/              # 登录态母本与快照
+    └── instances/<insId>/          # 各实例独立 profile
+```
+
+**备份 / 迁移到新机器** = 退出应用后整目录拷贝。旧版本数据迁移见下方 FAQ（`scripts/migrate-legacy.js`）。
+
 ## 已知边界（FAQ）
 
 - **session cookie 登录态重启即失效**：Chrome 标准语义（session cookie 不落盘）。此类系统的免登录路径 = 登录浏览器登录 → 捕获快照 → 新建实例。

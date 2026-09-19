@@ -39,6 +39,15 @@
 - 熔断：60 秒窗口内连续崩溃 3 次 → 停止自动重启并标记 error，防重启风暴；
 - 用户主动 stop 的实例不会被拉起。
 
+## 扩展（Extensions）
+
+扩展分两类：
+
+- **系统扩展**：应用内置，随启动自动同步，锁定不可禁用/移除（`EXTENSION_SYSTEM_LOCKED`）。当前内置 **Environment Label**（环境标签角标）：按设置的位置/颜色在每个实例窗口叠加环境名，多环境并行时一眼区分；
+- **用户扩展**：任意本地扩展目录，GUI Extensions 页选目录注册，或 CLI `extension register`；可启停、可删除。
+
+实例启动时自动以 `--load-extension` 注入当前启用的扩展；全部不可用时不阻断启动。
+
 ## 内核（Chrome for Testing）
 
 应用自管浏览器内核：首次启动自动下载 pinned 版 Chrome for Testing（双镜像），状态与版本见 Settings 页；随应用升级切换版本，不用系统 Chrome。
