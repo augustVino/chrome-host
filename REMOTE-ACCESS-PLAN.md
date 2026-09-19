@@ -586,3 +586,24 @@ yun: CDP_BASE=http://127.0.0.1:17890/cdp/ins_xxx/<sid> cdp.mjs shot <target>
 - CLI 三态：连接拒绝 → exit 8；401 → **exit 10**（`UNAUTHORIZED`）；正常 → exit 0；
 - 杀 ssh 断链 → 3s 感知 → 退避重连 → yun 复验 401/200 恢复；
 - app 正常退出 → 隧道进程零残留（EOF 守尸 + 退出钩子双路径验证）。
+
+### E.4 PR-2（CDP 会话代理）端到端验收结果（2025-09，真实 yun）
+
+本地闭环（经 17890 代理面）：
+- `cdp-session --quiet` 输出完整代理 URL（`CDP_BASE=$(...)` 直接可用，新契约）；
+- `CDP_BASE=<url> cdp.mjs list/eval/shot` 全通：/json/version 改写、browser 级 WS
+  （Target.getTargets）、page 级 attach + Runtime.evaluate + Page.captureScreenshot
+  均过帧级桥（本地截图落盘真 PNG 2400×1532）；
+- 负路径：伪造会话 → 404 `SESSION_NOT_FOUND`；`/json/new` → 400（非代理端点）；
+  实例停止后发放 → 409 `INSTANCE_NOT_RUNNING`。
+
+远程闭环（yun，经隧道 + Bearer token）：
+- yun 侧 curl（token）POST sessions 发放成功 → `CDP_BASE=http://127.0.0.1:17890/cdp/...`
+  `node cdp.mjs list` 与 `shot` 全通，截图在 yun 落盘（PNG 2400×1532，与本地同源同尺寸）。
+
+实施备注：
+- axum 0.8 移除了 `Option<T>` 万能提取器（WebSocketUpgrade 未实现
+  OptionalFromRequestParts）→ 自写 `MaybeUpgrade` 提取器（cdp_proxy.rs）；
+- tungstenite 0.26 的 Text/Binary 载荷与 axum ws 同源（Bytes 直传、Utf8Bytes 经 &str 转换）；
+- 观察到既有问题（与本方案无关，待单独处理）：`open_tab` 的 `PUT /json/new?url=`
+  在 CfT 131 下创建 tab 但不导航（停在 about:blank）——远程测试改用既有 tab 完成。

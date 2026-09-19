@@ -259,6 +259,17 @@ pub struct AppSettingsView {
     pub remote_access_token: String,
 }
 
+/// 来源：POST /api/v1/instances/{id}/cdp/sessions（v2 远程接入）。
+/// baseUrl 为代理路径前缀，客户端拼上自身可达的 scheme://host:port 使用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CdpSessionView {
+    pub session_id: String,
+    pub base_url: String,
+    /// 过期时刻（epoch ms）
+    pub expires_at: i64,
+}
+
 /// 来源：src-tauri/src/domain/login_profile.rs `LoginProfileStatus`（snake_case 全集 4 变体）。
 /// `Unknown` 兜底语义同 [`InstanceStatus`]：服务端未来新增状态时旧 CLI 反序列化为
 /// Unknown 而**不是报错**（服务端演进不直接击穿 CLI 进程）。

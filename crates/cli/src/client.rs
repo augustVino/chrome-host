@@ -27,7 +27,7 @@ use crate::error::CliError;
 use crate::model::{
     AppEvent, AppSettingsView, CdpEndpoint, CdpTarget, CftStatus, Environment, EnvironmentSummary,
     EnvStatus, Extension, HealthReport, Instance, InstanceStatusView, InstanceView,
-    KernelCancelResult, KernelDownloadResult, LoginProfileRow, LoginProfileView,
+    KernelCancelResult, KernelDownloadResult, LoginProfileRow, LoginProfileView, CdpSessionView,
 };
 
 /// TCP 连接超时：API 绑定本机回环地址，3s 足够；连不上即按「服务不可达」（exit 8）。
@@ -75,6 +75,11 @@ impl AgentClient {
     /// （`AgentClient::new(...)?.with_verbose(globals.verbose)`）。true 时每次请求
     /// 向 stderr 追加一行请求摘要（见模块注释「verbose 纪律」）；默认 false，
     /// tests/contract.rs 走裸 [`AgentClient::new`] 不受影响。
+    /// 基地址只读访问（cdp-session 组合完整代理 URL：base + baseUrl 路径）。
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
         self
@@ -411,6 +416,17 @@ impl AgentClient {
         Self::decode(self.send(
             Method::GET,
             &format!("/api/v1/instances/{id}/cdp"),
+            None,
+            false,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/cdp/sessions —— 发放 CDP 会话（30 分钟有效）。
+    /// 远程（经隧道 17891）需 Bearer token；本地直连免鉴权。
+    pub fn instance_cdp_session(&self, id: &str) -> Result<CdpSessionView, CliError> {
+        Self::decode(self.send(
+            Method::POST,
+            &format!("/api/v1/instances/{id}/cdp/sessions"),
             None,
             false,
         ))

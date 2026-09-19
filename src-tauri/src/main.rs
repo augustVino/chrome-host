@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use tauri::{Manager, WebviewUrl};
 
 use api::server::ApiState;
+use application::cdp_session::CdpSessionService;
 use application::environment_service::EnvironmentService;
 use application::extension_service::ExtensionService;
 use application::health_service::HealthService;
@@ -114,6 +115,11 @@ fn main() {
             ));
             // 同时写入退出钩子通道（见 main 尾部 tunnel_slot 说明）
             let _ = tunnel_slot_for_setup.set(tunnel.clone());
+
+            // CDP 会话服务（token 下级凭证：单实例作用域 + TTL；后台清扫过期项）
+            let sessions = Arc::new(CdpSessionService::new(activity.clone()));
+            sessions.start_sweeper();
+
             let reconciler = Arc::new(Reconciler::new(
                 ins_repo.clone(),
                 process.clone(),
@@ -286,6 +292,7 @@ fn main() {
                 health,
                 kernel,
                 tunnel: tunnel.clone(),
+                sessions: sessions.clone(),
                 app: handle.clone(),
             };
             tauri::async_runtime::spawn({

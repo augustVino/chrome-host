@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod cdp_proxy;
 pub mod environments;
 pub mod extensions;
 pub mod error;

@@ -459,6 +459,14 @@ impl InstanceService {
         Ok((ins, port))
     }
 
+    /// 会话代理用：对账 + running 校验 + 返回 CDP 端口。与 get_cdp 的差异：
+    /// 不额外请求 /json/version（代理路径每请求都会调，省一次往返；
+    /// 会话发放与代理路由共用，404/409 语义与 get_cdp 一致）。
+    pub async fn require_cdp_port(&self, id: &str) -> Result<u16, AppError> {
+        let (_, port) = self.require_running(id).await?;
+        Ok(port)
+    }
+
     /// GET tabs：仅返回 type == page 的目标
     pub async fn list_tabs(&self, id: &str) -> Result<Vec<cdp::client::Target>, AppError> {
         let (_, port) = self.require_running(id).await?;

@@ -19,6 +19,7 @@ use crate::application::extension_service::ExtensionService;
 use crate::application::health_service::HealthService;
 use crate::application::instance_service::InstanceService;
 use crate::application::activity::Activity;
+use crate::application::cdp_session::CdpSessionService;
 use crate::application::profile_service::ProfileService;
 use crate::application::settings_service::SettingsService;
 use crate::application::tunnel::TunnelService;
@@ -40,6 +41,7 @@ pub struct ApiState {
     pub health: Arc<HealthService>,
     pub kernel: Arc<KernelManager>,
     pub tunnel: Arc<TunnelService>,
+    pub sessions: Arc<CdpSessionService>,
     pub app: AppHandle,
 }
 
@@ -147,6 +149,17 @@ fn routes(state: ApiState) -> Router {
         .route(
             "/api/v1/remote-access/token",
             post(crate::api::remote_access::rotate_token),
+        )
+        // CDP 会话代理（两个监听器都挂：17890 免鉴权本地可用，17891 豁免 Bearer、
+        // 会话 key 即凭证——见 auth.rs；非 /api/v1 前缀：与改写后的 WS 路径一致）
+        .route(
+            "/cdp/{instance_id}/{session_id}/{*rest}",
+            get(crate::api::cdp_proxy::proxy),
+        )
+        // CDP 会话发放（需 token，17891 上）
+        .route(
+            "/api/v1/instances/{id}/cdp/sessions",
+            post(crate::api::instances::create_cdp_session),
         )
         // CLI status/doctor 共用健康快照
         .route("/api/v1/health", get(crate::api::health::get))

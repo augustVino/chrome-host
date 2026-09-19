@@ -29,6 +29,7 @@ pub const LOCAL_LANDING_PORT: u16 = 17891;
 pub const FORWARD_SPEC: &str = "17890:127.0.0.1:17891";
 
 /// ssh 命令行参数（除 `-R` 与 target 外的全部），逐条依据见方案 §5.1。
+///
 /// `-F <净化配置>`：指向应用数据目录里剔除转发行后的用户配置副本——
 /// ① 用户 ~/.ssh/config 的 RemoteForward（如代理转发 7890）不进入应用隧道，
 ///    其 bind 失败不会在 ExitOnForwardFailure 下杀死本隧道（实测踩坑 A）；
@@ -68,6 +69,7 @@ const STALE_SIGNATURE: &str = "remote port forwarding failed for listen port";
 /// - `( cat <&3; kill $p ) &`：stdin EOF（app 死亡）→ kill ssh（孤儿防护）；
 /// - `wait $p`：ssh 死亡（任何原因）→ sh 随即退出（监督器 try_wait 秒级感知；
 ///   旧版 cat 在前台阻塞会掩盖 ssh 死亡，状态机盲停在 connected）。
+///
 /// 双向监控任一先发生均正确收敛。
 const WRAPPER_SCRIPT: &str =
     "exec 3<&0; \"$@\" & p=$!; ( cat <&3 >/dev/null; kill $p ) & c=$!; wait $p; kill $c 2>/dev/null; wait $c 2>/dev/null";
@@ -123,6 +125,7 @@ struct Shared {
     data_dir: Option<std::path::PathBuf>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn new_shared(child_program: &str) -> Arc<Shared> {
     new_shared_with_dir(child_program, None)
 }
@@ -225,6 +228,7 @@ impl TunnelService {
     }
 
     /// 注入自定义事件回调的构造（测试/诊断用：无 Activity 依赖）
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_sink(sink: EventSink) -> Self {
         TunnelService {
             shared: new_shared("ssh"),
