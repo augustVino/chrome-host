@@ -1,9 +1,5 @@
 # 远程接入（云桌面 / CI）
 
-::: warning 功能状态：方案定稿，尚未发布
-本页描述的目标行为来自[远程接入实施方案](https://github.com/augustVino/chrome-host/blob/main/REMOTE-ACCESS-PLAN.md)（v2.1，已按当前代码逐项核实修订），**尚未包含在当前发布版中**。页面先行发布用于了解设计方向与使用方式，功能随后续版本生效。
-:::
-
 ## 解决什么问题
 
 云桌面 / CI 机器上的 AI Agent 需要**驱动你 Mac 上的浏览器**（复用登录态、hosts 环境、GUI 上可见的窗口），而 chrome-host 的所有端口都只绑本机回环——这是安全底线，不能破。远程接入用「SSH 隧道 + 鉴权网关」在不暴露端口的前提下打通这条路。
@@ -67,13 +63,15 @@ chrome-host status                                    # 探活（见下方三态
 ENV_ID=$(chrome-host env list --json | jq -r '.[] | select(.name=="staging") | .id')
 INS_ID=$(chrome-host instance create "$ENV_ID" --quiet)
 
-# CDP 走会话代理：取会话 → 用 CDP_BASE 走代理路径（设置后 cdp.mjs 全部请求改走代理）
-BASE=$(chrome-host instance cdp-session "$INS_ID" --quiet)
-CDP_BASE="http://127.0.0.1:17890$BASE" node skills/chrome-cdp/scripts/cdp.mjs list
-CDP_BASE="http://127.0.0.1:17890$BASE" node skills/chrome-cdp/scripts/cdp.mjs shot <target>
+# CDP 走会话代理：cdp-session --quiet 直接输出完整代理 URL（供 CDP_BASE 直接捕获）
+CDP_BASE=$(chrome-host instance cdp-session "$INS_ID" --quiet)
+CDP_BASE="$CDP_BASE" node skills/chrome-cdp/scripts/cdp.mjs list
+CDP_BASE="$CDP_BASE" node skills/chrome-cdp/scripts/cdp.mjs shot <target>
 
 chrome-host instance delete "$INS_ID" --yes           # 收尾
 ```
+
+令牌注入：环境变量 `CHROME_HOST_TOKEN`，或隐藏 flag `--token`（优先级更高，同 `--api-url` 模式）；本地直连两者都不需要。MCP 客户端同样可用 `create_cdp_session` 工具取会话。
 
 会话 30 分钟过期后重新 `cdp-session` 取新会话即可（cdp.mjs 本就逐命令建连，无长连接损失）。用户在远程全程零参与；仅当环境首次登录或 Chrome 弹 "Allow debugging" 授权框时，需要**在 Mac 本地点击**。
 
@@ -81,6 +79,10 @@ chrome-host instance delete "$INS_ID" --yes           # 收尾
 
 | 现象 | 含义 | 处置 |
 |---|---|---|
-| 连接拒绝（exit 8） | 隧道断开或 Mac 应用未运行 | 等待自动重连（退避重试），或检查 Mac 侧状态行 |
-| 401（新 CLI 为 exit 10） | 隧道与应用均在线，仅凭证问题 | 检查/轮换令牌，重试无意义 |
+| 连接拒绝（exit 8） | 隧道断开或 Mac 应用未运行 | 等待自动重连（退避重试），或检查 Mac 侧状态行 / `chrome-host doctor` 的 remote_access 项 |
+| 401（CLI exit 10） | 隧道与应用均在线，仅凭证问题 | 检查/轮换令牌，重试无意义 |
 | 200 | 正常 | — |
+
+## API 参考
+
+端点、字段与错误码见 [Agent API 手册 · 远程接入](/reference/agent-api#远程接入-remote-access)；CLI 侧参数见 [CLI 手册](/reference/cli)。

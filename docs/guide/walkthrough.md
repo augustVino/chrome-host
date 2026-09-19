@@ -97,3 +97,5 @@ chrome-host env delete "$ENV_ID" --yes         # 环境仍有运行实例时会�
 | `exit 5` + `INSTANCE_ALREADY_RUNNING` 等 409 族 | 状态冲突不是错误：按状态机处理（先 stop 或直接复用运行中实例），不要盲目重试 |
 | `instance create` 卡住 | 首次内核下载属正常；CI 里为 create/start/restart 设置作业级超时 |
 | 快照登录态失效 | session cookie 类站点重启即失效（Chrome 标准语义），重新 launch → capture |
+
+同一闭环在云桌面 / CI 上远程驱动本地浏览器的方式，见[远程接入](./remote-access)。

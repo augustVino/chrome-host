@@ -19,7 +19,7 @@
 - **Claude Code**：按其 skills 机制注册仓库内 skill；
 - 其他 agent：`SKILL.md` 本身就是完整的操作手册（含触发条件、流程、命令速查、错误决策表），直接作为上下文喂给 agent 亦可。
 
-若 agent 环境支持 MCP，更简单的路径是直接接 MCP 服务（见 [MCP 手册](/reference/mcp)），24 个工具覆盖编排层；skills 的价值在于附带的 `cdp.mjs` 自动化工具与更细的排障决策知识。
+若 agent 环境支持 MCP，更简单的路径是直接接 MCP 服务（见 [MCP 手册](/reference/mcp)），25 个工具覆盖编排层（含远程场景的 `create_cdp_session`）；skills 的价值在于附带的 `cdp.mjs` 自动化工具与更细的排障决策知识。
 
 ## cdp.mjs：人类也能直接用
 
@@ -39,7 +39,7 @@ cdp.mjs open [url]                  # 新开标签页
 cdp.mjs stop [target]               # 停掉后台 daemon
 ```
 
-连接目标默认 `127.0.0.1:9222`，用 `CDP_PORT` / `CDP_HOST` 环境变量改——接 chrome-host 实例时把 `instance cdp` 查到的端口传进来（完整闭环见[单环境闭环演练](./walkthrough)）。
+连接目标默认 `127.0.0.1:9222`，用 `CDP_PORT` / `CDP_HOST` 环境变量改——接 chrome-host 实例时把 `instance cdp` 查到的端口传进来（完整闭环见[单环境闭环演练](./walkthrough)）；远程经 chrome-host 会话代理时改用 `CDP_BASE`（见[远程接入](./remote-access)）。
 
 ## 使用要点（SKILL.md 中的经验浓缩）
 

@@ -31,7 +31,7 @@ export default defineConfig({
             { text: '核心概念', link: '/guide/concepts' },
             { text: '日常使用', link: '/guide/daily' },
             { text: 'AI Agent Skills', link: '/guide/skills' },
-            { text: '远程接入（规划中）', link: '/guide/remote-access' },
+            { text: '远程接入', link: '/guide/remote-access' },
           ],
         },
         {

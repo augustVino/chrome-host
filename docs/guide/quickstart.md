@@ -62,4 +62,4 @@ claude mcp add --transport http chrome-host http://127.0.0.1:17890/mcp
 
 - [单环境闭环演练](./walkthrough)：从建环境到 CDP 自动化收尾的完整流程
 - [AI Agent Skills](./skills)：仓库自带的 agent 技能包与 cdp.mjs 工具
-- [远程接入](./remote-access)：云桌面 / CI 上的 Agent 驱动本地浏览器（规划中）
+- [远程接入](./remote-access)：云桌面 / CI 上的 Agent 驱动本地浏览器
