@@ -7,7 +7,7 @@ description: 通过 chrome-host CLI（chrome-host 桌面应用的官方命令行
 
 ## 定位
 
-Chrome Host 是桌面应用（Tauri），本 skill 通过其官方命令行入口 **chrome-host CLI** 完成全部操作。CLI 的两个契约直接影响操作方式：危险操作有确认闸门（见「危险操作与确认闸门」），退出码 0–9 语义冻结（见「退出码契约」）。
+Chrome Host 是桌面应用（Tauri），本 skill 通过其官方命令行入口 **chrome-host CLI** 完成全部操作。CLI 的两个契约直接影响操作方式：危险操作有确认闸门（见「危险操作与确认闸门」），退出码 0–10 语义冻结（见「退出码契约」）。
 
 职责分工：
 - **本 skill**：实例编排层——环境/实例生命周期、标签页开关、登录态、扩展、内核。
@@ -28,6 +28,7 @@ chrome-host status
 
 - **exit 8**（服务不可达）→ 应用未启动 → 提示用户启动 Chrome Host。API 就在 17890，CLI 恒连此地址；连不上就是没起，**不要**猜端口、不要尝试其他地址、不要试图绕道 HTTP。
 - **exit 0** → 应用在线，继续正常流程。
+- **exit 10**（未授权）→ 本机是远程接入客户端（经 SSH 隧道连 Mac），令牌缺失/错误。**隧道与应用均在线**，只是凭证问题——核对 `CHROME_HOST_TOKEN`，详见「远程接入」章节；这不是服务故障，勿按 exit 8 处置。
 - **其他退出码**（多为 exit 1）→ 应用在跑但内部异常（错误行格式 `[CODE] message（HTTP status）`）。把 CODE + message 原样转述给用户——这属于应用自身故障，agent 无法修复，不要建议"重试"掩盖问题，也不要编造数据。需要细节时跑 `chrome-host doctor`（逐项 ✓/✗ + 修复建议；存在失败项时 exit 1）。
   - 特例：错误为「响应格式异常」时，典型原因是**运行中的应用是旧版本**，缺少 CLI 依赖的新端点（如 `/api/v1/health` 返回 404 空体）。此时业务命令（env/instance 等）通常仍正常，请用户更新/重启桌面应用即可，不要误判为 API 故障。
 
@@ -93,6 +94,8 @@ URL 必须以 http:// 或 https:// 开头——CLI 本地校验，非法输入 e
 
 ### 5. 移交 chrome-cdp 做页面自动化
 
+本步默认 **Mac 本地直连**；在远程机器上运行（或拿到的端口连不上）时，改走「远程接入」章节的会话代理路径（`cdp-session` + `CDP_BASE`，本地远程通用），不要直连实例端口。
+
 ```bash
 chrome-host instance cdp <insId> --json | jq .port
 # → JSON 含 host / port / httpUrl / webSocketUrl
@@ -107,7 +110,7 @@ CDP_PORT=<port> <chrome-cdp-skill>/scripts/cdp.mjs shot <target>
 
 衔接要点（断链几乎都出在这里）：
 
-- 实例 CDP 端口从 **29222 起动态分配**，永远不是 chrome-cdp 默认的 9222。每次移交都现查 `instance cdp`，不要缓存旧端口——实例重启后端口可能变化。
+- 实例 CDP 端口从 **9222 起动态分配**（与 chrome-cdp 默认端口同基；分配器会跳过被占端口，9222 被其他调试 Chrome 占用时顺延）。每次移交都现查 `instance cdp`，不要缓存旧端口——实例重启后端口可能变化。
 - 实例未运行时该命令 exit 5（`INSTANCE_NOT_RUNNING`），先 `instance start` 再查。
 - 每个 tab 首次被 CDP 访问时 Chrome 会弹 "Allow debugging" 授权框，需用户在本地点一次允许；后续命令走 daemon 无需再批。
 - `webSocketUrl` 供需要直连 CDP WebSocket 的场景使用。
@@ -118,7 +121,7 @@ CDP_PORT=<port> <chrome-cdp-skill>/scripts/cdp.mjs shot <target>
 
 ## CLI 命令速查
 
-全局 flag（所有命令通用）：`--json`（stdout 纯 JSON，错误体也走 stdout，配合 jq）、`--quiet`（仅输出主实体 id，供 `$(...)` 捕获）、`--verbose`（stderr 追加请求摘要：method/path/耗时，不含 query 与敏感内容）、`--yes`（全局跳过确认）。`--api-url` 与环境变量 `CHROME_HOST_API_URL` 可改基地址——**本 skill 不要使用**，恒连默认本机地址。
+全局 flag（所有命令通用）：`--json`（stdout 纯 JSON，错误体也走 stdout，配合 jq）、`--quiet`（仅输出主实体 id，供 `$(...)` 捕获）、`--verbose`（stderr 追加请求摘要：method/path/耗时，不含 query 与敏感内容）、`--yes`（全局跳过确认）。`--api-url` 与环境变量 `CHROME_HOST_API_URL` 可改基地址——**本 skill 不要使用**，恒连默认本机地址（远程接入场景下该默认地址恰好就是隧道入口，同样无需改动）。远程机器上经隧道接入时令牌来自环境变量 `CHROME_HOST_TOKEN`（隐藏 flag `--token` 优先级更高）；本地直连两者都不需要。
 
 ### 诊断
 
@@ -191,7 +194,7 @@ chrome-host runtime install [--timeout SEC] [--cancel]   安装（轮询到完�
 
 ## 退出码契约（决策依据）
 
-0–9 冻结语义。**依据退出码决策**，勿解析文案；需要机器可读错误详情时用 `--json`（stdout 输出 `{"error":{"code","message"}}`）。
+0–10 冻结语义（10 为远程接入追加项）。**依据退出码决策**，勿解析文案；需要机器可读错误详情时用 `--json`（stdout 输出 `{"error":{"code","message"}}`）。
 
 | Exit | 语义 | agent 处置 |
 |------|------|-----------|
@@ -205,6 +208,7 @@ chrome-host runtime install [--timeout SEC] [--cancel]   安装（轮询到完�
 | 7 | 请求校验失败（400 族） | 修正参数后重试 |
 | 8 | 服务不可达（应用未运行） | 提示用户启动应用，勿猜端口 |
 | 9 | CLI 侧等待超时（`runtime install` 轮询超时） | 用 `runtime version` 查进度，必要时继续等待或 `--cancel` |
+| 10 | 未授权（401 `UNAUTHORIZED`，远程令牌缺失/错误） | 核对 `CHROME_HOST_TOKEN` 或请用户在 Mac 端 Settings 轮换后重发；隧道与应用均在线，勿按 exit 8 处置 |
 
 ## 登录态快照（长期免登录）
 
@@ -244,6 +248,14 @@ CLI 错误行格式 `[CODE] message（HTTP status）`，CODE 与服务端错误�
 应用内置「远程接入」：守护一条 SSH 反向隧道（仅转发 17890 → 本机 17891 鉴权监听器），
 远程机器访问**自己的** `127.0.0.1:17890` 即等价于访问本机 API。CLI 默认地址零改动。
 
+**何时走本章节**：不确定在本机还是远程时，无令牌探活一次：
+
+```bash
+env -u CHROME_HOST_TOKEN chrome-host status
+```
+
+exit 0 = 在 Mac 本地（走主工作流直连路径）；exit 10 = 在远程机器上（本章约定的令牌与 cdp-session 路径生效，主工作流第 5 步的直连移交对本机不可用）。
+
 前提与约定：
 
 1. **令牌**：远程调用需 `export CHROME_HOST_TOKEN=<令牌>`（Mac 端 chrome-host
@@ -274,4 +286,4 @@ CDP_BASE=$CDP_BASE <chrome-cdp-skill>/scripts/cdp.mjs shot <target>
 
 ## 补充：MCP 入口
 
-应用同时内嵌 MCP server（`http://127.0.0.1:17890/mcp`，Streamable HTTP，24 个 tools，能力为 CLI 的子集——无 settings / 内核下载 / 诊断）。已在 MCP 客户端配置过的会话可直接用 MCP tools；本 skill 默认走 CLI，因为退出码契约与确认闸门对 agent 更安全。两者调用同一个服务层，状态完全一致。
+应用同时内嵌 MCP server（`http://127.0.0.1:17890/mcp`，Streamable HTTP，25 个 tools，能力为 CLI 的子集——无 settings / 内核下载 / 诊断）。已在 MCP 客户端配置过的会话可直接用 MCP tools；本 skill 默认走 CLI，因为退出码契约与确认闸门对 agent 更安全。两者调用同一个服务层，状态完全一致。
