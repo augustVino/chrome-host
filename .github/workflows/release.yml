@@ -117,10 +117,9 @@ jobs:
           workspaces: ./src-tauri -> ./target
           key: ${{ matrix.rust_target }}
 
+      # pnpm 版本取 package.json 的 packageManager 字段（与 docs.yml 一致，勿再写 version 输入）
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 10
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
