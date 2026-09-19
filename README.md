@@ -2,6 +2,8 @@
 
 基于 Tauri + Rust 的 Chrome 浏览器多环境管理工具：为每个环境启动完全隔离的 Chrome 实例（独立 Profile、进程级 hosts 映射、CDP 可自动化），并支持**登录态快照**——环境捕获一次登录，之后每个新实例免登录。
 
+> 📖 在线文档：<https://augustVino.github.io/chrome-host/>
+
 ## 核心能力
 
 - **环境与实例**：环境 = 一份配置（可选 hosts 配置源 + keepAlive）；实例 = 该环境的一次隔离运行（独立 user-data-dir + CDP 端口）

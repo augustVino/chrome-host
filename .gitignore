@@ -27,3 +27,8 @@ dist-ssr
 
 # Tauri externalBin sidecar（构建脚本生成，不入库）
 /src-tauri/binaries/
+
+# VitePress：docs/reference/ 由 scripts/sync-docs.mjs 构建前从根目录手册生成
+# （dist 产物已被上方 dist 规则覆盖，cache 是 vitepress 独有目录）
+docs/.vitepress/cache
+docs/reference/

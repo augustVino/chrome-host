@@ -1,0 +1,53 @@
+name: Docs
+
+# 文档站（GitHub Pages）：main 分支文档/构建相关文件变更时构建部署。
+# 前置条件（一次性）：仓库 Settings → Pages → Build and deployment → Source 选 GitHub Actions
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'scripts/sync-docs.mjs'
+      - '.github/workflows/docs.yml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'CLI.md'
+      - 'AGENT-API.md'
+      - 'MCP.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只保留一次部署；不取消进行中的部署，避免半途撤下线上站点
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4 # pnpm 版本取 package.json 的 packageManager 字段
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm docs:build # 含根目录手册同步进 docs/reference/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/.vitepress/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
