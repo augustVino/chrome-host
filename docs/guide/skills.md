@@ -2,18 +2,20 @@
 
 仓库内的 `skills/` 目录是**随仓库分发的 AI Agent 技能包**：每个 skill 一份 `SKILL.md`（教 agent 何时触发、怎么操作、有哪些坑）+ 配套脚本。支持 SKILL.md 约定的 coding agent（pi、Claude Code 等）加载后即「学会」操作 chrome-host，无需人工逐步下达命令。
 
-## 两个 skill 的分工
+## skill 内部分层
 
-| Skill | 职责 | 层面 |
+单 skill（`skills/chrome-host`）覆盖完整链路，内部分两层：
+
+| 层 | 内容 | 形态 |
 |---|---|---|
-| `skills/chrome-host` | 环境与实例编排：健康自检、环境模型、CLI 全流程、危险操作闸门、错误码决策表 | CLI / REST |
-| `skills/chrome-cdp` | 页面自动化：截图、可访问性树、执行 JS、点击输入等轻量 CDP 命令 | CDP WebSocket |
+| 编排层 | 健康自检、环境模型、CLI 全流程、危险操作闸门、错误码决策表 | SKILL.md + `references/cli.md` |
+| 自动化层 | 截图、可访问性树、执行 JS、点击输入等轻量 CDP 命令 | `scripts/cdp.mjs`（零依赖，Node 22+） |
 
-协作方式是**接力**：chrome-host skill 负责「把隔离浏览器起起来、拿到 CDP 端口」，chrome-cdp skill 负责「连上去操作页面」——前者产出 `CDP_PORT` / `webSocketUrl`，后者消费它。
+两层的衔接：编排层把隔离实例「起好、开好页、登好录」，产出 `CDP_PORT`（本地直连）或 `CDP_BASE`（远程会话代理），自动化层接管做页面操作。SKILL.md 只保留每次都要用的决策主干，完整命令速查 / 退出码契约 / 错误码决策表等查表型内容在 `references/cli.md` 按需加载。
 
 ## 如何启用
 
-把本仓库 clone 到 agent 可访问的环境，并将两个 skill 目录加入其技能加载路径：
+把本仓库 clone 到 agent 可访问的环境，并将 skill 目录加入其技能加载路径：
 
 - **pi**：项目级 `.pi/agents/` 或全局技能目录中挂载 / 链接；
 - **Claude Code**：按其 skills 机制注册仓库内 skill；
@@ -23,7 +25,7 @@
 
 ## cdp.mjs：人类也能直接用
 
-`skills/chrome-cdp/scripts/cdp.mjs` 是零依赖的 CDP 命令行工具（Node 22+，WebSocket 直连，支持 100+ tab），**不需要 agent 也能用**：
+`skills/chrome-host/scripts/cdp.mjs` 是零依赖的 CDP 命令行工具（Node 22+，WebSocket 直连，支持 100+ tab），**不需要 agent 也能用**：
 
 ```bash
 cdp.mjs list                        # 列出打开的页面（targetId 前缀）

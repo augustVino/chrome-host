@@ -65,8 +65,8 @@ INS_ID=$(chrome-host instance create "$ENV_ID" --quiet)
 
 # CDP 走会话代理：cdp-session --quiet 直接输出完整代理 URL（供 CDP_BASE 直接捕获）
 CDP_BASE=$(chrome-host instance cdp-session "$INS_ID" --quiet)
-CDP_BASE="$CDP_BASE" node skills/chrome-cdp/scripts/cdp.mjs list
-CDP_BASE="$CDP_BASE" node skills/chrome-cdp/scripts/cdp.mjs shot <target>
+CDP_BASE="$CDP_BASE" node skills/chrome-host/scripts/cdp.mjs list
+CDP_BASE="$CDP_BASE" node skills/chrome-host/scripts/cdp.mjs shot <target>
 
 chrome-host instance delete "$INS_ID" --yes           # 收尾
 ```

@@ -68,10 +68,10 @@ playwright --browser "cdp://$WS" ...
 
 ```bash
 PORT=$(chrome-host instance cdp "$INS_ID" --json | jq -r .port)
-node skills/chrome-cdp/scripts/cdp.mjs list                    # 列出页面，取 targetId 前缀
-CDP_PORT=$PORT node skills/chrome-cdp/scripts/cdp.mjs shot 6BE827FA   # 截图
-CDP_PORT=$PORT node skills/chrome-cdp/scripts/cdp.mjs snap 6BE827FA   # 可访问性树
-CDP_PORT=$PORT node skills/chrome-cdp/scripts/cdp.mjs eval 6BE827FA 'document.title'
+node skills/chrome-host/scripts/cdp.mjs list                    # 列出页面，取 targetId 前缀
+CDP_PORT=$PORT node skills/chrome-host/scripts/cdp.mjs shot 6BE827FA   # 截图
+CDP_PORT=$PORT node skills/chrome-host/scripts/cdp.mjs snap 6BE827FA   # 可访问性树
+CDP_PORT=$PORT node skills/chrome-host/scripts/cdp.mjs eval 6BE827FA 'document.title'
 ```
 
 完整命令见 [AI Agent Skills](./skills)。
