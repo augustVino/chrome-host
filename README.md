@@ -32,6 +32,12 @@ CLI 内置于桌面应用（v0.1.7 起），**不随安装自动可用，需在�
 
 **📖 完整接入指南（命令参考 / Exit Code 契约 / AI Agent 与 CI 接入范式 / 故障排查）：[CLI.md](CLI.md)**
 
+## 远程接入（云桌面 / CI）
+
+设置页「远程接入」一键开启：应用自动守护 SSH 隧道（仅转发 17890）+ Bearer 令牌鉴权 +
+CDP 会话代理（实例端口零暴露）。远程机器 `export CHROME_HOST_TOKEN=…` 后 CLI / MCP /
+CDP 全部可用，详见 [AGENT-API.md](AGENT-API.md) 的「远程接入」章节。
+
 ## AI 接入（Agent API / MCP）
 
 REST 与 MCP 均只绑定 `127.0.0.1:17890`，随应用启动：

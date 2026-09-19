@@ -85,8 +85,10 @@ chrome-host env delete <env_id> --yes
 | `--no-color` | 禁用 ANSI 颜色。当前版本本就不输出颜色（纯文本 + 表格），管道/重定向下天然无转义符 |
 | `--yes` | 跳过危险操作确认。**delete 类命令专属参数**；非 TTY 环境（CI/脚本）执行 delete 时缺失则 exit 2，绝不静默执行 |
 | `--api-url <URL>` | Agent API 基地址（隐藏参数）；环境变量 `CHROME_HOST_API_URL` 是其回退，优先级低于 flag |
+| `--token <TOKEN>` | 远程访问令牌（隐藏参数）：经 SSH 隧道接入（目标机 127.0.0.1:17890 → 本机 17891 鉴权监听器）时必需；环境变量 `CHROME_HOST_TOKEN` 是其回退。本地直连无需 |
 
-环境变量优先级：`--api-url` > `CHROME_HOST_API_URL` > 默认 `http://127.0.0.1:17890`。
+环境变量优先级：`--api-url` > `CHROME_HOST_API_URL` > 默认 `http://127.0.0.1:17890`；
+令牌同理：`--token` > `CHROME_HOST_TOKEN` > 不携带（本地直连语义）。
 
 **TTY 语义**：stdin 为终端时，危险操作交互询问 `[y/N]`（默认 N）；stdin 非 TTY（CI、管道、定时任务）时，缺 `--yes` 直接拒绝（exit 2），保证自动化环境零意外交互。
 
@@ -125,6 +127,7 @@ env_d4285b49-...
 | 7 | 请求校验失败 | 400 族（`INVALID_REQUEST`、`HOSTS_SOURCE_INVALID` 等） |
 | 8 | 服务不可达 | Agent API 连接拒绝 / 连接超时（桌面应用未运行） |
 | 9 | CLI 侧等待超时（`runtime install --timeout` 轮询超时） | 下载未在 `--timeout`（缺省 900s，0 = 无限等待）内完成；CLI 停止等待，服务端下载仍在后台进行，可用 `runtime install --cancel` 中止 |
+| 10 | 未授权（401 `UNAUTHORIZED`） | 远程访问令牌缺失/错误。**隧道与桌面应用均在线**（仅凭证问题）——与 exit 8（不可达）构成三态诊断；0–9 冻结契约的追加项 |
 
 ## 错误格式
 
@@ -187,6 +190,7 @@ chrome-host env delete <id> --yes
 | `instance navigate <ID> <TAB_ID> <URL>` | 将 `tabs` 中的指定标签页导航到新 URL（实现为新开页并关闭旧页，返回新页 target；仅 http/https） |
 | `instance focus <ID>` | 聚焦实例窗口 |
 | `instance cdp <ID>` | 输出 CDP 端点（host/port/httpUrl/webSocketUrl），可直接接入 Playwright / Puppeteer / puppeteer-core |
+| `instance cdp-session <ID>` | 发放 CDP 会话（远程/代理访问用，30 分钟有效）。`--quiet` 输出**完整代理 URL**（新契约，供 `CDP_BASE=$(...)` 直接捕获）；`--json` 含 sessionId/baseUrl/expiresAt/fullUrl。远程调用需 `CHROME_HOST_TOKEN` |
 | `instance delete <ID> [--yes]` | 删除实例（含 profile 数据）。运行中实例：`--yes` 自动 stop → delete；stop 失败则原样报错 |
 
 实例状态机：`starting → running → stopped`，异常路径 `error / crashed`。读路径全部经过对账（以真实进程为准，不轻信数据库）。
