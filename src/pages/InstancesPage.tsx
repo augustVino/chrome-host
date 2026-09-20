@@ -78,7 +78,7 @@ export default function InstancesPage() {
             if (list.length === 0) return null;
             const open = expanded[env.id] ?? true;
             return (
-              <li key={env.id} className="rounded-xl border border-hairline bg-white">
+              <li key={env.id} className="rounded-xl border border-hairline bg-surface-card">
                 <button
                   className="flex w-full items-center gap-2 px-4 py-2.5 text-left"
                   onClick={() => toggle(env.id)}
@@ -88,11 +88,11 @@ export default function InstancesPage() {
                   <span className="text-xs text-ink-3">{list.length} instances</span>
                 </button>
                 {open && (
-                  <ul className="border-t border-neutral-100">
+                  <ul className="border-t border-hairline-soft">
                     {list.map((ins, idx) => (
                       <li
                         key={ins.id}
-                        className="flex items-center gap-3 border-b border-neutral-50 px-4 py-2 last:border-0"
+                        className="flex items-center gap-3 border-b border-hairline-soft px-4 py-2 last:border-0"
                       >
                         <StatusDot status={ins.status} className="w-24" />
                         <Link

@@ -251,7 +251,7 @@ export default function SettingsPage() {
       <h1 className="mb-5 text-base font-semibold text-ink">Settings</h1>
 
       {/* 内核卡 */}
-      <section className="mb-4 rounded-xl border border-hairline bg-white p-4">
+      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
         <h2 className="text-sm font-medium text-ink">浏览器内核（Chrome for Testing）</h2>
         {!kernel ? (
           <p className="mt-2 text-xs text-ink-3">Agent API 未连接，无法读取内核状态。</p>
@@ -277,7 +277,7 @@ export default function SettingsPage() {
                     </div>
                   );
                 })()}
-                <div className="h-1.5 overflow-hidden rounded-full bg-neutral-100">
+                <div className="h-1.5 overflow-hidden rounded-full bg-surface-inset">
                   <div
                     className="h-full rounded-full bg-accent transition-all"
                     style={{ width: `${kernelProgress?.percent ?? 0}%` }}
@@ -304,7 +304,7 @@ export default function SettingsPage() {
       </section>
 
       {/* 默认起始页（实例/登录浏览器启动页；环境专属 host 优先） */}
-      <section className="mb-4 rounded-xl border border-hairline bg-white p-4">
+      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
         <h2 className="text-sm font-medium text-ink">默认起始页</h2>
         <p className="mt-0.5 text-xs text-ink-3">
           新建环境无需再填起始页：实例与登录浏览器打开时使用此地址，留空则打开 about:blank。
@@ -332,7 +332,7 @@ export default function SettingsPage() {
       </section>
 
       {/* Developer Mode */}
-      <section className="mb-4 rounded-xl border border-hairline bg-white p-4">
+      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-sm font-medium text-ink">Developer Mode</h2>
@@ -358,7 +358,7 @@ export default function SettingsPage() {
       </section>
 
       {/* 远程接入（云桌面 / CI）：单端口 SSH 隧道 + Bearer 鉴权 + CDP 会话代理（方案 v2） */}
-      <section className="mb-4 rounded-xl border border-hairline bg-white p-4">
+      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-sm font-medium text-ink">远程接入（云桌面 / CI）</h2>
@@ -451,7 +451,7 @@ export default function SettingsPage() {
       </section>
 
       {/* 应用更新 */}
-      <section className="mb-4 rounded-xl border border-hairline bg-white p-4">
+      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-sm font-medium text-ink">应用更新</h2>
@@ -484,7 +484,7 @@ export default function SettingsPage() {
           )}
         </div>
         {updateState.phase === 'downloading' && updateState.total !== null && (
-          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-neutral-100">
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-surface-inset">
             <div
               className="h-full rounded-full bg-accent transition-all"
               style={{ width: `${Math.round((updateState.received / updateState.total) * 100)}%` }}
@@ -494,7 +494,7 @@ export default function SettingsPage() {
       </section>
 
       {/* 开机自启 */}
-      <section className="mb-4 rounded-xl border border-hairline bg-white p-4">
+      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-sm font-medium text-ink">开机自启</h2>
@@ -521,7 +521,7 @@ export default function SettingsPage() {
       </section>
 
       {/* 命令行工具（CLI 随应用打包，symlink 安装到 PATH） */}
-      <section className="mb-4 rounded-xl border border-hairline bg-white p-4">
+      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
             <h2 className="text-sm font-medium text-ink">命令行工具（chrome-host CLI）</h2>
@@ -569,14 +569,14 @@ export default function SettingsPage() {
       </section>
 
       {/* 环境标识卡（位置/颜色可配） */}
-      <section className="mb-4 rounded-xl border border-neutral-200 bg-white p-4">
-        <h2 className="text-sm font-medium text-neutral-700">环境标识（Environment Label）</h2>
-        <p className="mt-0.5 text-xs text-neutral-400">
+      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
+        <h2 className="text-sm font-medium text-neutral-700 dark:text-neutral-200">环境标识（Environment Label）</h2>
+        <p className="mt-0.5 text-xs text-neutral-400 dark:text-neutral-500">
           实例页面角落显示环境标签，便于区分多实例。修改后对新启动的实例生效。
         </p>
         <div className="mt-3 space-y-3 text-xs">
           <div>
-            <p className="mb-1.5 text-neutral-500">位置</p>
+            <p className="mb-1.5 text-neutral-500 dark:text-neutral-400">位置</p>
             <div className="flex gap-1.5">
               {([
                 ['top-left', '左上'],
@@ -588,8 +588,8 @@ export default function SettingsPage() {
                   key={value}
                   className={`rounded-md border px-2.5 py-1 transition ${
                     settings?.envLabelPosition === value
-                      ? 'border-neutral-800 bg-neutral-800 text-white'
-                      : 'border-neutral-200 text-neutral-600 hover:bg-neutral-50'
+                      ? 'border-neutral-800 bg-neutral-800 text-white dark:border-neutral-100 dark:bg-neutral-100 dark:text-neutral-800'
+                      : 'border-neutral-200 text-neutral-600 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800'
                   }`}
                   onClick={() => updateSettings({ envLabelPosition: value })}
                 >
@@ -599,7 +599,7 @@ export default function SettingsPage() {
             </div>
           </div>
           <div>
-            <p className="mb-1.5 text-neutral-500">颜色</p>
+            <p className="mb-1.5 text-neutral-500 dark:text-neutral-400">颜色</p>
             <div className="flex gap-1.5">
               {([
                 ['red', 'rgb(239,68,68)', '红'],
@@ -611,8 +611,8 @@ export default function SettingsPage() {
                   key={value}
                   className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1 transition ${
                     settings?.envLabelColor === value
-                      ? 'border-neutral-800 bg-neutral-800 text-white'
-                      : 'border-neutral-200 text-neutral-600 hover:bg-neutral-50'
+                      ? 'border-neutral-800 bg-neutral-800 text-white dark:border-neutral-100 dark:bg-neutral-100 dark:text-neutral-800'
+                      : 'border-neutral-200 text-neutral-600 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800'
                   }`}
                   onClick={() => updateSettings({ envLabelColor: value })}
                 >
@@ -626,7 +626,7 @@ export default function SettingsPage() {
       </section>
 
       {/* Agent API 卡 */}
-      <section className="rounded-xl border border-hairline bg-white p-4">
+      <section className="rounded-xl border border-hairline bg-surface-card p-4">
         <h2 className="text-sm font-medium text-ink">Agent API</h2>
         <div className="mt-3 space-y-1.5 text-xs text-ink-2">
           <p className="flex items-center gap-2">

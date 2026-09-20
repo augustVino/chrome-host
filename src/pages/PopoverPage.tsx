@@ -117,13 +117,13 @@ export default function PopoverPage() {
   return (
     <div
       className={`flex flex-col overflow-hidden rounded-xl ${
-        isMac ? '' : 'bg-white/95 shadow-2xl'
+        isMac ? '' : 'bg-surface-card/95 shadow-2xl'
       }`}
       style={{ height: contentH ? `${contentH}px` : '100vh' }}
     >
       <div
         ref={headerRef}
-        className="flex items-center justify-between border-b border-black/[0.08] px-3.5 py-2.5"
+        className="flex items-center justify-between border-b border-popover-line px-3.5 py-2.5"
       >
         <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-2">
           Chrome Host
@@ -142,14 +142,14 @@ export default function PopoverPage() {
           const instances = instancesByEnv[env.id] ?? [];
           const running = instances.filter((i) => i.status === 'running').length;
           return (
-            <div key={env.id} className="rounded-lg border border-black/[0.06] bg-white/60 p-2.5 backdrop-blur-sm">
+            <div key={env.id} className="rounded-lg border border-popover-line bg-popover-card p-2.5 backdrop-blur-sm">
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
                   <p className="truncate text-xs font-medium text-ink">{env.name}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
                   <button
-                    className="rounded-md px-1.5 py-1 text-[11px] text-ink-2 transition hover:bg-red-50 hover:text-status-error"
+                    className="rounded-md px-1.5 py-1 text-[11px] text-ink-2 transition hover:bg-red-50 hover:text-status-error dark:hover:bg-red-500/15"
                     title="删除环境"
                     onClick={() =>
                       removeEnv(env.id, env.name, instances.filter((i) => i.status === 'running').length)
@@ -173,7 +173,7 @@ export default function PopoverPage() {
               </div>
 
               {instances.length > 0 && (
-                <ul className="mt-2 space-y-1 border-t border-black/[0.06] pt-2">
+                <ul className="mt-2 space-y-1 border-t border-popover-line pt-2">
                   {instances.map((ins) => (
                     <li key={ins.id} className="flex items-center gap-2">
                       <StatusDot status={ins.status} />
@@ -184,7 +184,7 @@ export default function PopoverPage() {
                         {ins.status === 'running' && (
                           <>
                             <button
-                              className="rounded-md border border-black/[0.08] bg-white/70 px-1.5 py-0.5 text-[10px] text-ink-2 transition hover:bg-white disabled:opacity-40"
+                              className="rounded-md border border-popover-line bg-popover-btn px-1.5 py-0.5 text-[10px] text-ink-2 transition hover:bg-popover-btn-hover disabled:opacity-40"
                               disabled={busyId === ins.id}
                               onClick={() =>
                                 act(async () => {
@@ -197,14 +197,14 @@ export default function PopoverPage() {
                               CDP
                             </button>
                             <button
-                              className="rounded-md border border-black/[0.08] bg-white/70 px-1.5 py-0.5 text-[10px] text-ink-2 transition hover:bg-white disabled:opacity-40"
+                              className="rounded-md border border-popover-line bg-popover-btn px-1.5 py-0.5 text-[10px] text-ink-2 transition hover:bg-popover-btn-hover disabled:opacity-40"
                               disabled={busyId === ins.id}
                               onClick={() => act(() => api.restartInstance(ins.id), ins.id)}
                             >
                               Restart
                             </button>
                             <button
-                              className="rounded-md border border-black/[0.08] bg-white/70 px-1.5 py-0.5 text-[10px] text-ink-2 transition hover:bg-white disabled:opacity-40"
+                              className="rounded-md border border-popover-line bg-popover-btn px-1.5 py-0.5 text-[10px] text-ink-2 transition hover:bg-popover-btn-hover disabled:opacity-40"
                               disabled={busyId === ins.id}
                               onClick={() => act(() => api.stopInstance(ins.id), ins.id)}
                             >
@@ -214,7 +214,7 @@ export default function PopoverPage() {
                         )}
                         {(ins.status === 'stopped' || ins.status === 'error') && (
                           <button
-                            className="rounded-md border border-black/[0.08] bg-white/70 px-1.5 py-0.5 text-[10px] text-ink-2 transition hover:bg-white disabled:opacity-40"
+                            className="rounded-md border border-popover-line bg-popover-btn px-1.5 py-0.5 text-[10px] text-ink-2 transition hover:bg-popover-btn-hover disabled:opacity-40"
                             disabled={busyId === ins.id}
                             onClick={() => act(() => api.startInstance(ins.id), ins.id)}
                           >
@@ -237,7 +237,7 @@ export default function PopoverPage() {
 
       <div
         ref={footerRef}
-        className="border-t border-black/[0.08] px-3.5 py-2.5"
+        className="border-t border-popover-line px-3.5 py-2.5"
       >
         <button className={`${btnGhost} w-full justify-center`} onClick={() => openManager()}>
           + Add Environment
@@ -254,7 +254,7 @@ function Toast({ toast }: { toast: { kind: 'ok' | 'err'; text: string } }) {
   return (
     <div
       className={`absolute bottom-4 left-1/2 -translate-x-1/2 rounded-lg px-3 py-1.5 text-[11px] shadow-lg ${
-        toast.kind === 'ok' ? 'bg-ink text-white' : 'bg-status-error text-white'
+        toast.kind === 'ok' ? 'bg-toast text-white' : 'bg-status-error text-white'
       }`}
     >
       {toast.text}

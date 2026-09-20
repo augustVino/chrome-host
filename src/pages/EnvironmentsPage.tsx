@@ -76,12 +76,12 @@ export default function EnvironmentsPage() {
           {envs.map((env) => (
             <li
               key={env.id}
-              className="flex items-center gap-2 rounded-xl border border-hairline bg-white p-4 transition hover:border-neutral-300 hover:shadow-sm"
+              className="flex items-center gap-2 rounded-xl border border-hairline bg-surface-card p-4 transition hover:border-neutral-300 hover:shadow-sm dark:hover:border-neutral-600"
             >
               <Link to={`/environments/${env.id}`} className="min-w-0 flex-1">
                 <p className="truncate text-sm font-medium text-ink">{env.name}</p>
                 {env.hostsSourceUrl && (
-                  <p className="mt-2 inline-flex rounded-md bg-neutral-50 px-1.5 py-0.5 text-[11px] text-ink-2">
+                  <p className="mt-2 inline-flex rounded-md bg-surface-inset px-1.5 py-0.5 text-[11px] text-ink-2">
                     🔗 hosts 源已配置
                   </p>
                 )}
@@ -105,7 +105,7 @@ export default function EnvironmentsPage() {
                   <span className="text-ink-3">○ No instances</span>
                 )}
                 <button
-                  className="shrink-0 rounded-md px-2 py-1 text-xs text-ink-2 transition hover:bg-red-50 hover:text-status-error"
+                  className="shrink-0 rounded-md px-2 py-1 text-xs text-ink-2 transition hover:bg-red-50 hover:text-status-error dark:hover:bg-red-500/15"
                   title="删除环境"
                   onClick={() => remove(env.id, env.name, env.runningInstances)}
                 >

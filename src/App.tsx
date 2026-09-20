@@ -42,8 +42,8 @@ function Sidebar() {
             className={({ isActive }) =>
               `flex items-center rounded-lg px-2.5 py-1.5 text-xs transition ${
                 isActive
-                  ? 'bg-white font-medium text-ink shadow-sm ring-1 ring-hairline'
-                  : 'text-ink-2 hover:bg-white/60 hover:text-ink'
+                  ? 'bg-surface-raised font-medium text-ink shadow-sm ring-1 ring-hairline'
+                  : 'text-ink-2 hover:bg-ink/5 hover:text-ink'
               }`
             }
           >
@@ -62,7 +62,7 @@ function Toast() {
   return (
     <div
       className={`fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded-lg px-3.5 py-2 text-xs shadow-lg ${
-        toast.kind === 'ok' ? 'bg-ink text-white' : 'bg-status-error text-white'
+        toast.kind === 'ok' ? 'bg-toast text-white' : 'bg-status-error text-white'
       }`}
     >
       {toast.text}
@@ -99,7 +99,7 @@ function Shell() {
   }, []);
 
   return (
-    <div className="flex h-screen bg-white text-ink">
+    <div className="flex h-screen bg-surface text-ink">
       <Sidebar />
       <main className="flex-1 overflow-y-auto px-8 py-6">
         <Routes>

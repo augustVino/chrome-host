@@ -21,6 +21,8 @@ pub fn build_args(spec: &LaunchSpec) -> Vec<String> {
         "--remote-allow-origins=*".to_string(),
         // 抑制“不受支持的命令行标记”警告条（host-resolver-rules 等自定义 flag 会触发）
         "--test-type".to_string(),
+        // 抑制 CfT 自带的“仅适用于自动测试”提示条（--test-type 管不住它，M131 实测有效）
+        "--disable-infobars".to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
     ];
@@ -321,6 +323,7 @@ mod tests {
         assert!(args.contains(&"--user-data-dir=/tmp/env/env_a/instances/ins_1".to_string()));
         assert!(args.contains(&"--remote-debugging-port=9223".to_string()));
         assert!(args.contains(&"--remote-allow-origins=*".to_string()));
+        assert!(args.contains(&"--disable-infobars".to_string()));
         assert!(args.contains(&"--no-first-run".to_string()));
         assert!(args.contains(&"--no-default-browser-check".to_string()));
         // extra 保持顺序且位于标准参数之后

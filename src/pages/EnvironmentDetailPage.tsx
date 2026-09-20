@@ -189,7 +189,7 @@ export default function EnvironmentDetailPage() {
           <h1 className="text-base font-semibold text-ink">{env.name}</h1>
         </div>
         <button
-          className="rounded-md px-2 py-1 text-xs text-ink-2 transition hover:bg-red-50 hover:text-status-error"
+          className="rounded-md px-2 py-1 text-xs text-ink-2 transition hover:bg-red-50 hover:text-status-error dark:hover:bg-red-500/15"
           onClick={async () => {
             const running = instances.filter((i) => i.status === 'running').length;
             if (!(await confirmDeleteEnv(env.name, running))) return;
@@ -226,7 +226,7 @@ export default function EnvironmentDetailPage() {
         {instances.length === 0 ? (
           <EmptyState title="No Chrome instances" desc="为此环境启动一个隔离的浏览器实例。" />
         ) : (
-          <ul className="divide-y divide-neutral-100 rounded-xl border border-hairline bg-white">
+          <ul className="divide-y divide-hairline-soft rounded-xl border border-hairline bg-surface-card">
             {instances.map((ins) => (
               <li key={ins.id} className="flex flex-wrap items-center gap-3 px-4 py-2.5">
                 <StatusDot status={ins.status} />
@@ -303,7 +303,7 @@ export default function EnvironmentDetailPage() {
       </div>
 
       {/* Login Profile */}
-      <div className="mb-6 rounded-xl border border-hairline bg-white p-4">
+      <div className="mb-6 rounded-xl border border-hairline bg-surface-card p-4">
         <h2 className="text-sm font-medium text-ink">🔐 {profile?.name ?? 'Login Profile'}</h2>
         {profile ? (
           <>
@@ -358,7 +358,7 @@ export default function EnvironmentDetailPage() {
       </div>
 
       {/* Activity 流 */}
-      <div className="mb-6 rounded-xl border border-hairline bg-white p-4">
+      <div className="mb-6 rounded-xl border border-hairline bg-surface-card p-4">
         <h2 className="text-sm font-medium text-ink">Activity</h2>
         {activity.length === 0 ? (
           <p className="mt-2 text-xs text-ink-3">暂无事件</p>
@@ -388,7 +388,7 @@ export default function EnvironmentDetailPage() {
       </div>
 
       {/* Hosts Mapping */}
-      <div className="rounded-xl border border-hairline bg-white p-4">
+      <div className="rounded-xl border border-hairline bg-surface-card p-4">
         <h2 className="text-sm font-medium text-ink">Hosts Mapping</h2>
         {env.hostsSourceUrl ? (
           <div className="mt-1.5 space-y-1 text-xs text-ink-2">

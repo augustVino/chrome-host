@@ -86,7 +86,7 @@ export default function LoginProfilesPage() {
       ) : (
         <ul className="space-y-3">
           {rows.map((p) => (
-            <li key={p.id} className="rounded-xl border border-hairline bg-white p-4">
+            <li key={p.id} className="rounded-xl border border-hairline bg-surface-card p-4">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <p className="truncate text-sm font-medium text-ink">🔐 {p.name}</p>
@@ -106,10 +106,10 @@ export default function LoginProfilesPage() {
                 <span
                   className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
                     p.status === 'ready'
-                      ? 'bg-emerald-50 text-run-text'
+                      ? 'bg-emerald-50 text-run-text dark:bg-emerald-500/15'
                       : p.status === 'error'
-                        ? 'bg-red-50 text-status-error'
-                        : 'bg-neutral-100 text-ink-2'
+                        ? 'bg-red-50 text-status-error dark:bg-red-500/15'
+                        : 'bg-surface-inset text-ink-2'
                   }`}
                 >
                   {STATUS_TEXT[p.status]}

@@ -6,11 +6,11 @@ import { btnGhost, btnPrimary } from '../components/ui';
 const BASE = 'http://127.0.0.1:17890/api/v1';
 
 const METHOD_COLOR: Record<string, string> = {
-  GET: 'bg-emerald-50 text-run-text',
-  POST: 'bg-blue-50 text-blue-700',
-  PUT: 'bg-amber-50 text-amber-700',
-  PATCH: 'bg-amber-50 text-amber-700',
-  DELETE: 'bg-red-50 text-red-700',
+  GET: 'bg-emerald-50 text-run-text dark:bg-emerald-500/15',
+  POST: 'bg-blue-50 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300',
+  PUT: 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+  PATCH: 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+  DELETE: 'bg-red-50 text-red-700 dark:bg-red-500/15 dark:text-red-300',
 };
 
 /**
@@ -108,7 +108,7 @@ export default function AgentApiPage() {
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <code className="rounded bg-white px-2 py-1 font-mono text-[10px] text-ink ring-1 ring-hairline">
+          <code className="rounded bg-surface-inset px-2 py-1 font-mono text-[10px] text-ink ring-1 ring-hairline">
             http://127.0.0.1:17890/mcp
           </code>
           <button
@@ -138,7 +138,7 @@ export default function AgentApiPage() {
                     <li key={key + item.desc}>
                       <button
                         className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px] transition ${
-                          active ? 'bg-neutral-100 text-ink' : 'text-ink-2 hover:bg-neutral-50'
+                          active ? 'bg-surface-inset text-ink' : 'text-ink-2 hover:bg-ink/5'
                         }`}
                         onClick={() => pick(item)}
                       >
@@ -203,7 +203,7 @@ export default function AgentApiPage() {
                   {resp.status || '网络错误'}
                 </span>
               </p>
-              <pre className="max-h-80 overflow-auto rounded-lg bg-neutral-50 p-3 font-mono text-[11px] leading-5 text-ink">
+              <pre className="max-h-80 overflow-auto rounded-lg bg-surface-inset p-3 font-mono text-[11px] leading-5 text-ink">
                 {resp.text}
               </pre>
             </div>

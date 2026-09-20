@@ -43,7 +43,7 @@ export function Modal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/25" onClick={onClose}>
       <div
-        className="w-[420px] rounded-xl bg-white p-5 shadow-xl ring-1 ring-hairline"
+        className="w-[420px] rounded-xl bg-surface-card p-5 shadow-xl ring-1 ring-hairline"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="mb-4 text-sm font-semibold text-ink">{title}</h2>
@@ -64,7 +64,7 @@ export function Field({ label, children, hint }: { label: string; children: Reac
 }
 
 export const inputCls =
-  'w-full rounded-lg border border-hairline px-2.5 py-1.5 text-sm outline-none transition focus:border-ink-3 focus:ring-2 focus:ring-neutral-100';
+  'w-full rounded-lg border border-hairline px-2.5 py-1.5 text-sm outline-none transition focus:border-ink-3 focus:ring-2 focus:ring-ink/10';
 
 export function EmptyState({ title, desc, action }: { title: string; desc: string; action?: ReactNode }) {
   return (
@@ -79,4 +79,4 @@ export function EmptyState({ title, desc, action }: { title: string; desc: strin
 export const btn =
   'inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-40 disabled:cursor-not-allowed';
 export const btnPrimary = `${btn} bg-accent text-white hover:bg-accent-hover`;
-export const btnGhost = `${btn} border border-hairline bg-white text-ink-2 hover:bg-neutral-50`;
+export const btnGhost = `${btn} border border-hairline bg-surface-raised text-ink-2 hover:bg-ink/5`;

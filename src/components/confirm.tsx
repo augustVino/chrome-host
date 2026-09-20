@@ -51,11 +51,11 @@ export function ConfirmDialog() {
   const { options, resolve } = st;
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/25 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/25 p-4 dark:bg-black/50"
       onClick={() => resolve?.(false)}
     >
       <div
-        className="w-[380px] rounded-xl bg-white p-5 shadow-xl ring-1 ring-hairline"
+        className="w-[380px] rounded-xl bg-surface-card p-5 shadow-xl ring-1 ring-hairline"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="mb-2 text-sm font-semibold text-ink">{options.title}</h2>

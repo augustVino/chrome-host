@@ -7,3 +7,68 @@ body,
 #root {
   height: 100%;
 }
+
+/*
+ * 语义色变量（RGB 三元组，tailwind.config.js 以 rgb(var(--x) / <alpha-value>) 引用）。
+ * 亮色 = DESIGN.md v1 色板（值不变）；暗色 = macOS 系统色板暗色变体，成对同源。
+ * 触发机制：跟随系统（prefers-color-scheme），零 JS，主窗口与 Popover 同时生效。
+ * 未来若需应用内手动切换：变量已就位，只需把触发器换成 html.dark class（Tailwind 切回 'class'）。
+ */
+:root {
+  color-scheme: light;
+
+  --accent: 0 122 255; /* systemBlue */
+  --accent-hover: 0 113 235;
+  --ink: 29 29 31; /* 主文字 */
+  --ink-2: 110 110 115; /* 次要文字 */
+  --ink-3: 174 174 178; /* 辅助/placeholder */
+  --hairline: 229 229 234; /* separator：卡片描边 */
+  --hairline-soft: 245 245 247; /* 卡内弱分隔（行间 divide） */
+  --surface: 255 255 255; /* 窗口内容区底 */
+  --surface-sidebar: 245 245 247;
+  --surface-card: 255 255 255; /* 卡片 / 浮层底 */
+  --surface-raised: 255 255 255; /* 浮起元素：nav active、ghost 按钮底 */
+  --surface-inset: 245 245 247; /* 卡内嵌套底：badge、代码块、进度槽 */
+  --toast: 29 29 31; /* Toast 底（独立于 ink，避免暗色反转后白底白字） */
+  --status-running: 52 199 89; /* systemGreen */
+  --status-starting: 255 159 10; /* systemOrange（暗色同值） */
+  --status-stopped: 209 209 214; /* systemGray */
+  --status-error: 255 59 48; /* systemRed */
+  --run-text: 36 138 61; /* 运行中文字（亮底加深保证对比度） */
+
+  /* Popover 半透明材质（完整颜色值，不支持 alpha modifier，也用不到） */
+  --popover-card: rgba(255, 255, 255, 0.6);
+  --popover-line: rgba(0, 0, 0, 0.08);
+  --popover-btn: rgba(255, 255, 255, 0.7);
+  --popover-btn-hover: rgba(255, 255, 255, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --accent: 10 132 255; /* systemBlue dark：hover 提亮而非压暗 */
+    --accent-hover: 64 156 255;
+    --ink: 245 245 247;
+    --ink-2: 161 161 166; /* secondaryLabel，暗底对比 ≥ 6:1 */
+    --ink-3: 124 124 129; /* tertiaryLabel，辅助文本 ≥ 3:1 */
+    --hairline: 56 56 58; /* separator dark */
+    --hairline-soft: 62 62 64; /* ≈ white 8%，暗卡上的弱分隔 */
+    --surface: 30 30 32; /* windowBackground dark */
+    --surface-sidebar: 40 40 42; /* 比窗口底亮一档（macOS sidebar 惯例） */
+    --surface-card: 44 44 46; /* secondarySystemBackground dark */
+    --surface-raised: 58 58 60; /* systemGray3 dark */
+    --surface-inset: 58 58 60;
+    --toast: 58 58 60;
+    --status-running: 48 209 88; /* systemGreen dark */
+    --status-starting: 255 159 10;
+    --status-stopped: 99 99 102; /* systemGray2 dark：灰但不抢「活动」语义 */
+    --status-error: 255 69 58; /* systemRed dark */
+    --run-text: 48 209 88; /* 暗底直接用亮绿，无需加深 */
+
+    --popover-card: rgba(255, 255, 255, 0.08); /* 暗色磨砂材质上的白 overlay */
+    --popover-line: rgba(255, 255, 255, 0.12);
+    --popover-btn: rgba(255, 255, 255, 0.1);
+    --popover-btn-hover: rgba(255, 255, 255, 0.16);
+  }
+}

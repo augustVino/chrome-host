@@ -80,7 +80,7 @@ function ExtensionRow({ ext }: { ext: Extension }) {
             Open Folder
           </button>
           <button
-            className="rounded-lg px-2.5 py-1.5 text-xs text-ink-2 transition hover:bg-red-50 hover:text-status-error"
+            className="rounded-lg px-2.5 py-1.5 text-xs text-ink-2 transition hover:bg-red-50 hover:text-status-error dark:hover:bg-red-500/15"
             onClick={remove}
           >
             移除
@@ -94,12 +94,12 @@ function ExtensionRow({ ext }: { ext: Extension }) {
 function GroupCard({ title, items }: { title: string; items: Extension[] }) {
   if (items.length === 0) return null;
   return (
-    <section className="mb-4 rounded-xl border border-hairline bg-white">
+    <section className="mb-4 rounded-xl border border-hairline bg-surface-card">
       <div className="flex items-center justify-between px-4 pt-4 pb-2">
         <h2 className="text-sm font-medium text-ink">{title}</h2>
         <span className="text-[11px] text-ink-3">{items.length} 项</span>
       </div>
-      <div className="divide-y divide-neutral-100 border-t border-neutral-100 pb-1">
+      <div className="divide-y divide-hairline-soft border-t border-hairline-soft pb-1">
         {items.map((ext) => (
           <ExtensionRow key={ext.id} ext={ext} />
         ))}
