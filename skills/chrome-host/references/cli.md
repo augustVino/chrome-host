@@ -129,18 +129,20 @@ CLI 错误行格式 `[CODE] message（HTTP status）`。exit 3/6/8 已被退出�
 
 ## 远程接入（云桌面 / 远程机器）
 
-应用内置「远程接入」：守护一条 SSH 反向隧道（仅转发 17890 → Mac 端 17891 鉴权监听器）。远程机器访问**自己的** `127.0.0.1:17890` 即等价于访问 Mac 的 API，CLI 默认地址零改动。
+应用内置「远程接入」：守护一条 SSH 反向隧道（仅转发 17890 → 主机端 17891 鉴权监听器；主机 = 运行桌面应用的 Mac 或 Windows）。远程机器访问**自己的** `127.0.0.1:17890` 即等价于访问主机上应用的 API，CLI 默认地址零改动。
 
 远程探活三态：
 
-- 连接拒绝 → exit 8：隧道断或应用停，请用户到 Mac 端检查（agent 无法远程修隧道）
-- exit 10 → 仅令牌问题：核对 `CHROME_HOST_TOKEN`，或请用户在 Mac 端 Settings 页轮换后重发；这同时证明隧道与应用都在线
+- 连接拒绝 → exit 8：隧道断或应用停，请用户到主机端检查（agent 无法远程修隧道）
+- exit 10 → 仅令牌问题：核对 `CHROME_HOST_TOKEN`，或请用户在主机端 Settings 页轮换后重发；这同时证明隧道与应用都在线
 - exit 0 → 一切正常
+
+**exit 0 的二义性**：token 存在时它只证明「隧道 + 授权正常」，不证明 shell 与浏览器同机（CDP 端口只绑主机回环，远程直连必 fetch failed）。同机判别：`env -u CHROME_HOST_TOKEN chrome-host status` → exit 0 = 同机（可直连）；exit 10 = 远程 shell。务实兜底：直连试探一次 `cdp.mjs list` 失败就切 `cdp-session`，勿反复重试。
 
 要点：
 
-1. **令牌**：远程调用需 `export CHROME_HOST_TOKEN=<令牌>`（Mac 端 Settings 页「远程接入」复制）。
-2. **CDP 自动化走会话代理**（远程拿不到实例真实端口，`instance cdp` 的直连端口仅 Mac 本地有效）：
+1. **令牌**：远程调用需 `export CHROME_HOST_TOKEN=<令牌>`（主机端 Settings 页「远程接入」复制）。
+2. **CDP 自动化走会话代理**（远程拿不到实例真实端口，`instance cdp` 的直连端口仅主机本地有效）：
 
    ```bash
    CDP_BASE=$(chrome-host instance cdp-session <insId> --quiet)   # 30 分钟有效
@@ -148,7 +150,7 @@ CLI 错误行格式 `[CODE] message（HTTP status）`。exit 3/6/8 已被退出�
    ```
 
    会话过期（404 `SESSION_NOT_FOUND`）→ 重新 `cdp-session`，无需重建实例。
-3. 隧道状态在 Mac 端查：`curl 127.0.0.1:17890/api/v1/remote-access/status` 或 `chrome-host doctor`（remote_access 检查项）。
+3. 隧道状态在主机端查：`curl 127.0.0.1:17890/api/v1/remote-access/status` 或 `chrome-host doctor`（remote_access 检查项）。
 
 ## MCP 入口
 

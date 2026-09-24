@@ -22,12 +22,12 @@ chrome-host status
 
 按退出码分支：
 
-- **exit 0** → 在线，走主工作流。
+- **exit 0** → 应用可达且授权正常。**但这不等于“本机可直连 CDP”**：配置了 `CHROME_HOST_TOKEN` 的 shell（云桌面 / CI）走的是远程路径，exit 0 只证明隧道与令牌正常；实例 CDP 端口（9222 起）只绑主机回环，远程 shell 直连必然 fetch failed。同机与否用下方判别法确认。
 - **exit 8**（不可达）→ 应用未启动，提示用户启动 Chrome Host。API 固定在 17890，连不上就是没起——不要猜端口、不要绕道 HTTP。
-- **exit 10**（未授权）→ 本机是远程接入客户端（经 SSH 隧道连 Mac），`CHROME_HOST_TOKEN` 缺失/错误。隧道与应用均在线，只是凭证问题——勿按 exit 8 处置。此后走远程路径：CDP 自动化用 `cdp-session` 会话代理（见第 5 步），不要直连实例端口。
+- **exit 10**（未授权）→ 本机是远程接入客户端（经 SSH 隧道连主机），`CHROME_HOST_TOKEN` 缺失/错误。隧道与应用均在线，只是凭证问题——勿按 exit 8 处置。此后走远程路径：CDP 自动化用 `cdp-session` 会话代理（见第 5 步），不要直连实例端口。
 - **其他**（多为 exit 1）→ 应用在跑但内部异常。错误行格式 `[CODE] message（HTTP status）`，把 CODE + message 原样转述给用户——应用自身故障 agent 修不了，不要建议"重试"掩盖问题，也不要编造数据。需要细节跑 `chrome-host doctor`。
 
-> 不确定在本机还是远程？`env -u CHROME_HOST_TOKEN chrome-host status`：exit 0 = Mac 本地（直连路径）；exit 10 = 远程机器（会话代理路径）。
+> **判断 shell 与浏览器是否同机**（token 存在时 status 的 exit 0 区分不了）：`env -u CHROME_HOST_TOKEN chrome-host status` → exit 0 = 同机，走直连路径；exit 10 = 远程 shell，走会话代理路径。务实兜底：按直连跑一次 `cdp.mjs list`，fetch failed 就立即切 `cdp-session` 代理，**不要反复重试直连**。
 
 ## 核心模型
 
@@ -93,10 +93,10 @@ URL 必须 http:// 或 https:// 开头（本地校验，非法 exit 2 且请求�
 先拿连接凭证——**每次现查，不缓存端口**（实例重启后端口可能变化；分配器从 9222 起动态分配，被占自动顺延）：
 
 ```bash
-# Mac 本地（第零步 exit 0）：直连实例端口
+# 同机 shell（判别法 exit 0）：直连实例端口
 CDP_PORT=$(chrome-host instance cdp <insId> --json | jq .port)
 
-# 远程机器（第零步 exit 10）：会话代理，30 分钟有效
+# 远程 shell（判别法 exit 10 / 授权失败）：会话代理，30 分钟有效
 CDP_BASE=$(chrome-host instance cdp-session <insId> --quiet)
 ```
 
@@ -125,7 +125,7 @@ node scripts/cdp.mjs stop   [target]            # 停后台 daemon
 - **坐标换算**：截图按原生分辨率保存（图像像素 = CSS 像素 × DPR），CDP 点击吃 CSS 像素。`shot` 输出会带当前页 DPR，Retina（DPR=2）除以 2 再点击。
 - **eval 索引漂移**：多次 `eval` 之间 DOM 会变（如点掉一个卡片后全体系号位移），跨调用别用 `querySelectorAll(...)[i]`——一次 eval 收齐数据，或用稳定选择器。
 - **跨域 iframe 输入**：`eval` 进不去跨域 iframe，用 `click`/`clickxy` 聚焦后 `type`（Input.insertText，不受同源限制）。
-- **"Allow debugging" 授权框**：每个 tab 首次被 CDP 访问 Chrome 会弹一次，需用户在本地点允许；cdp.mjs 的后台 daemon 保住会话，后续命令不再弹，daemon 空闲 20 分钟自动退出。
+- **不存在 "Allow debugging" 授权弹窗**：实例内核是 Chrome for Testing，CDP 访问不弹任何授权框，无需用户点允许——操作失败时别往“用户未授权”归因，按端口/实例/会话逐层排查。cdp.mjs 页面命令经 per-tab 后台 daemon 保持 CDP 会话，daemon 空闲 20 分钟自动退出。
 - **会话过期**（仅 CDP_BASE 模式，404 `SESSION_NOT_FOUND`）→ 重新 `cdp-session` 即可，无需重建实例。
 
 ### 6. 收尾
