@@ -78,8 +78,6 @@ CDP_PORT=$PORT node skills/chrome-host/scripts/cdp.mjs eval 6BE827FA 'document.t
 
 **方式 C：交给 AI Agent**：通过 MCP 或加载仓库 skills 接入，见 [AI Agent Skills](./skills)。
 
-> **首次访问提示**：Chrome 新版每个 tab 首次被 CDP 访问时会弹 "Allow debugging" 授权框，需人工点一次允许；cdp.mjs 的后台 daemon 会保住会话，后续命令不再弹。
-
 ## 6. 收尾清理
 
 ```bash

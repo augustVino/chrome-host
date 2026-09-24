@@ -48,5 +48,4 @@ cdp.mjs stop [target]               # 停掉后台 daemon
 - `<target>` 用 `list` 输出的 **targetId 唯一前缀**，歧义前缀会被拒绝；
 - **坐标**：截图按物理像素保存，CDP 点击按 CSS 像素——Retina（DPR=2）下截图坐标 ÷ 2；
 - **跨域 iframe 输入**用 `type`（eval 的 JS 注入不生效）；
-- **弹框**：每个 tab 首次 CDP 访问弹 "Allow debugging"，点一次后由后台 daemon 保活，闲置 20 分钟自动退出；
 - **多步 eval 之间 DOM 会变**：一次性取全数据，或用稳定选择器，避免跨调用的索引错位。
