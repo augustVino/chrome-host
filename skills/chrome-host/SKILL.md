@@ -86,7 +86,14 @@ URL 必须 http:// 或 https:// 开头（本地校验，非法 exit 2 且请求�
 2. **等待用户回复**，不轮询猜测，不自动填表单——隔离 profile 里没有用户凭据，自动登录必然失败且可能触发风控。
 3. 用户确认后验证：`instance tabs` 看 URL 是否已离开登录页，或用 cdp.mjs `snap` 确认页面内容。
 
-只需本次登录 → 到此为止。需要**长期免登录**（每个新实例都带登录态）→ 走登录态快照流程（launch → 人工登录 → 关浏览器 → capture），完整步骤与已知边界见 references/cli.md「登录态快照」。
+**登录态会自动保存（默认 first-login 策略）**：用户在实例里登录后，**关闭该实例**（或告诉用户直接关窗口），Cookie 保险库自动落盘；同环境的下一个新实例自动免登录，无需任何 capture 命令。要点：
+
+- 保存发生在**实例停止时**（stop / 用户关窗口都算）；运行中的实例不会被读取。
+- 查看保存状态与历史代：`chrome-host env session <envId>`（当前代 / Cookie 数 / 来源实例 / 历史代）。
+- 回滚登录态到上一代：`chrome-host env session-restore <envId> <gen>`（gen 来自 env session 输出；仅回滚 Cookie 层）。
+- 需要**显式固化某个实例**的登录态（如 always 策略下反复保存、或想把当前实例状态存为基准）：`chrome-host login-profile capture <envId> --from <insId> --yes`（实例须已停止）。
+- 免登录判定链：新实例启动时注入保险库 Cookie（失败降级为空登录态，实例照常可用）；session cookie（关浏览器即失效那类）不在注入范围——此类系统免登录 = 复用 running 实例。
+- 环境级策略可调：`env create/update --session-capture <off|first-login|always>`（默认 first-login：仅首个实例退出时保存）。
 
 ### 5. 页面自动化（cdp.mjs）
 
@@ -128,7 +135,35 @@ node scripts/cdp.mjs stop   [target]            # 停后台 daemon
 - **不存在 "Allow debugging" 授权弹窗**：实例内核是 Chrome for Testing，CDP 访问不弹任何授权框，无需用户点允许——操作失败时别往“用户未授权”归因，按端口/实例/会话逐层排查。cdp.mjs 页面命令经 per-tab 后台 daemon 保持 CDP 会话，daemon 空闲 20 分钟自动退出。
 - **会话过期**（仅 CDP_BASE 模式，404 `SESSION_NOT_FOUND`）→ 重新 `cdp-session` 即可，无需重建实例。
 
-### 6. 收尾
+### 6. 页面排障：先查历史，不要 reload 重放
+
+页面报错/白屏/接口失败时，**实例在后台持续记录 console 与全部请求**（环形缓冲，进程内态）——直接查历史即可，重新加载页面会破坏现场（spa 状态丢失、错误可能不再复现）：
+
+```bash
+chrome-host instance console  <insId> --level error        # JS 错误（含 unhandledrejection）
+chrome-host instance network  <insId> --failed-only        # 失败请求或 HTTP ≥400
+chrome-host instance screenshot <insId> --out /tmp/now.png # 不动页面看当前现场（png）
+chrome-host instance har      <insId> --out /tmp/trace.har # 完整时序导出（HAR 1.2，可直接给 LLM 分析）
+chrome-host instance diagnostics <insId>                    # 当前页快照：JS 错误/失败资源/LCP/FCP
+```
+
+选择顺序：console/network 先定位直接证据 → screenshot 看视觉现场 → diagnostics 拿性能指标 → har 导出做完整时序分析（无请求/响应头、分阶段耗时以 -1 占位）。注意：缓冲随实例重启清空，重启后查不到重启前的记录。
+
+### 7. 拦截/改写网络（net-rules 扩展，按环境配置）
+
+需要屏蔽埋点、或把前端接口指到本地 mock 服务时，不必改代码/代理——写环境级网络规则（对新启动实例生效）：
+
+```bash
+NR=$(chrome-host extension list --json | jq -r '.[] | select(.name=="Net Rules") | .id')
+# 屏蔽埋点域（域及全部子域；对新启动的实例生效）
+chrome-host extension config set $NR '{"block":["*.google-analytics.com"]}'
+# api 指到本地 mock（仅该环境）：https://api.foo.com/v1/x → http://localhost:3000/v1/x（* 依序对应 $1 $2…）
+chrome-host extension config set $NR '{"redirect":[{"from":"https://api.foo.com/*","to":"http://localhost:3000/$1"}]}' --env <envId>
+```
+
+要点：省略 `--env` 写全局默认，`--env` 写环境覆盖；headers 注入用 `[{"url":"...","set":{"X-Debug-Uid":"42"}}]`；语法参考 `chrome-host extension get $NR` 输出的 configDocsUrl。
+
+### 8. 收尾
 
 排查完成后**询问用户**是否停止实例：`chrome-host instance stop <insId>`。不默认停止（用户可能还要用），也不默认保留（长期挂着占内存）。开启 keepAlive 的环境由应用自管，无需干预。
 
@@ -149,6 +184,6 @@ agent 的 shell 是非交互环境（非 TTY），缺 `--yes` 时这些命令直
 | 完整命令与全局 flag 速查 | references/cli.md「命令速查」 |
 | exit 0–10 全表与处置 | references/cli.md「退出码契约」 |
 | exit 5/7 时按 `[CODE]` 细分 | references/cli.md「错误码细分决策表」 |
-| 登录态快照完整流程与边界（session cookie / 单 session 互踢） | references/cli.md「登录态快照」 |
+| 登录态自动保存 / 显式固化 / 回滚 | references/cli.md「登录态」 |
 | 远程接入原理与隧道排障 | references/cli.md「远程接入」 |
-| MCP 入口（25 个 tools）与安全边界 | references/cli.md 末尾两章 |
+| MCP 入口（33 个 tools）与安全边界 | references/cli.md 末尾两章 |

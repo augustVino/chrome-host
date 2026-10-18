@@ -27,9 +27,11 @@ chrome-host doctor     逐项诊断 + 修复建议（存在失败项 → exit 1�
 ```text
 chrome-host env list                        列表（含运行摘要）
 chrome-host env get <id>                    详情
-chrome-host env create <name> [--hosts-source-url URL] [--icon PATH]
-chrome-host env update <id> [--name N] [--hosts-source-url URL] [--startup-args ARGS] [--keep-alive BOOL]
+chrome-host env create <name> [--hosts-source-url URL] [--icon PATH] [--session-capture off|first-login|always]
+chrome-host env update <id> [--name N] [--hosts-source-url URL] [--startup-args ARGS] [--keep-alive BOOL] [--session-capture ...]
                                             只更新传入的 flag；值为空串 = 显式置空
+chrome-host env session <id>                会话身份层状态（当前代/Cookie 数/历史代）
+chrome-host env session-restore <id> <gen>  回滚 Cookie 保险库到历史代（仅 Cookie 层）
 chrome-host env delete <id> --yes           删除（级联：运行中实例自动停止后删除）
 chrome-host env status <id>                 实例状态计数
 chrome-host env activity <id> [--limit N]   事件审计流（排查启动失败用）
@@ -49,18 +51,27 @@ chrome-host instance navigate <id> <tabId> <url>   导航既有标签页（丢�
 chrome-host instance focus <id>             唤出窗口到前台
 chrome-host instance cdp <id>               CDP endpoint（--json 后 jq .port）
 chrome-host instance cdp-session <id>       发放 CDP 会话 URL（远程自动化用，30 分钟有效）
+chrome-host instance console <id> [--level error] [--limit N]   console 环（500 条，重启即清）
+chrome-host instance network <id> [--failed-only]               请求环（失败/HTTP≥400 过滤）
+chrome-host instance screenshot <id> [--out F]  当前页 png（缺省 <id>.png）
+chrome-host instance har <id> [--out F]         请求环生成 HAR 1.2（缺省 <id>.har）
+chrome-host instance diagnostics <id>          页面诊断快照（错误/失败资源/LCP/FCP）
 chrome-host instance delete <id> --yes      删除（运行中自动 stop→delete）
 ```
 
-### 登录态快照
+### 登录态
 
 ```text
 chrome-host login-profile list              全量列表（含环境名）
 chrome-host login-profile get <envId>       视图（惰性创建）
-chrome-host login-profile launch <envId>    打开登录浏览器（母本）
-chrome-host login-profile capture <envId> [--yes]   捕获快照（覆盖已有快照需确认；登录浏览器须已关）
+chrome-host login-profile capture <envId> [--from <insId>] [--yes]   捕获快照（--from 从已停止实例）
 chrome-host login-profile reset <envId> --yes       清空快照（总是确认）
+chrome-host env session <envId>             会话状态（策略/当前代/历史代）
+chrome-host env session-restore <envId> <gen>       回滚 Cookie 保险库
 ```
+
+常用路径是**实例即登录源**：实例里登录 → 停止实例 → 自动保存（first-login 默认策略）→
+同环境新实例免登录；显式固化用 `capture --from`，状态与回滚用 `env session`。详见下文「登录态」章节。
 
 ### 扩展 / 设置 / 内核
 
@@ -111,19 +122,25 @@ CLI 错误行格式 `[CODE] message（HTTP status）`。exit 3/6/8 已被退出�
 
 补充：应用启动时若 17890 被占，Agent API 降级禁用——表现为健康检查持续 exit 8，提示用户重启应用。错误为「响应格式异常」时，典型原因是**运行中的应用是旧版本**（缺 CLI 依赖的新端点），业务命令通常仍正常，请用户更新应用即可，勿误判为 API 故障。
 
-## 登录态快照（长期免登录）
+## 登录态（实例即登录源）
 
-实例每次启动克隆环境快照，"捕获一次、终身免登"。适合每天都要用的环境：
+默认工作流（环境策略 `first-login`，无需任何 capture 命令）：
 
-1. `login-profile launch <envId>` → 弹出独立登录浏览器（母本，不在 instances 列表）
-2. 提示用户完成登录（等待人工，同 SKILL.md 主工作流第 4 步原则）
-3. 用户登录后**让用户关闭该浏览器**（必须由用户关闭或自然退出）
-4. `login-profile capture <envId> --yes`（已获用户同意才加 `--yes`）
-5. 之后该环境 `instance create` 自动带登录态
+1. 实例里人工完成登录（同 SKILL.md 主工作流第 4 步原则：停下等用户）
+2. **停止该实例**（`instance stop`，或用户直接关窗口——关窗即保存）
+3. Cookie 保险库自动落盘；`env session <envId>` 可查当前代 / Cookie 数 / 来源实例
+4. 同环境 `instance create` 的新实例启动时自动注入，免登录（注入失败自动降级为空登录态，实例照常可用）
+
+变体与工具：
+
+- **显式固化某实例**：`login-profile capture <envId> --from <insId> --yes`（实例须已停止；覆盖已有快照需确认）
+- **每次实例退出都保存**：`env update <envId> --session-capture always`；关闭保存用 `--session-capture off`
+- **回滚登录态**：`env session-restore <envId> <gen>`（gen 来自 env session；仅回滚 Cookie 层，文件快照保留当前）
+- `login-profile launch`（独立登录浏览器母本）仍可用，但已非主路径——实例即登录源更直接
 
 已知边界，引导用户时提前说明：
 
-- **session cookie（关浏览器即失效那类）无法靠快照保留**——Chrome 标准语义，不落盘。此类系统免登录 = 复用 running 实例，或每次走 launch → 登录 → capture。
+- **session cookie（关浏览器即失效那类）不落盘**——Chrome 标准语义。此类系统免登录 = 复用 running 实例。
 - **单 session 互踢**：单 session 策略的内部系统，多实例共用同一快照会互相踢下线。此类环境一次只跑一个实例。
 - 快照过期（后端 session 过期）→ 重走 launch/capture，或 `reset --yes` 后重来。
 
@@ -154,7 +171,7 @@ CLI 错误行格式 `[CODE] message（HTTP status）`。exit 3/6/8 已被退出�
 
 ## MCP 入口
 
-应用内嵌 MCP server（`http://127.0.0.1:17890/mcp`，Streamable HTTP，25 个 tools，能力为 CLI 子集——无 settings / 内核下载 / 诊断）。已配置 MCP 的会话可直接用 tools；本 skill 默认走 CLI，因为退出码契约与确认闸门对 agent 更安全。两者调用同一服务层，状态一致。
+应用内嵌 MCP server（`http://127.0.0.1:17890/mcp`，Streamable HTTP，33 个 tools，能力为 CLI 子集——无 settings / 内核下载）。已配置 MCP 的会话可直接用 tools；本 skill 默认走 CLI，因为退出码契约与确认闸门对 agent 更安全。两者调用同一服务层，状态一致。
 
 ## 安全与边界
 
