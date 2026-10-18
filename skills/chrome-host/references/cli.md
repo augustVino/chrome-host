@@ -136,13 +136,13 @@ CLI 错误行格式 `[CODE] message（HTTP status）`。exit 3/6/8 已被退出�
 - **显式固化某实例**：`login-profile capture <envId> --from <insId> --yes`（实例须已停止；覆盖已有快照需确认）
 - **每次实例退出都保存**：`env update <envId> --session-capture always`；关闭保存用 `--session-capture off`
 - **回滚登录态**：`env session-restore <envId> <gen>`（gen 来自 env session；仅回滚 Cookie 层，文件快照保留当前）
-- `login-profile launch`（独立登录浏览器母本）仍可用，但已非主路径——实例即登录源更直接
+- `login-profile launch`（独立登录浏览器母本）已于 0.3.0 移除（breaking）——登录一律走实例即登录源
 
 已知边界，引导用户时提前说明：
 
 - **session cookie（关浏览器即失效那类）不落盘**——Chrome 标准语义。此类系统免登录 = 复用 running 实例。
 - **单 session 互踢**：单 session 策略的内部系统，多实例共用同一快照会互相踢下线。此类环境一次只跑一个实例。
-- 快照过期（后端 session 过期）→ 重走 launch/capture，或 `reset --yes` 后重来。
+- 快照过期（后端 session 过期）→ 实例里重新登录并关闭（自动保存新代），或 `reset --yes` 后重来。
 
 ## 远程接入（云桌面 / 远程机器）
 
