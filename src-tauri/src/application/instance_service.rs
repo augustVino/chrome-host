@@ -18,6 +18,8 @@ use crate::infrastructure::paths::AppPaths;
 use crate::infrastructure::platform;
 use crate::infrastructure::process::port_allocator;
 use crate::infrastructure::process::{LaunchSpec, ProcessManager};
+use crate::infrastructure::session_vault;
+use crate::infrastructure::cdp::ws::CdpConnection;
 
 use super::activity::Activity;
 use super::extension_service::ExtensionService;
@@ -273,6 +275,15 @@ impl InstanceService {
             .await
         {
             Ok(v) => {
+                // 身份层注入：CDP 就绪后、置 running 前灌入保险库 Cookie。
+                // 必须先于 agent 看到.running 后的首次 open_tab；失败降级——
+                // 实例照常启动，仅丢失免登录（保证「实例永远能创建」）
+                if let Err(e) = self.inject_session_cookies(ins).await {
+                    tracing::warn!(
+                        "[session] 实例 {} Cookie 注入失败（降级为空登录态启动）: {e}",
+                        ins.id
+                    );
+                }
                 self.instances.update_runtime(
                     &ins.id,
                     RuntimeUpdate {
@@ -403,6 +414,37 @@ impl InstanceService {
     pub async fn restart(&self, id: &str) -> Result<Instance, AppError> {
         self.stop(id).await?;
         self.start(id).await
+    }
+
+    /// 身份层注入：把环境保险库 Cookie 灌入刚就绪的实例（browser 级，无需 page）。
+    /// 分批防单帧超限；CookieRecord 与 Storage.setCookies 入参同构，
+    /// session cookie 的 expires=-1 原样回传（这正是文件层拿不到的部分）。
+    async fn inject_session_cookies(&self, ins: &Instance) -> Result<(), AppError> {
+        let Some(port) = ins.cdp_port else { return Ok(()) };
+        let env_dir = self.paths.environment_dir(&ins.environment_id);
+        let Some(vault) = session_vault::read_current(&env_dir) else {
+            return Ok(()); // 从未捕获：空身份，正常路径
+        };
+        if vault.cookies.is_empty() {
+            return Ok(());
+        }
+        let mut conn = CdpConnection::connect(port).await?;
+        let params = session_vault::to_set_cookie_params(&vault.cookies);
+        for chunk in params.chunks(100) {
+            conn.send::<serde_json::Value>(
+                "Storage.setCookies",
+                serde_json::json!({ "cookies": chunk }),
+                None,
+            )
+            .await?;
+        }
+        tracing::info!(
+            "[session] 实例 {} 注入 {} 条身份 Cookie（gen={}）",
+            ins.id,
+            vault.cookies.len(),
+            vault.generation
+        );
+        Ok(())
     }
 
     /// CDP endpoint：运行中才可获取；webSocketUrl 透传给 Agent

@@ -183,6 +183,7 @@ fn main() {
                 profile_service.clone(),
                 activity.clone(),
                 keep_alive.clone(),
+                paths.clone(),
             ));
             let instance_service = Arc::new(InstanceService::new(
                 env_repo,

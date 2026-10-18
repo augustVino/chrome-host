@@ -132,8 +132,10 @@ struct NavigateArgs {
 #[serde(rename_all = "camelCase")]
 struct LoginProfileArgs {
     environment_id: String,
-    #[schemars(description = "get=查状态/快照版本; launch=打开登录浏览器(人工登录); capture=捕获快照(浏览器须已关); reset=清空快照")]
+    #[schemars(description = "get=查状态/快照版本; launch=打开登录浏览器(人工登录，已废弃，推荐在实例里登录); capture=捕获快照(浏览器须已关); reset=清空快照")]
     action: LoginProfileAction,
+    #[schemars(description = "capture 可选：从指定实例捕获登录态（实例即登录源，实例须已停止）。缺省 = 传统母本捕获")]
+    from_instance_id: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -370,9 +372,26 @@ impl ChromeHostMcp {
         match a.action {
             LoginProfileAction::Get => run(|| self.state.profile_service.view(&a.environment_id)).await,
             LoginProfileAction::Launch => run(|| self.state.profile_service.launch(&a.environment_id)).await,
-            LoginProfileAction::Capture => run(|| self.state.profile_service.capture(&a.environment_id)).await,
-            LoginProfileAction::Reset => run(|| self.state.profile_service.reset(&a.environment_id)).await,
+            LoginProfileAction::Capture => match a.from_instance_id {
+                Some(ins) => {
+                    let env = a.environment_id.clone();
+                    run(move || async move {
+                        self.state.session_service.capture_from_instance(&env, &ins).await
+                    })
+                    .await
+                }
+                None => run(|| self.state.profile_service.capture(&a.environment_id)).await,
+            },
+            LoginProfileAction::Reset => run(|| self.state.session_service.reset(&a.environment_id)).await,
         }
+    }
+
+    #[tool(description = "查环境会话身份层：策略/当前代/来源实例/Cookie 数/历史代（回滚观测面）")]
+    async fn session_status(
+        &self,
+        Parameters(a): Parameters<EnvironmentArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run_sync(|| self.state.session_service.status(&a.environment_id))
     }
 
     // ── 扩展 ────────────────────────────────────────────────────────────

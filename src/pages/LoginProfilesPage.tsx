@@ -7,14 +7,7 @@ import { useStore } from '../store';
 import { ConfirmDialog, confirm } from '../components/confirm';
 import { btnGhost } from '../components/ui';
 
-const STATUS_TEXT: Record<LoginProfileRow['status'], string> = {
-  not_configured: 'Not configured',
-  ready: 'Ready',
-  capturing: 'Capturing…',
-  error: 'Error',
-};
-
-/** Login Profiles 页：全部环境的登录快照总览与快捷操作 */
+/** Login Profiles 页：全部环境登录态总览（实例即登录源：在实例里登录 → 关闭即保存） */
 export default function LoginProfilesPage() {
   const { showToast } = useStore();
   const [rows, setRows] = useState<LoginProfileRow[] | null>(null);
@@ -105,47 +98,28 @@ export default function LoginProfilesPage() {
                 </div>
                 <span
                   className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
-                    p.status === 'ready'
+                    p.snapshotVersion > 0
                       ? 'bg-emerald-50 text-run-text dark:bg-emerald-500/15'
                       : p.status === 'error'
                         ? 'bg-red-50 text-status-error dark:bg-red-500/15'
                         : 'bg-surface-inset text-ink-2'
                   }`}
                 >
-                  {STATUS_TEXT[p.status]}
+                  {p.snapshotVersion > 0 ? `已登录 v${p.snapshotVersion}` : p.status === 'error' ? 'Error' : '未登录'}
                 </span>
               </div>
 
               {p.browserRunning && (
-                <p className="mt-2 text-xs text-amber-600">登录浏览器运行中，关闭窗口后即可捕获</p>
+                <p className="mt-2 text-xs text-amber-600">旧登录浏览器仍在运行，关闭其窗口即可自动保存</p>
               )}
 
               <div className="mt-3 flex items-center gap-1.5">
                 <button
                   className={btnGhost}
-                  disabled={busyKey !== null || p.status === 'capturing' || p.browserRunning}
-                  onClick={() =>
-                    act(`launch:${p.id}`, () => api.launchLoginProfile(p.environmentId), '登录浏览器已打开')
-                  }
-                >
-                  打开并登录
-                </button>
-                <button
-                  className={btnGhost}
-                  disabled={busyKey !== null || p.status === 'capturing' || p.browserRunning}
-                  title={p.browserRunning ? '先关闭登录浏览器' : undefined}
-                  onClick={() =>
-                    act(`capture:${p.id}`, () => api.captureLoginProfile(p.environmentId), '快照已捕获')
-                  }
-                >
-                  {p.status === 'capturing' ? '捕获中…' : '捕获快照'}
-                </button>
-                <button
-                  className={btnGhost}
                   disabled={busyKey !== null || p.status === 'capturing'}
                   onClick={() => reset(p.name, () => api.resetLoginProfile(p.environmentId))}
                 >
-                  重置
+                  重置登录态
                 </button>
               </div>
             </li>

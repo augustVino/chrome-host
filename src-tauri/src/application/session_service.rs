@@ -244,6 +244,21 @@ impl SessionService {
         Ok(self.status(env_id)?)
     }
 
+    /// 清空身份层两层：Cookie 保险库（含历史）+ 文件快照母本（回到 not_configured）。
+    /// 登录浏览器运行中 → 409，不代杀（由 ProfileService.reset 保证）。
+    pub async fn reset(&self, env_id: &str) -> Result<serde_json::Value, AppError> {
+        let env_dir = self.paths.environment_dir(env_id);
+        session_vault::clear(&env_dir)?;
+        self.activity.record(
+            "warn",
+            "session_reset",
+            Some(env_id),
+            None,
+            "身份层已清空（文件快照 + Cookie 保险库）",
+        );
+        Ok(json!(self.profiles.reset(env_id).await?))
+    }
+
     async fn export_instance_cookies(
         &self,
         port: u16,

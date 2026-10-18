@@ -50,10 +50,11 @@ pub async fn capture(
     }
 }
 
-/// POST /api/v1/environments/{id}/login-profile/reset（清空母本，回到 Not Configured）
+/// POST /api/v1/environments/{id}/login-profile/reset
+/// 清空身份层两层（Cookie 保险库 + 文件快照母本）；登录浏览器运行中 → 409
 pub async fn reset(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    Ok(Json(json!(state.profile_service.reset(&id).await?)))
+    Ok(Json(json!(state.session_service.reset(&id).await?)))
 }

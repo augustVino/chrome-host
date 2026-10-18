@@ -32,6 +32,7 @@ pub struct EnvironmentService {
     profiles: Arc<ProfileService>,
     activity: Arc<Activity>,
     keep_alive: Arc<KeepAliveWatcher>,
+    paths: crate::infrastructure::paths::AppPaths,
 }
 
 impl EnvironmentService {
@@ -42,8 +43,9 @@ impl EnvironmentService {
         profiles: Arc<ProfileService>,
         activity: Arc<Activity>,
         keep_alive: Arc<KeepAliveWatcher>,
+        paths: crate::infrastructure::paths::AppPaths,
     ) -> Self {
-        EnvironmentService { envs, instances, reconciler, profiles, activity, keep_alive }
+        EnvironmentService { envs, instances, reconciler, profiles, activity, keep_alive, paths }
     }
 
     pub fn create(&self, input: CreateEnvironmentInput) -> Result<Environment, AppError> {
@@ -195,6 +197,9 @@ impl EnvironmentService {
         self.profiles.delete_for_env(id)?;
 
         self.envs.delete(id)?;
+        // 环境根目录收尾清理（best-effort）：实例/母本子目录已清，残留的只有
+        // 空目录骨架与会话保险库文件，不制留下孤儿目录
+        let _ = std::fs::remove_dir_all(self.paths.environment_dir(id));
         self.emit("environment-deleted", id);
         tracing::info!("环境已删除: {id}");
         Ok(())

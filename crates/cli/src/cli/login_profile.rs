@@ -49,11 +49,14 @@ pub enum LoginProfileCommands {
         env_id: String,
     },
 
-    /// 捕获登录态快照（覆盖已有快照时需确认；须先关闭登录浏览器）
-    #[command(about = "捕获登录态快照（覆盖已有快照时需确认；须先关闭登录浏览器）")]
+    /// 捕获登录态快照（从指定实例捕获需 --from；覆盖已有快照时需确认）
+    #[command(about = "捕获登录态快照（--from 从指定已停止实例捕获；覆盖已有快照时需确认）")]
     Capture {
         /// 环境 id
         env_id: String,
+        /// 从指定实例捕获（实例即登录源；实例须已停止）。缺省 = 传统母本捕获
+        #[arg(long, value_name = "INS_ID")]
+        from: Option<String>,
         /// 跳过确认（非交互环境必需）
         #[arg(long)]
         yes: bool,
@@ -80,7 +83,9 @@ pub fn run(
         LoginProfileCommands::List => list(globals, client),
         LoginProfileCommands::Get { env_id } => get(globals, client, env_id),
         LoginProfileCommands::Launch { env_id } => launch(globals, client, env_id),
-        LoginProfileCommands::Capture { env_id, yes } => capture(globals, client, env_id, *yes),
+        LoginProfileCommands::Capture { env_id, from, yes } => {
+            capture(globals, client, env_id, from.as_deref(), *yes)
+        }
         LoginProfileCommands::Reset { env_id, yes } => reset(globals, client, env_id, *yes),
     }
 }
@@ -219,13 +224,43 @@ fn capture(
     globals: &GlobalArgs,
     client: &AgentClient,
     env_id: &str,
+    from: Option<&str>,
     sub_yes: bool,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
     // 子命令级 --yes 与全局 --yes 等效：任一放行即跳过确认流（env delete 同约定）
     let yes = sub_yes || globals.yes;
 
-    let current = client.login_profile_get(env_id)?;
+    // 从实例捕获（实例即登录源）：确认语义同覆盖（影响之后的全部实例）
+    if let Some(ins_id) = from {
+        let current = client.login_profile_get(env_id)?;
+        if !yes && current.snapshot_version > 0 {
+            confirm_or_yes(
+                globals,
+                &format!(
+                    "捕获将覆盖现有登录态（当前版本 {}），继续?",
+                    current.snapshot_version
+                ),
+            )?;
+        }
+        let result = client.login_profile_capture_from(env_id, ins_id)?;
+        if out.quiet {
+            out.print_id(&result.environment_id);
+            return Ok(());
+        }
+        out.render_kv(
+            &vec![
+                ("environmentId".into(), result.environment_id.clone()),
+                ("instanceId".into(), result.instance_id.clone()),
+                ("generation".into(), result.generation.to_string()),
+                ("cookieCount".into(), result.cookie_count.to_string()),
+            ],
+            serde_json::to_value(&result).expect("纯数据 DTO 的序列化不会失败"),
+        );
+        return Ok(());
+    }
+
+    let current = client.login_profile_get(env_id)?;;
     if !yes && current.snapshot_version > 0 {
         confirm_or_yes(
             globals,

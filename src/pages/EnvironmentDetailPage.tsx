@@ -17,13 +17,6 @@ function isStaleConflict(e: unknown): boolean {
   );
 }
 
-const PROFILE_STATUS_TEXT: Record<LoginProfileView['status'], string> = {
-  not_configured: 'Not configured',
-  ready: 'Ready',
-  capturing: 'Capturing…',
-  error: 'Error',
-};
-
 /** 实例显示名：环境内创建顺序序号（列表已按 created_at ASC 返回） */
 function displayName(list: Instance[], id: string): string {
   const idx = list.findIndex((i) => i.id === id);
@@ -138,33 +131,23 @@ export default function EnvironmentDetailPage() {
     }
   };
 
-  /** Login Profile 操作。capture 为秒级操作：本地 optimistic capturing 态。 */
-  const profileAct = async (action: 'launch' | 'capture' | 'reset') => {
+  /** Login Profile 重置（实例即登录源后，保存路径已自动化，仅剩重置入口） */
+  const profileAct = async () => {
     if (
-      action === 'reset' &&
       !(await confirm({
-        title: '重置登录快照',
-        message: ['母本登录态将被清空（已创建实例不受影响）。', '确定重置？'],
+        title: '重置登录态',
+        message: ['环境登录态将被清空（Cookie 保险库 + 文件快照）。', '已创建实例不受影响。确定重置？'],
         confirmText: '重置',
       }))
     ) {
       return;
     }
     setProfileBusy(true);
-    if (action === 'capture') {
-      setProfile((p) => (p ? { ...p, status: 'capturing' } : p));
-    }
     try {
-      if (action === 'launch') await api.launchLoginProfile(id);
-      else if (action === 'capture') await api.captureLoginProfile(id);
-      else await api.resetLoginProfile(id);
-      showToast('ok', action === 'launch' ? '登录浏览器已打开' : action === 'capture' ? '快照已捕获' : '已重置');
+      await api.resetLoginProfile(id);
+      showToast('ok', '已重置');
     } catch (e) {
-      if (action === 'capture' && isStaleConflict(e)) {
-        showToast('ok', '登录浏览器运行中，请先关闭再捕获');
-      } else {
-        showToast('err', errorText(e));
-      }
+      showToast('err', errorText(e));
     } finally {
       setProfileBusy(false);
       fetchProfile();
@@ -302,54 +285,45 @@ export default function EnvironmentDetailPage() {
         )}
       </div>
 
-      {/* Login Profile */}
+      {/* Login Profile（实例即登录源：在实例里登录 → 关闭，登录态自动保存） */}
       <div className="mb-6 rounded-xl border border-hairline bg-surface-card p-4">
         <h2 className="text-sm font-medium text-ink">🔐 {profile?.name ?? 'Login Profile'}</h2>
         {profile ? (
           <>
             <div className="mt-1.5 space-y-1 text-xs text-ink-2">
               <p>
-                状态 <span className="font-medium text-ink">{PROFILE_STATUS_TEXT[profile.status]}</span>
-                {' · '}
-                {profile.instancesUsing} 个实例使用
-                {' · '}
-                最近捕获{' '}
-                {profile.lastCapturedAt ? new Date(profile.lastCapturedAt).toLocaleString() : '从未'}
-                {profile.snapshotVersion > 0 && ` · v${profile.snapshotVersion}`}
+                {profile.snapshotVersion > 0 ? (
+                  <>
+                    已登录{' '}
+                    <span className="font-medium text-run-text">v{profile.snapshotVersion}</span>
+                    {' · '}
+                    {profile.lastCapturedAt ? new Date(profile.lastCapturedAt).toLocaleString() : '-'}
+                    {' · '}
+                    {profile.instancesUsing} 个实例使用
+                  </>
+                ) : (
+                  <>未登录：在任一实例中登录后关闭它，登录态自动保存</>
+                )}
               </p>
               {profile.browserRunning && (
-                <p className="text-amber-600">登录浏览器运行中，关闭窗口后几秒内即可捕获快照</p>
+                <p className="text-amber-600">旧登录浏览器仍在运行，关闭其窗口即可自动保存</p>
               )}
               {profile.status === 'error' && (
-                <p className="text-status-error">上次捕获失败，可重试捕获或重置</p>
+                <p className="text-status-error">上次登录态保存失败，重新登录一次即可恢复</p>
               )}
             </div>
             <div className="mt-3 flex items-center gap-1.5">
               <button
                 className={btnGhost}
-                disabled={profileBusy || profile.status === 'capturing' || profile.browserRunning}
-                onClick={() => profileAct('launch')}
-              >
-                打开并登录
-              </button>
-              <button
-                className={btnGhost}
-                disabled={profileBusy || profile.status === 'capturing' || profile.browserRunning}
-                title={profile.browserRunning ? '先关闭登录浏览器' : undefined}
-                onClick={() => profileAct('capture')}
-              >
-                {profile.status === 'capturing' ? '捕获中…' : '捕获快照'}
-              </button>
-              <button
-                className={btnGhost}
                 disabled={profileBusy || profile.status === 'capturing'}
-                onClick={() => profileAct('reset')}
+                onClick={() => profileAct()}
               >
-                重置
+                重置登录态
               </button>
             </div>
             <p className="mt-2 text-[11px] text-ink-3">
-              捕获后的快照会克隆给之后创建的每个实例；快照更新不影响已运行实例
+              在实例里登录 → 关闭实例 → 之后创建的实例自动免登录（含 Cookie 与本地存储）；
+              也可用 CLI <code className="font-mono">login-profile capture --from</code> 从指定实例固化
             </p>
           </>
         ) : (

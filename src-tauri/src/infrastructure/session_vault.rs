@@ -69,6 +69,36 @@ pub fn parse_cdp_cookies(result: &serde_json::Value) -> Vec<CookieRecord> {
         .unwrap_or_default()
 }
 
+/// CookieRecord → Storage.setCookies 的 CookieParam（纯函数）。
+/// 两个协议差异（实测踩坑）：
+/// - `session` 是 getCookies 的输出字段，CookieParam 不接受，必须剔除；
+/// - 会话 cookie（expires ≤ 0）应**省略 expires 字段**，传 -1 会被拒 -32602；
+/// - sameSite "Unspecified" 不在 CookieParam 枚举内，剔除。
+pub fn to_set_cookie_params(cookies: &[CookieRecord]) -> Vec<serde_json::Value> {
+    cookies
+        .iter()
+        .map(|c| {
+            let mut v = serde_json::json!({
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain,
+                "path": c.path,
+                "secure": c.secure,
+                "httpOnly": c.http_only,
+            });
+            if c.expires > 0.0 {
+                v["expires"] = serde_json::json!(c.expires);
+            }
+            if let Some(s) = &c.same_site {
+                if s != "Unspecified" && !s.is_empty() {
+                    v["sameSite"] = serde_json::json!(s);
+                }
+            }
+            v
+        })
+        .collect()
+}
+
 fn write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -179,6 +209,13 @@ pub fn read_instance_export(path: &Path) -> Option<InstanceCookieExport> {
     serde_json::from_str(&data).ok()
 }
 
+/// 清空保险库（当前 + 全部历史）。best-effort：不存在视为成功。
+pub fn clear(env_dir: &Path) -> Result<(), AppError> {
+    let _ = std::fs::remove_file(env_dir.join("session-vault.json"));
+    let _ = std::fs::remove_dir_all(env_dir.join("session-vault-history"));
+    Ok(())
+}
+
 fn prune(hist: &Path) -> Result<(), AppError> {
     let mut gens: Vec<(i64, std::path::PathBuf)> = std::fs::read_dir(hist)?
         .flatten()
@@ -276,7 +313,6 @@ mod tests {
         assert_eq!(err.code(), "SESSION_GENERATION_NOT_FOUND");
     }
 
-    #[cfg(unix)]
     #[test]
     fn credential_files_get_0600_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -287,6 +323,35 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// CookieParam 转换协议契约：剔除 session 字段、会话 cookie 省略 expires、
+    /// Unspecified/空 sameSite 剔除（实测 -32602 根因）
+    #[test]
+    fn to_set_cookie_params_matches_cdp_contract() {
+        let mut session_cookie = cookie("sess");
+        session_cookie.session = true; // expires=-1 默认
+        let mut persistent = cookie("perm");
+        persistent.expires = 1893456000.0;
+        persistent.same_site = Some("Lax".into());
+        let mut unspecified = cookie("uns");
+        unspecified.same_site = Some("Unspecified".into());
+        persistent.http_only = true;
+
+        let params = to_set_cookie_params(&[session_cookie, persistent, unspecified]);
+        // 会话 cookie：无 expires、无 session 字段
+        assert!(params[0].get("expires").is_none());
+        assert!(params[0].get("session").is_none());
+        // 持久 cookie：expires 保留、sameSite 保留
+        assert_eq!(params[1]["expires"], 1893456000.0);
+        assert_eq!(params[1]["sameSite"], "Lax");
+        assert!(params[1]["httpOnly"].as_bool().unwrap());
+        // Unspecified sameSite 剔除
+        assert!(params[2].get("sameSite").is_none());
+        // 全部条目都无 session 字段
+        for p in &params {
+            assert!(p.get("session").is_none());
+        }
     }
 
     #[test]

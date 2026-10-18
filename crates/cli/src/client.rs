@@ -28,6 +28,7 @@ use crate::model::{
     AppEvent, AppSettingsView, CdpEndpoint, CdpTarget, CftStatus, Environment, EnvironmentSummary,
     EnvStatus, Extension, HealthReport, Instance, InstanceStatusView, InstanceView,
     KernelCancelResult, KernelDownloadResult, LoginProfileRow, LoginProfileView, CdpSessionView,
+    SessionCaptureResult, SessionStatus,
 };
 
 /// TCP 连接超时：API 绑定本机回环地址，3s 足够；连不上即按「服务不可达」（exit 8）。
@@ -276,11 +277,13 @@ impl AgentClient {
         name: &str,
         hosts_source_url: Option<&str>,
         icon: Option<&str>,
+        session_capture: Option<&str>,
     ) -> Result<Environment, CliError> {
         let body = serde_json::json!({
             "name": name,
             "hostsSourceUrl": hosts_source_url,
             "icon": icon,
+            "sessionCapture": session_capture,
         });
         Self::decode(self.send(Method::POST, "/api/v1/environments", Some(body), false))
     }
@@ -625,6 +628,42 @@ impl AgentClient {
             Method::POST,
             &format!("/api/v1/environments/{env_id}/login-profile/reset"),
             None,
+            false,
+        ))
+    }
+
+    /// POST /api/v1/environments/{id}/login-profile/capture {fromInstanceId}
+    /// —— 从已停止实例捕获登录态（实例即登录源；实例须已停止，运行中 → 409）。
+    pub fn login_profile_capture_from(
+        &self,
+        env_id: &str,
+        ins_id: &str,
+    ) -> Result<SessionCaptureResult, CliError> {
+        Self::decode(self.send(
+            Method::POST,
+            &format!("/api/v1/environments/{env_id}/login-profile/capture"),
+            Some(serde_json::json!({ "fromInstanceId": ins_id })),
+            false,
+        ))
+    }
+
+    /// GET /api/v1/environments/{id}/session —— 身份层状态（策略/当前代/历史）。
+    pub fn session_status(&self, env_id: &str) -> Result<SessionStatus, CliError> {
+        Self::decode(self.send(
+            Method::GET,
+            &format!("/api/v1/environments/{env_id}/session"),
+            None,
+            false,
+        ))
+    }
+
+    /// POST /api/v1/environments/{id}/session/restore {generation}
+    /// —— 回滚 Cookie 保险库到指定历史代（仅 Cookie 层；文件快照保留当前）。
+    pub fn session_restore(&self, env_id: &str, generation: i64) -> Result<SessionStatus, CliError> {
+        Self::decode(self.send(
+            Method::POST,
+            &format!("/api/v1/environments/{env_id}/session/restore"),
+            Some(serde_json::json!({ "generation": generation })),
             false,
         ))
     }

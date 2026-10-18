@@ -22,6 +22,9 @@ pub struct Environment {
     /// 附加启动参数（高级逃生口）
     pub startup_args: Option<String>,
     pub keep_alive: bool,
+    /// 登录态回写策略（off / first-login / always）；旧服务端无此字段 → None
+    #[serde(default)]
+    pub session_capture: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -349,4 +352,41 @@ pub struct KernelDownloadResult {
 #[serde(rename_all = "camelCase")]
 pub struct KernelCancelResult {
     pub ok: bool,
+}
+
+// ===== Session 身份层（实例即登录源）=====
+
+/// GET /api/v1/environments/{id}/session 响应。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatus {
+    pub environment_id: String,
+    /// off / first-login / always
+    pub policy: String,
+    pub generation: i64,
+    pub exported_at: Option<i64>,
+    pub source_instance_id: Option<String>,
+    pub cookie_count: i64,
+    #[serde(default)]
+    pub history: Vec<SessionGeneration>,
+}
+
+/// 保险库历史代（新 → 旧）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGeneration {
+    pub generation: i64,
+    pub exported_at: i64,
+    pub source_instance_id: Option<String>,
+    pub cookie_count: i64,
+}
+
+/// POST .../login-profile/capture {fromInstanceId} 响应。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCaptureResult {
+    pub environment_id: String,
+    pub instance_id: String,
+    pub generation: i64,
+    pub cookie_count: i64,
 }

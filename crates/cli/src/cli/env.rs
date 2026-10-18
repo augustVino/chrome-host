@@ -41,6 +41,9 @@ pub enum EnvCommands {
         /// 图标路径（可省略）
         #[arg(long, value_name = "PATH")]
         icon: Option<String>,
+        /// 登录态回写策略：off / first-login / always（缺省 first-login）
+        #[arg(long, value_name = "POLICY")]
+        session_capture: Option<String>,
     },
 
     /// 更新环境（只更新传入的 flag；值为空串表示显式置空）
@@ -63,6 +66,9 @@ pub enum EnvCommands {
         /// 实例常驻保留（true/false）
         #[arg(long, value_name = "BOOL", value_parser = clap::value_parser!(bool))]
         keep_alive: Option<bool>,
+        /// 登录态回写策略：off / first-login / always
+        #[arg(long, value_name = "POLICY")]
+        session_capture: Option<String>,
     },
 
     /// 删除环境（同时删除其实例数据；有运行中实例时先停止）
@@ -91,6 +97,22 @@ pub enum EnvCommands {
         /// 环境 id
         id: String,
     },
+
+    /// 查看会话身份层（策略/当前代/Cookie 数/历史代）
+    #[command(about = "查看会话身份层（策略/当前代/Cookie 数/历史代）")]
+    Session {
+        /// 环境 id
+        id: String,
+    },
+
+    /// 回滚会话保险库到指定历史代（仅回滚 Cookie 层；文件快照保留当前）
+    #[command(about = "回滚会话保险库到指定历史代（仅回滚 Cookie 层；文件快照保留当前）")]
+    SessionRestore {
+        /// 环境 id
+        id: String,
+        /// 要回滚到的历史代（env session 可查）
+        generation: i64,
+    },
 }
 
 /// env 组分发入口（main.rs dispatch 的唯一调用点）。
@@ -102,7 +124,15 @@ pub fn run(cmd: &EnvCommands, globals: &GlobalArgs, client: &AgentClient) -> Res
             name,
             hosts_source_url,
             icon,
-        } => create(globals, client, name, hosts_source_url.as_deref(), icon.as_deref()),
+            session_capture,
+        } => create(
+            globals,
+            client,
+            name,
+            hosts_source_url.as_deref(),
+            icon.as_deref(),
+            session_capture.as_deref(),
+        ),
         EnvCommands::Update {
             id,
             name,
@@ -110,6 +140,7 @@ pub fn run(cmd: &EnvCommands, globals: &GlobalArgs, client: &AgentClient) -> Res
             icon,
             startup_args,
             keep_alive,
+            session_capture,
         } => update(
             globals,
             client,
@@ -119,10 +150,15 @@ pub fn run(cmd: &EnvCommands, globals: &GlobalArgs, client: &AgentClient) -> Res
             icon.as_deref(),
             startup_args.as_deref(),
             *keep_alive,
+            session_capture.as_deref(),
         ),
         EnvCommands::Delete { id, yes } => delete(globals, client, id, *yes),
         EnvCommands::Activity { id, limit } => activity(globals, client, id, *limit),
         EnvCommands::Status { id } => status(globals, client, id),
+        EnvCommands::Session { id } => session(globals, client, id),
+        EnvCommands::SessionRestore { id, generation } => {
+            session_restore(globals, client, id, *generation)
+        }
     }
 }
 
@@ -246,6 +282,10 @@ fn env_kv_pairs(env: &Environment) -> Vec<(String, String)> {
         ),
         ("icon".into(), env.icon.clone().unwrap_or_else(|| "-".into())),
         ("keepAlive".into(), env.keep_alive.to_string()),
+        (
+            "sessionCapture".into(),
+            env.session_capture.clone().unwrap_or_else(|| "first-login".into()),
+        ),
         ("createdAt".into(), env.created_at.to_string()),
         ("updatedAt".into(), env.updated_at.to_string()),
     ]
@@ -258,9 +298,10 @@ fn create(
     name: &str,
     hosts_source_url: Option<&str>,
     icon: Option<&str>,
+    session_capture: Option<&str>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let env = client.env_create(name, hosts_source_url, icon)?;
+    let env = client.env_create(name, hosts_source_url, icon, session_capture)?;;
     if out.quiet {
         out.print_id(&env.id);
         return Ok(());
@@ -290,6 +331,7 @@ fn update(
     icon: Option<&str>,
     startup_args: Option<&str>,
     keep_alive: Option<bool>,
+    session_capture: Option<&str>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
     let mut body = serde_json::Map::new();
@@ -307,6 +349,9 @@ fn update(
     }
     if let Some(v) = keep_alive {
         body.insert("keepAlive".into(), serde_json::Value::Bool(v));
+    }
+    if let Some(v) = session_capture {
+        body.insert("sessionCapture".into(), serde_json::Value::String(v.to_string()));
     }
 
     let env = client.env_patch(id, serde_json::Value::Object(body))?;
@@ -379,5 +424,65 @@ fn delete(globals: &GlobalArgs, client: &AgentClient, id: &str, sub_yes: bool) -
     if out.quiet {
         out.print_id(id);
     }
+    Ok(())
+}
+
+/// `chrome-host env session <ID>`：会话身份层状态。
+/// table/kv：当前代五行 + 历史代计数；json：顶层 SessionStatus 对象（history 数组完整保留，
+/// 不用 render_list——那会把 json 输出变成 TableRow 数组，对 agent 不友好）。
+fn session(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let s = client.session_status(id)?;
+    if out.quiet {
+        out.print_id(&s.environment_id);
+        return Ok(());
+    }
+    out.render_kv(
+        &vec![
+            ("environmentId".into(), s.environment_id.clone()),
+            ("policy".into(), s.policy.clone()),
+            ("generation".into(), s.generation.to_string()),
+            ("cookieCount".into(), s.cookie_count.to_string()),
+            (
+                "exportedAt".into(),
+                s.exported_at.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            ),
+            (
+                "sourceInstanceId".into(),
+                s.source_instance_id.clone().unwrap_or_else(|| "-".into()),
+            ),
+            ("historyGenerations".into(), s.history.len().to_string()),
+        ],
+        serde_json::to_value(&s).expect("纯数据 DTO 的序列化不会失败"),
+    );
+    Ok(())
+}
+
+/// `chrome-host env session-restore <ID> <GEN>`：回滚保险库到历史代。
+/// 可逆（旧当前自动入档，restore 回去即可），不做确认流。
+fn session_restore(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    generation: i64,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let s = client.session_restore(id, generation)?;
+    if out.quiet {
+        out.print_id(&s.environment_id);
+        return Ok(());
+    }
+    out.render_kv(
+        &vec![
+            ("environmentId".into(), s.environment_id.clone()),
+            ("generation".into(), s.generation.to_string()),
+            ("cookieCount".into(), s.cookie_count.to_string()),
+            (
+                "sourceInstanceId".into(),
+                s.source_instance_id.clone().unwrap_or_else(|| "-".into()),
+            ),
+        ],
+        serde_json::to_value(&s).expect("纯数据 DTO 的序列化不会失败"),
+    );
     Ok(())
 }

@@ -205,6 +205,30 @@ fn canned_settings() -> serde_json::Value {
     })
 }
 
+fn canned_session_status() -> serde_json::Value {
+    json!({
+        "environmentId": "env_1",
+        "policy": "first-login",
+        "generation": 3,
+        "exportedAt": 1700000000000i64,
+        "sourceInstanceId": "ins_9",
+        "cookieCount": 12,
+        "history": [
+            { "generation": 2, "exportedAt": 1690000000000i64, "sourceInstanceId": "ins_4", "cookieCount": 9 },
+            { "generation": 1, "exportedAt": 1680000000000i64, "sourceInstanceId": null, "cookieCount": 2 }
+        ]
+    })
+}
+
+fn canned_session_capture_result() -> serde_json::Value {
+    json!({
+        "environmentId": "env_2",
+        "instanceId": "ins_7",
+        "generation": 4,
+        "cookieCount": 15
+    })
+}
+
 fn canned_login_profile_view() -> serde_json::Value {
     // LoginProfileView：Ready 态 + 快照已捕获 + 登录浏览器运行中（launch 之后的形态）
     json!({
@@ -374,6 +398,14 @@ fn fixture_router() -> Router {
             get(|| async { Json(json!([canned_login_profile_row()])) }),
         )
         .route(
+            "/api/v1/environments/env_1/session",
+            get(|| async { Json(canned_session_status()) }),
+        )
+        .route(
+            "/api/v1/environments/env_1/session/restore",
+            post(|| async { Json(canned_session_status()) }),
+        )
+        .route(
             "/api/v1/environments/env_1/login-profile",
             get(|| async { Json(canned_login_profile_view()) }),
         )
@@ -387,7 +419,15 @@ fn fixture_router() -> Router {
         )
         .route(
             "/api/v1/environments/env_2/login-profile/capture",
-            post(|| async { Json(canned_login_profile_view()) }),
+            // 按 body 分支：带 fromInstanceId → 从实例捕获结果；无 body → 传统母本 View
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                match body {
+                    Some(Json(v)) if v.get("fromInstanceId").is_some() => {
+                        axum::response::IntoResponse::into_response(Json(canned_session_capture_result()))
+                    }
+                    _ => axum::response::IntoResponse::into_response(Json(canned_login_profile_view())),
+                }
+            }),
         )
         .route(
             "/api/v1/environments/env_2/login-profile/reset",
@@ -463,7 +503,7 @@ fn env_list_decodes_cjk_summary_and_flatten() {
 fn env_crud_and_stop_all_contract() {
     let client = test_client();
     let env = client
-        .env_create("测试环境", Some("https://example.com/hosts"), None)
+        .env_create("测试环境", Some("https://example.com/hosts"), None, Some("first-login"))
         .expect("env_create 应成功");
     // fixture 是 canned 契约（不回显 body）：断言点在 DTO 的 Some/null 双向解码，
     // 即 Option<String> 对字符串值与 null 各自正确落位
@@ -686,6 +726,31 @@ fn settings_get_and_update_contract() {
 }
 
 /// login-profile 全方法面：list(Row) / get(View) / launch / capture / reset + 409
+#[test]
+fn session_endpoints_contract() {
+    let client = test_client();
+
+    // 状态：policy/generation/历史代（新 → 旧），可空 sourceInstanceId=null 兜底
+    let s = client.session_status("env_1").expect("session_status 应成功");
+    assert_eq!(s.policy, "first-login");
+    assert_eq!(s.generation, 3);
+    assert_eq!(s.cookie_count, 12);
+    assert_eq!(s.source_instance_id.as_deref(), Some("ins_9"));
+    assert_eq!(s.history.len(), 2);
+    assert_eq!(s.history[0].generation, 2);
+    assert!(s.history[1].source_instance_id.is_none());
+
+    // 回滚：响应仍是 SessionStatus
+    let restored = client.session_restore("env_1", 2).expect("restore 应成功");
+    assert_eq!(restored.environment_id, "env_1");
+
+    // 从实例捕获：独立响应形状（environmentId/instanceId/generation/cookieCount）
+    let cap = client.login_profile_capture_from("env_2", "ins_7").expect("capture_from 应成功");
+    assert_eq!(cap.instance_id, "ins_7");
+    assert_eq!(cap.generation, 4);
+    assert_eq!(cap.cookie_count, 15);
+}
+
 #[test]
 fn login_profile_endpoints_contract() {
     let client = test_client();
