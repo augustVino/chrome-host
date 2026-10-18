@@ -64,25 +64,7 @@ impl LoginProfileRepository {
         Ok(result)
     }
 
-    /// 登录浏览器拉起：登记 CDP 端口（pid 走内存态，不落库）。
-    pub fn mark_browser_started(&self, id: &str, cdp_port: u16) -> Result<(), AppError> {
-        let conn = self.pool.get()?;
-        conn.execute(
-            "UPDATE login_profiles SET cdp_port = ?1, updated_at = ?2 WHERE id = ?3",
-            params![cdp_port as i64, chrono::Utc::now().timestamp_millis(), id],
-        )?;
-        Ok(())
-    }
 
-    /// 登录浏览器退出：显式清空 cdp_port（专用清空 SQL）。
-    pub fn mark_browser_stopped(&self, id: &str) -> Result<(), AppError> {
-        let conn = self.pool.get()?;
-        conn.execute(
-            "UPDATE login_profiles SET cdp_port = NULL, updated_at = ?1 WHERE id = ?2",
-            params![chrono::Utc::now().timestamp_millis(), id],
-        )?;
-        Ok(())
-    }
 
     pub fn mark_capturing(&self, id: &str) -> Result<(), AppError> {
         let conn = self.pool.get()?;
@@ -141,25 +123,12 @@ impl LoginProfileRepository {
         Ok(count)
     }
 
-    /// 所有登录浏览器登记的 CDP 端口——实例端口分配的占用来源之一
-    /// （与 instances.used_ports 并集，防止把运行中登录浏览器的端口分给新实例）。
-    pub fn used_cdp_ports(&self) -> Result<BTreeSet<u16>, AppError> {
-        let conn = self.pool.get()?;
-        let mut stmt = conn.prepare("SELECT cdp_port FROM login_profiles WHERE cdp_port IS NOT NULL")?;
-        let rows = stmt.query_map([], |row: &rusqlite::Row| row.get::<_, i64>(0))?;
-        let mut ports = BTreeSet::new();
-        for row in rows {
-            ports.insert(row? as u16);
-        }
-        Ok(ports)
-    }
 
     const SELECT: &'static str =
-        "SELECT id, environment_id, name, profile_dir, snapshot_version, status, last_captured_at, cdp_port, created_at, updated_at
+        "SELECT id, environment_id, name, profile_dir, snapshot_version, status, last_captured_at, created_at, updated_at
          FROM login_profiles";
 
     fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoginProfile> {
-        let cdp_port: Option<i64> = row.get(7)?;
         Ok(LoginProfile {
             id: row.get(0)?,
             environment_id: row.get(1)?,
@@ -168,9 +137,8 @@ impl LoginProfileRepository {
             snapshot_version: row.get(4)?,
             status: LoginProfileStatus::from_db(&row.get::<_, String>(5)?),
             last_captured_at: row.get(6)?,
-            cdp_port: cdp_port.map(|p| p as u16),
-            created_at: row.get(8)?,
-            updated_at: row.get(9)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
         })
     }
 }
@@ -223,7 +191,6 @@ mod tests {
         assert_eq!(first.status, LoginProfileStatus::NotConfigured);
         assert_eq!(first.snapshot_version, 0);
         assert_eq!(first.last_captured_at, None);
-        assert_eq!(first.cdp_port, None);
     }
 
     /// 状态机全流转：not_configured → ready → capturing → ready；reset 归零
@@ -232,9 +199,6 @@ mod tests {
         let (_pool, envs, profiles) = setup();
         insert_env(&envs, "env_a");
         let lp = profiles.get_or_create("env_a", "A Login", "/tmp/lp").unwrap();
-
-        profiles.mark_browser_started(&lp.id, 9300).unwrap();
-        assert_eq!(profiles.find_by_env("env_a").unwrap().unwrap().cdp_port, Some(9300));
 
         profiles.mark_capturing(&lp.id).unwrap();
         assert_eq!(
@@ -247,12 +211,6 @@ mod tests {
         assert_eq!(ready.status, LoginProfileStatus::Ready);
         assert_eq!(ready.snapshot_version, 1);
         assert!(ready.last_captured_at.is_some());
-
-        // 浏览器退出：cdp_port 显式清空，其他字段不动
-        profiles.mark_browser_stopped(&lp.id).unwrap();
-        let stopped = profiles.find_by_env("env_a").unwrap().unwrap();
-        assert_eq!(stopped.cdp_port, None);
-        assert_eq!(stopped.status, LoginProfileStatus::Ready);
 
         // reset：版本归零 + 捕获时间清空 + 回 not_configured
         profiles.mark_reset(&lp.id).unwrap();
@@ -269,17 +227,13 @@ mod tests {
         );
     }
 
-    /// 端口占用登记与 instancesUsing 计数：
-    /// 端口并入实例分配的 used 集合；计数口径 = 克隆自该快照的实例累计数
+    /// instancesUsing 计数：计数口径 = 克隆自该快照的实例累计数
+    /// （0.3.0 起登录浏览器端口登记随 launch 子系统移除）
     #[test]
-    fn used_ports_and_instances_using() {
+    fn instances_using_counts_clones() {
         let (pool, envs, profiles) = setup();
         insert_env(&envs, "env_a");
         let lp = profiles.get_or_create("env_a", "A Login", "/tmp/lp").unwrap();
-
-        assert!(profiles.used_cdp_ports().unwrap().is_empty());
-        profiles.mark_browser_started(&lp.id, 9310).unwrap();
-        assert!(profiles.used_cdp_ports().unwrap().contains(&9310));
 
         assert_eq!(profiles.count_instances_using(&lp.id).unwrap(), 0);
 

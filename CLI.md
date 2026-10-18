@@ -230,13 +230,12 @@ chrome-host extension config get <net_rules_id> --env <env_id>
 
 ### login-profile — 登录态生命周期
 
-环境级登录态快照：`launch` 打开登录浏览器 → 人工登录后关闭浏览器 → `capture` 捕获快照 → 之后该环境 `instance create` 的实例自动克隆快照。`capture` 仅在**覆盖已有快照**（snapshotVersion > 0）时要求确认，`reset` 总是确认（非 TTY 缺 `--yes` → exit 2）；登录浏览器运行中或捕获进行中时 `capture`/`launch` 返回 409 `PROFILE_IN_USE`，CLI **原样透传服务端 message**（该码含多个子场景，不做本地翻译；exit 5）。
+环境级登录态快照。**主路径 = 实例即登录源**：实例里人工登录 → 关闭实例 → 自动保存 → 该环境 `instance create` 自动克隆。`capture` 用于显式固化（`--from` 从指定已停止实例；0.3.0 起母本 `launch` 登录浏览器子系统已移除，breaking）。`capture` 仅在**覆盖已有快照**（snapshotVersion > 0）时要求确认，`reset` 总是确认（非 TTY 缺 `--yes` → exit 2）；快照操作进行中或遗留登录浏览器运行中返回 409 `PROFILE_IN_USE`（exit 5）。
 
 | 命令 | 说明 |
 |---|---|
 | `login-profile list` | 全部环境登录态（environmentName / status / snapshotVersion / instancesUsing） |
 | `login-profile get <ENV_ID>` | 单环境登录态视图（登录浏览器运行中时附 cdpPort，即自动化登录入口） |
-| `login-profile launch <ENV_ID>` | 打开登录浏览器（人工登录后关闭；视图含 browserRunning / cdpPort） |
 | `login-profile capture <ENV_ID> [--from <INS_ID>] [--yes]` | 捕获登录态快照（覆盖已有快照时确认）。`--from` 从指定**已停止实例**捕获（实例即登录源，推荐路径） |
 | `login-profile reset <ENV_ID> [--yes]` | 清空登录态快照（总是确认） |
 

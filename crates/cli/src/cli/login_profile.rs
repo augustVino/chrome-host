@@ -1,6 +1,8 @@
-//! login-profile 命令组 —— 登录态生命周期管理（list/get/launch/capture/reset）。
+//! login-profile 命令组 —— 登录态生命周期管理（list/get/capture/reset）。
 //!
-//! 生命周期一句话：`launch` 打开登录浏览器 → 人工登录 → 关闭浏览器 → `capture`
+//! 登录主路径 = 实例里登录后关闭实例自动保存（v0.2.3 起，SessionService）；
+//! `launch` 登录浏览器已在 0.3.0 移除。生命周期一句话：实例里登录 → 关闭 →
+//! （可选）`capture --from` 显式固化
 //! 捕获快照 → 之后 `instance create` 的实例自动克隆该快照。
 //!
 //! 命名：组名 `login-profile`，不采用 PRD cli.md 的
@@ -42,13 +44,6 @@ pub enum LoginProfileCommands {
         env_id: String,
     },
 
-    /// 打开登录浏览器（人工登录后关闭，再用 capture 捕获快照）
-    #[command(about = "打开登录浏览器（人工登录后关闭，再用 capture 捕获快照）")]
-    Launch {
-        /// 环境 id
-        env_id: String,
-    },
-
     /// 捕获登录态快照（从指定实例捕获需 --from；覆盖已有快照时需确认）
     #[command(about = "捕获登录态快照（--from 从指定已停止实例捕获；覆盖已有快照时需确认）")]
     Capture {
@@ -82,7 +77,6 @@ pub fn run(
     match cmd {
         LoginProfileCommands::List => list(globals, client),
         LoginProfileCommands::Get { env_id } => get(globals, client, env_id),
-        LoginProfileCommands::Launch { env_id } => launch(globals, client, env_id),
         LoginProfileCommands::Capture { env_id, from, yes } => {
             capture(globals, client, env_id, from.as_deref(), *yes)
         }
@@ -146,8 +140,8 @@ fn list(globals: &GlobalArgs, client: &AgentClient) -> Result<(), CliError> {
 }
 
 /// LoginProfileView 的单对象 key: value 对，键名与 JSON 字段一致（camelCase 原样，
-/// 两模式无信息差）。布尔原样 true/false（Rust bool Display 即小写字面量）；
-/// lastCapturedAt/cdpPort 空值 `-`，时间戳 epoch ms 原样。
+/// 两模式无信息差）。lastCapturedAt 空值 `-`，时间戳 epoch ms 原样。
+/// （browserRunning/cdpPort 随 0.3.0 launch 子系统移除而删除）
 fn view_kv_pairs(view: &LoginProfileView) -> Vec<(String, String)> {
     vec![
         ("id".into(), view.id.clone()),
@@ -159,12 +153,10 @@ fn view_kv_pairs(view: &LoginProfileView) -> Vec<(String, String)> {
             "lastCapturedAt".into(),
             option_cell(view.last_captured_at),
         ),
-        ("browserRunning".into(), view.browser_running.to_string()),
-        ("cdpPort".into(), option_cell(view.cdp_port)),
     ]
 }
 
-/// get / launch / capture / reset 共用的单对象渲染：json 原样、缺省 kv。
+/// get / capture / reset 共用的单对象渲染：json 原样、缺省 kv。
 fn render_view(out: &OutputCtx, view: &LoginProfileView) {
     out.render_kv(
         &view_kv_pairs(view),
@@ -189,28 +181,6 @@ fn get(globals: &GlobalArgs, client: &AgentClient, env_id: &str) -> Result<(), C
     let out = OutputCtx::from(globals);
     let view = client.login_profile_get(env_id)?;
     render_view(&out, &view);
-    Ok(())
-}
-
-/// `chrome-host login-profile launch <ENV_ID>`：用母本目录打开登录浏览器
-/// （非破坏性，不确认）。渲染更新后的视图。
-fn launch(globals: &GlobalArgs, client: &AgentClient, env_id: &str) -> Result<(), CliError> {
-    let out = OutputCtx::from(globals);
-    // 重复 launch（浏览器已开）→ 409 PROFILE_IN_USE 原样透传（见模块注释的多子
-    // 场景对比）：不在此匹配错误臂，`?` 直接把服务端中文 message 带给用户 → exit 5
-    let view = client.login_profile_launch(env_id)?;
-    if out.quiet {
-        out.print_id(&view.id);
-        return Ok(());
-    }
-    render_view(&out, &view);
-    // launch 区别于其他命令的价值点：打开的登录浏览器带 CDP 调试端口，自动化
-    // 登录（Playwright / Selenium connect_over_cdp）以它为入口 —— 该行把「下一
-    // 步怎么接」直接给到调用方。仅人类模式追加：json 消费方按字段编程、quiet
-    // 契约是单行 id，提示行都会污染机器可读输出（与 render_kv 的 json 短路同理）。
-    if let Some(port) = view.cdp_port {
-        out.render_text(format!("自动化登录可用 CDP: 127.0.0.1:{port}"));
-    }
     Ok(())
 }
 
@@ -318,7 +288,8 @@ mod tests {
         assert_eq!(status_label(&LoginProfileStatus::Unknown), "unknown");
     }
 
-    /// kv 键名与 JSON 字段一致（camelCase 原样）；布尔 true/false；空值 `-`。
+    /// kv 键名与 JSON 字段一致（camelCase 原样）；空值 `-`。
+    /// （browserRunning/cdpPort 随 0.3.0 launch 子系统移除而删除）
     #[test]
     fn view_kv_pairs_matches_json_fields() {
         let view = LoginProfileView {
@@ -328,8 +299,6 @@ mod tests {
             snapshot_version: 3,
             instances_using: 2,
             last_captured_at: Some(1_700_000_000_000),
-            browser_running: true,
-            cdp_port: Some(9223),
         };
         let pairs = view_kv_pairs(&view);
         let get = |k: &str| {
@@ -344,25 +313,23 @@ mod tests {
         assert_eq!(get("snapshotVersion"), "3");
         assert_eq!(get("instancesUsing"), "2");
         assert_eq!(get("lastCapturedAt"), "1700000000000");
-        assert_eq!(get("browserRunning"), "true");
-        assert_eq!(get("cdpPort"), "9223");
 
-        // 空值占位：lastCapturedAt/cdpPort 为 None → `-`（布尔仍原样输出）
+        // 空值占位：lastCapturedAt 为 None → `-`
         let mut empty = view.clone();
         empty.last_captured_at = None;
-        empty.cdp_port = None;
-        empty.browser_running = false;
         let pairs = view_kv_pairs(&empty);
-        let get = |k: &str| {
+        assert!(
+            !pairs.iter().any(|(k, _)| k == "browserRunning" || k == "cdpPort"),
+            "已删字段不得残留 kv 输出"
+        );
+        assert_eq!(
             pairs
                 .iter()
-                .find(|(key, _)| key == k)
+                .find(|(key, _)| key == "lastCapturedAt")
                 .map(|(_, v)| v.clone())
-                .unwrap()
-        };
-        assert_eq!(get("lastCapturedAt"), "-");
-        assert_eq!(get("cdpPort"), "-");
-        assert_eq!(get("browserRunning"), "false");
+                .unwrap(),
+            "-"
+        );
     }
 
     /// LoginProfileRow 反序列化（snake_case 状态 + null 时间戳）往返护栏，
@@ -377,13 +344,11 @@ mod tests {
             "status": "not_configured",
             "snapshotVersion": 0,
             "instancesUsing": 0,
-            "lastCapturedAt": null,
-            "browserRunning": false
+            "lastCapturedAt": null
         }))
         .expect("服务端行 JSON 应可反序列化");
         assert_eq!(row.status, LoginProfileStatus::NotConfigured);
         assert_eq!(row.snapshot_version, 0);
         assert!(row.last_captured_at.is_none());
-        assert!(!row.browser_running);
     }
 }

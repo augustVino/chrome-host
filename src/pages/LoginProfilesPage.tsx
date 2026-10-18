@@ -109,10 +109,6 @@ export default function LoginProfilesPage() {
                 </span>
               </div>
 
-              {p.browserRunning && (
-                <p className="mt-2 text-xs text-amber-600">旧登录浏览器仍在运行，关闭其窗口即可自动保存</p>
-              )}
-
               <div className="mt-3 flex items-center gap-1.5">
                 <button
                   className={btnGhost}

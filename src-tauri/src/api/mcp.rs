@@ -132,7 +132,7 @@ struct NavigateArgs {
 #[serde(rename_all = "camelCase")]
 struct LoginProfileArgs {
     environment_id: String,
-    #[schemars(description = "get=查状态/快照版本; launch=打开登录浏览器(人工登录，已废弃，推荐在实例里登录); capture=捕获快照(浏览器须已关); reset=清空快照")]
+    #[schemars(description = "get=查状态/快照版本; capture=捕获快照; reset=清空快照")]
     action: LoginProfileAction,
     #[schemars(description = "capture 可选：从指定实例捕获登录态（实例即登录源，实例须已停止）。缺省 = 传统母本捕获")]
     from_instance_id: Option<String>,
@@ -142,7 +142,6 @@ struct LoginProfileArgs {
 #[serde(rename_all = "lowercase")]
 enum LoginProfileAction {
     Get,
-    Launch,
     Capture,
     Reset,
 }
@@ -456,14 +455,13 @@ impl ChromeHostMcp {
 
     // ── 登录态 ──────────────────────────────────────────────────────────
 
-    #[tool(description = "环境登录态管理。capture 前 login 浏览器须已关闭（运行中 → 409 PROFILE_IN_USE）")]
+    #[tool(description = "环境登录态管理（查询/捕获/重置）。登录主路径 = 实例里登录后关闭实例自动保存（SessionService）；capture 用于显式固化（可选 fromInstanceId 从已停止实例捕获）")]
     async fn login_profile(
         &self,
         Parameters(a): Parameters<LoginProfileArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         match a.action {
             LoginProfileAction::Get => run(|| self.state.profile_service.view(&a.environment_id)).await,
-            LoginProfileAction::Launch => run(|| self.state.profile_service.launch(&a.environment_id)).await,
             LoginProfileAction::Capture => match a.from_instance_id {
                 Some(ins) => {
                     let env = a.environment_id.clone();
@@ -562,7 +560,7 @@ impl ServerHandler for ChromeHostMcp {
             .with_instructions(
                 "chrome-host：为 AI Agent 提供完全隔离的 Chrome 实例编排。\
                  典型闭环：create_instance → open_tab → list_tabs 读页面标题；\
-                 需要登录态时先 login_profile(launch) 人工登录再 capture。\
+                 需要登录态时在实例里人工登录后关闭实例即自动保存。\
                  业务错误以 isError + {code,message,status} 结构化返回，可据此重试或换路径。",
             )
     }

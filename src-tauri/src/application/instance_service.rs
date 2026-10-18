@@ -643,8 +643,10 @@ impl InstanceService {
         }
         // 物化扩展目录同步清理（与 profile 同生命周期；路径拼接与写入点同源）
         self.paths.remove_instance_generated_extensions(id);
-        self.instances.delete(id)?;
+        // 事件先于行删除：Activity 按 target_id 回填 environment_id，
+        // 行已删则查不到（instance-deleted 的 environmentId 恒 null 的旧 bug）
         self.emit("instance-deleted", id);
+        self.instances.delete(id)?;
         tracing::info!("实例已删除: {id}");
         Ok(())
     }

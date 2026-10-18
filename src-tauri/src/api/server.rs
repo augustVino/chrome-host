@@ -82,10 +82,6 @@ fn routes(state: ApiState) -> Router {
             get(crate::api::login_profiles::get),
         )
         .route(
-            "/api/v1/environments/{id}/login-profile/launch",
-            post(crate::api::login_profiles::launch),
-        )
-        .route(
             "/api/v1/environments/{id}/login-profile/capture",
             post(crate::api::login_profiles::capture),
         )

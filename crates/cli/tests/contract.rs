@@ -233,16 +233,14 @@ fn canned_session_capture_result() -> serde_json::Value {
 }
 
 fn canned_login_profile_view() -> serde_json::Value {
-    // LoginProfileView：Ready 态 + 快照已捕获 + 登录浏览器运行中（launch 之后的形态）
+    // LoginProfileView：Ready 态 + 快照已捕获（0.3.0 起无 browserRunning/cdpPort）
     json!({
         "id": "env_1",
         "name": "env_1 母本",
         "status": "ready",
         "snapshotVersion": 3,
         "instancesUsing": 1,
-        "lastCapturedAt": 1700000000000i64,
-        "browserRunning": true,
-        "cdpPort": 9223
+        "lastCapturedAt": 1700000000000i64
     })
 }
 
@@ -256,8 +254,7 @@ fn canned_login_profile_row() -> serde_json::Value {
         "status": "not_configured",
         "snapshotVersion": 0,
         "instancesUsing": 0,
-        "lastCapturedAt": null,
-        "browserRunning": false
+        "lastCapturedAt": null
     })
 }
 
@@ -505,10 +502,6 @@ fn fixture_router() -> Router {
         .route(
             "/api/v1/environments/env_1/login-profile/capture",
             post(|| async { (StatusCode::CONFLICT, Json(error_body("PROFILE_IN_USE"))) }),
-        )
-        .route(
-            "/api/v1/environments/env_2/login-profile/launch",
-            post(|| async { Json(canned_login_profile_view()) }),
         )
         .route(
             "/api/v1/environments/env_2/login-profile/capture",
@@ -951,20 +944,16 @@ fn login_profile_endpoints_contract() {
     assert_eq!(rows[0].status, LoginProfileStatus::NotConfigured);
     assert_eq!(rows[0].snapshot_version, 0);
     assert!(rows[0].last_captured_at.is_none());
-    assert!(!rows[0].browser_running);
 
-    // 单环境 View：比 Row 多 cdpPort（自动化登录入口）
+    // 单环境 View（0.3.0 起 browserRunning/cdpPort 随 launch 移除而删除）
     let view = client.login_profile_get("env_1").expect("应成功");
     assert_eq!(view.status, LoginProfileStatus::Ready);
     assert_eq!(view.snapshot_version, 3);
     assert_eq!(view.instances_using, 1);
     assert_eq!(view.last_captured_at, Some(1_700_000_000_000));
-    assert!(view.browser_running);
-    assert_eq!(view.cdp_port, Some(9223));
 
-    // 三个动作统一回 View（fixture 是 canned 契约，不回显请求语境）
+    // 两个动作统一回 View（fixture 是 canned 契约，不回显请求语境）
     for view in [
-        client.login_profile_launch("env_2").expect("launch 应成功"),
         client.login_profile_capture("env_2").expect("capture 应成功"),
         client.login_profile_reset("env_2").expect("reset 应成功"),
     ] {

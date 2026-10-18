@@ -20,14 +20,6 @@ pub async fn get(
     Ok(Json(json!(state.profile_service.view(&id).await?)))
 }
 
-/// POST /api/v1/environments/{id}/login-profile/launch（用母本目录启动浏览器供登录）
-pub async fn launch(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    Ok(Json(json!(state.profile_service.launch(&id).await?)))
-}
-
 /// POST /api/v1/environments/{id}/login-profile/capture
 /// 可选 body {"fromInstanceId"}：从已停止实例捕获（实例即登录源；推荐路径）。
 /// 无 body：传统母本捕获（兼容保留，后续版本废弃）。

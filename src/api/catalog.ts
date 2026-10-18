@@ -46,7 +46,6 @@ export const API_CATALOG: CatalogGroup[] = [
         path: '/environments/:id/login-profile',
         desc: 'Login Profile 视图（惰性创建）',
       },
-      { method: 'POST', path: '/environments/:id/login-profile/launch', desc: '打开登录浏览器' },
       {
         method: 'POST',
         path: '/environments/:id/login-profile/capture',

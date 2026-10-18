@@ -31,7 +31,6 @@ CREATE TABLE IF NOT EXISTS login_profiles (
     snapshot_version  INTEGER NOT NULL DEFAULT 0,
     status            TEXT NOT NULL DEFAULT 'not_configured',
     last_captured_at  INTEGER,
-    cdp_port          INTEGER,
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL
 );
@@ -106,6 +105,7 @@ pub fn init_schema(pool: &DbPool) -> Result<(), AppError> {
     let conn: PooledConnection<_> = pool.get()?;
     conn.execute_batch(SCHEMA)?;
     drop_legacy_columns(&conn)?;
+    drop_login_profile_cdp_port(&conn)?;
     ensure_session_capture_column(&conn)?;
     Ok(())
 }
@@ -126,6 +126,21 @@ fn drop_legacy_columns(conn: &PooledConnection<SqliteConnectionManager>) -> Resu
             conn.execute(&format!("ALTER TABLE environments DROP COLUMN {column}"), [])?;
             tracing::info!("[schema] 已删除 environments.{column} 列（历史遗留迁移）");
         }
+    }
+    Ok(())
+}
+
+/// 迁移：删除 login_profiles.cdp_port（0.3.0 移除登录浏览器 launch 子系统后，
+/// 端口凭证不再存在）。与 drop_legacy_columns 同款 pragma 检查 + 幂等。
+fn drop_login_profile_cdp_port(conn: &PooledConnection<SqliteConnectionManager>) -> Result<(), AppError> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('login_profiles') WHERE name = 'cdp_port'",
+        [],
+        |row| row.get(0),
+    )?;
+    if exists > 0 {
+        conn.execute("ALTER TABLE login_profiles DROP COLUMN cdp_port", [])?;
+        tracing::info!("[schema] 已删除 login_profiles.cdp_port 列（launch 子系统移除迁移）");
     }
     Ok(())
 }

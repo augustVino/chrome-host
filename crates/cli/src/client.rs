@@ -699,17 +699,6 @@ impl AgentClient {
         ))
     }
 
-    /// POST /api/v1/environments/{id}/login-profile/launch —— 用母本目录启动
-    /// 登录浏览器（非破坏性，不确认）。
-    pub fn login_profile_launch(&self, env_id: &str) -> Result<LoginProfileView, CliError> {
-        Self::decode(self.send(
-            Method::POST,
-            &format!("/api/v1/environments/{env_id}/login-profile/launch"),
-            None,
-            false,
-        ))
-    }
-
     /// POST /api/v1/environments/{id}/login-profile/capture —— 停机捕获快照。
     /// 409 PROFILE_IN_USE 有多个子场景（登录浏览器运行中 / 捕获已在进行），
     /// 服务端 message 由命令层**原样透传不覆写**（统一翻译会误导）。

@@ -129,9 +129,7 @@ fn main() {
                 env_repo.clone(),
                 ins_repo.clone(),
                 lp_repo,
-                kernel.clone(),
                 process.clone(),
-                settings_service.clone(),
                 paths.clone(),
                 handle.clone(),
             ));
@@ -220,7 +218,6 @@ fn main() {
             // 启动全量对账
             // 登录浏览器不在 instances 表，单独 reattach
             tauri::async_runtime::block_on(reconciler.reconcile_all());
-            profile_service.reattach_all();
             keep_alive.scan_register();
             // 孤儿物化目录对账（删除编排补齐前的历史残留，一次清）
             instance_service.prune_orphan_generated_extensions();

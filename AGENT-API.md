@@ -120,13 +120,12 @@
 
 ## Login Profile — 登录态快照
 
-每个环境至多一个登录态母本：`launch` 打开独立登录浏览器（人工完成登录）→ 关闭浏览器 → `capture` 捕获快照 → 之后创建的实例克隆该快照。**状态机**：`not_configured → ready → capturing`，失败 `error`。
+每个环境至多一个登录态母本（快照本体目录）。**主路径 = 实例即登录源**（0.2.3 起）：实例里人工登录 → 关闭实例 → SessionService 自动保存；`capture` 用于显式固化（可选 `fromInstanceId`）。母本 `launch` 登录浏览器子系统已于 0.3.0 **移除**（breaking）。**状态机**：`not_configured → ready → capturing`，失败 `error`。
 
 | 端点 | 说明 |
 |---|---|
 | `GET /api/v1/login-profiles` | 全部快照列表（含环境名，供列表页） |
 | `GET /api/v1/environments/{id}/login-profile` | 单环境视图（惰性建行，从未配置过也返回） |
-| `POST /api/v1/environments/{id}/login-profile/launch` | 打开登录浏览器（人工登录）。响应含 `cdpPort`，自动化登录可用 |
 | `POST /api/v1/environments/{id}/login-profile/capture` | 捕获快照。**登录浏览器必须已关闭**，运行中 → `409 PROFILE_IN_USE`；可选 body `{ "fromInstanceId": "ins_..." }` 从指定**已停止实例**捕获（实例即登录源，推荐路径） |
 | `POST /api/v1/environments/{id}/login-profile/reset` | 清空快照回到 not_configured |
 | `GET /api/v1/environments/{id}/session` | 会话身份层状态：策略（off/first-login/always）/当前代/来源实例/Cookie 数/历史代列表 |
@@ -136,8 +135,7 @@
 
 ```json
 { "id": "lp_...", "name": "...", "status": "ready", "snapshotVersion": 3,
-  "instancesUsing": 2, "lastCapturedAt": 1789298923396,
-  "browserRunning": false, "cdpPort": null }
+  "instancesUsing": 2, "lastCapturedAt": 1789298923396 }
 ```
 
 ## Instances — 实例
@@ -389,7 +387,7 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `INSTANCE_ALREADY_RUNNING` | 重复 start；删除运行中实例 |
 | 409 | `INSTANCE_NOT_RUNNING` | 对停止实例 open/stop/焦点操作 |
 | 409 | `DIAGNOSTICS_UNAVAILABLE` | 诊断查询（快照/console/network/screenshot/har）：实例未运行、常驻连接未就绪，或无 http(s) 页面目标 |
-| 409 | `PROFILE_IN_USE` | 登录浏览器未关闭即 capture |
+| 409 | `PROFILE_IN_USE` | 快照操作进行中，或遗留登录浏览器（旧版本 launch 遗留）运行中 |
 | 409 | `SESSION_CAPTURE_FAILED` | 从实例捕获登录态失败（实例目录无导出文件，或导出 Cookie 为空） |
 | 404 | `SESSION_GENERATION_NOT_FOUND` | session/restore 目标历史代不存在 |
 | 409 | `CDP_PORT_UNAVAILABLE` | 实例 start 时 CDP 端口被外部进程占用 |

@@ -46,8 +46,6 @@ pub struct LoginProfile {
     pub snapshot_version: i64,
     pub status: LoginProfileStatus,
     pub last_captured_at: Option<i64>,
-    /// 登录浏览器当前占用的 CDP 端口（跨重启的端口占用凭证；退出时专用 SQL 清空）
-    pub cdp_port: Option<u16>,
     pub created_at: i64,
     pub updated_at: i64,
 }

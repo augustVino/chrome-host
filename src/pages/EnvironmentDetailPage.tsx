@@ -305,9 +305,6 @@ export default function EnvironmentDetailPage() {
                   <>未登录：在任一实例中登录后关闭它，登录态自动保存</>
                 )}
               </p>
-              {profile.browserRunning && (
-                <p className="text-amber-600">旧登录浏览器仍在运行，关闭其窗口即可自动保存</p>
-              )}
               {profile.status === 'error' && (
                 <p className="text-status-error">上次登录态保存失败，重新登录一次即可恢复</p>
               )}

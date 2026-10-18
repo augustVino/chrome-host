@@ -50,7 +50,7 @@ export interface CdpEndpoint {
   webSocketUrl: string | null;
 }
 
-/** Login Profile 视图（browserRunning 为后端派生附加字段） */
+/** Login Profile 视图（0.3.0 起 launch 移除，无 browserRunning/cdpPort） */
 export interface LoginProfileView {
   id: string;
   name: string;
@@ -58,7 +58,6 @@ export interface LoginProfileView {
   snapshotVersion: number;
   instancesUsing: number;
   lastCapturedAt: number | null;
-  browserRunning: boolean;
 }
 
 export interface KernelStatus {
@@ -128,7 +127,6 @@ export interface LoginProfileRow {
   snapshotVersion: number;
   instancesUsing: number;
   lastCapturedAt: number | null;
-  browserRunning: boolean;
 }
 
 /** ：Extension 一级资源（status 由后端每次读取时惰性计算） */

@@ -75,8 +75,6 @@ export const api = {
 
   // login profile
   getLoginProfile: (envId: string) => request(`/environments/${envId}/login-profile`),
-  launchLoginProfile: (envId: string) =>
-    request(`/environments/${envId}/login-profile/launch`, { method: 'POST' }),
   captureLoginProfile: (envId: string) =>
     request(`/environments/${envId}/login-profile/capture`, { method: 'POST' }),
   resetLoginProfile: (envId: string) =>

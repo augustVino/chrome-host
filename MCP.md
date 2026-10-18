@@ -135,11 +135,12 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | action | 行为 | 前置/错误 |
 |---|---|---|
 | `get` | 查状态/快照版本/实例引用数 | — |
-| `launch` | 打开登录浏览器（人工完成登录；响应含 `cdpPort`，自动化登录可用） | — |
-| `capture` | 捕获快照（之后创建的实例克隆该登录态） | **登录浏览器须已关闭**，运行中 → 409 PROFILE_IN_USE |
+| `capture` | 显式固化快照（主路径「实例里登录→关闭→自动保存」无需 capture；可选 `fromInstanceId` 从已停止实例捕获） | 快照操作进行中或遗留浏览器运行中 → 409 PROFILE_IN_USE |
 | `reset` | 清空快照回到 not_configured | — |
 
-典型闭环：`launch` →（人工/自动化登录）→ 关闭浏览器 → `capture` → `create_instance` 即带登录态。
+> 母本 `launch` 登录浏览器 action 已于 0.3.0 移除（breaking；登录主路径 = 实例即登录源）。
+
+典型闭环：`create_instance` →（实例里人工登录）→ 关闭实例（自动保存）→ 新 `create_instance` 即带登录态；需要固化基准时 `capture(fromInstanceId)`。
 
 ### `session_status`
 

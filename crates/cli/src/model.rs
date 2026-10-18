@@ -303,10 +303,6 @@ pub struct LoginProfileView {
     pub snapshot_version: i64,
     pub instances_using: i64,
     pub last_captured_at: Option<i64>,
-    /// 派生运行态（登录浏览器 pid 探活），不落库、不属于 [`LoginProfileStatus`] 状态机
-    pub browser_running: bool,
-    /// 登录浏览器 CDP 端口（运行中才有；Agent 自动化登录的入口）
-    pub cdp_port: Option<u16>,
 }
 
 /// 来源：src-tauri/src/application/profile_service.rs `LoginProfileRow`
@@ -323,7 +319,6 @@ pub struct LoginProfileRow {
     pub snapshot_version: i64,
     pub instances_using: i64,
     pub last_captured_at: Option<i64>,
-    pub browser_running: bool,
 }
 
 /// 来源：src-tauri/src/api/instances.rs `status` handler 的精简视图
