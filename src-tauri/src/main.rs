@@ -12,6 +12,7 @@ use tauri::{Manager, WebviewUrl};
 
 use api::server::ApiState;
 use application::cdp_session::CdpSessionService;
+use application::diagnostics_service::DiagnosticsService;
 use application::environment_service::EnvironmentService;
 use application::extension_service::ExtensionService;
 use application::health_service::HealthService;
@@ -169,6 +170,12 @@ fn main() {
             // 仓储以 Arc 直传（服务层不反向依赖其他服务）；env_repo 随后 move 进
             // InstanceService，必须在此之前装配
             let app_version = handle.package_info().version.to_string();
+
+            // 常驻诊断（M6）：实例级 watcher 注册表，仅作诊断查询面
+            let diagnostics = Arc::new(DiagnosticsService::new(
+                ins_repo.clone(),
+                app_version.clone(),
+            ));
             let health = Arc::new(HealthService::new(
                 pool.clone(),
                 kernel.clone(),
@@ -200,6 +207,7 @@ fn main() {
                 activity.clone(),
                 keep_alive.clone(),
                 extension_service.clone(),
+                diagnostics.clone(),
                 Arc::new(ExtensionConfigRepository::new(service_pool.clone())),
                 settings_service.clone(),
                 paths.clone(),
@@ -307,6 +315,7 @@ fn main() {
                 session_service,
                 settings_service,
                 extension_service,
+                diagnostics,
                 activity,
                 health,
                 kernel,

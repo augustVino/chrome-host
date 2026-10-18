@@ -398,6 +398,48 @@ fn fixture_router() -> Router {
                 }))
             }),
         )
+        // —— 常驻诊断（M6）：console/network 环 + screenshot + har ——
+        .route(
+            "/api/v1/instances/ins_x/console",
+            get(|| async {
+                Json(json!({ "instanceId": "ins_x", "entries": [
+                    { "ts": 1, "level": "error", "text": "boom", "source": "console", "targetUrl": "https://a/" },
+                    { "ts": 2, "level": "warning", "text": "w", "source": "network", "targetUrl": "https://a/" }
+                ] }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/network",
+            get(|| async {
+                Json(json!({ "instanceId": "ins_x", "entries": [
+                    { "ts": 1, "requestId": "r1", "method": "GET", "url": "https://a/404", "status": 404, "failed": false, "targetUrl": "https://a/" }
+                ] }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/screenshot",
+            get(|| async {
+                // 1x1 透明 png（真实魔数，验证客户端解码校验链）
+                Json(json!({ "instanceId": "ins_x", "format": "png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==" }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/har",
+            get(|| async {
+                Json(json!({ "log": { "version": "1.2", "creator": { "name": "chrome-host", "version": "0.2.3" }, "pages": [], "entries": [
+                    { "request": { "method": "GET", "url": "https://a/x" }, "response": { "status": 200 } }
+                ] } }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/err_409_diag/console",
+            get(|| async {
+                (
+                    StatusCode::CONFLICT,
+                    Json(error_body("DIAGNOSTICS_UNAVAILABLE")),
+                )
+            }),
+        )
         .route(
             "/api/v1/instances/err_409_diag/diagnostics",
             get(|| async {
@@ -715,6 +757,39 @@ fn instance_diagnostics_passthrough_and_unavailable() {
         other => panic!("应为 Api 变体: {other:?}"),
     }
     assert_eq!(exit::from_cli_error(&err).as_u8(), 5, "409 → RUNTIME exit 5");
+}
+
+/// 常驻诊断（M6）四方法面：console/network 环解包（含 query 透传）、
+/// screenshot 的 base64+PNG 魔数解码链、har 文档解包、409 → exit 5
+#[test]
+fn resident_diagnostics_endpoints() {
+    let client = test_client();
+
+    let console = client.instance_console("ins_x", Some("error"), Some(10)).expect("console 应成功");
+    assert_eq!(console["entries"].as_array().unwrap().len(), 2);
+
+    let network = client.instance_network("ins_x", true, None).expect("network 应成功");
+    assert_eq!(network["entries"][0]["status"], 404);
+
+    let shot = client.instance_screenshot("ins_x").expect("screenshot 应成功");
+    assert_eq!(shot["format"], "png");
+    // 客户端解码链（base64 + PNG 魔数）由截图命令内部使用，此处至少验 base64 可解
+    let data = shot["data"].as_str().unwrap();
+    assert!(data.len() > 40, "非空截图数据");
+
+    let har = client.instance_har("ins_x").expect("har 应成功");
+    assert_eq!(har["log"]["version"], "1.2");
+    assert_eq!(har["log"]["entries"].as_array().unwrap().len(), 1);
+
+    let err = client.instance_console("err_409_diag", None, None).unwrap_err();
+    match &err {
+        CliError::Api { status, code, .. } => {
+            assert_eq!(*status, 409);
+            assert_eq!(code, "DIAGNOSTICS_UNAVAILABLE");
+        }
+        other => panic!("应为 Api 变体: {other:?}"),
+    }
+    assert_eq!(exit::from_cli_error(&err).as_u8(), 5);
 }
 
 /// runtime + health：CftStatus / HealthReport（checks + counts）

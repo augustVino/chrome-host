@@ -8,7 +8,7 @@
 
 - [连接配置](#连接配置)
 - [通用行为约定](#通用行为约定)
-- [工具总览（29 个）](#工具总览29-个)
+- [工具总览（33 个）](#工具总览33-个)
 - [内核](#内核)
 - [环境](#环境)
 - [实例](#实例)
@@ -65,13 +65,14 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 4. **内核未装时 `create_instance` 会阻塞于首次下载**（约 150MB）——复杂任务先调 `kernel_status` 预判。
 5. 扩展启停只影响**之后启动的实例**；实例创建非幂等（每次新增一个）。
 
-## 工具总览（29 个）
+## 工具总览（33 个）
 
 | 分组 | 工具 |
 |---|---|
 | 内核（1） | `kernel_status` |
 | 环境（6） | `list_environments` · `create_environment` · `delete_environment` · `set_keep_alive` · `stop_all_for_environment` · `activity` |
-| 实例（10） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` · `get_diagnostics` |
+| 实例（10） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
+| 常驻诊断（5） | `get_diagnostics` · `get_console` · `get_network` · `get_screenshot` · `get_har` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
 | 登录态（2） | `login_profile`（action: get / launch / capture / reset） · `session_status` |
 | 扩展（7） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` · `get_extension_config` · `set_extension_config` |
@@ -109,6 +110,10 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | `delete_instance` | `instanceId` | 删除实例（运行中 → 409，须先停止） |
 | `create_cdp_session` | `instanceId` | 发放 CDP 会话（远程/代理访问用，30 分钟有效）→ `{ sessionId, baseUrl, expiresAt }`。远程客户端以 baseUrl 代理访问 CDP（`/json/version` 与 `/devtools/*` WS，webSocketDebuggerUrl 已改写）；本地直连场景优先 `get_cdp` |
 | `get_cdp` | `instanceId` | CDP endpoint（含 WebSocket URL，可直接连 Chrome DevTools Protocol 做页面自动化） |
+| `get_console` | `instanceId`；可选 `level`、`limit` | 常驻 console 环（500 条，进程内态重启即清）：console API + 页面日志 |
+| `get_network` | `instanceId`；可选 `failedOnly`、`limit` | 常驻请求环（1000 条，完成/失败时入环）。完整时序用 `get_har` |
+| `get_screenshot` | `instanceId` | 当前页面 png 截图（base64，复用常驻连接；未运行/未就绪/无 http 页 → 409） |
+| `get_har` | `instanceId` | 请求环生成 HAR 1.2 文档（`_targetUrl` 标注归属页面；未采集字段按规范占位） |
 | `get_diagnostics` | `instanceId` | 当前页面诊断快照（JS 错误/失败资源各环形 100 条 + LCP/FCP；对第一个 http(s) 页面短连接求值页面扩展）。未运行或无 http 页 → 409 `DIAGNOSTICS_UNAVAILABLE`；`diagnostics: null` = 页面未注入 |
 
 ## 标签页

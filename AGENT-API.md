@@ -170,6 +170,10 @@
 |---|---|
 | `GET /api/v1/instances/{id}/cdp` | CDP 端点。CDP 仅绑定 `127.0.0.1` |
 | `GET /api/v1/instances/{id}/diagnostics` | 页面诊断快照（透传）：对第一个 http(s) 页面短连接求值 page-diagnostics 扩展挂载的 `window.__chromeHostDiagnostics`。未运行或无 http 页 → `409 DIAGNOSTICS_UNAVAILABLE` |
+| `GET /api/v1/instances/{id}/console?level=&limit=` | 常驻订阅 console 环（500 条）：console API + 页面日志。level 精确匹配，limit 缺省 100 |
+| `GET /api/v1/instances/{id}/network?failedOnly=&limit=` | 常驻订阅请求环（1000 条，请求完成/失败时入环）。failedOnly = 失败或 HTTP≥400 |
+| `GET /api/v1/instances/{id}/screenshot` | 当前页面 png 截图（base64，复用常驻连接）。未运行/连接未就绪/无 http 页 → 409 |
+| `GET /api/v1/instances/{id}/har` | 请求环生成 HAR 1.2 文档（未采集字段按规范 -1/空集占位；`_targetUrl` 标注归属页面） |
 | `GET /api/v1/instances/{id}/tabs` | 页面标签列表（仅 `type: "page"`） |
 | `POST /api/v1/instances/{id}/tabs` | 新开标签页并导航。请求体 `{ "url": "https://…" }`（须含协议） |
 | `POST /api/v1/instances/{id}/navigate` | 导航既有标签页。请求体 `{ "tabId": "...", "url": "..." }`（new+close 组合近似，旧页历史丢失） |
@@ -195,6 +199,12 @@
 diagnostics 采集规则：JS 错误（`error`/`unhandledrejection`）与失败资源（HTTP 状态 ≥400，或
 `transferSize == 0`——磁盘缓存命中/被阻断的启发式信号，可能含少量噪声）各环形保留 100 条；
 错误页/about:blank 等不运行 content script 的页面读不到快照。
+
+**常驻诊断（console/network/screenshot/har）**：实例启动后 chrome-host 保持一条 browser 级
+CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外部 agent 自建的 CDP 会话
+互不干扰；console 环 500 条 / 请求环 1000 条，均为**进程内态，chrome-host 重启或实例重启
+即清空**；请求在完成/失败时入环（in-flight 不可见）。截图取第一个 http(s) 页面 session
+（隐藏页面可能拍到空白帧，与浏览器行为一致）。
 
 拿到 `webSocketUrl` 后可直接接入 Playwright（`connectOverCDP`）/ Puppeteer / chrome-remote-interface。
 
@@ -329,7 +339,7 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `ENVIRONMENT_HAS_RUNNING_INSTANCES` | 删环境前须 stop-all |
 | 409 | `INSTANCE_ALREADY_RUNNING` | 重复 start；删除运行中实例 |
 | 409 | `INSTANCE_NOT_RUNNING` | 对停止实例 open/stop/焦点操作 |
-| 409 | `DIAGNOSTICS_UNAVAILABLE` | 页面诊断查询：实例未运行，或实例内无 http(s) 页面目标 |
+| 409 | `DIAGNOSTICS_UNAVAILABLE` | 诊断查询（快照/console/network/screenshot/har）：实例未运行、常驻连接未就绪，或无 http(s) 页面目标 |
 | 409 | `PROFILE_IN_USE` | 登录浏览器未关闭即 capture |
 | 409 | `CDP_PORT_UNAVAILABLE` | 实例 start 时 CDP 端口被外部进程占用 |
 | 500 | `CDP_PORT_UNAVAILABLE` | 创建实例时端口窗口耗尽（9222–9421 全部不可用） |

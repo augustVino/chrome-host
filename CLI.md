@@ -183,6 +183,10 @@ chrome-host env delete <id> --yes
 | `instance get <ID>` | 实例详情（status/pid/cdpPort/browserVersion/profileDir） |
 | `instance status <ID>` | 轻量轮询视图（id/status/pid/cdpPort/browserVersion）；全量详情（含 profileDir）用 `get` |
 | `instance diagnostics <ID>` | 页面诊断快照摘要（targetUrl / errors / badResources / lcp / fcp；`--json` 完整透传）。未运行或无 http 页 → 409 exit 5 |
+| `instance console <ID> [--level error] [--limit 50]` | 常驻 console 环（500 条，进程内态）；table 列 LEVEL/SOURCE/TEXT |
+| `instance network <ID> [--failed-only] [--limit 50]` | 常驻请求环（1000 条）；`--failed-only` 只看失败/HTTP≥400 |
+| `instance screenshot <ID> [--out <path>]` | 当前页面 png（base64 解码 + PNG 魔数校验后写文件，缺省 `<id>.png`；`--json` 输出响应原样） |
+| `instance har <ID> [--out <path>]` | 请求环生成 HAR 1.2（缺省写 `<id>.har`；`--json` 输出文档原样） |
 | `instance create <ENV_ID>` | 创建并启动。读操作族用 30s 超时，本命令**无总超时**（容忍内核下载） |
 | `instance start <ID>` / `instance stop <ID>` | 启动已停止实例 / 优雅停止。`start`/`restart` 同样无总超时 |
 | `instance restart <ID>` | 停止再启动（hosts 重新拉取最新） |

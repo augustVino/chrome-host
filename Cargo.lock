@@ -683,6 +683,7 @@ name = "chrome-host-cli"
 version = "0.2.3"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "clap",
  "comfy-table",
  "reqwest 0.12.28",

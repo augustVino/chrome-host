@@ -14,12 +14,13 @@ use axum::Router;
 use tauri::AppHandle;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::application::activity::Activity;
+use crate::application::cdp_session::CdpSessionService;
+use crate::application::diagnostics_service::DiagnosticsService;
 use crate::application::environment_service::EnvironmentService;
 use crate::application::extension_service::ExtensionService;
 use crate::application::health_service::HealthService;
 use crate::application::instance_service::InstanceService;
-use crate::application::activity::Activity;
-use crate::application::cdp_session::CdpSessionService;
 use crate::application::profile_service::ProfileService;
 use crate::application::settings_service::SettingsService;
 use crate::application::session_service::SessionService;
@@ -39,6 +40,8 @@ pub struct ApiState {
     pub session_service: Arc<SessionService>,
     pub settings_service: Arc<SettingsService>,
     pub extension_service: Arc<ExtensionService>,
+    /// 常驻诊断（M6）：console/network/screenshot/har 查询面
+    pub diagnostics: Arc<DiagnosticsService>,
     pub activity: Arc<Activity>,
     pub health: Arc<HealthService>,
     pub kernel: Arc<KernelManager>,
@@ -125,6 +128,10 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/diagnostics",
             get(crate::api::instances::diagnostics),
         )
+        .route("/api/v1/instances/{id}/console", get(crate::api::instances::console))
+        .route("/api/v1/instances/{id}/network", get(crate::api::instances::network))
+        .route("/api/v1/instances/{id}/screenshot", get(crate::api::instances::screenshot))
+        .route("/api/v1/instances/{id}/har", get(crate::api::instances::har))
         .route(
             "/api/v1/instances/{id}/tabs",
             get(crate::api::instances::tabs).post(crate::api::instances::open_tab),

@@ -556,6 +556,63 @@ impl AgentClient {
         ))
     }
 
+    /// GET /api/v1/instances/{id}/console —— 常驻订阅 console 环。
+    /// query：可选 level（精确匹配）与 limit；均非敏感，同 activity 的直拼先例。
+    pub fn instance_console(
+        &self,
+        id: &str,
+        level: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, CliError> {
+        let mut path = format!("/api/v1/instances/{id}/console");
+        if let Some(l) = level {
+            path.push_str(&format!("?level={l}"));
+        }
+        if let Some(n) = limit {
+            path.push_str(if level.is_some() { "&" } else { "?" });
+            path.push_str(&format!("limit={n}"));
+        }
+        Self::decode(self.send(Method::GET, &path, None, false))
+    }
+
+    /// GET /api/v1/instances/{id}/network —— 常驻订阅请求环（failedOnly 过滤）
+    pub fn instance_network(
+        &self,
+        id: &str,
+        failed_only: bool,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, CliError> {
+        let mut path = format!("/api/v1/instances/{id}/network");
+        if failed_only {
+            path.push_str("?failedOnly=true");
+        }
+        if let Some(n) = limit {
+            path.push_str(if failed_only { "&" } else { "?" });
+            path.push_str(&format!("limit={n}"));
+        }
+        Self::decode(self.send(Method::GET, &path, None, false))
+    }
+
+    /// GET /api/v1/instances/{id}/screenshot —— png base64（复用常驻诊断连接）
+    pub fn instance_screenshot(&self, id: &str) -> Result<serde_json::Value, CliError> {
+        Self::decode(self.send(
+            Method::GET,
+            &format!("/api/v1/instances/{id}/screenshot"),
+            None,
+            false,
+        ))
+    }
+
+    /// GET /api/v1/instances/{id}/har —— 请求环生成的 HAR 1.2 文档
+    pub fn instance_har(&self, id: &str) -> Result<serde_json::Value, CliError> {
+        Self::decode(self.send(
+            Method::GET,
+            &format!("/api/v1/instances/{id}/har"),
+            None,
+            false,
+        ))
+    }
+
     /// GET /api/v1/instances/{id}/tabs —— 当前标签页列表（与 POST 同路径不同 method）。
     pub fn instance_tabs(&self, id: &str) -> Result<Vec<CdpTarget>, CliError> {
         Self::decode(self.send(

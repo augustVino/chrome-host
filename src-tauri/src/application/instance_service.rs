@@ -23,6 +23,7 @@ use crate::infrastructure::session_vault;
 use crate::infrastructure::cdp::ws::CdpConnection;
 
 use super::activity::Activity;
+use super::diagnostics_service::DiagnosticsService;
 use super::extension_service::ExtensionService;
 use super::keep_alive::KeepAliveWatcher;
 use super::profile_service::ProfileService;
@@ -64,6 +65,8 @@ pub struct InstanceService {
     activity: Arc<Activity>,
     keep_alive: Arc<KeepAliveWatcher>,
     extensions: Arc<ExtensionService>,
+    /// 常驻诊断（M6）：置 running 后 spawn watcher，不阻塞启动路径
+    diagnostics: Arc<DiagnosticsService>,
     /// 扩展运行时配置装配（resolve_for_runtime 入参；读失败按空 map 降级）
     extension_configs: Arc<ExtensionConfigRepository>,
     settings: Arc<SettingsService>,
@@ -84,12 +87,13 @@ impl InstanceService {
         activity: Arc<Activity>,
         keep_alive: Arc<KeepAliveWatcher>,
         extensions: Arc<ExtensionService>,
+        diagnostics: Arc<DiagnosticsService>,
         extension_configs: Arc<ExtensionConfigRepository>,
         settings: Arc<SettingsService>,
         paths: AppPaths,
         app: AppHandle,
     ) -> Self {
-        InstanceService { envs, instances, kernel, process, reconciler, profiles, sessions, activity, keep_alive, extensions, extension_configs, settings, paths, app }
+        InstanceService { envs, instances, kernel, process, reconciler, profiles, sessions, activity, keep_alive, extensions, diagnostics, extension_configs, settings, paths, app }
     }
 
     /// 创建并启动 Instance。创建非幂等：每调用一次新增一个 Instance。
@@ -306,6 +310,9 @@ impl InstanceService {
                     },
                 )?;
                 self.emit("instance-started", &ins.id);
+                // 常驻诊断 watcher（M6）：置 running 后 spawn，不阻塞启动返回路径；
+                // 只订阅不操作，与外部 agent 的 CDP 会话共存
+                self.diagnostics.spawn(&ins.id, ins.cdp_port.unwrap_or_default());
                 tracing::info!("实例启动成功: {} pid={pid} cdp={}", ins.id, ins.cdp_port.unwrap_or_default());
             }
             Err(_) => {

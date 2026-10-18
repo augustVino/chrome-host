@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
@@ -135,6 +135,61 @@ pub async fn diagnostics(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let view = state.instance_service.diagnostics(&id).await?;
+    Ok(Json(view))
+}
+
+#[derive(Deserialize)]
+pub struct ConsoleQuery {
+    /// error / warning / info / debug / log（缺省全量）
+    pub level: Option<String>,
+    /// 缺省 100，上限 1000
+    pub limit: Option<usize>,
+}
+
+/// GET /api/v1/instances/{id}/console：常驻订阅的 console 环（500 条，进程内态）
+pub async fn console(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<ConsoleQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let view = state.diagnostics.console(&id, q.level.as_deref(), q.limit)?;
+    Ok(Json(view))
+}
+
+#[derive(Deserialize)]
+pub struct NetworkQuery {
+    /// "true" = 只看失败请求或 HTTP ≥400
+    #[serde(rename = "failedOnly", default)]
+    pub failed_only: bool,
+    pub limit: Option<usize>,
+}
+
+/// GET /api/v1/instances/{id}/network：常驻订阅的请求环（1000 条，完成/失败时入环）
+pub async fn network(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<NetworkQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let view = state.diagnostics.network(&id, q.failed_only, q.limit)?;
+    Ok(Json(view))
+}
+
+/// GET /api/v1/instances/{id}/screenshot：当前页面 png 截图（base64，
+/// 复用常驻诊断连接；实例未运行/连接未就绪/无 http 页 → 409）
+pub async fn screenshot(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let view = state.diagnostics.screenshot(&id).await?;
+    Ok(Json(view))
+}
+
+/// GET /api/v1/instances/{id}/har：从请求环生成 HAR 1.2 文档
+pub async fn har(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let view = state.diagnostics.har(&id)?;
     Ok(Json(view))
 }
 

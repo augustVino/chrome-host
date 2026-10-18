@@ -165,6 +165,28 @@ struct ExtensionConfigArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct ConsoleArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = "级别过滤：error/warning/info/debug/log；省略全量")]
+    level: Option<String>,
+    #[schemars(description = "尾部条数；缺省 100，上限 1000")]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct NetworkArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = "true = 只看失败请求或 HTTP≥400")]
+    failed_only: Option<bool>,
+    #[schemars(description = "尾部条数；缺省 100，上限 1000")]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct SetExtensionConfigArgs {
     #[schemars(description = "扩展 id（ext_ 前缀）")]
     extension_id: String,
@@ -390,6 +412,46 @@ impl ChromeHostMcp {
         Parameters(a): Parameters<InstanceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run(|| self.state.instance_service.diagnostics(&a.instance_id)).await
+    }
+
+    #[tool(description = "常驻订阅的 console 环形缓冲（500 条，进程内态重启即清）：console API 输出 + 页面日志（含资源加载失败）。可选 level（error/warning/info/debug/log）与 limit（缺省 100）")]
+    async fn get_console(
+        &self,
+        Parameters(a): Parameters<ConsoleArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run_sync(|| {
+            self.state
+                .diagnostics
+                .console(&a.instance_id, a.level.as_deref(), a.limit)
+        })
+    }
+
+    #[tool(description = "常驻订阅的请求环（1000 条，进程内态重启即清；请求完成/失败时入环）。可选 failedOnly（失败或 HTTP≥400）与 limit；完整时序与耗时用 get_har")]
+    async fn get_network(
+        &self,
+        Parameters(a): Parameters<NetworkArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run_sync(|| {
+            self.state
+                .diagnostics
+                .network(&a.instance_id, a.failed_only.unwrap_or(false), a.limit)
+        })
+    }
+
+    #[tool(description = "当前页面 png 截图（base64，复用常驻诊断连接的第一个 http(s) 页面 session）。实例未运行/连接未就绪/无 http 页 → 409 DIAGNOSTICS_UNAVAILABLE")]
+    async fn get_screenshot(
+        &self,
+        Parameters(a): Parameters<InstanceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| self.state.diagnostics.screenshot(&a.instance_id)).await
+    }
+
+    #[tool(description = "从请求环生成 HAR 1.2 文档（har-recorder 落地点，可直接存档/回放分析）；未采集字段按规范以 -1/空集占位，_targetUrl 标注条目归属页面")]
+    async fn get_har(
+        &self,
+        Parameters(a): Parameters<InstanceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run_sync(|| self.state.diagnostics.har(&a.instance_id))
     }
 
     // ── 登录态 ──────────────────────────────────────────────────────────

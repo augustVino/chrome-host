@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod cdp_session;
+pub mod diagnostics_service;
 pub mod environment_service;
 pub mod extension_service;
 pub mod health_service;

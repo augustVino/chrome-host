@@ -1,13 +1,15 @@
-//! CDP WebSocket 客户端：按需短连接（连上 → 若干命令 → 关闭丢弃）。
+//! CDP WebSocket 客户端：按需短连接（连上 → 若干命令 → 关闭丢弃）与常驻事件
+//! 订阅（连上 → 事件透传 → 断线由调用方重连）两种形态同一实现：无 id 帧是否
+//! 有消费方由 [`EventSink`] 决定，命令路径完全一致。
 //!
-//! 与 proxy.rs 的帧级桥共用 tokio-tungstenite；本模块面向 chrome-host 侧的
-//! 主动命令调用（Cookie 导出/注入、diagnostics evaluate），常驻事件订阅
-//! （console/network 历史）后续在同一连接层上扩展。
+//! 与 proxy.rs 的帧级桥共用 tokio-tungstenite；短连接面向 chrome-host 侧的
+//! 一次性主动命令（Cookie 导出/注入、diagnostics evaluate），常驻形态面向
+//! M6 诊断订阅（console/network 事件）。
 //!
 //! 纪律：
 //! - 目标恒为本机回环的 CDP 端口，connect_async 直连 TCP、不经系统代理——
 //!   与 client.rs 的 no_proxy 同源约定；
-//! - `session_id` 参数为常驻监听（Target.setAutoAttach flatten 模式）预留：
+//! - `session_id` 参数服务于常驻 flatten 模式（Target.setAutoAttach）：
 //!   Network/Runtime 的命令与事件都是 per-target session 维度。
 
 use std::collections::HashMap;
@@ -17,7 +19,7 @@ use std::time::Duration;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::error::AppError;
@@ -28,6 +30,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
+/// 常驻连接的事件出口：无 id 帧（CDP 事件）透传给消费者
+pub type EventSink = mpsc::UnboundedSender<serde_json::Value>;
 
 /// 一次性 CDP 命令连接。不实现 Clone：调用方独占写半部，用完即弃。
 pub struct CdpConnection {
@@ -51,12 +55,30 @@ impl CdpConnection {
 
     /// 直连指定 wsUrl（测试入口；生产路径走 [`CdpConnection::connect`]）。
     pub async fn connect_ws(ws_url: &str, timeout: Duration) -> Result<Self, AppError> {
+        Self::connect_ws_eventing(ws_url, timeout, None).await
+    }
+
+    /// 连接实例 browser 级 WS 并把事件帧透传给 `events`（常驻订阅形态，M6 起
+    /// 接入生产路径）：无 id 帧路由到事件通道，命令路径与短连接完全一致。
+    pub async fn connect_eventing(port: u16, events: EventSink) -> Result<Self, AppError> {
+        let v = super::client::version(port).await?;
+        let url = v.web_socket_url.ok_or_else(|| {
+            AppError::business(500, "CDP_CONNECTION_FAILED", "CDP 未提供 webSocketDebuggerUrl")
+        })?;
+        Self::connect_ws_eventing(&url, DEFAULT_TIMEOUT, Some(events)).await
+    }
+
+    pub async fn connect_ws_eventing(
+        ws_url: &str,
+        timeout: Duration,
+        events: Option<EventSink>,
+    ) -> Result<Self, AppError> {
         let (ws, _resp) = tokio_tungstenite::connect_async(ws_url).await.map_err(|e| {
             AppError::business(500, "CDP_CONNECTION_FAILED", format!("CDP WS 连接失败: {e}"))
         })?;
         let (write, read) = ws.split();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        tokio::spawn(reader_loop(read, Arc::clone(&pending)));
+        tokio::spawn(reader_loop(read, Arc::clone(&pending), events));
         Ok(Self { write, next_id: 0, pending, timeout })
     }
 
@@ -128,9 +150,10 @@ impl CdpConnection {
     }
 }
 
-/// 读循环：响应（带 id）路由回 pending 等待者；事件（无 id）当前无消费方，
-/// 丢弃即可——常驻监听落地时在此处接入事件通道，不影响本模块的调用方。
-async fn reader_loop(read: SplitStream<WsStream>, pending: Pending) {
+/// 读循环：响应（带 id）路由回 pending 等待者；事件（无 id）——短连接无消费方
+/// 丢弃，常驻连接（M6 起）透传给事件通道。事件通道随 reader 结束而 drop，
+/// 消费侧 recv 返回 None 即连接已死的信号。
+async fn reader_loop(read: SplitStream<WsStream>, pending: Pending, events: Option<EventSink>) {
     let mut read = read;
     while let Some(msg) = read.next().await {
         match msg {
@@ -139,7 +162,10 @@ async fn reader_loop(read: SplitStream<WsStream>, pending: Pending) {
                     continue;
                 };
                 let Some(id) = v.get("id").and_then(|x| x.as_u64()) else {
-                    continue; // 事件帧：M1 无消费方
+                    if let Some(tx) = &events {
+                        let _ = tx.send(v);
+                    }
+                    continue;
                 };
                 let tx = pending.lock().unwrap().remove(&id);
                 if let Some(tx) = tx {
@@ -270,5 +296,60 @@ mod tests {
         let err = conn.send::<Value>("Echo.close", (), None).await.unwrap_err();
         assert_eq!(err.code(), "CDP_COMMAND_FAILED");
         assert!(err.to_string().contains("关闭"));
+    }
+
+    /// 常驻形态：事件帧（无 id）透传给 EventSink，命令路径不变；
+    /// reader 结束时通道 drop → 消费侧 recv None 即「连接已死」信号
+    #[tokio::test]
+    async fn eventing_routes_events_and_signals_close() {
+        // mock：收到 Echo.event 命令后先推一个事件帧（无 id）再回命令响应；
+        // Echo.close 断开连接
+        async fn event_socket(mut socket: WebSocket) {
+            while let Some(Ok(msg)) = socket.recv().await {
+                let Message::Text(text) = msg else { continue };
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let Some(id) = v.get("id").and_then(|x| x.as_u64()) else { continue };
+                match v["method"].as_str() {
+                    Some("Echo.event") => {
+                        let event = json!({ "method": "Test.event", "params": { "n": 7 }, "sessionId": "sess-1" });
+                        let _ = socket.send(Message::Text(event.to_string().into())).await;
+                        let _ = socket.send(Message::Text(json!({ "id": id, "result": {} }).to_string().into())).await;
+                    }
+                    Some("Echo.close") => break,
+                    _ => {}
+                }
+            }
+        }
+        let app = Router::new().route(
+            "/ws",
+            get(|ws: WebSocketUpgrade| async move { ws.on_upgrade(event_socket) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://127.0.0.1:{}/ws", addr.port());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut conn = CdpConnection::connect_ws_eventing(&url, DEFAULT_TIMEOUT, Some(tx))
+            .await
+            .unwrap();
+
+        // 命令仍可用（同一连接双通道）
+        conn.send::<Value>("Echo.event", (), None).await.unwrap();
+        let event = rx.recv().await.expect("事件帧应透传");
+        assert_eq!(event["method"], "Test.event");
+        assert_eq!(event["params"]["n"], 7);
+        assert_eq!(event["sessionId"], "sess-1", "session 维度保留（常驻订阅核心）");
+
+        // 连接关闭 → 通道 drop → recv None（重连循环的退出信号）
+        let _ = conn.send::<Value>("Echo.close", (), None).await;
+        let mut none_count = 0;
+        for _ in 0..3 {
+            if rx.recv().await.is_none() {
+                none_count += 1;
+                break;
+            }
+        }
+        assert_eq!(none_count, 1, "连接死后通道应终止");
     }
 }

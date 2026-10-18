@@ -50,6 +50,52 @@ pub enum InstanceCommands {
         id: String,
     },
 
+    /// 常驻订阅的 console 环（进程内态重启即清）
+    #[command(about = "console 环形缓冲（500 条）：--level 过滤、--limit 尾部 N 条")]
+    Console {
+        /// 实例 id
+        id: String,
+        /// 级别过滤：error/warning/info/debug/log
+        #[arg(long)]
+        level: Option<String>,
+        /// 尾部条数（缺省 100）
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
+    /// 常驻订阅的请求环（进程内态重启即清）
+    #[command(about = "请求环形缓冲（1000 条）：--failed-only 只看失败/HTTP≥400")]
+    Network {
+        /// 实例 id
+        id: String,
+        /// 只看失败请求或 HTTP ≥400
+        #[arg(long = "failed-only")]
+        failed_only: bool,
+        /// 尾部条数（缺省 100）
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
+    /// 当前页面 png 截图（复用常驻诊断连接）
+    #[command(about = "当前页面 png 截图：--out 写文件（缺省 <实例id>.png），quiet 输出路径")]
+    Screenshot {
+        /// 实例 id
+        id: String,
+        /// 输出文件路径
+        #[arg(long = "out")]
+        out: Option<String>,
+    },
+
+    /// 请求环生成 HAR 1.2 文档
+    #[command(about = "生成 HAR 1.2：--out 写文件（缺省 <实例id>.har），quiet 输出路径")]
+    Har {
+        /// 实例 id
+        id: String,
+        /// 输出文件路径
+        #[arg(long = "out")]
+        out: Option<String>,
+    },
+
     /// 创建实例（创建即启动；首次运行可能阻塞于内核下载）
     #[command(about = "创建实例（创建即启动；首次运行可能阻塞于内核下载）")]
     Create {
@@ -148,6 +194,14 @@ pub fn run(
         InstanceCommands::Get { id } => get(globals, client, id),
         InstanceCommands::Status { id } => status(globals, client, id),
         InstanceCommands::Diagnostics { id } => diagnostics(globals, client, id),
+        InstanceCommands::Console { id, level, limit } => {
+            console(globals, client, id, level.as_deref(), *limit)
+        }
+        InstanceCommands::Network { id, failed_only, limit } => {
+            network(globals, client, id, *failed_only, *limit)
+        }
+        InstanceCommands::Screenshot { id, out } => screenshot(globals, client, id, out.as_deref()),
+        InstanceCommands::Har { id, out } => har(globals, client, id, out.as_deref()),
         InstanceCommands::Create { env_id } => create(globals, client, env_id),
         InstanceCommands::Start { id } => start(globals, client, id),
         InstanceCommands::Stop { id } => stop(globals, client, id),
@@ -281,7 +335,193 @@ fn status(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), Cl
     Ok(())
 }
 
-/// `chrome-host instance diagnostics <ID>`：页面诊断快照。
+/// `chrome-host instance console <ID> [--level] [--limit]`：console 环渲染。
+/// table：LEVEL SOURCE TEXT 列表（TEXT 截断到 80 列，json 模式完整保留）；
+/// quiet：每行一条 `level\ttext`。
+fn console(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    level: Option<&str>,
+    limit: Option<usize>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.instance_console(id, level, limit)?;
+    let entries = resp
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if out.quiet {
+        for e in &entries {
+            out.print_id(&format!(
+                "{}\t{}",
+                e.get("level").and_then(|v| v.as_str()).unwrap_or("?"),
+                e.get("text").and_then(|v| v.as_str()).unwrap_or("")
+            ));
+        }
+        return Ok(());
+    }
+    let rows: Vec<TableRow> = entries
+        .iter()
+        .map(|e| TableRow {
+            id: e
+                .get("ts")
+                .and_then(|v| v.as_i64())
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            cells: vec![
+                e.get("level").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                e.get("source").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                truncate(
+                    e.get("text").and_then(|v| v.as_str()).unwrap_or(""),
+                    80,
+                ),
+            ],
+            json: e.clone(),
+        })
+        .collect();
+    out.render_list(&["LEVEL", "SOURCE", "TEXT"], &rows);
+    Ok(())
+}
+
+/// `chrome-host instance network <ID> [--failed-only] [--limit]`：请求环渲染。
+/// table：METHOD STATUS URL 列表；quiet：每行 `status\turl`。
+fn network(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    failed_only: bool,
+    limit: Option<usize>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.instance_network(id, failed_only, limit)?;
+    let entries = resp
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if out.quiet {
+        for e in &entries {
+            out.print_id(&format!(
+                "{}\t{}",
+                e.get("status").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "FAIL".into()),
+                e.get("url").and_then(|v| v.as_str()).unwrap_or("")
+            ));
+        }
+        return Ok(());
+    }
+    let rows: Vec<TableRow> = entries
+        .iter()
+        .map(|e| TableRow {
+            id: e
+                .get("ts")
+                .and_then(|v| v.as_i64())
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            cells: vec![
+                e.get("method").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                e.get("status")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| e.get("error").and_then(|v| v.as_str()).unwrap_or("FAIL").to_string()),
+                truncate(e.get("url").and_then(|v| v.as_str()).unwrap_or(""), 70),
+            ],
+            json: e.clone(),
+        })
+        .collect();
+    out.render_list(&["METHOD", "STATUS", "URL"], &rows);
+    Ok(())
+}
+
+/// `chrome-host instance screenshot <ID> [--out]`：解码 base64 写 png。
+/// json 模式输出响应原样（含 data），不落盘——落盘路径仅 table 模式输出。
+fn screenshot(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    out_path: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.instance_screenshot(id)?;
+    let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    let bytes = decode_base64_png(data)?;
+    if !out.json {
+        let path = out_path.map(str::to_string).unwrap_or_else(|| format!("{id}.png"));
+        std::fs::write(&path, &bytes).map_err(|e| {
+            CliError::Local(format!("写截图文件失败 {path}: {e}"))
+        })?;
+        if out.quiet {
+            out.print_id(&path);
+        } else {
+            out.render_kv(
+                &[("file".into(), path.clone()), ("bytes".into(), bytes.len().to_string())],
+                serde_json::json!({ "file": path, "bytes": bytes.len(), "format": "png" }),
+            );
+        }
+    } else {
+        out.render_kv(&[], resp);
+    }
+    Ok(())
+}
+
+/// `chrome-host instance har <ID> [--out]`：HAR 1.2 文档。
+/// json 模式输出 HAR 原样；table 模式写文件 + 摘要（条目数）。
+fn har(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    out_path: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.instance_har(id)?;
+    if out.json {
+        out.render_kv(&[], resp);
+        return Ok(());
+    }
+    let path = out_path.map(str::to_string).unwrap_or_else(|| format!("{id}.har"));
+    let pretty = serde_json::to_string_pretty(&resp)
+        .map_err(|e| CliError::Local(format!("HAR 序列化失败: {e}")))?;
+    std::fs::write(&path, pretty)
+        .map_err(|e| CliError::Local(format!("写 HAR 文件失败 {path}: {e}")))?;
+    let entries = resp
+        .pointer("/log/entries")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if out.quiet {
+        out.print_id(&path);
+    } else {
+        out.render_kv(
+            &[("file".into(), path.clone()), ("entries".into(), entries.to_string())],
+            serde_json::json!({ "file": path, "entries": entries }),
+        );
+    }
+    Ok(())
+}
+
+/// base64 解码 + PNG 魔数校验（服务端形状漂移在客户端拦下，不写坏文件）
+fn decode_base64_png(data: &str) -> Result<Vec<u8>, CliError> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| CliError::Local(format!("截图 base64 解码失败: {e}")))?;
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(CliError::Protocol("截图数据不是 PNG（魔数校验失败）".into()));
+    }
+    Ok(bytes)
+}
+
+/// table 列截断（ascii 截断即可：中文按字符数截，不追求显示宽度对齐）
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
+    }
+}
+/// `chrome-host instance diagnostics <ID>`：页面诊断快照（M5 短连接透传）。
 /// 响应是服务端透传的自由形状 JSON（页面扩展挂载的快照），不建 DTO ——
 /// 诊断面随扩展演进，CLI 只做摘要提取 + 原样透传（json 模式完整保留）。
 /// quiet：输出 targetUrl（供脚本捕获定位被诊断页面）。
