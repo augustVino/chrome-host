@@ -204,15 +204,21 @@ chrome-host env delete <id> --yes
 
 | 命令 | 说明 |
 |---|---|
-| `extension list` | 全部扩展（type: system/user，status: ready/missing/invalid） |
+| `extension list` | 全部扩展（type: system/user，status: ready/missing/invalid，configurable 标记可配置性） |
 | `extension get <ID>` | 扩展详情（manifest 元数据） |
 | `extension add <PATH>` | 注册用户扩展目录。本地先校验目录存在且含 `manifest.json`；路径会转为绝对路径存储 |
 | `extension enable <ID>` / `extension disable <ID>` | 启停。仅 user 扩展可用；system 扩展 → exit 6 |
 | `extension remove <ID> [--yes]` | 移除注册项（**不删除源目录文件**） |
+| `extension config get <ID> [--env <ENV_ID>]` | 读运行时配置（未配置 → `config: null`；省略 `--env` = 全局默认） |
+| `extension config set <ID> <JSON> [--env <ENV_ID>]` | 写运行时配置（JSON 对象，整体覆盖；仅 net-rules 等 `configurable: true` 的内置扩展；非法 → 400 exit 7）。**对新启动实例生效** |
 
 ```bash
 chrome-host extension add ~/projects/my-dev-helper
 chrome-host extension disable <ext_id>     # 只影响之后启动的实例
+# net-rules：全局屏蔽埋点域，个别环境再覆盖
+chrome-host extension config set <net_rules_id> '{"block":["*.google-analytics.com"]}'
+chrome-host extension config set <net_rules_id> --env <env_id> '{"block":[],"redirect":[{"from":"https://api.foo.com/*","to":"http://localhost:3000/$1"}]}'
+chrome-host extension config get <net_rules_id> --env <env_id>
 ```
 
 ### login-profile — 登录态生命周期

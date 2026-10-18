@@ -107,6 +107,7 @@ impl ExtensionRepository {
             source_path: row.get(6)?,
             enabled: row.get::<_, i64>(7)? != 0,
             status: ExtensionStatus::from_str_or_ready(&status_str),
+            configurable: false, // 仓储不带真相：服务层按目录元数据惰性计算
             created_at: row.get(9)?,
             updated_at: row.get(10)?,
         })

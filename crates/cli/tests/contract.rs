@@ -33,8 +33,9 @@ mod exit;
 #[path = "../src/model.rs"]
 mod model;
 
+use axum::extract::Query;
 use axum::http::StatusCode;
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde_json::json;
 
@@ -126,6 +127,7 @@ fn canned_extension() -> serde_json::Value {
         "sourcePath": "/tmp/extensions/user-helper",
         "enabled": true,
         "status": "ready",
+        "configurable": false,
         "createdAt": 1,
         "updatedAt": 2
     })
@@ -346,6 +348,26 @@ fn fixture_router() -> Router {
             "/api/v1/extensions/ext_system",
             patch(|| async {
                 (StatusCode::FORBIDDEN, Json(error_body("EXTENSION_SYSTEM_LOCKED")))
+            }),
+        )
+        // —— extension config（可配置扩展的运行时配置读写）——
+        .route(
+            "/api/v1/extensions/ext_cfg/config",
+            get(|Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                Json(json!({
+                    "environmentId": q.get("environmentId"),
+                    "config": {"block": ["a.com"]}
+                }))
+            })
+                .put(|| async { Json(json!({ "ok": true })) }),
+        )
+        .route(
+            "/api/v1/extensions/ext_bad/config",
+            put(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body("EXTENSION_CONFIG_INVALID")),
+                )
             }),
         )
         // —— runtime / health ——
@@ -603,6 +625,46 @@ fn extension_endpoints_and_type_rename() {
     assert_eq!(toggled.id, "ext_user");
 
     client.extension_delete("ext_user").expect("extension_delete 应成功");
+}
+
+/// extension config：GET 往返（含 environmentId query 路径）、PUT 成功、
+/// 400 EXTENSION_CONFIG_INVALID 错误解包与 exit 映射（未知 400 码 → VALIDATION 兜底）
+#[test]
+fn extension_config_endpoints_roundtrip_and_error() {
+    let client = test_client();
+
+    let resp = client
+        .extension_config_get("ext_cfg", None)
+        .expect("全局默认配置读取应成功");
+    assert_eq!(resp["environmentId"], serde_json::json!(null));
+    assert_eq!(resp["config"]["block"][0], "a.com");
+
+    let resp = client
+        .extension_config_get("ext_cfg", Some("env_1"))
+        .expect("per-env 配置读取应成功");
+    assert_eq!(resp["environmentId"], "env_1");
+
+    let config = serde_json::json!({"block": ["*.google-analytics.com"]});
+    let ok = client
+        .extension_config_set("ext_cfg", None, &config)
+        .expect("写入应成功");
+    assert_eq!(ok["ok"], true);
+
+    let err = client
+        .extension_config_set("ext_bad", None, &serde_json::json!({"block": [42]}))
+        .unwrap_err();
+    match &err {
+        CliError::Api { status, code, .. } => {
+            assert_eq!(*status, 400);
+            assert_eq!(code, "EXTENSION_CONFIG_INVALID");
+        }
+        other => panic!("应为 Api 变体: {other:?}"),
+    }
+    assert_eq!(
+        exit::from_cli_error(&err).as_u8(),
+        7,
+        "400 未特判码 EXTENSION_CONFIG_INVALID → VALIDATION 兜底 exit 7"
+    );
 }
 
 /// runtime + health：CftStatus / HealthReport（checks + counts）

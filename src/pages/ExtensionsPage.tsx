@@ -1,10 +1,10 @@
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { api, errorText } from '../api/client';
 import { useStore } from '../store';
 import { confirm } from '../components/confirm';
-import { btnGhost, btnPrimary } from '../components/ui';
+import { btnGhost, btnPrimary, inputCls } from '../components/ui';
 import type { Extension } from '../api/types';
 
 /** 展示层状态 → 语义色（DESIGN.md：状态点 bg-status-*，异常文字加深） */
@@ -23,8 +23,88 @@ function StatusBadge({ status }: { status: Extension['status'] }) {
   );
 }
 
+/** 可配置扩展（net-rules 等）的运行时配置编辑器：环境作用域切换 + JSON 文本域。
+ * 配置对新启动实例生效；未配置 → 空文本域（保存 '{}' 即清空）。 */
+function ConfigEditor({ ext, onClose }: { ext: Extension; onClose: () => void }) {
+  const { envs, showToast } = useStore();
+  const [scope, setScope] = useState<string>('');
+  const [text, setText] = useState('');
+
+  const load = useCallback(
+    async (envId: string) => {
+      try {
+        const view = await api.getExtensionConfig(ext.id, envId || undefined);
+        setText(view.config === null ? '' : JSON.stringify(view.config, null, 2));
+      } catch (e) {
+        showToast('err', errorText(e));
+      }
+    },
+    [ext.id, showToast],
+  );
+
+  useEffect(() => {
+    load(scope);
+  }, [scope, load]);
+
+  const save = useCallback(async () => {
+    let config: unknown = {};
+    if (text.trim()) {
+      try {
+        config = JSON.parse(text);
+      } catch {
+        showToast('err', '配置不是合法 JSON');
+        return;
+      }
+    }
+    try {
+      await api.setExtensionConfig(ext.id, config, scope || undefined);
+      showToast('ok', `配置已保存（对新启动的实例生效）`);
+      onClose();
+    } catch (e) {
+      showToast('err', errorText(e));
+    }
+  }, [text, scope, ext.id, showToast, onClose]);
+
+  return (
+    <div className="mx-4 mb-3 rounded-lg border border-hairline bg-surface-inset p-3">
+      <div className="mb-2 flex items-center gap-2">
+        <span className="text-xs text-ink-2">作用域</span>
+        <select
+          className="rounded-lg border border-hairline bg-surface-raised px-2 py-1 text-xs"
+          value={scope}
+          onChange={(e) => setScope(e.target.value)}
+        >
+          <option value="">全局默认（未单独配置的环境）</option>
+          {envs.map((env) => (
+            <option key={env.id} value={env.id}>
+              {env.name}
+            </option>
+          ))}
+        </select>
+        <span className="ml-auto text-[11px] text-ink-3">仅影响之后启动的实例</span>
+      </div>
+      <textarea
+        className={`${inputCls} h-40 resize-y font-mono text-xs`}
+        placeholder='留空保存即写入 {}（如清空拦截规则）。net-rules 形如 {"block":["*.google-analytics.com"]}'
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        spellCheck={false}
+      />
+      <div className="mt-2 flex justify-end gap-1.5">
+        <button className={btnGhost} onClick={onClose}>
+          取消
+        </button>
+        <button className={btnPrimary} onClick={save}>
+          保存
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function ExtensionRow({ ext }: { ext: Extension }) {
   const { showToast, fetchExtensions } = useStore();
+  const [editing, setEditing] = useState(false);
 
   const toggle = useCallback(async () => {
     try {
@@ -59,34 +139,44 @@ function ExtensionRow({ ext }: { ext: Extension }) {
   }, [ext.sourcePath, showToast]);
 
   return (
-    <div className="flex items-start justify-between gap-3 px-4 py-3">
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="truncate text-sm font-medium text-ink">{ext.name}</span>
-          <StatusBadge status={ext.status} />
-          {ext.version && <span className="shrink-0 font-mono text-[11px] text-ink-3">v{ext.version}</span>}
+    <div className="px-4 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-sm font-medium text-ink">{ext.name}</span>
+            <StatusBadge status={ext.status} />
+            {ext.version && <span className="shrink-0 font-mono text-[11px] text-ink-3">v{ext.version}</span>}
+          </div>
+          {ext.description && <p className="mt-0.5 truncate text-xs text-ink-2">{ext.description}</p>}
+          <p className="mt-1 truncate font-mono text-[11px] text-ink-3" title={ext.sourcePath}>
+            {ext.sourcePath}
+          </p>
         </div>
-        {ext.description && <p className="mt-0.5 truncate text-xs text-ink-2">{ext.description}</p>}
-        <p className="mt-1 truncate font-mono text-[11px] text-ink-3" title={ext.sourcePath}>
-          {ext.sourcePath}
-        </p>
-      </div>
-      {ext.type === 'user' && (
         <div className="flex shrink-0 items-center gap-1.5 pt-0.5">
-          <button className={btnGhost} onClick={toggle}>
-            {ext.enabled ? '禁用' : '启用'}
-          </button>
-          <button className={btnGhost} onClick={openFolder}>
-            Open Folder
-          </button>
-          <button
-            className="rounded-lg px-2.5 py-1.5 text-xs text-ink-2 transition hover:bg-red-50 hover:text-status-error dark:hover:bg-red-500/15"
-            onClick={remove}
-          >
-            移除
-          </button>
+          {ext.type === 'system' && ext.configurable && (
+            <button className={btnGhost} onClick={() => setEditing((v) => !v)}>
+              配置
+            </button>
+          )}
+          {ext.type === 'user' && (
+            <>
+              <button className={btnGhost} onClick={toggle}>
+                {ext.enabled ? '禁用' : '启用'}
+              </button>
+              <button className={btnGhost} onClick={openFolder}>
+                Open Folder
+              </button>
+              <button
+                className="rounded-lg px-2.5 py-1.5 text-xs text-ink-2 transition hover:bg-red-50 hover:text-status-error dark:hover:bg-red-500/15"
+                onClick={remove}
+              >
+                移除
+              </button>
+            </>
+          )}
         </div>
-      )}
+      </div>
+      {editing && <ConfigEditor ext={ext} onClose={() => setEditing(false)} />}
     </div>
   );
 }

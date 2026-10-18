@@ -196,14 +196,29 @@
 | `POST /api/v1/extensions` | 注册：`{ "path": "/abs/path/to/ext" }`（目录须含合法 `manifest.json`，服务端读出元数据；`400` = 目录/manifest 非法） |
 | `PATCH /api/v1/extensions/{id}` | `{ "enabled": false }` 启停。system → `403 EXTENSION_SYSTEM_LOCKED` |
 | `DELETE /api/v1/extensions/{id}` | 移除注册项（**不删源文件**）。system → 403 |
+| `GET /api/v1/extensions/{id}/config?environmentId=` | 读运行时配置 → `{ environmentId, config }`（未配置 → `config: null`；省略 query = 全局默认） |
+| `PUT /api/v1/extensions/{id}/config?environmentId=` | 写运行时配置（body 即 JSON 对象，整体覆盖；仅列表中 `configurable: true` 的 system 扩展如 net-rules；体 ≤64KB；未知 environmentId → 404）。**对新启动实例生效** |
 
 ```json
 { "id": "ext_...", "name": "My Dev Helper", "description": "...", "version": "0.3.1",
   "manifestVersion": 3, "type": "user", "sourcePath": "/Users/x/projects/my-dev-helper",
-  "enabled": true, "status": "ready", "createdAt": ..., "updatedAt": ... }
+  "enabled": true, "status": "ready", "configurable": false, "createdAt": ..., "updatedAt": ... }
 ```
 
-`status` 是读取时按文件系统现状惰性计算的展示值：`ready` / `missing`（目录没了）/ `invalid`（manifest 损坏）。
+`status` 是读取时按文件系统现状惰性计算的展示值：`ready` / `missing`（目录没了）/ `invalid`（manifest 损坏）；`configurable: true` 仅限声明了 configFile 的内置物化扩展（当前为 net-rules），这类扩展可经 config 端点按环境写入运行时配置。
+
+**net-rules 配置形状**（写入时同步校验可编译，非法 → 400 `EXTENSION_CONFIG_INVALID`）：
+
+```json
+{ "block": ["*.google-analytics.com"],
+  "redirect": [{ "from": "https://api.foo.com/*", "to": "http://localhost:3000/$1" }],
+  "headers": [{ "url": "https://app.foo.com/*", "set": { "X-Debug-Uid": "42" } }] }
+```
+
+- `block`/`headers[].url`：域锚定匹配，可选 scheme 前缀与路径通配（`*.` 与裸域名均匹配域及全部子域）；
+- `redirect[].from`：全量 glob，`*` 依序对应 `$1`、`$2`…；`to` 中的 `$N` 展开为第 N 个捕获组（无数字后缀的 `$` 为字面量）；
+- `headers[].set`：注入请求头（服务端可见）；
+- 规则在浏览器层（DNR）生效，service worker 休眠不影响拦截。
 
 ## Settings — 应用设置
 
@@ -293,6 +308,7 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 400 | `INVALID_REQUEST` | 请求体校验失败（含非代理端点访问 `/cdp/*`） |
 | 400 | `HOSTS_SOURCE_INVALID` | hosts 配置源 URL 非法 |
 | 400 | `REMOTE_ACCESS_TARGET_INVALID` | 开启远程接入时 SSH 目标缺失/非法（含空白、`-` 开头、超长；已开启时置空） |
+| 400 | `EXTENSION_CONFIG_INVALID` | 扩展配置写入非法（非 configFile 扩展 / 非 JSON 对象 / >64KB / net-rules 规则不可编译） |
 | 401 | `UNAUTHORIZED` | 17891 访问缺少/错误 Bearer token（隧道与应用均在线的信号） |
 | 404 | `SESSION_NOT_FOUND` | CDP 会话不存在或已过期（30 分钟），或实例与会话不匹配 |
 | 403 | `EXTENSION_SYSTEM_LOCKED` | 内置扩展不可启停/移除 |

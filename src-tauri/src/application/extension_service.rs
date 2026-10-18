@@ -5,26 +5,37 @@
 //! - `sync_system_extensions`：内置扩展目录自动发现（resources/extensions 即真相源，
 //!   新增扩展无需改代码）+ prune 已移除目录的注册行
 //! - `resolve_for_runtime` 是实例启动加载扩展的唯一入口，加载方式由目录内
-//!   chrome-host.json 声明：static（缺省）直引源目录；materialize 物化烘焙
-//!   （MV3 content script 无文件系统访问，占位符替换为唯一可行方案）；
+//!   chrome-host.json 声明：static（缺省）直引源目录；materialize 统一哑管道
+//!   （模板原样拷贝 + 写 config.js，配置组装见 assemble_config）；
 //!   User 扩展恒为 Direct Mode（用户改代码，新实例即加载最新）
 //! - 安全铁律：实例加载的扩展路径只能来自注册表，REST 不提供按任意路径加载
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::domain::environment::Environment;
 use crate::domain::extension::{Extension, ExtensionStatus, ExtensionType};
 use crate::domain::instance::Instance;
+use crate::domain::net_rules;
 use crate::error::AppError;
+use crate::infrastructure::db::repositories::environment_repository::EnvironmentRepository;
+use crate::infrastructure::db::repositories::extension_config_repository::{
+    ExtensionConfigRepository, GLOBAL_ENV_ID,
+};
 use crate::infrastructure::db::repositories::extension_repository::ExtensionRepository;
 use crate::infrastructure::extension;
 
 use super::settings_service::SettingsService;
 
+/// 扩展配置体大小上限（防滥用；net-rules 实际场景几 KB 足够）
+const CONFIG_MAX_BYTES: usize = 64 * 1024;
+
 pub struct ExtensionService {
     repo: Arc<ExtensionRepository>,
+    /// config 写入时的 envId 存在性校验（防拼写错误静默落库永不生效）
+    envs: Arc<EnvironmentRepository>,
+    config_repo: Arc<ExtensionConfigRepository>,
     settings: Arc<SettingsService>,
     /// app_data 根（generated-extensions 输出位置）
     data_root: PathBuf,
@@ -35,11 +46,13 @@ pub struct ExtensionService {
 impl ExtensionService {
     pub fn new(
         repo: Arc<ExtensionRepository>,
+        envs: Arc<EnvironmentRepository>,
+        config_repo: Arc<ExtensionConfigRepository>,
         settings: Arc<SettingsService>,
         data_root: PathBuf,
         resource_root: PathBuf,
     ) -> Self {
-        ExtensionService { repo, settings, data_root, resource_root }
+        ExtensionService { repo, envs, config_repo, settings, data_root, resource_root }
     }
 
     /// 启动同步（自动发现 + prune，幂等）：扫描 `resources/extensions/*/manifest.json`
@@ -89,6 +102,7 @@ impl ExtensionService {
                         source_path: source,
                         enabled: true,
                         status: ExtensionStatus::Ready,
+                        configurable: false,
                         created_at: now,
                         updated_at: now,
                     })?;
@@ -132,6 +146,7 @@ impl ExtensionService {
             source_path: path.to_string(),
             enabled: true,
             status: ExtensionStatus::Ready,
+            configurable: false,
             created_at: now,
             updated_at: now,
         };
@@ -176,15 +191,18 @@ impl ExtensionService {
 
     /// 实例启动时解析加载列表。
     /// `chrome_index`：实例在环境内的序号（1 起，与 UI 命名一致，由持有 instances 仓储的
-    /// 调用方计算——服务间不互相依赖仓储）。
-    /// 加载方式按目录元数据分派：static（缺省）直引；materialize 按目录名分派物化器。
-    /// 返回目录路径列表，调用方以逗号拼接为 `--load-extension`；
-    /// 个别扩展失败不阻断启动（仅告警跳过）。
+    /// 调用方计算——服务间不互相依赖仓储）；`configs`：extension_id → 生效配置 JSON
+    /// （调用方查 extension_configs 表装配，读失败按空 map 不阻断启动）。
+    /// 加载方式按目录元数据分派：static（缺省）直引；materialize 统一走
+    /// config.js 哑管道（物化器无 per-consumer 分支，配置组装的少量分派见
+    /// [`Self::assemble_config`]）。返回目录路径列表，调用方以逗号拼接为
+    /// `--load-extension`；个别扩展失败不阻断启动（仅告警跳过）。
     pub fn resolve_for_runtime(
         &self,
         env: &Environment,
         ins: &Instance,
         chrome_index: usize,
+        configs: &HashMap<String, String>,
     ) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         let rows = match self.repo.list() {
@@ -201,36 +219,38 @@ impl ExtensionService {
             }
             let dir = PathBuf::from(&row.source_path);
             // 元数据仅对内置（system）扩展生效；user 扩展恒为 Direct Mode
-            let mode = if row.extension_type == ExtensionType::System {
+            let meta = if row.extension_type == ExtensionType::System {
                 match extension::read_bundle_meta(&dir) {
-                    Ok(meta) => meta.mode,
+                    Ok(meta) => meta,
                     Err(e) => {
                         tracing::warn!("扩展 {} 元数据不可读（跳过）: {e}", row.name);
                         continue;
                     }
                 }
             } else {
-                extension::ExtensionLoadMode::Static
+                Default::default()
             };
-            match mode {
+            match meta.mode {
                 extension::ExtensionLoadMode::Static => match extension::read_manifest(&dir) {
                     Ok(_) => paths.push(dir),
                     Err(e) => tracing::warn!("扩展 {} 不可加载（跳过）: {e}", row.name),
                 },
                 extension::ExtensionLoadMode::Materialize => {
-                    let dir_name = dir
+                    let leaf = dir
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    // 新增物化型内置扩展：目录放 chrome-host.json + 在此加一个分派臂 + 物化函数
-                    let result = match dir_name.as_str() {
-                        "environment-label" => {
-                            self.materialize_env_label(&dir, env, ins, chrome_index)
-                        }
-                        other => Err(AppError::internal(format!(
-                            "物化型扩展「{other}」未实现物化器"
-                        ))),
-                    };
+                    let out = self
+                        .data_root
+                        .join("generated-extensions")
+                        .join(&ins.id)
+                        .join(&leaf);
+                    let config_file = meta.config_file.as_deref().unwrap_or(extension::DEFAULT_CONFIG_FILE);
+                    let result = self
+                        .assemble_config(&leaf, &row.id, env, chrome_index, configs)
+                        .and_then(|config| {
+                            extension::materialize_with_config(&dir, &out, config_file, &config)
+                        });
                     match result {
                         Ok(p) => paths.push(p),
                         Err(e) => tracing::warn!("扩展 {} 物化失败（跳过）: {e}", row.name),
@@ -241,37 +261,151 @@ impl ExtensionService {
         paths
     }
 
-    /// 物化环境标识（当前唯一的物化器）：标签文本 = `<环境名> · Chrome #N`，
-    /// 位置/颜色来自设置页（持久化于 app_settings，启动时物化进实例副本）
-    fn materialize_env_label(
+    /// 物化管道唯一的 per-consumer 分派（配置组装；物化器本身是哑管道）：
+    /// - environment-label：文本 = `<环境名> · Chrome #N`，位置/颜色来自全局设置
+    ///   （未声明 configFile → 不读配置表，也不可经 config API 写入）
+    /// - net-rules：配置表原始配置编译为 DNR 规则（background.js 哑应用 cfg.rules）
+    /// - 其他声明了 configFile 的物化扩展：表内原始配置原样透传
+    fn assemble_config(
         &self,
-        source_dir: &Path,
+        leaf: &str,
+        extension_id: &str,
         env: &Environment,
-        ins: &Instance,
         chrome_index: usize,
-    ) -> Result<PathBuf, AppError> {
-        let leaf = source_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "environment-label".to_string());
-        let out = self
-            .data_root
-            .join("generated-extensions")
-            .join(&ins.id)
-            .join(leaf);
-        let settings = self.settings.get()?;
-        extension::materialize_environment_label(
-            source_dir,
-            &out,
-            &format!("{} · Chrome #{}", env.name, chrome_index),
-            &settings.env_label_position,
-            &settings.env_label_color,
-        )
+        configs: &HashMap<String, String>,
+    ) -> Result<serde_json::Value, AppError> {
+        match leaf {
+            "environment-label" => {
+                let settings = self.settings.get()?;
+                Ok(serde_json::json!({
+                    "text": format!("{} · Chrome #{}", env.name, chrome_index),
+                    "position": settings.env_label_position,
+                    "color": settings.env_label_color,
+                }))
+            }
+            "net-rules" => {
+                let config = configs
+                    .get(extension_id)
+                    .map(|s| serde_json::from_str::<serde_json::Value>(s))
+                    .transpose()
+                    .map_err(|e| {
+                        AppError::business(
+                            400,
+                            "EXTENSION_CONFIG_INVALID",
+                            format!("net-rules 配置非法 JSON: {e}"),
+                        )
+                    })?
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let rules = net_rules::compile(&config)?;
+                Ok(serde_json::json!({ "rules": rules }))
+            }
+            other => {
+                let config = configs
+                    .get(extension_id)
+                    .map(|s| serde_json::from_str::<serde_json::Value>(s))
+                    .transpose()
+                    .map_err(|e| {
+                        AppError::business(
+                            400,
+                            "EXTENSION_CONFIG_INVALID",
+                            format!("扩展 {other} 配置非法 JSON: {e}"),
+                        )
+                    })?
+                    .unwrap_or_else(|| serde_json::json!({}));
+                Ok(config)
+            }
+        }
     }
 
-    /// 状态惰性刷新：目录没了 → missing；manifest 坏了 → invalid；否则保持 ready
-    fn with_fresh_status(&self, ext: Extension) -> Extension {
-        let mut ext = ext;
+    /// 读取扩展运行时配置（environmentId 缺省 = 全局默认行；未配置 → null）
+    pub fn get_config(
+        &self,
+        extension_id: &str,
+        environment_id: Option<&str>,
+    ) -> Result<serde_json::Value, AppError> {
+        let env_key = self.config_scope(extension_id, environment_id)?;
+        let config = self
+            .config_repo
+            .get(&env_key, extension_id)?
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        Ok(serde_json::json!({
+            "environmentId": environment_id,
+            "config": config,
+        }))
+    }
+
+    /// 写入扩展运行时配置（整体覆盖；environmentId 缺省 = 全局默认行）。
+    /// 校验：仅声明了 configFile 的 system 物化扩展可配置；体 ≤64KB；合法 JSON 对象；
+    /// net-rules 额外做编译校验（写入即反馈，不留到启动时才告警）。对新启动实例生效。
+    pub fn set_config(
+        &self,
+        extension_id: &str,
+        environment_id: Option<&str>,
+        body: &str,
+    ) -> Result<(), AppError> {
+        let env_key = self.config_scope(extension_id, environment_id)?;
+        if let Some(env) = environment_id {
+            self.envs.get(env)?; // 拼写错误立即 404，不静默落库永不生效
+        }
+        if body.len() > CONFIG_MAX_BYTES {
+            return Err(AppError::business(
+                400,
+                "EXTENSION_CONFIG_INVALID",
+                format!("配置体超过 {}KB 上限", CONFIG_MAX_BYTES / 1024),
+            ));
+        }
+        let config: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+            AppError::business(400, "EXTENSION_CONFIG_INVALID", format!("配置非合法 JSON: {e}"))
+        })?;
+        if !config.is_object() {
+            return Err(AppError::business(
+                400,
+                "EXTENSION_CONFIG_INVALID",
+                "配置必须是 JSON 对象",
+            ));
+        }
+        let dir = PathBuf::from(self.repo.get(extension_id)?.source_path);
+        if dir.file_name().map(|n| n == "net-rules").unwrap_or(false) {
+            net_rules::compile(&config)?; // 写入即校验可编译
+        }
+        self.config_repo.put(&env_key, extension_id, &config.to_string())?;
+        tracing::info!(
+            "扩展配置已更新: {extension_id} scope={}",
+            environment_id.unwrap_or("<global>")
+        );
+        Ok(())
+    }
+
+    /// config 读写前置：扩展存在 + 可配置（system + materialize + 声明 configFile）。
+    /// 返回落库的 env key（全局行哨兵或真实 env id）
+    fn config_scope(
+        &self,
+        extension_id: &str,
+        environment_id: Option<&str>,
+    ) -> Result<String, AppError> {
+        let ext = self.repo.get(extension_id)?;
+        if !self.is_configurable(&ext) {
+            return Err(AppError::business(
+                400,
+                "EXTENSION_CONFIG_INVALID",
+                format!("扩展 {} 不支持运行时配置（仅声明 configFile 的内置物化扩展可配置）", ext.name),
+            ));
+        }
+        Ok(environment_id.unwrap_or(GLOBAL_ENV_ID).to_string())
+    }
+
+    fn is_configurable(&self, ext: &Extension) -> bool {
+        ext.extension_type == ExtensionType::System
+            && extension::read_bundle_meta(Path::new(&ext.source_path))
+                .map(|m| {
+                    m.mode == extension::ExtensionLoadMode::Materialize && m.config_file.is_some()
+                })
+                .unwrap_or(false)
+    }
+
+    /// 状态惰性刷新：目录没了 → missing；manifest 坏了 → invalid；否则保持 ready；
+    /// configurable 同步按目录元数据重算
+    fn with_fresh_status(&self, mut ext: Extension) -> Extension {
         let dir = PathBuf::from(&ext.source_path);
         ext.status = if !dir.is_dir() {
             ExtensionStatus::Missing
@@ -280,6 +414,7 @@ impl ExtensionService {
         } else {
             ExtensionStatus::Ready
         };
+        ext.configurable = self.is_configurable(&ext);
         ext
     }
 }
@@ -296,6 +431,9 @@ mod tests {
         svc: ExtensionService,
         settings: Arc<SettingsService>,
         templates: PathBuf,
+        /// net-rules 模板目录（声明 configFile，可配置）
+        net_rules_dir: PathBuf,
+        config_repo: Arc<ExtensionConfigRepository>,
     }
 
     fn setup() -> Ctx {
@@ -304,7 +442,7 @@ mod tests {
         let pool = init_pool(&dir.join("test.db")).unwrap();
         init_schema(&pool).unwrap();
         let settings = Arc::new(SettingsService::new(pool.clone()));
-        // resource_root 下按 ENV_LABEL_TEMPLATE 相对路径（extensions/environment-label）存放模板
+        // resource_root 下存放模板（extensions/<name>），与真实 bundle 布局一致
         let templates = dir.join("templates").join("extensions").join("environment-label");
         std::fs::create_dir_all(&templates).unwrap();
         std::fs::write(
@@ -312,13 +450,22 @@ mod tests {
             r#"{"name":"Environment Label","manifest_version":3}"#,
         )
         .unwrap();
+        std::fs::write(templates.join("content.js"), "// reads self.__CHROME_HOST_CONFIG__").unwrap();
+        // env-label 声明为物化型且不声明 configFile（配置由全局设置组装，不可经 API 写入）
+        std::fs::write(templates.join("chrome-host.json"), r#"{"mode":"materialize"}"#).unwrap();
+        let net_rules_dir = dir.join("templates").join("extensions").join("net-rules");
+        std::fs::create_dir_all(&net_rules_dir).unwrap();
         std::fs::write(
-            templates.join("content.js"),
-            "const n = 'ENVIRONMENT_NAME_PLACEHOLDER';",
+            net_rules_dir.join("manifest.json"),
+            r#"{"name":"Net Rules","manifest_version":3}"#,
         )
         .unwrap();
-        // env-label 声明为物化型（与真实 bundle 一致）
-        std::fs::write(templates.join("chrome-host.json"), r#"{"mode":"materialize"}"#).unwrap();
+        std::fs::write(net_rules_dir.join("background.js"), "// applies cfg.rules").unwrap();
+        std::fs::write(
+            net_rules_dir.join("chrome-host.json"),
+            r#"{"mode":"materialize","configFile":"config.js"}"#,
+        )
+        .unwrap();
         let static_ext = dir.join("templates").join("extensions").join("sample-static");
         std::fs::create_dir_all(&static_ext).unwrap();
         std::fs::write(
@@ -327,13 +474,24 @@ mod tests {
         )
         .unwrap();
         std::fs::write(static_ext.join("content.js"), "// static").unwrap();
+        // set_config 的 envId 校验需要一条真实环境
+        crate::infrastructure::db::repositories::environment_repository::EnvironmentRepository::new(
+            pool.clone(),
+        )
+        .insert(&sample_env())
+        .unwrap();
+        let config_repo = Arc::new(ExtensionConfigRepository::new(pool.clone()));
         let svc = ExtensionService::new(
-            Arc::new(ExtensionRepository::new(pool)),
+            Arc::new(ExtensionRepository::new(pool.clone())),
+            Arc::new(
+                crate::infrastructure::db::repositories::environment_repository::EnvironmentRepository::new(pool.clone()),
+            ),
+            config_repo.clone(),
             settings.clone(),
             dir.clone(),
             dir.join("templates"),
         );
-        Ctx { svc, settings, templates }
+        Ctx { svc, settings, templates, net_rules_dir, config_repo }
     }
 
     fn sample_ins(env_id: &str) -> Instance {
@@ -385,7 +543,7 @@ mod tests {
         ctx.svc.sync_system_extensions().unwrap();
         ctx.svc.sync_system_extensions().unwrap(); // 二次幂等
         let list = ctx.svc.list().unwrap();
-        assert_eq!(list.len(), 2, "目录自动发现两个内置 system 扩展");
+        assert_eq!(list.len(), 3, "目录自动发现三个内置 system 扩展");
         assert!(list.iter().all(|e| e.extension_type == ExtensionType::System));
         assert!(list.iter().all(|e| e.status == ExtensionStatus::Ready));
 
@@ -454,12 +612,22 @@ mod tests {
         assert!(ctx.svc.list().unwrap().iter().all(|e| e.id != ext.id));
     }
 
-    /// 加载方式按目录元数据分派：static 直引 / materialize 物化；
-    /// user 扩展恒为直引（误配元数据不生效）；禁用/manifest 损坏/未知物化器均跳过不阻断
+    /// 加载方式按目录元数据分派：static 直引 / materialize 统一哑管道；
+    /// user 扩展恒为直引（误配元数据不生效）；禁用/manifest 损坏均跳过不阻断。
+    /// 物化配置按 consumer 组装：env-label = 设置公式；net-rules = 表配置编译 DNR
+    /// （per-env 覆盖全局）；其他声明 configFile 的目录 = 表内原始配置透传
     #[test]
     fn resolve_dispatches_by_metadata() {
         let ctx = setup();
         ctx.svc.sync_system_extensions().unwrap();
+        let net_rules_id = ctx
+            .svc
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "Net Rules")
+            .unwrap()
+            .id;
 
         let on = ctx.templates.parent().unwrap().join("ext-on");
         let off = ctx.templates.parent().unwrap().join("ext-off");
@@ -473,20 +641,29 @@ mod tests {
         let _ = ctx.svc.register(broken.to_str().unwrap()).unwrap();
         ctx.svc.set_enabled(&e_off.id, false).unwrap();
         // user 扩展即使误配 materialize 元数据也走直引（元数据仅对 system 生效）
-        std::fs::write(on.join("chrome-host.json"), r#"{"mode":"materialize"}"#).unwrap();
+        std::fs::write(on.join("chrome-host.json"), r#"{"mode":"materialize","configFile":"config.js"}"#).unwrap();
         // 注册后源目录损坏（manifest 被删）：resolve 时应跳过而非阻断启动
         std::fs::remove_file(broken.join("manifest.json")).unwrap();
 
+        // net-rules 配置：全局默认 + per-env 覆盖（写入路径同时被编译校验）
+        ctx.svc.set_config(&net_rules_id, None, r#"{"block":["*.google-analytics.com"]}"#).unwrap();
+        ctx.svc.set_config(&net_rules_id, Some("env_test"), r#"{"block":["example.com"]}"#).unwrap();
+
         let env = sample_env();
         let ins = sample_ins(&env.id);
-        let paths = ctx.svc.resolve_for_runtime(&env, &ins, 1);
+        let configs = ctx.config_repo.resolve_map_for_env(&env.id).unwrap();
+        let paths = ctx.svc.resolve_for_runtime(&env, &ins, 1, &configs);
         let strs: Vec<String> =
             paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
 
-        assert!(
-            strs.iter().any(|p| p.contains("generated-extensions/ins_test")),
-            "env-label 按元数据物化: {strs:?}"
-        );
+        let label = paths
+            .iter()
+            .find(|p| p.to_string_lossy().contains("environment-label"))
+            .expect("env-label 按元数据物化");
+        let net = paths
+            .iter()
+            .find(|p| p.to_string_lossy().contains("net-rules"))
+            .expect("net-rules 按元数据物化");
         assert!(
             strs.iter().any(|p| p.ends_with("extensions/sample-static")),
             "静态 system 直引: {strs:?}"
@@ -495,30 +672,108 @@ mod tests {
             strs.iter().any(|p| p.ends_with("ext-on")),
             "user 直引（meta 对 user 不生效）: {strs:?}"
         );
-        assert_eq!(paths.len(), 3, "off（禁用）/broken（损坏）排除: {strs:?}");
+        assert_eq!(paths.len(), 4, "off（禁用）/broken（损坏）排除: {strs:?}");
 
-        // 物化内容含标签文本与序号
-        let label = paths
-            .iter()
-            .find(|p| p.to_string_lossy().contains("generated-extensions"))
-            .unwrap();
-        let js = std::fs::read_to_string(label.join("content.js")).unwrap();
+        // env-label 配置 = 设置公式烘入 config.js
+        let js = std::fs::read_to_string(label.join("config.js")).unwrap();
         assert!(js.contains("qapub · Chrome #1"), "标签文本烘焙: {js}");
+        assert!(js.contains("bottom-left"), "位置取全局设置默认: {js}");
 
-        // 未知物化器：system 目录声明 materialize 但无分派臂 → 告警跳过，不阻断
+        // net-rules 配置 = 表内原始配置编译为 DNR 规则（per-env 覆盖全局）
+        let js = std::fs::read_to_string(net.join("config.js")).unwrap();
+        assert!(js.contains("||example.com"), "per-env 覆盖生效: {js}");
+        assert!(!js.contains("google-analytics"), "全局默认被覆盖: {js}");
+        assert!(js.contains("\"block\""), "DNR 规则已编译: {js}");
+        assert!(net.join("background.js").exists(), "模板文件随目录拷贝");
+
+        // 统一管道：无专门组装逻辑的物化目录 → 表内原始配置透传（不再有未知物化器跳过）
+        let static_dir = ctx.templates.parent().unwrap().join("sample-static");
         std::fs::write(
-            ctx.templates
-                .parent()
-                .unwrap()
-                .join("sample-static")
-                .join("chrome-host.json"),
-            r#"{"mode":"materialize"}"#,
+            static_dir.join("chrome-host.json"),
+            r#"{"mode":"materialize","configFile":"config.js"}"#,
         )
         .unwrap();
-        let paths = ctx.svc.resolve_for_runtime(&env, &ins, 1);
-        assert!(
-            !paths.iter().any(|p| p.ends_with("extensions/sample-static")),
-            "未知物化器应跳过"
+        let static_id = ctx
+            .svc
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "Sample Static")
+            .unwrap()
+            .id;
+        ctx.svc.set_config(&static_id, Some("env_test"), r#"{"k":"v"}"#).unwrap();
+        let configs = ctx.config_repo.resolve_map_for_env(&env.id).unwrap();
+        let paths = ctx.svc.resolve_for_runtime(&env, &ins, 1, &configs);
+        let copy = paths
+            .iter()
+            .find(|p| p.to_string_lossy().contains("sample-static"))
+            .expect("物化声明即物化（哑管道无未知分支）");
+        let js = std::fs::read_to_string(copy.join("config.js")).unwrap();
+        assert!(js.contains("\"k\":\"v\""), "原始配置透传: {js}");
+    }
+
+    /// config API 面：get/set 往返、可配置标记、校验拒绝矩阵
+    #[test]
+    fn config_crud_and_validation() {
+        let ctx = setup();
+        ctx.svc.sync_system_extensions().unwrap();
+        let list = ctx.svc.list().unwrap();
+        let by_name = |n: &str| list.iter().find(|e| e.name == n).unwrap().clone();
+        let net_rules_id = by_name("Net Rules").id;
+        let env_label_id = by_name("Environment Label").id;
+        let static_id = by_name("Sample Static").id;
+
+        // configurable 惰性标记：仅声明 configFile 的物化 system 扩展为 true
+        assert!(by_name("Net Rules").configurable);
+        assert!(!by_name("Environment Label").configurable, "未声明 configFile 不可配置");
+        assert!(!by_name("Sample Static").configurable);
+
+        // 未配置 → null；set/get 往返（全局 + per-env）
+        assert_eq!(
+            ctx.svc.get_config(&net_rules_id, None).unwrap()["config"],
+            serde_json::json!(null)
         );
+        ctx.svc.set_config(&net_rules_id, None, r#"{"block":["a.com"]}"#).unwrap();
+        assert_eq!(
+            ctx.svc.get_config(&net_rules_id, None).unwrap()["config"],
+            serde_json::json!({"block":["a.com"]})
+        );
+        ctx.svc.set_config(&net_rules_id, Some("env_test"), r#"{"block":["b.com"]}"#).unwrap();
+        assert_eq!(
+            ctx.svc.get_config(&net_rules_id, Some("env_test")).unwrap()["config"],
+            serde_json::json!({"block":["b.com"]})
+        );
+        assert_eq!(
+            ctx.svc.get_config(&net_rules_id, None).unwrap()["config"],
+            serde_json::json!({"block":["a.com"]}),
+            "全局行不被 per-env 写入影响"
+        );
+
+        // 拒绝矩阵：均 400 EXTENSION_CONFIG_INVALID
+        let rejects: [(&String, Option<&str>, &str, u16); 6] = [
+            (&net_rules_id, None, "[1,2]", 400),
+            (&net_rules_id, None, "{bad", 400),
+            (&net_rules_id, None, &"x".repeat(64 * 1024 + 1), 400),
+            (&net_rules_id, None, r#"{"block":[42]}"#, 400),
+            (&env_label_id, None, "{}", 400),
+            (&static_id, None, "{}", 400),
+        ];
+        for (id, env, body, status) in rejects {
+            let err = ctx.svc.set_config(id, env, body).unwrap_err();
+            assert_eq!(err.status(), status, "拒绝 body={:.20}...", body);
+            assert_eq!(err.code(), "EXTENSION_CONFIG_INVALID");
+        }
+        // user 扩展不可配置
+        let good = ctx.templates.parent().unwrap().join("good-ext");
+        write_user_ext(&good, "My Ext");
+        let user_ext = ctx.svc.register(good.to_str().unwrap()).unwrap();
+        let err = ctx.svc.set_config(&user_ext.id, None, "{}").unwrap_err();
+        assert_eq!(err.status(), 400);
+        // 未知环境：防拼写错误静默落库
+        let err = ctx.svc.set_config(&net_rules_id, Some("env_missing"), "{}").unwrap_err();
+        assert_eq!(err.status(), 404);
+        assert_eq!(err.code(), "ENVIRONMENT_NOT_FOUND");
+        // 拒绝后表内无脏数据
+        assert_eq!(ctx.config_repo.get("", &env_label_id).unwrap(), None);
     }
 }

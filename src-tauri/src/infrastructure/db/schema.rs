@@ -78,6 +78,16 @@ CREATE TABLE IF NOT EXISTS extensions (
     updated_at       INTEGER NOT NULL
 );
 
+-- Extension 运行时配置（per-env 覆盖全局默认；env_id='' 为全局行。
+-- 不建 FK：全局行 env_id 非真实环境；环境删除由 EnvironmentService 编排清理）
+CREATE TABLE IF NOT EXISTS extension_configs (
+    env_id       TEXT NOT NULL,
+    extension_id TEXT NOT NULL,
+    config_json  TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (env_id, extension_id)
+);
+
 CREATE TABLE IF NOT EXISTS app_events (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     ts             INTEGER NOT NULL,

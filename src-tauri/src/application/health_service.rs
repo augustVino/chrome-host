@@ -326,6 +326,7 @@ mod tests {
             source_path: source_path.to_string(),
             enabled: true,
             status: ExtensionStatus::Ready,
+            configurable: false,
             created_at: 1,
             updated_at: 1,
         }

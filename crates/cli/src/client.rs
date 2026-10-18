@@ -207,11 +207,21 @@ impl AgentClient {
     }
 }
 
+/// extension config 端点路径：可选 environmentId query（env id 为 `env_` 前缀安全字符集，
+/// 无需 URL 编码；同 activity 的 limit 直拼先例）
+fn config_path(id: &str, env: Option<&str>) -> String {
+    match env {
+        Some(e) => format!("/api/v1/extensions/{id}/config?environmentId={e}"),
+        None => format!("/api/v1/extensions/{id}/config"),
+    }
+}
+
 /// verbose 请求行的纯格式化：`→ {method} {path} ({ms}ms)`。
 /// 抽成纯函数以便单测（stderr 是进程级全局资源，打印薄壳不测 —— 与 output.rs 同一取舍）。
-/// path 存在唯一带 query 的调用（activity 的 `?limit=N`，非敏感分页数字）：
-/// 打印前剥离 `?` 及之后内容，守住「verbose 不含 query」承诺（limit 虽非敏感但纪律不开口子，
-/// PRD cli.md §22.3）；本函数签名只收 method/path/elapsed，body 从类型上就进不来。
+/// path 带过 query 的调用（activity 的 `?limit=N`、extension config 的 `?environmentId=`
+/// 均非敏感）：打印前剥离 `?` 及之后内容，守住「verbose 不含 query」承诺（limit
+/// 虽非敏感但纪律不开口子，PRD cli.md §22.3）；本函数签名只收 method/path/elapsed，
+/// body 从类型上就进不来。
 fn verbose_line(method: &str, path: &str, elapsed: Duration) -> String {
     let path = path.split('?').next().unwrap_or(path);
     format!("→ {method} {path} ({}ms)", elapsed.as_millis())
@@ -480,6 +490,29 @@ impl AgentClient {
             false,
         )?;
         Ok(())
+    }
+
+    /// GET /api/v1/extensions/{id}/config —— 可选 `?environmentId=`（省略 = 全局默认）。
+    /// 返回 `{environmentId, config}`（未配置 → config null）。
+    pub fn extension_config_get(
+        &self,
+        id: &str,
+        env: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let path = config_path(id, env);
+        Self::decode(self.send(Method::GET, &path, None, false))
+    }
+
+    /// PUT /api/v1/extensions/{id}/config —— body 为配置 JSON 对象（整体覆盖）；
+    /// 非法配置 → 400 EXTENSION_CONFIG_INVALID。对新启动实例生效。
+    pub fn extension_config_set(
+        &self,
+        id: &str,
+        env: Option<&str>,
+        config: &serde_json::Value,
+    ) -> Result<serde_json::Value, CliError> {
+        let path = config_path(id, env);
+        Self::decode(self.send(Method::PUT, &path, Some(config.clone()), false))
     }
 
     // -----------------------------------------------------------------------

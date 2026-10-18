@@ -156,6 +156,26 @@ struct ExtensionIdArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct ExtensionConfigArgs {
+    #[schemars(description = "扩展 id（ext_ 前缀）")]
+    extension_id: String,
+    #[schemars(description = "环境 id；省略 = 全局默认配置（被 per-env 配置覆盖）")]
+    environment_id: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SetExtensionConfigArgs {
+    #[schemars(description = "扩展 id（ext_ 前缀）")]
+    extension_id: String,
+    #[schemars(description = "环境 id；省略 = 全局默认配置（被 per-env 配置覆盖）")]
+    environment_id: Option<String>,
+    #[schemars(description = "配置 JSON 对象（整体覆盖；net-rules 形状见工具描述）")]
+    config: serde_json::Value,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct RegisterExtensionArgs {
     #[schemars(description = "扩展源目录的绝对路径（须含合法 manifest.json）")]
     path: String,
@@ -431,6 +451,31 @@ impl ChromeHostMcp {
         Parameters(a): Parameters<ExtensionIdArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run_sync(|| self.state.extension_service.delete(&a.extension_id))
+    }
+
+    #[tool(description = "读取扩展运行时配置（可选 environmentId，省略 = 全局默认；未配置 → config: null）。仅声明 configFile 的 system 扩展可配置（list_extensions 的 configurable 字段）")]
+    async fn get_extension_config(
+        &self,
+        Parameters(a): Parameters<ExtensionConfigArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run_sync(|| {
+            self.state
+                .extension_service
+                .get_config(&a.extension_id, a.environment_id.as_deref())
+        })
+    }
+
+    #[tool(description = "写入扩展运行时配置（整体覆盖；可选 environmentId 省略 = 全局默认；对新启动实例生效）。net-rules 形状：{\"block\":[\"*.google-analytics.com\"],\"redirect\":[{\"from\":\"https://api.foo.com/*\",\"to\":\"http://localhost:3000/$1\"}],\"headers\":[{\"url\":\"https://app.foo.com/*\",\"set\":{\"X-Debug-Uid\":\"42\"}}]}（block/headers 域锚定可带路径通配；redirect 的 * 依序为 $1 $2…）；非法 → 400 EXTENSION_CONFIG_INVALID")]
+    async fn set_extension_config(
+        &self,
+        Parameters(a): Parameters<SetExtensionConfigArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run_sync(|| {
+            let body = a.config.to_string();
+            self.state
+                .extension_service
+                .set_config(&a.extension_id, a.environment_id.as_deref(), &body)
+        })
     }
 }
 

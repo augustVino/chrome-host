@@ -11,6 +11,7 @@ use crate::domain::instance::{Instance, InstanceStatus, RuntimeUpdate};
 use crate::error::AppError;
 use crate::infrastructure::cdp;
 use crate::infrastructure::db::repositories::environment_repository::EnvironmentRepository;
+use crate::infrastructure::db::repositories::extension_config_repository::ExtensionConfigRepository;
 use crate::infrastructure::db::repositories::instance_repository::InstanceRepository;
 use crate::infrastructure::hosts;
 use crate::infrastructure::kernel::KernelManager;
@@ -63,6 +64,8 @@ pub struct InstanceService {
     activity: Arc<Activity>,
     keep_alive: Arc<KeepAliveWatcher>,
     extensions: Arc<ExtensionService>,
+    /// 扩展运行时配置装配（resolve_for_runtime 入参；读失败按空 map 降级）
+    extension_configs: Arc<ExtensionConfigRepository>,
     settings: Arc<SettingsService>,
     paths: AppPaths,
     app: AppHandle,
@@ -81,11 +84,12 @@ impl InstanceService {
         activity: Arc<Activity>,
         keep_alive: Arc<KeepAliveWatcher>,
         extensions: Arc<ExtensionService>,
+        extension_configs: Arc<ExtensionConfigRepository>,
         settings: Arc<SettingsService>,
         paths: AppPaths,
         app: AppHandle,
     ) -> Self {
-        InstanceService { envs, instances, kernel, process, reconciler, profiles, sessions, activity, keep_alive, extensions, settings, paths, app }
+        InstanceService { envs, instances, kernel, process, reconciler, profiles, sessions, activity, keep_alive, extensions, extension_configs, settings, paths, app }
     }
 
     /// 创建并启动 Instance。创建非幂等：每调用一次新增一个 Instance。
@@ -228,8 +232,9 @@ impl InstanceService {
             extra_args.extend(args.split_whitespace().map(str::to_string));
         }
 
-        // 扩展加载：System（环境标识物化）+ enabled 用户扩展，统一由 ExtensionService 解析；
-        // 全部不可用时不含 --load-extension，不阻断启动
+        // 扩展加载：System（物化管道注入运行时配置）+ enabled 用户扩展，统一由
+        // ExtensionService 解析；全部不可用时不含 --load-extension，不阻断启动。
+        // 配置查表失败 → 空 map 降级（扩展照常加载，仅无 per-env 配置）
         let chrome_index = self
             .instances
             .list_by_env(&env.id)?
@@ -237,7 +242,14 @@ impl InstanceService {
             .position(|i| i.id == ins.id)
             .map(|p| p + 1)
             .unwrap_or(0);
-        let ext_paths = self.extensions.resolve_for_runtime(env, ins, chrome_index);
+        let ext_configs = self
+            .extension_configs
+            .resolve_map_for_env(&env.id)
+            .unwrap_or_else(|e| {
+                tracing::warn!("扩展配置读取失败（按空配置继续）: {e}");
+                Default::default()
+            });
+        let ext_paths = self.extensions.resolve_for_runtime(env, ins, chrome_index, &ext_configs);
         if !ext_paths.is_empty() {
             let joined = ext_paths
                 .iter()

@@ -1,4 +1,4 @@
-import type { ApiError } from './types';
+import type { ApiError, ExtensionConfigView } from './types';
 
 const BASE = 'http://127.0.0.1:17890/api/v1';
 
@@ -24,6 +24,7 @@ const ERROR_TEXT: Record<string, string> = {
   PROFILE_SNAPSHOT_FAILED: '快照捕获失败',
   EXTENSION_SYSTEM_LOCKED: '系统扩展不可修改',
   EXTENSION_NOT_FOUND: '扩展不存在',
+  EXTENSION_CONFIG_INVALID: '扩展配置不合法（仅声明 configFile 的内置扩展可配置；体 ≤64KB；须为 JSON 对象）',
   INVALID_REQUEST: '请求参数不合法',
   UNAUTHORIZED: '远程访问令牌缺失或不正确（Bearer token）',
   REMOTE_ACCESS_TARGET_INVALID: 'SSH 目标不能为空，且不能以 - 开头或包含空白字符',
@@ -109,4 +110,11 @@ export const api = {
   updateExtension: (id: string, enabled: boolean) =>
     request(`/extensions/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
   deleteExtension: (id: string) => request(`/extensions/${id}`, { method: 'DELETE' }),
+  getExtensionConfig: (id: string, envId?: string) =>
+    request<ExtensionConfigView>(`/extensions/${id}/config${envId ? `?environmentId=${envId}` : ''}`),
+  setExtensionConfig: (id: string, config: unknown, envId?: string) =>
+    request(`/extensions/${id}/config${envId ? `?environmentId=${envId}` : ''}`, {
+      method: 'PUT',
+      body: JSON.stringify(config),
+    }),
 };

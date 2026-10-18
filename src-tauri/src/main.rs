@@ -27,6 +27,7 @@ use application::tunnel::TunnelService;
 use error::AppError;
 use infrastructure::db::client::DbPool;
 use infrastructure::db::repositories::environment_repository::EnvironmentRepository;
+use infrastructure::db::repositories::extension_config_repository::ExtensionConfigRepository;
 use infrastructure::db::repositories::extension_repository::ExtensionRepository;
 use infrastructure::db::repositories::instance_repository::InstanceRepository;
 use infrastructure::db::repositories::login_profile_repository::LoginProfileRepository;
@@ -148,6 +149,8 @@ fn main() {
             ));
             let extension_service = Arc::new(ExtensionService::new(
                 Arc::new(ExtensionRepository::new(service_pool.clone())),
+                env_repo.clone(),
+                Arc::new(ExtensionConfigRepository::new(service_pool.clone())),
                 settings_service.clone(),
                 paths.root.clone(),
                 handle
@@ -181,6 +184,7 @@ fn main() {
                 ins_repo.clone(),
                 reconciler.clone(),
                 profile_service.clone(),
+                Arc::new(ExtensionConfigRepository::new(service_pool.clone())),
                 activity.clone(),
                 keep_alive.clone(),
                 paths.clone(),
@@ -196,6 +200,7 @@ fn main() {
                 activity.clone(),
                 keep_alive.clone(),
                 extension_service.clone(),
+                Arc::new(ExtensionConfigRepository::new(service_pool.clone())),
                 settings_service.clone(),
                 paths.clone(),
                 handle.clone(),

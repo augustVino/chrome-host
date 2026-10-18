@@ -151,6 +151,8 @@ pub struct Extension {
     pub source_path: String,
     pub enabled: bool,
     pub status: ExtensionStatus,
+    /// 仅声明 configFile 的内置物化扩展为 true（如 net-rules；其余不可经 config API 写入）
+    pub configurable: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }

@@ -53,6 +53,9 @@ pub struct Extension {
     pub source_path: String,
     pub enabled: bool,
     pub status: ExtensionStatus,
+    /// 是否可通过 config API 写入运行时配置（system + materialize + 声明 configFile；
+    /// 读取时由服务层按目录元数据惰性计算，不落库）
+    pub configurable: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }

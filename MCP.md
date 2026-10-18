@@ -8,7 +8,7 @@
 
 - [连接配置](#连接配置)
 - [通用行为约定](#通用行为约定)
-- [工具总览（25 个）](#工具总览25-个)
+- [工具总览（28 个）](#工具总览28-个)
 - [内核](#内核)
 - [环境](#环境)
 - [实例](#实例)
@@ -65,7 +65,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 4. **内核未装时 `create_instance` 会阻塞于首次下载**（约 150MB）——复杂任务先调 `kernel_status` 预判。
 5. 扩展启停只影响**之后启动的实例**；实例创建非幂等（每次新增一个）。
 
-## 工具总览（25 个）
+## 工具总览（28 个）
 
 | 分组 | 工具 |
 |---|---|
@@ -73,8 +73,8 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | 环境（6） | `list_environments` · `create_environment` · `delete_environment` · `set_keep_alive` · `stop_all_for_environment` · `activity` |
 | 实例（9） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
-| 登录态（1） | `login_profile`（action: get / launch / capture / reset） |
-| 扩展（5） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` |
+| 登录态（2） | `login_profile`（action: get / launch / capture / reset） · `session_status` |
+| 扩展（7） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` · `get_extension_config` · `set_extension_config` |
 
 ## 内核
 
@@ -135,6 +135,11 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 
 典型闭环：`launch` →（人工/自动化登录）→ 关闭浏览器 → `capture` → `create_instance` 即带登录态。
 
+### `session_status`
+
+输入：`environmentId`。查环境会话身份层：当前策略（off / first-login / always）、当前代、
+来源实例、Cookie 数、历史代列表（回滚观测面）。
+
 ## 扩展
 
 | 工具 | 输入 | 说明 |
@@ -144,6 +149,8 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | `register_extension` | `path`（**绝对路径**，须含合法 manifest.json） | 注册用户扩展；安全边界：只接受显式注册，无按任意路径加载 |
 | `set_extension_enabled` | `extensionId`, `enabled: bool` | 启停（system → 403 EXTENSION_SYSTEM_LOCKED；只影响之后启动的实例） |
 | `delete_extension` | `extensionId` | 移除注册项（不删源文件；system → 403） |
+| `get_extension_config` | `extensionId`；可选 `environmentId` | 读运行时配置（未配置 → `config: null`；省略 `environmentId` = 全局默认） |
+| `set_extension_config` | `extensionId`, `config`（JSON 对象）；可选 `environmentId` | 写运行时配置（整体覆盖，对新启动实例生效）。仅 `configurable: true` 的 system 扩展（如 net-rules）；形状：`{"block":["*.google-analytics.com"],"redirect":[{"from":"https://api.foo.com/*","to":"http://localhost:3000/$1"}],"headers":[{"url":"...","set":{"X-Debug-Uid":"42"}}]}`；非法 → 400 `EXTENSION_CONFIG_INVALID` |
 
 ## 典型编排闭环
 

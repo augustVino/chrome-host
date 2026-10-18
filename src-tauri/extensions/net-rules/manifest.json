@@ -1,0 +1,9 @@
+{
+  "name": "Net Rules",
+  "version": "1.0",
+  "manifest_version": 3,
+  "description": "按环境注入的网络规则（block/redirect/headers），浏览器层生效",
+  "permissions": ["declarativeNetRequest", "declarativeNetRequestWithHostAccess"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" }
+}

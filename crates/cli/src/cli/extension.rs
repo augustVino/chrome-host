@@ -60,6 +60,39 @@ pub enum ExtensionCommands {
         #[arg(long)]
         yes: bool,
     },
+
+    /// 读写扩展运行时配置（仅 net-rules 等声明 configFile 的内置扩展；对新启动实例生效）
+    #[command(about = "读写扩展运行时配置（省略 --env 读写全局默认；对新启动实例生效）")]
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCommands,
+    },
+}
+
+/// `extension config` 子命令树。
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommands {
+    /// 读取扩展运行时配置
+    #[command(about = "读取扩展运行时配置（未配置 → config: null）")]
+    Get {
+        /// 扩展 id
+        id: String,
+        /// 环境 id（省略 = 全局默认配置；被 per-env 配置覆盖）
+        #[arg(long = "env")]
+        env: Option<String>,
+    },
+
+    /// 写入扩展运行时配置（JSON 对象，整体覆盖）
+    #[command(about = "写入扩展运行时配置（JSON 对象，整体覆盖）")]
+    Set {
+        /// 扩展 id
+        id: String,
+        /// 配置 JSON 对象，如 '{"block":["*.google-analytics.com"]}'
+        json: String,
+        /// 环境 id（省略 = 全局默认配置；被 per-env 配置覆盖）
+        #[arg(long = "env")]
+        env: Option<String>,
+    },
 }
 
 /// extension 组分发入口（main.rs dispatch 的唯一调用点）。
@@ -75,7 +108,84 @@ pub fn run(
         ExtensionCommands::Enable { id } => set_enabled(globals, client, id, true),
         ExtensionCommands::Disable { id } => set_enabled(globals, client, id, false),
         ExtensionCommands::Remove { id, yes } => remove(globals, client, id, *yes),
+        ExtensionCommands::Config { cmd } => config(globals, client, cmd),
     }
+}
+
+/// `extension config get/set` 分发。
+fn config(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    cmd: &ConfigCommands,
+) -> Result<(), CliError> {
+    match cmd {
+        ConfigCommands::Get { id, env } => config_get(globals, client, id, env.as_deref()),
+        ConfigCommands::Set { id, json, env } => {
+            config_set(globals, client, id, json, env.as_deref())
+        }
+    }
+}
+
+/// `chrome-host extension config get <id> [--env <ENV_ID>]`。
+/// table 模式：environmentId + config（pretty JSON）两行 kv；json 模式：完整响应；
+/// quiet：紧凑 config 单行（未配置 → null）供脚本捕获。
+fn config_get(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    env: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.extension_config_get(id, env)?;
+    let config = resp.get("config").cloned().unwrap_or(serde_json::Value::Null);
+    if out.quiet {
+        out.print_id(&config.to_string());
+        return Ok(());
+    }
+    let scope = env.unwrap_or("<global>");
+    out.render_kv(
+        &[
+            ("environmentId".into(), scope.to_string()),
+            (
+                "config".into(),
+                serde_json::to_string_pretty(&config).unwrap_or_else(|_| config.to_string()),
+            ),
+        ],
+        resp,
+    );
+    Ok(())
+}
+
+/// `chrome-host extension config set <id> <json> [--env <ENV_ID>]`。
+/// JSON 解析本地前置（同 add 的目录校验决策：最高频输入错误不浪费网络往返）；
+/// 语义校验（可配置性/大小/可编译）由服务端把关 → 400 EXTENSION_CONFIG_INVALID。
+fn config_set(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    json: &str,
+    env: Option<&str>,
+) -> Result<(), CliError> {
+    let config: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| CliError::Local(format!("配置不是合法 JSON: {e}")))?;
+    if !config.is_object() {
+        return Err(CliError::Local("配置必须是 JSON 对象（如 \"{}\" ）".to_string()));
+    }
+    client.extension_config_set(id, env, &config)?;
+    let out = OutputCtx::from(globals);
+    if out.quiet {
+        out.print_id(id);
+        return Ok(());
+    }
+    let scope = env.unwrap_or("<global>");
+    out.render_kv(
+        &[
+            ("environmentId".into(), scope.to_string()),
+            ("status".into(), "updated".into()),
+        ],
+        serde_json::json!({ "ok": true, "environmentId": env, "extensionId": id }),
+    );
+    Ok(())
 }
 
 /// `chrome-host extension list`。table 列集冻结：NAME VERSION TYPE STATUS。
@@ -276,6 +386,7 @@ mod tests {
             source_path: "/tmp/ext".into(),
             enabled: true,
             status,
+            configurable: false,
             created_at: 1,
             updated_at: 2,
         }

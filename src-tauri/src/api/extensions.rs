@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
@@ -61,5 +61,36 @@ pub async fn delete(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.extension_service.delete(&id)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct ConfigQuery {
+    /// 省略 = 全局默认配置（被 per-env 配置覆盖）
+    #[serde(rename = "environmentId")]
+    pub environment_id: Option<String>,
+}
+
+/// GET /api/v1/extensions/:id/config?environmentId=
+/// 返回 `{environmentId, config}`；未配置 → config 为 null
+pub async fn get_config(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<ConfigQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let view = state.extension_service.get_config(&id, q.environment_id.as_deref())?;
+    Ok(Json(view))
+}
+
+/// PUT /api/v1/extensions/:id/config?environmentId=：body 即配置 JSON 对象（整体覆盖）。
+/// 仅声明 configFile 的 system 物化扩展可配置（否则 400 EXTENSION_CONFIG_INVALID）；
+/// 体 ≤64KB；net-rules 写入时同步做 DNR 可编译校验。对新启动实例生效。
+pub async fn put_config(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<ConfigQuery>,
+    body: String,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state.extension_service.set_config(&id, q.environment_id.as_deref(), &body)?;
     Ok(Json(json!({ "ok": true })))
 }

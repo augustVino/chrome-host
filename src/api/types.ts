@@ -142,6 +142,14 @@ export interface Extension {
   sourcePath: string;
   enabled: boolean;
   status: 'ready' | 'missing' | 'invalid';
+  /** 仅声明 configFile 的内置物化扩展为 true（如 net-rules），可经 config API 写入 */
+  configurable: boolean;
   createdAt: number;
   updatedAt: number;
+}
+
+/** GET /extensions/:id/config 响应（未配置 → config: null） */
+export interface ExtensionConfigView {
+  environmentId: string | null;
+  config: unknown;
 }

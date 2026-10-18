@@ -145,6 +145,10 @@ fn routes(state: ApiState) -> Router {
                 .delete(crate::api::extensions::delete),
         )
         .route(
+            "/api/v1/extensions/{id}/config",
+            get(crate::api::extensions::get_config).put(crate::api::extensions::put_config),
+        )
+        .route(
             "/api/v1/environments/{id}/activity",
             get(crate::api::environments::activity),
         )

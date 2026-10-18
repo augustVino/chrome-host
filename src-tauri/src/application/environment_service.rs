@@ -8,6 +8,7 @@ use crate::domain::environment::{CreateEnvironmentInput, Environment, UpdateEnvi
 use crate::domain::hosts;
 use crate::error::AppError;
 use crate::infrastructure::db::repositories::environment_repository::EnvironmentRepository;
+use crate::infrastructure::db::repositories::extension_config_repository::ExtensionConfigRepository;
 use crate::infrastructure::db::repositories::instance_repository::InstanceRepository;
 
 use super::activity::Activity;
@@ -30,6 +31,8 @@ pub struct EnvironmentService {
     instances: Arc<InstanceRepository>,
     reconciler: Arc<Reconciler>,
     profiles: Arc<ProfileService>,
+    /// 环境删除时级联清理 extension_configs 的 per-env 行
+    extension_configs: Arc<ExtensionConfigRepository>,
     activity: Arc<Activity>,
     keep_alive: Arc<KeepAliveWatcher>,
     paths: crate::infrastructure::paths::AppPaths,
@@ -41,11 +44,12 @@ impl EnvironmentService {
         instances: Arc<InstanceRepository>,
         reconciler: Arc<Reconciler>,
         profiles: Arc<ProfileService>,
+        extension_configs: Arc<ExtensionConfigRepository>,
         activity: Arc<Activity>,
         keep_alive: Arc<KeepAliveWatcher>,
         paths: crate::infrastructure::paths::AppPaths,
     ) -> Self {
-        EnvironmentService { envs, instances, reconciler, profiles, activity, keep_alive, paths }
+        EnvironmentService { envs, instances, reconciler, profiles, extension_configs, activity, keep_alive, paths }
     }
 
     pub fn create(&self, input: CreateEnvironmentInput) -> Result<Environment, AppError> {
@@ -195,6 +199,8 @@ impl EnvironmentService {
         self.instances.delete_by_env(id)?;
         // 级联清理登录 profile（浏览器运行中 → 409；否则清目录 + 删行）
         self.profiles.delete_for_env(id)?;
+        // 级联清理扩展 per-env 配置行（全局默认行不受影响）
+        self.extension_configs.delete_for_env(id)?;
 
         self.envs.delete(id)?;
         // 环境根目录收尾清理（best-effort）：实例/母本子目录已清，残留的只有
