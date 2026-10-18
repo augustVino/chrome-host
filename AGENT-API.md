@@ -301,7 +301,8 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `INSTANCE_ALREADY_RUNNING` | 重复 start；删除运行中实例 |
 | 409 | `INSTANCE_NOT_RUNNING` | 对停止实例 open/stop/焦点操作 |
 | 409 | `PROFILE_IN_USE` | 登录浏览器未关闭即 capture |
-| 409 | `CDP_PORT_UNAVAILABLE` | 实例 CDP 端口被外部进程占用 |
+| 409 | `CDP_PORT_UNAVAILABLE` | 实例 start 时 CDP 端口被外部进程占用 |
+| 500 | `CDP_PORT_UNAVAILABLE` | 创建实例时端口窗口耗尽（9222–9421 全部不可用） |
 | 500 | `KERNEL_NOT_READY` | 内核未就绪（未安装/下载中） |
 | 500 | `INSTANCE_START_FAILED` / `CDP_CONNECTION_FAILED` / `HOSTS_FETCH_FAILED` | 启动/CDP/hosts 拉取失败 |
 | 500 | `INTERNAL_ERROR` | 未分类（附 message） |

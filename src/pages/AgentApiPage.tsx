@@ -101,7 +101,7 @@ export default function AgentApiPage() {
         <div className="min-w-0">
           <h2 className="text-xs font-semibold text-ink">MCP（AI 客户端接入）</h2>
           <p className="mt-1 text-[11px] leading-5 text-ink-2">
-            内嵌 MCP over Streamable HTTP，随应用启动。24 个 tools 覆盖环境/实例/标签页/CDP/登录态/扩展管理，业务错误结构化透传。
+            内嵌 MCP over Streamable HTTP，随应用启动。25 个 tools 覆盖环境/实例/标签页/CDP/登录态/扩展管理，业务错误结构化透传。
           </p>
           <p className="mt-1.5 truncate font-mono text-[10px] text-ink-3">
             claude mcp add --transport http chrome-host http://127.0.0.1:17890/mcp

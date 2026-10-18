@@ -36,7 +36,7 @@ interface AppStore {
   fetchSettings: () => Promise<void>;
   extensions: Extension[];
   fetchExtensions: () => Promise<void>;
-  updateSettings: (patch: { developerMode?: boolean; envLabelPosition?: string; envLabelColor?: string; defaultStartUrl?: string }) => Promise<void>;
+  updateSettings: (patch: { developerMode?: boolean; envLabelPosition?: string; envLabelColor?: string; defaultStartUrl?: string; remoteAccessEnabled?: boolean; remoteAccessSshTarget?: string }) => Promise<void>;
   fetchKernel: () => Promise<void>;
   initEvents: () => Promise<() => void>;
 }

@@ -83,7 +83,7 @@ chrome-host env delete <env_id> --yes
 | `--quiet` | 安静模式：变更类命令仅输出主实体 id（每行一个），供 `$(...)` 捕获 |
 | `--verbose` | 向 stderr 追加请求诊断行（`→ GET /api/v1/... (23ms)`）。不含 query 与 body，不落任何敏感数据 |
 | `--no-color` | 禁用 ANSI 颜色。当前版本本就不输出颜色（纯文本 + 表格），管道/重定向下天然无转义符 |
-| `--yes` | 跳过危险操作确认。**delete 类命令专属参数**；非 TTY 环境（CI/脚本）执行 delete 时缺失则 exit 2，绝不静默执行 |
+| `--yes` | 跳过危险操作确认。适用范围：`env/instance/extension delete(remove)`、`login-profile capture/reset`（覆盖已有快照/不可逆）、`runtime install --cancel` 等危险或覆盖性操作；非 TTY 环境（CI/脚本）执行此类操作时缺失则 exit 2，绝不静默执行。子命令级 `--yes` 与全局 `--yes` 等效，任一放行即跳过确认流 |
 | `--api-url <URL>` | Agent API 基地址（隐藏参数）；环境变量 `CHROME_HOST_API_URL` 是其回退，优先级低于 flag |
 | `--token <TOKEN>` | 远程访问令牌（隐藏参数）：经 SSH 隧道接入（目标机 127.0.0.1:17890 → 本机 17891 鉴权监听器）时必需；环境变量 `CHROME_HOST_TOKEN` 是其回退。本地直连无需 |
 
@@ -233,7 +233,7 @@ chrome-host extension disable <ext_id>     # 只影响之后启动的实例
 
 | 命令 | 说明 |
 |---|---|
-| `settings get` | 查看全局设置（developerMode / envLabelPosition / envLabelColor / defaultStartUrl） |
+| `settings get` | 查看全局设置（developerMode / envLabelPosition / envLabelColor / defaultStartUrl / remoteAccessEnabled / remoteAccessSshTarget / remoteAccessToken） |
 | `settings update [--developer-mode <BOOL>] [--env-label-position <POSITION>] [--env-label-color <COLOR>] [--start-url <URL>]` | 部分更新：只更新传入的 flag（至少传一个） |
 
 ### runtime — 内核管理
