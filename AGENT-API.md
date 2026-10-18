@@ -169,6 +169,7 @@
 | 端点 | 说明 |
 |---|---|
 | `GET /api/v1/instances/{id}/cdp` | CDP 端点。CDP 仅绑定 `127.0.0.1` |
+| `GET /api/v1/instances/{id}/diagnostics` | 页面诊断快照（透传）：对第一个 http(s) 页面短连接求值 page-diagnostics 扩展挂载的 `window.__chromeHostDiagnostics`。未运行或无 http 页 → `409 DIAGNOSTICS_UNAVAILABLE` |
 | `GET /api/v1/instances/{id}/tabs` | 页面标签列表（仅 `type: "page"`） |
 | `POST /api/v1/instances/{id}/tabs` | 新开标签页并导航。请求体 `{ "url": "https://…" }`（须含协议） |
 | `POST /api/v1/instances/{id}/navigate` | 导航既有标签页。请求体 `{ "tabId": "...", "url": "..." }`（new+close 组合近似，旧页历史丢失） |
@@ -181,7 +182,19 @@
 
 // 标签页对象
 { "id": "ABC123", "type": "page", "title": "Example Domain", "url": "https://example.com" }
+
+// GET .../diagnostics 响应（diagnostics 为页面扩展快照透传；未注入时为 null）
+{ "instanceId": "ins_...", "targetId": "ABC123", "targetUrl": "https://app.example.com/home",
+  "diagnostics": {
+    "startedAt": 1710000000000, "url": "https://app.example.com/home",
+    "errors": [ { "ts": 1710000001000, "type": "error", "message": "boom", "source": "https://.../app.js", "line": 42 } ],
+    "resources": [ { "ts": 1710000001200, "url": "https://api.example.com/x", "status": 500, "transferSize": 0, "initiatorType": "fetch", "durationMs": 12 } ],
+    "lcp": 731, "fcp": 120 } }
 ```
+
+diagnostics 采集规则：JS 错误（`error`/`unhandledrejection`）与失败资源（HTTP 状态 ≥400，或
+`transferSize == 0`——磁盘缓存命中/被阻断的启发式信号，可能含少量噪声）各环形保留 100 条；
+错误页/about:blank 等不运行 content script 的页面读不到快照。
 
 拿到 `webSocketUrl` 后可直接接入 Playwright（`connectOverCDP`）/ Puppeteer / chrome-remote-interface。
 
@@ -316,6 +329,7 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `ENVIRONMENT_HAS_RUNNING_INSTANCES` | 删环境前须 stop-all |
 | 409 | `INSTANCE_ALREADY_RUNNING` | 重复 start；删除运行中实例 |
 | 409 | `INSTANCE_NOT_RUNNING` | 对停止实例 open/stop/焦点操作 |
+| 409 | `DIAGNOSTICS_UNAVAILABLE` | 页面诊断查询：实例未运行，或实例内无 http(s) 页面目标 |
 | 409 | `PROFILE_IN_USE` | 登录浏览器未关闭即 capture |
 | 409 | `CDP_PORT_UNAVAILABLE` | 实例 start 时 CDP 端口被外部进程占用 |
 | 500 | `CDP_PORT_UNAVAILABLE` | 创建实例时端口窗口耗尽（9222–9421 全部不可用） |

@@ -128,6 +128,16 @@ pub async fn cdp(
     Ok(Json(json!(endpoint)))
 }
 
+/// GET /api/v1/instances/{id}/diagnostics：页面诊断快照透传
+/// （实例未运行/无 http 页 → 409 DIAGNOSTICS_UNAVAILABLE）
+pub async fn diagnostics(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let view = state.instance_service.diagnostics(&id).await?;
+    Ok(Json(view))
+}
+
 /// GET /api/v1/instances/{id}/tabs
 pub async fn tabs(
     State(state): State<ApiState>,

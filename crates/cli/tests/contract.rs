@@ -379,6 +379,34 @@ fn fixture_router() -> Router {
             "/api/v1/instances/ins_x/status",
             get(|| async { Json(canned_instance_status()) }),
         )
+        // 页面诊断快照（透传自由形状 JSON）+ 409 不可用路径
+        .route(
+            "/api/v1/instances/ins_x/diagnostics",
+            get(|| async {
+                Json(json!({
+                    "instanceId": "ins_x",
+                    "targetId": "t1",
+                    "targetUrl": "https://app.example.com/home",
+                    "diagnostics": {
+                        "startedAt": 1,
+                        "url": "https://app.example.com/home",
+                        "errors": [{ "type": "error", "message": "boom" }],
+                        "resources": [],
+                        "lcp": 731,
+                        "fcp": 120
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/err_409_diag/diagnostics",
+            get(|| async {
+                (
+                    StatusCode::CONFLICT,
+                    Json(error_body("DIAGNOSTICS_UNAVAILABLE")),
+                )
+            }),
+        )
         .route(
             "/api/v1/instances/ins_x/tabs",
             get(|| async { Json(json!([canned_target()])) }),
@@ -665,6 +693,28 @@ fn extension_config_endpoints_roundtrip_and_error() {
         7,
         "400 未特判码 EXTENSION_CONFIG_INVALID → VALIDATION 兜底 exit 7"
     );
+}
+
+/// instance diagnostics：透传快照解包 + 409 DIAGNOSTICS_UNAVAILABLE 的
+/// code/exit 映射（409 泛化 → RUNTIME exit 5，无特判码）
+#[test]
+fn instance_diagnostics_passthrough_and_unavailable() {
+    let client = test_client();
+
+    let resp = client.instance_diagnostics("ins_x").expect("应成功");
+    assert_eq!(resp["targetUrl"], "https://app.example.com/home");
+    assert_eq!(resp["diagnostics"]["errors"][0]["message"], "boom");
+    assert_eq!(resp["diagnostics"]["lcp"], 731);
+
+    let err = client.instance_diagnostics("err_409_diag").unwrap_err();
+    match &err {
+        CliError::Api { status, code, .. } => {
+            assert_eq!(*status, 409);
+            assert_eq!(code, "DIAGNOSTICS_UNAVAILABLE");
+        }
+        other => panic!("应为 Api 变体: {other:?}"),
+    }
+    assert_eq!(exit::from_cli_error(&err).as_u8(), 5, "409 → RUNTIME exit 5");
 }
 
 /// runtime + health：CftStatus / HealthReport（checks + counts）

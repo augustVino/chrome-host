@@ -182,6 +182,7 @@ chrome-host env delete <id> --yes
 | `instance list [--env <ENV_ID>]` | 实例列表。缺省全量（含 `environmentName` 列，需 v0.1.5+ 应用）；`--env` 只看指定环境 |
 | `instance get <ID>` | 实例详情（status/pid/cdpPort/browserVersion/profileDir） |
 | `instance status <ID>` | 轻量轮询视图（id/status/pid/cdpPort/browserVersion）；全量详情（含 profileDir）用 `get` |
+| `instance diagnostics <ID>` | 页面诊断快照摘要（targetUrl / errors / badResources / lcp / fcp；`--json` 完整透传）。未运行或无 http 页 → 409 exit 5 |
 | `instance create <ENV_ID>` | 创建并启动。读操作族用 30s 超时，本命令**无总超时**（容忍内核下载） |
 | `instance start <ID>` / `instance stop <ID>` | 启动已停止实例 / 优雅停止。`start`/`restart` 同样无总超时 |
 | `instance restart <ID>` | 停止再启动（hosts 重新拉取最新） |

@@ -122,6 +122,10 @@ fn routes(state: ApiState) -> Router {
         .route("/api/v1/instances/{id}/focus", post(crate::api::instances::focus))
         .route("/api/v1/instances/{id}/cdp", get(crate::api::instances::cdp))
         .route(
+            "/api/v1/instances/{id}/diagnostics",
+            get(crate::api::instances::diagnostics),
+        )
+        .route(
             "/api/v1/instances/{id}/tabs",
             get(crate::api::instances::tabs).post(crate::api::instances::open_tab),
         )

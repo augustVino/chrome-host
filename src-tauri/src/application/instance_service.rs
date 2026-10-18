@@ -428,6 +428,53 @@ impl InstanceService {
         self.start(id).await
     }
 
+    /// 页面诊断查询（M5）：对第一个 http(s) page target 做一次短连接 evaluate，
+    /// 透传页面扩展挂载的 __chromeHostDiagnostics 快照。连接即用即弃（M1 形态，
+    /// 常驻 console/network 订阅是 M6 范围）。
+    /// 409 DIAGNOSTICS_UNAVAILABLE：实例未运行，或无 http(s) 页面目标；
+    /// diagnostics: null = 页面未注入（实例启动早于扩展加载，或目标页不运行
+    /// content script）。
+    pub async fn diagnostics(&self, id: &str) -> Result<serde_json::Value, AppError> {
+        let ins = self.reconciler.reconciled(id).await?;
+        if ins.status != InstanceStatus::Running {
+            return Err(AppError::conflict(
+                "DIAGNOSTICS_UNAVAILABLE",
+                format!("实例 {id} 未在运行，页面诊断仅对运行中实例可用"),
+            ));
+        }
+        let port = ins.cdp_port.ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
+        let targets = cdp::client::list_targets(port).await?;
+        let target = pick_diagnostic_target(&targets).ok_or_else(|| {
+            AppError::conflict(
+                "DIAGNOSTICS_UNAVAILABLE",
+                "无可诊断的页面目标（需先在实例内打开 http(s) 页面）",
+            )
+        })?;
+        // 页面级 WS 端点为 ws://.../devtools/page/<targetId>（Chrome 稳定约定，
+        // 与 /json 返回的 webSocketDebuggerUrl 同构），免扩 Target 结构
+        let ws_url = format!("ws://127.0.0.1:{port}/devtools/page/{}", target.id);
+        let mut conn = CdpConnection::connect_ws(&ws_url, Duration::from_secs(5)).await?;
+        let resp: serde_json::Value = conn
+            .send(
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": "__chromeHostDiagnostics",
+                    "returnByValue": true
+                }),
+                None,
+            )
+            .await?;
+        // result.value 缺席 = undefined（扩展未注入）；exceptionDetails 不可能
+        // 出现（纯变量读取），出现连接级错误已在 send 内归为 CDP_COMMAND_FAILED
+        let diagnostics = resp.get("result").and_then(|r| r.get("value")).cloned();
+        Ok(serde_json::json!({
+            "instanceId": ins.id,
+            "targetId": target.id,
+            "targetUrl": target.url,
+            "diagnostics": diagnostics,
+        }))
+    }
+
     /// 身份层注入：把环境保险库 Cookie 灌入刚就绪的实例（browser 级，无需 page）。
     /// 分批防单帧超限；CookieRecord 与 Storage.setCookies 入参同构，
     /// session cookie 的 expires=-1 原样回传（这正是文件层拿不到的部分）。
@@ -647,6 +694,15 @@ impl InstanceService {
     }
 }
 
+/// 诊断目标选择：第一个 http(s) page。过滤 chrome-extension:// 内部页（dev 环境
+/// 代理扩展常驻 options 页，会抢占「第一个 page」）与 about:blank（content script
+/// 不注入，读到的只有 undefined）——单页操作场景下首个 http 页即 agent 所在页面。
+fn pick_diagnostic_target(targets: &[cdp::client::Target]) -> Option<&cdp::client::Target> {
+    targets.iter().find(|t| {
+        t.target_type == "page" && (t.url.starts_with("http://") || t.url.starts_with("https://"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,5 +815,29 @@ mod tests {
             "Instance 字段平铺且 camelCase"
         );
         assert!(json.get("instance").is_none(), "不得出现嵌套 instance 键");
+    }
+
+    /// 诊断目标选择：扩展内部页与空白页让位，首个 http(s) 页胜出；
+    /// 全非 http → None（调用方转 409 DIAGNOSTICS_UNAVAILABLE）
+    #[test]
+    fn pick_diagnostic_target_prefers_first_http_page() {
+        let mk = |ty: &str, url: &str| cdp::client::Target {
+            id: format!("t_{url}"),
+            target_type: ty.into(),
+            title: String::new(),
+            url: url.into(),
+        };
+        let targets = vec![
+            mk("page", "chrome-extension://abc/options.html"), // dev 环境代理扩展页
+            mk("page", "about:blank"),
+            mk("service_worker", "https://sw.example.com/sw.js"), // 非 page 类型不让位
+            mk("page", "https://app.example.com/home"),
+            mk("page", "http://other.example.com/late"),
+        ];
+        let picked = pick_diagnostic_target(&targets).unwrap();
+        assert_eq!(picked.url, "https://app.example.com/home", "首个 http 页");
+
+        assert!(pick_diagnostic_target(&[mk("page", "about:blank")]).is_none());
+        assert!(pick_diagnostic_target(&[]).is_none(), "空列表 → None");
     }
 }

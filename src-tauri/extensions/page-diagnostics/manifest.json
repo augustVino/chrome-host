@@ -1,0 +1,14 @@
+{
+  "name": "Page Diagnostics",
+  "version": "1.0",
+  "manifest_version": 3,
+  "description": "页面级诊断采集（JS 错误 / 失败资源 / LCP / FCP），供 chrome-host 查询端点按值透传",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ]
+}

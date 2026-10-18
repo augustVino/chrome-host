@@ -43,6 +43,13 @@ pub enum InstanceCommands {
         id: String,
     },
 
+    /// 页面诊断快照（JS 错误/失败资源/LCP/FCP；仅运行中实例）
+    #[command(about = "页面诊断快照：JS 错误/失败资源/LCP/FCP（仅运行中实例，409 = 未运行或无 http 页面）")]
+    Diagnostics {
+        /// 实例 id
+        id: String,
+    },
+
     /// 创建实例（创建即启动；首次运行可能阻塞于内核下载）
     #[command(about = "创建实例（创建即启动；首次运行可能阻塞于内核下载）")]
     Create {
@@ -140,6 +147,7 @@ pub fn run(
         InstanceCommands::List { env } => list(globals, client, env.as_deref()),
         InstanceCommands::Get { id } => get(globals, client, id),
         InstanceCommands::Status { id } => status(globals, client, id),
+        InstanceCommands::Diagnostics { id } => diagnostics(globals, client, id),
         InstanceCommands::Create { env_id } => create(globals, client, env_id),
         InstanceCommands::Start { id } => start(globals, client, id),
         InstanceCommands::Stop { id } => stop(globals, client, id),
@@ -271,6 +279,88 @@ fn status(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), Cl
         serde_json::to_value(&view).expect("纯数据 DTO 的序列化不会失败"),
     );
     Ok(())
+}
+
+/// `chrome-host instance diagnostics <ID>`：页面诊断快照。
+/// 响应是服务端透传的自由形状 JSON（页面扩展挂载的快照），不建 DTO ——
+/// 诊断面随扩展演进，CLI 只做摘要提取 + 原样透传（json 模式完整保留）。
+/// quiet：输出 targetUrl（供脚本捕获定位被诊断页面）。
+fn diagnostics(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.instance_diagnostics(id)?;
+    if out.quiet {
+        out.print_id(
+            resp.get("targetUrl").and_then(|v| v.as_str()).unwrap_or(""),
+        );
+        return Ok(());
+    }
+    out.render_kv(&diagnostics_kv_pairs(&resp), resp);
+    Ok(())
+}
+
+/// 诊断摘要 kv：目标页 + 两类计数 + 性能指标；diagnostics 为 null 时明示未注入
+/// （旧实例/非 content script 页），而不是把空对象渲染成误导性的 0）。
+fn diagnostics_kv_pairs(resp: &serde_json::Value) -> Vec<(String, String)> {
+    let mut pairs = vec![(
+        "targetUrl".into(),
+        resp.get("targetUrl").and_then(|v| v.as_str()).unwrap_or("-").to_string(),
+    )];
+    match resp.get("diagnostics") {
+        Some(d) if d.is_object() => {
+            let count = |key: &str| {
+                d.get(key).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0).to_string()
+            };
+            let ms = |key: &str| {
+                d.get(key)
+                    .and_then(|v| v.as_i64())
+                    .map(|v| format!("{v}ms"))
+                    .unwrap_or_else(|| "-".into())
+            };
+            pairs.push(("errors".into(), count("errors")));
+            pairs.push(("badResources".into(), count("resources")));
+            pairs.push(("lcp".into(), ms("lcp")));
+            pairs.push(("fcp".into(), ms("fcp")));
+        }
+        _ => pairs.push(("diagnostics".into(), "null（页面未注入：实例早于扩展启动，或目标页不运行 content script）".into())),
+    }
+    pairs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 摘要提取：对象快照 → 计数/指标；null/缺失 → 明示未注入而非伪 0
+    #[test]
+    fn diagnostics_kv_summarizes_object_and_flags_null() {
+        let resp = json!({
+            "instanceId": "ins_1",
+            "targetId": "t1",
+            "targetUrl": "https://app.example.com/home",
+            "diagnostics": {
+                "startedAt": 1,
+                "url": "https://app.example.com/home",
+                "errors": [{ "type": "error", "message": "a" }, { "type": "unhandledrejection", "message": "b" }],
+                "resources": [{ "url": "https://x/404", "status": 404 }],
+                "lcp": 731,
+                "fcp": 120
+            }
+        });
+        let pairs = diagnostics_kv_pairs(&resp);
+        assert_eq!(pairs[0], ("targetUrl".into(), "https://app.example.com/home".into()));
+        assert!(pairs.iter().any(|(k, v)| k == "errors" && v == "2"), "{pairs:?}");
+        assert!(pairs.iter().any(|(k, v)| k == "badResources" && v == "1"), "{pairs:?}");
+        assert!(pairs.iter().any(|(k, v)| k == "lcp" && v == "731ms"), "{pairs:?}");
+        assert!(pairs.iter().any(|(k, v)| k == "fcp" && v == "120ms"), "{pairs:?}");
+
+        let null_resp = json!({ "targetUrl": "https://a.com", "diagnostics": null });
+        let pairs = diagnostics_kv_pairs(&null_resp);
+        assert!(
+            pairs.iter().any(|(k, v)| k == "diagnostics" && v.contains("未注入")),
+            "null 明示原因: {pairs:?}"
+        );
+    }
 }
 
 /// status 的单对象 kv：键名与 `InstanceStatusView` JSON 字段一致（两模式无信息差）。

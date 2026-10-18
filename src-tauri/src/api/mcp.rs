@@ -382,6 +382,16 @@ impl ChromeHostMcp {
         run(|| self.state.instance_service.navigate(&a.instance_id, &a.tab_id, &a.url)).await
     }
 
+    // ── 页面诊断 ──────────────────────────────────────────────────
+
+    #[tool(description = "读取实例当前页面诊断快照：JS 错误（error/unhandledrejection）与失败资源（status≥400 或 transferSize==0）各环形 100 条 + LCP/FCP。对第一个 http(s) 页面目标短连接求值 page-diagnostics 扩展挂载的 window.__chromeHostDiagnostics；实例未运行或无 http 页面 → 409 DIAGNOSTICS_UNAVAILABLE；diagnostics: null = 页面未注入（实例启动早于扩展加载或目标页不运行 content script）")]
+    async fn get_diagnostics(
+        &self,
+        Parameters(a): Parameters<InstanceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| self.state.instance_service.diagnostics(&a.instance_id)).await
+    }
+
     // ── 登录态 ──────────────────────────────────────────────────────────
 
     #[tool(description = "环境登录态管理。capture 前 login 浏览器须已关闭（运行中 → 409 PROFILE_IN_USE）")]

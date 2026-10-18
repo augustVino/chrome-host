@@ -545,6 +545,17 @@ impl AgentClient {
         ))
     }
 
+    /// GET /api/v1/instances/{id}/diagnostics —— 页面诊断快照（服务端透传的
+    /// 自由形状 JSON：页面扩展挂载的 __chromeHostDiagnostics），不建 DTO。
+    pub fn instance_diagnostics(&self, id: &str) -> Result<serde_json::Value, CliError> {
+        Self::decode(self.send(
+            Method::GET,
+            &format!("/api/v1/instances/{id}/diagnostics"),
+            None,
+            false,
+        ))
+    }
+
     /// GET /api/v1/instances/{id}/tabs —— 当前标签页列表（与 POST 同路径不同 method）。
     pub fn instance_tabs(&self, id: &str) -> Result<Vec<CdpTarget>, CliError> {
         Self::decode(self.send(
