@@ -56,6 +56,9 @@ pub struct Extension {
     /// 是否可通过 config API 写入运行时配置（system + materialize + 声明 configFile；
     /// 读取时由服务层按目录元数据惰性计算，不落库）
     pub configurable: bool,
+    /// 配置语法参考外链（chrome-host.json 的 configDocsUrl，可多条；
+    /// 同为惰性计算，仅 configurable 扩展有值）
+    pub config_docs_url: Option<Vec<String>>,
     pub created_at: i64,
     pub updated_at: i64,
 }

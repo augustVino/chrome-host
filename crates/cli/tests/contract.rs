@@ -128,6 +128,7 @@ fn canned_extension() -> serde_json::Value {
         "enabled": true,
         "status": "ready",
         "configurable": false,
+        "configDocsUrl": null,
         "createdAt": 1,
         "updatedAt": 2
     })

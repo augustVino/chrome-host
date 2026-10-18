@@ -327,6 +327,7 @@ mod tests {
             enabled: true,
             status: ExtensionStatus::Ready,
             configurable: false,
+            config_docs_url: None,
             created_at: 1,
             updated_at: 1,
         }

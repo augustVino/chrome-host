@@ -44,6 +44,9 @@ pub struct ExtensionBundleMeta {
     pub mode: ExtensionLoadMode,
     #[serde(default, rename = "configFile")]
     pub config_file: Option<String>,
+    /// 配置语法参考链接（可多条）；声明后 GUI 配置对话框/CLI 输出展示外链
+    #[serde(default, rename = "configDocsUrl")]
+    pub config_docs_url: Option<Vec<String>>,
 }
 
 /// 读取扩展目录的自描述元数据。文件缺失 = Static；

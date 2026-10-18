@@ -67,6 +67,8 @@
 
 `hostsSourceUrl` 可选（指向返回 **hosts 格式纯文本** 的 http(s) 地址，实例每次启动时拉取注入；非法 URL → `400 HOSTS_SOURCE_INVALID`）。
 
+`sessionCapture`（可选，默认 `first-login`）：身份层回写策略——`off` 不保存；`first-login` 仅首个实例退出时保存；`always` 每个实例退出都保存（详见下方 Session 小节）。
+
 ### `GET /api/v1/environments/{id}` — 详情
 
 返回单个 `Environment`（同上，无摘要字段）。
@@ -84,6 +86,7 @@
 | `hostsSourceUrl` | string = 更新；`null` = 置空（不再注入 hosts） |
 | `icon` / `startupArgs` | 同上置空语义；`startupArgs` 是附加 Chrome 启动参数（高级逃生口） |
 | `keepAlive` | true = 该环境实例意外退出自动重启（60s 窗口 3 次熔断），开关联动运行中实例的监控注册 |
+| `sessionCapture` | 身份层回写策略：`off` / `first-login` / `always` |
 
 ### `DELETE /api/v1/environments/{id}` — 删除
 
@@ -123,8 +126,10 @@
 | `GET /api/v1/login-profiles` | 全部快照列表（含环境名，供列表页） |
 | `GET /api/v1/environments/{id}/login-profile` | 单环境视图（惰性建行，从未配置过也返回） |
 | `POST /api/v1/environments/{id}/login-profile/launch` | 打开登录浏览器（人工登录）。响应含 `cdpPort`，自动化登录可用 |
-| `POST /api/v1/environments/{id}/login-profile/capture` | 捕获快照。**登录浏览器必须已关闭**，运行中 → `409 PROFILE_IN_USE` |
+| `POST /api/v1/environments/{id}/login-profile/capture` | 捕获快照。**登录浏览器必须已关闭**，运行中 → `409 PROFILE_IN_USE`；可选 body `{ "fromInstanceId": "ins_..." }` 从指定**已停止实例**捕获（实例即登录源，推荐路径） |
 | `POST /api/v1/environments/{id}/login-profile/reset` | 清空快照回到 not_configured |
+| `GET /api/v1/environments/{id}/session` | 会话身份层状态：策略（off/first-login/always）/当前代/来源实例/Cookie 数/历史代列表 |
+| `POST /api/v1/environments/{id}/session/restore` | 回滚 Cookie 保险库到历史代：body `{ "generation": <n> }`。不存在 → `404 SESSION_GENERATION_NOT_FOUND`；仅回滚 Cookie 层，文件快照保留当前 |
 
 视图结构：
 
@@ -341,6 +346,8 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `INSTANCE_NOT_RUNNING` | 对停止实例 open/stop/焦点操作 |
 | 409 | `DIAGNOSTICS_UNAVAILABLE` | 诊断查询（快照/console/network/screenshot/har）：实例未运行、常驻连接未就绪，或无 http(s) 页面目标 |
 | 409 | `PROFILE_IN_USE` | 登录浏览器未关闭即 capture |
+| 409 | `SESSION_CAPTURE_FAILED` | 从实例捕获登录态失败（实例目录无导出文件，或导出 Cookie 为空） |
+| 404 | `SESSION_GENERATION_NOT_FOUND` | session/restore 目标历史代不存在 |
 | 409 | `CDP_PORT_UNAVAILABLE` | 实例 start 时 CDP 端口被外部进程占用 |
 | 500 | `CDP_PORT_UNAVAILABLE` | 创建实例时端口窗口耗尽（9222–9421 全部不可用） |
 | 500 | `KERNEL_NOT_READY` | 内核未就绪（未安装/下载中） |

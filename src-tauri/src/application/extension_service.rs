@@ -103,6 +103,7 @@ impl ExtensionService {
                         enabled: true,
                         status: ExtensionStatus::Ready,
                         configurable: false,
+                        config_docs_url: None,
                         created_at: now,
                         updated_at: now,
                     })?;
@@ -147,6 +148,7 @@ impl ExtensionService {
             enabled: true,
             status: ExtensionStatus::Ready,
             configurable: false,
+            config_docs_url: None,
             created_at: now,
             updated_at: now,
         };
@@ -404,7 +406,7 @@ impl ExtensionService {
     }
 
     /// 状态惰性刷新：目录没了 → missing；manifest 坏了 → invalid；否则保持 ready；
-    /// configurable 同步按目录元数据重算
+    /// configurable/configDocsUrl 同步按目录元数据重算（仅 system 扩展有资格）
     fn with_fresh_status(&self, mut ext: Extension) -> Extension {
         let dir = PathBuf::from(&ext.source_path);
         ext.status = if !dir.is_dir() {
@@ -414,7 +416,16 @@ impl ExtensionService {
         } else {
             ExtensionStatus::Ready
         };
-        ext.configurable = self.is_configurable(&ext);
+        let meta_ok = ext.extension_type == ExtensionType::System
+            && extension::read_bundle_meta(&dir)
+                .map(|m| m.mode == extension::ExtensionLoadMode::Materialize && m.config_file.is_some())
+                .unwrap_or(false);
+        ext.configurable = meta_ok;
+        ext.config_docs_url = if meta_ok {
+            extension::read_bundle_meta(&dir).ok().and_then(|m| m.config_docs_url)
+        } else {
+            None
+        };
         ext
     }
 }
@@ -463,7 +474,7 @@ mod tests {
         std::fs::write(net_rules_dir.join("background.js"), "// applies cfg.rules").unwrap();
         std::fs::write(
             net_rules_dir.join("chrome-host.json"),
-            r#"{"mode":"materialize","configFile":"config.js"}"#,
+            r#"{"mode":"materialize","configFile":"config.js","configDocsUrl":["https://dev.example/dnr"]}"#,
         )
         .unwrap();
         let static_ext = dir.join("templates").join("extensions").join("sample-static");
@@ -725,8 +736,14 @@ mod tests {
 
         // configurable 惰性标记：仅声明 configFile 的物化 system 扩展为 true
         assert!(by_name("Net Rules").configurable);
+        assert_eq!(
+            by_name("Net Rules").config_docs_url.as_deref(),
+            Some(["https://dev.example/dnr".to_string()].as_slice()),
+            "configDocsUrl 惰性透出（仅 configurable 扩展）"
+        );
         assert!(!by_name("Environment Label").configurable, "未声明 configFile 不可配置");
         assert!(!by_name("Sample Static").configurable);
+        assert_eq!(by_name("Sample Static").config_docs_url, None, "非 configurable 无文档链接");
 
         // 未配置 → null；set/get 往返（全局 + per-env）
         assert_eq!(

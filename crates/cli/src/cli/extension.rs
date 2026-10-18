@@ -227,9 +227,10 @@ fn get(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliEr
 
 /// 单对象 key: value 对，键名与 JSON 字段一致（PRD §39 两模式无信息差）。
 /// 冻结字段集：id/name/type/status/version/manifestVersion/
-/// sourcePath/enabled/createdAt/updatedAt。description 不进 kv（同 instance get
-/// 省略 hostRules 等字段的先例：kv 是面向人的精选子集，json 模式始终携带全集）。
-/// 时间戳输出原始 epoch 毫秒（同 env/instance：不为本地格式化加 chrono 依赖）。
+/// sourcePath/enabled/configDocsUrl/createdAt/updatedAt。description 不进 kv（同
+/// instance get 省略 hostRules 等字段的先例：kv 是面向人的精选子集，json 模式始终
+/// 携带全集）。时间戳输出原始 epoch 毫秒（同 env/instance：不为本地格式化加 chrono
+/// 依赖）。configDocsUrl 多链接以 ", " 连接（可配置扩展的语法参考入口）。
 fn extension_kv_pairs(ext: &Extension) -> Vec<(String, String)> {
     vec![
         ("id".into(), ext.id.clone()),
@@ -240,6 +241,10 @@ fn extension_kv_pairs(ext: &Extension) -> Vec<(String, String)> {
         ("manifestVersion".into(), option_cell(ext.manifest_version)),
         ("sourcePath".into(), ext.source_path.clone()),
         ("enabled".into(), ext.enabled.to_string()),
+        (
+            "configDocsUrl".into(),
+            ext.config_docs_url.clone().map(|v| v.join(", ")).unwrap_or_else(|| "-".into()),
+        ),
         ("createdAt".into(), ext.created_at.to_string()),
         ("updatedAt".into(), ext.updated_at.to_string()),
     ]
@@ -387,6 +392,7 @@ mod tests {
             enabled: true,
             status,
             configurable: false,
+            config_docs_url: None,
             created_at: 1,
             updated_at: 2,
         }
@@ -407,6 +413,7 @@ mod tests {
                 "manifestVersion",
                 "sourcePath",
                 "enabled",
+                "configDocsUrl",
                 "createdAt",
                 "updatedAt"
             ],
@@ -415,8 +422,8 @@ mod tests {
         let values: Vec<&str> = pairs.iter().map(|(_, v)| v.as_str()).collect();
         assert!(values.contains(&"user"), "type 小写原样: {values:?}");
         assert!(values.contains(&"ready"), "status 小写原样: {values:?}");
-        // version/manifestVersion 为 null → table 占位 `-`（json 模式不受影响）
-        assert_eq!(values.iter().filter(|v| **v == "-").count(), 2);
+        // version/manifestVersion/configDocsUrl 为 null → table 占位 `-`（json 模式不受影响）
+        assert_eq!(values.iter().filter(|v| **v == "-").count(), 3);
     }
 
     #[test]

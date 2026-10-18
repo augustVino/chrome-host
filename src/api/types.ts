@@ -144,6 +144,8 @@ export interface Extension {
   status: 'ready' | 'missing' | 'invalid';
   /** 仅声明 configFile 的内置物化扩展为 true（如 net-rules），可经 config API 写入 */
   configurable: boolean;
+  /** 配置语法参考外链（仅 configurable 扩展非空） */
+  configDocsUrl: string[] | null;
   createdAt: number;
   updatedAt: number;
 }

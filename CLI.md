@@ -159,11 +159,13 @@ Error: [EXTENSION_SYSTEM_LOCKED] 系统扩展不可禁用（HTTP 403）
 |---|---|
 | `env list` | 全部环境（含对账后的 running/total 计数） |
 | `env get <ID>` | 环境详情 |
-| `env create <NAME> [--hosts-source-url <URL>] [--icon <PATH>]` | 创建环境 |
-| `env update <ID> [--name] [--hosts-source-url] [--icon] [--startup-args] [--keep-alive <true\|false>]` | 部分更新：只更新传入的 flag；可空字段的**空串 = 显式置空**（如 `--hosts-source-url ""`） |
+| `env create <NAME> [--hosts-source-url <URL>] [--icon <PATH>] [--session-capture <off\|first-login\|always>]` | 创建环境；session-capture 身份层回写策略（默认 first-login：首个实例退出时保存登录态） |
+| `env update <ID> [--name] [--hosts-source-url] [--icon] [--startup-args] [--keep-alive <true\|false>] [--session-capture <off\|first-login\|always>]` | 部分更新：只更新传入的 flag；可空字段的**空串 = 显式置空**（如 `--hosts-source-url ""`） |
 | `env delete <ID> [--yes]` | 删除环境。有运行中实例时自动 stop-all 后删除（`--yes` 直接执行；交互模式会二次确认） |
 | `env activity <ID> [--limit <N>]` | 环境活动事件流（TIME/LEVEL/EVENT/TARGET/MESSAGE；`--limit` 1–200，越界由服务端 clamp） |
 | `env status <ID>` | 环境实例状态计数（total/running/starting/stopped/error） |
+| `env session <ID>` | 会话身份层状态：策略/当前代/来源实例/Cookie 数/历史代（回滚现测面） |
+| `env session-restore <ID> <GEN>` | 回滚 Cookie 保险库到指定历史代（代号用 `env session` 查；仅回滚 Cookie 层，文件快照保留当前） |
 
 ```bash
 chrome-host env create qa --hosts-source-url https://cfg.example.com/hosts?env=qa
@@ -235,7 +237,7 @@ chrome-host extension config get <net_rules_id> --env <env_id>
 | `login-profile list` | 全部环境登录态（environmentName / status / snapshotVersion / instancesUsing） |
 | `login-profile get <ENV_ID>` | 单环境登录态视图（登录浏览器运行中时附 cdpPort，即自动化登录入口） |
 | `login-profile launch <ENV_ID>` | 打开登录浏览器（人工登录后关闭；视图含 browserRunning / cdpPort） |
-| `login-profile capture <ENV_ID> [--yes]` | 捕获登录态快照（覆盖已有快照时确认） |
+| `login-profile capture <ENV_ID> [--from <INS_ID>] [--yes]` | 捕获登录态快照（覆盖已有快照时确认）。`--from` 从指定**已停止实例**捕获（实例即登录源，推荐路径） |
 | `login-profile reset <ENV_ID> [--yes]` | 清空登录态快照（总是确认） |
 
 ### settings — 全局设置

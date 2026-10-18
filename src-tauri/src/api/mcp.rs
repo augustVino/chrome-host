@@ -537,7 +537,7 @@ impl ChromeHostMcp {
         })
     }
 
-    #[tool(description = "写入扩展运行时配置（整体覆盖；可选 environmentId 省略 = 全局默认；对新启动实例生效）。net-rules 形状：{\"block\":[\"*.google-analytics.com\"],\"redirect\":[{\"from\":\"https://api.foo.com/*\",\"to\":\"http://localhost:3000/$1\"}],\"headers\":[{\"url\":\"https://app.foo.com/*\",\"set\":{\"X-Debug-Uid\":\"42\"}}]}（block/headers 域锚定可带路径通配；redirect 的 * 依序为 $1 $2…）；非法 → 400 EXTENSION_CONFIG_INVALID")]
+    #[tool(description = "写入扩展运行时配置（整体覆盖；可选 environmentId 省略 = 全局默认；对新启动实例生效）。net-rules 形状：{\"block\":[\"*.google-analytics.com\"],\"redirect\":[{\"from\":\"https://api.foo.com/*\",\"to\":\"http://localhost:3000/$1\"}],\"headers\":[{\"url\":\"https://app.foo.com/*\",\"set\":{\"X-Debug-Uid\":\"42\"}}]}（block/headers 域锚定可带路径通配；redirect 的 * 依序为 $1 $2…）；；语法参考（DNR）：https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest 与匹配模式 https://developer.chrome.com/docs/extensions/develop/concepts/match-patterns（extension get 的 configDocsUrl 同源）；非法 → 400 EXTENSION_CONFIG_INVALID")]
     async fn set_extension_config(
         &self,
         Parameters(a): Parameters<SetExtensionConfigArgs>,

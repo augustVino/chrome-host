@@ -67,6 +67,19 @@ function ConfigEditor({ ext, onClose }: { ext: Extension; onClose: () => void })
 
   return (
     <div className="mx-4 mb-3 rounded-lg border border-hairline bg-surface-inset p-3">
+      {ext.configDocsUrl && ext.configDocsUrl.length > 0 && (
+        <p className="mb-2 text-xs text-ink-2">
+          配置语法参考：
+          {ext.configDocsUrl.map((url, i) => (
+            <span key={url}>
+              {i > 0 && ' · '}
+              <a className="text-accent underline" href={url} target="_blank" rel="noreferrer">
+                {url.replace('https://developer.chrome.com', '')}
+              </a>
+            </span>
+          ))}
+        </p>
+      )}
       <div className="mb-2 flex items-center gap-2">
         <span className="text-xs text-ink-2">作用域</span>
         <select

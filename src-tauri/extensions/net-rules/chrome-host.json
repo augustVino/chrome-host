@@ -1,4 +1,8 @@
 {
   "mode": "materialize",
-  "configFile": "config.js"
+  "configFile": "config.js",
+  "configDocsUrl": [
+    "https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest",
+    "https://developer.chrome.com/docs/extensions/develop/concepts/match-patterns"
+  ]
 }
