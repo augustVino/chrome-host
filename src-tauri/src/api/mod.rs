@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cdp_proxy;
 pub mod environments;
+pub mod events;
 pub mod extensions;
 pub mod error;
 pub mod health;

@@ -186,6 +186,8 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/cdp/sessions",
             post(crate::api::instances::create_cdp_session),
         )
+        // 业务事件 SSE 流（17890 免鉴权；17891 全路由 Bearer 天然覆盖）
+        .route("/api/v1/events", get(crate::api::events::events))
         // CLI status/doctor 共用健康快照
         .route("/api/v1/health", get(crate::api::health::get))
         .layer(cors())

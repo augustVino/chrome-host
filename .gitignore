@@ -32,3 +32,5 @@ dist-ssr
 # （dist 产物已被上方 dist 规则覆盖，cache 是 vitepress 独有目录）
 docs/.vitepress/cache
 docs/reference/
+
+.agents

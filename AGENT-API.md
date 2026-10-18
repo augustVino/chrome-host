@@ -13,6 +13,7 @@
 - [Extensions — 扩展](#extensions--扩展)
 - [Settings — 应用设置](#settings--应用设置)
 - [Kernel — 内核](#kernel--内核)
+- [Events — 事件流（SSE）](#events--事件流sse)
 - [Health — 健康检查](#health--健康检查)
 - [错误码总表](#错误码总表)
 - [接入注意事项](#接入注意事项)
@@ -280,6 +281,49 @@ Chrome for Testing，**pinned 单版本策略**（不支持自定义路径/系�
 ```
 
 首次 `POST .../instances` 若内核未装会**同步阻塞于下载**（集成方应先查 kernel/status 或设作业级超时）。
+
+## Events — 事件流（SSE）
+
+`GET /api/v1/events`（`text/event-stream`）：服务端推送业务事件——与 `GET /environments/{id}/activity`
+同源（`Activity::record` 落库行），但为**订阅**形态：事件发生即推送，无需轮询。
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/v1/events` | 事件流。`event:` 为事件名（下表），`data:` 为落库行同款富 JSON（比 Tauri 事件多 `level`/`ts`/`targetId`） |
+
+```json
+// data 载荷（AppEvent 行）
+{ "ts": 1710000000000, "level": "info", "event": "instance-started",
+  "environmentId": "env_...", "targetId": "ins_...", "message": "" }
+```
+
+```bash
+curl -N http://127.0.0.1:17890/api/v1/events      # 挂住订阅（-N 禁用缓冲）
+# 另一终端 create instance 后依次收到：
+# event: instance-created
+# data: {"ts":...,"level":"info","event":"instance-created",...}
+# event: instance-started
+# data: {...}
+```
+
+事件清单（`event:` 值）：
+
+| 类别 | 事件 |
+|---|---|
+| 环境 | `environment-created` · `environment-updated` · `environment-deleted` · `hosts-resolved` |
+| 实例 | `instance-created` · `instance-started` · `instance-stopped` · `instance-error` · `instance-deleted` · `instance-crashed`（keep-alive 捕获） |
+| 登录态 | `login-profile-changed` |
+| 远程接入 | `tunnel_state_change` |
+| CDP 会话 | `cdp_session_created` · `cdp_session_expired` |
+
+行为语义：
+
+- **心跳**：空闲时每 15s 发 `: ping` 注释行（SSH 隧道/代理空闲掐连的兜底）。
+- **滞后**：订阅者消费过慢（服务端环形缓冲 256 条被冲掉）时收到 `: lagged n` 注释行，
+  丢弃的只是该订阅者的追赶窗口，不影响其他订阅者与事件落库。
+- **断开**：客户端断开即自动退订（无泄漏）；重连后从当下开始接收，**历史不回放**
+  （需要历史走 activity 查询）。
+- **鉴权**：17890 免鉴权；17891 与其余 API 相同的 Bearer token 中间件覆盖。
 
 ## Health — 健康检查
 

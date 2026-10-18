@@ -145,6 +145,17 @@ export const API_CATALOG: CatalogGroup[] = [
     ],
   },
   {
+    group: 'Events',
+    items: [
+      {
+        method: 'GET',
+        path: '/events',
+        desc: '业务事件 SSE 流（text/event-stream）',
+        note: 'event: 为事件名（instance-started 等），data: 为落库行同款富 JSON；15s 心跳注释行；断开自动退订、历史不回放（走 activity 查询）',
+      },
+    ],
+  },
+  {
     group: 'Kernel',
     items: [
       { method: 'GET', path: '/kernel/status', desc: '内核状态（pinned/本地版本/下载进度）' },
