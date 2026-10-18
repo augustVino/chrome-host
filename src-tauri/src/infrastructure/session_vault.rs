@@ -126,6 +126,10 @@ pub fn read_current(env_dir: &Path) -> Option<SessionVault> {
 
 /// 写入新当前版本：旧当前转入 history，修剪至 MAX_GENERATIONS 代。
 /// generation 单调 +1。返回写入的新 vault。
+/// 原子性（P1）：当前文件经 tmp+rename 落盘——写入中断不会留下半写坏的
+/// session-vault.json（读侧对损坏文件按空身份处理，半写意味着静默丢登录态）。
+/// history 代文件是新名写入无覆盖冲突，维持直写。跨路径互斥由 SessionService
+/// 的进程内锁保证，本函数不重复加锁。
 pub fn write_new(
     env_dir: &Path,
     cookies: Vec<CookieRecord>,
@@ -149,7 +153,10 @@ pub fn write_new(
         cookies,
     };
     let bytes = serde_json::to_vec_pretty(&vault)?;
-    write_0600(&env_dir.join("session-vault.json"), &bytes)?;
+    let target = env_dir.join("session-vault.json");
+    let tmp = env_dir.join(".session-vault.json.tmp");
+    write_0600(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &target)?;
     Ok(vault)
 }
 
@@ -212,6 +219,7 @@ pub fn read_instance_export(path: &Path) -> Option<InstanceCookieExport> {
 /// 清空保险库（当前 + 全部历史）。best-effort：不存在视为成功。
 pub fn clear(env_dir: &Path) -> Result<(), AppError> {
     let _ = std::fs::remove_file(env_dir.join("session-vault.json"));
+    let _ = std::fs::remove_file(env_dir.join(".session-vault.json.tmp"));
     let _ = std::fs::remove_dir_all(env_dir.join("session-vault-history"));
     Ok(())
 }
@@ -263,6 +271,17 @@ mod tests {
         assert_eq!(out[0].name, "a");
         assert!(out[0].http_only);
         assert_eq!(out[0].same_site.as_deref(), Some("Lax"));
+    }
+
+    /// 原子落盘（P1）：写后 tmp 不残留、当前文件完整可读
+    #[test]
+    fn write_new_leaves_no_tmp_and_reads_back() {
+        let dir = tmp_dir();
+        let v = write_new(&dir, vec![cookie("a")], Some("ins_1".into())).unwrap();
+        assert!(!dir.join(".session-vault.json.tmp").exists(), "tmp 已 rename 消费");
+        let back = read_current(&dir).unwrap();
+        assert_eq!(back.generation, v.generation);
+        assert_eq!(back.cookies.len(), 1);
     }
 
     #[test]

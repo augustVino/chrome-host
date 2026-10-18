@@ -310,8 +310,8 @@ curl -N http://127.0.0.1:17890/api/v1/events      # 挂住订阅（-N 禁用缓�
 |---|---|
 | 环境 | `environment-created` · `environment-updated` · `environment-deleted` · `hosts-resolved` |
 | 实例 | `instance-created` · `instance-started` · `instance-stopped` · `instance-error` · `instance-deleted` · `instance-crashed`（keep-alive 捕获） |
-| 登录态 | `login-profile-changed` |
-| 远程接入 | `tunnel_state_change` |
+| 登录态 | `login-profile-changed` · `session_cookies_exported`（实例停止时导出 N 条） · `session_captured_from_instance`（按策略/显式固化新代） · `session_promote_failed`（自动升级失败，warn） · `session_restored`（回滚到历史代） · `session_reset`（清空身份层） |
+| 远程接入 | `tunnel_state_change` · `remote_access_token_rotated`（令牌轮换） |
 | CDP 会话 | `cdp_session_created` · `cdp_session_expired` |
 
 行为语义：
@@ -402,5 +402,5 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 2. **`POST .../instances` 非幂等**——重试前先 `GET /instances/{id}` 或按环境列表判重，否则会堆积实例。
 3. **409 是状态机信号**——按语义处理（先 stop 再删、先关浏览器再 capture），不是可盲目重试的错误。
 4. **创建实例可能长阻塞**——内核下载（首次约 150MB）+ CDP 就绪等待（≤10s）；集成方设置作业级超时。
-5. **CORS 现状为放行任意 Origin**——本机任意网页在浏览器内可访问此 API（CSRF 面）。请勿将 17890/17891 端口做端口转发/容器映射暴露到本机之外；远程接入只经应用自身守护的 SSH 隧道（目标机器回环 ≡ 本机回环，与手工隧道同语义）。
+5. **CORS 为 Origin 白名单**（仅 GUI webview 与本地 dev vite 源）——本机网页不再能跨源读此 API；无 Origin 头的客户端（curl/CLI/MCP）不受影响。仍请勿将 17890/17891 端口做端口转发/容器映射暴露到本机之外；远程接入只经应用自身守护的 SSH 隧道（目标机器回环 ≡ 本机回环，与手工隧道同语义）。
 6. **前端即第一接入方**——chrome-host GUI 自身全部走这套 API（Tauri IPC 只做窗口/托盘壳），遇到行为疑问可直接参照前端 `src/api/` 的调用方式。

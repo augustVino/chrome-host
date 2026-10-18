@@ -12,7 +12,19 @@ use std::sync::Arc;
 use axum::routing::{get, post};
 use axum::Router;
 use tauri::AppHandle;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
+
+/// CORS 白名单（P0 收敛）：仅 GUI webview 与本地 dev vite 源。
+/// 无 Origin 头的客户端（curl/CLI/agent/MCP）不进 CORS 评定，不受影响；
+/// 本机任意网页（恶意 Origin）不再拿到 allow-origin 回包，浏览器端拦截成立。
+/// （此前 AGENT-API 接入注意事项第 5 条的「CORS 放行任意 Origin」风险面就此收敛）
+const ALLOWED_ORIGINS: [&str; 5] = [
+    "tauri://localhost",     // macOS GUI webview
+    "http://tauri.localhost", // Windows GUI webview
+    "http://localhost",       // Linux webview Origin（无端口形态）
+    "http://localhost:1420",  // dev vite（tauri.conf devUrl）
+    "http://127.0.0.1:1420",  // vite 备用回环源
+];
 
 use crate::application::activity::Activity;
 use crate::application::cdp_session::CdpSessionService;
@@ -51,11 +63,15 @@ pub struct ApiState {
 }
 
 fn cors() -> CorsLayer {
-    // 前端 webview（tauri://localhost）与 dev vite 同源访问；回环服务仅本机可达
+    // 前端 webview（tauri://localhost）与 dev vite 同源访问；回环服务仅本机可达。
+    // 收敛为白名单（见 ALLOWED_ORIGINS 注释）；methods/headers 维持放行——
+    // 鉴别面收敛在 Origin，方法/头枚举只增加无意义维护成本
     CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
+        .allow_origin(tower_http::cors::AllowOrigin::list(
+            ALLOWED_ORIGINS.iter().map(|o| o.parse().expect("常量 Origin 必可解析")),
+        ))
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any)
 }
 
 /// 全量业务路由（无鉴权层）：两个监听器共享，仅中间件差异。

@@ -122,6 +122,36 @@ impl ProfileService {
         })
     }
 
+    /// 启动对账恢复（P1/H1）：Capturing 卡死行按快照版本分流（v0 →
+    /// not_configured 防 clone 放行空登录态；v>0 → ready 按旧版本号）；
+    /// 并对全部母本目录执行换名残留处置（.old 是唯一母本时恢复回位，
+    /// 不必等下次 capture 才发现）。main 启动编排调用
+    pub fn recover_stale_capturing(&self) {
+        match self.profiles.recover_stale_capturing() {
+            Ok(0) => {}
+            Ok(n) => tracing::warn!("[profile] 启动恢复：{n} 个 Capturing 卡死状态已按版本分流恢复"),
+            Err(e) => tracing::warn!("[profile] Capturing 卡死恢复失败（不阻断启动）: {e}"),
+        }
+        match self.profiles.list_all() {
+            Ok(rows) => {
+                for row in rows {
+                    let dir = std::path::Path::new(&row.profile_dir);
+                    match copier::resolve_stale_swap(dir) {
+                        Ok(true) => tracing::warn!(
+                            "[profile] 启动恢复：母本目录从换名残留回位: {}",
+                            dir.display()
+                        ),
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!("[profile] 换名残留处置失败（继续）: {} - {e}", dir.display())
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("[profile] 读取 profile 行失败，跳过换名残留处置: {e}"),
+        }
+    }
+
     // ---------- capture----------
 
     /// 停机捕获快照：遗留登录浏览器运行中 → 409；否则终止孤儿 →
@@ -222,8 +252,11 @@ impl ProfileService {
         let parent = dir.parent().expect("profile_dir 有父目录");
         let tmp = parent.join(format!(".{file_name}.capturing"));
         let old = parent.join(format!(".{file_name}.old"));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&old);
+        // 换名区间崩溃残留处置（copier::resolve_stale_swap：old 是唯一母本时
+        // 恢复回位，否则清除；此前开头无条件删 old 会把唯一母本删掉）
+        if copier::resolve_stale_swap(dir)? {
+            tracing::warn!("[profile] 发现上次固化中断残留，母本目录已恢复: {}", dir.display());
+        }
         std::fs::create_dir_all(&tmp)?;
 
         let bytes = copier::execute(&plan, source, &tmp)?;

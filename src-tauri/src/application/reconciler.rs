@@ -182,16 +182,15 @@ impl Reconciler {
         if let Some(pid) = ins.pid {
             let _ = self.process.terminate(pid);
         }
-        let _ = self.instances.update_runtime(
-            &ins.id,
-            RuntimeUpdate {
-                status: Some(InstanceStatus::Stopped),
-                stopped_at: Some(chrono::Utc::now().timestamp_millis()),
-                ..Default::default()
-            },
-        );
-        self.emit("instance-stopped", &ins.id);
-        self.sessions.on_instance_stopped(&ins.environment_id, &ins.id).await;
+        // CAS 置位：与 stop 主路径/退出 watcher 防双 promote（同 instance_service）
+        if self
+            .instances
+            .mark_stopped_if_alive(&ins.id, chrono::Utc::now().timestamp_millis())
+            .unwrap_or(false)
+        {
+            self.emit("instance-stopped", &ins.id);
+            self.sessions.on_instance_stopped(&ins.environment_id, &ins.id).await;
+        }
     }
 
     /// 确认死亡：running → stopped；带 started_at 的按用户关闭语义记 stopped_at

@@ -74,7 +74,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | 实例（10） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
 | 常驻诊断（5） | `get_diagnostics` · `get_console` · `get_network` · `get_screenshot` · `get_har` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
-| 登录态（2） | `login_profile`（action: get / launch / capture / reset） · `session_status` |
+| 登录态（2） | `login_profile`（action: get / capture / reset） · `session_status` |
 | 扩展（7） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` · `get_extension_config` · `set_extension_config` |
 
 ## 内核
@@ -172,6 +172,6 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 6. delete_instance                     # 收尾清理（运行中先 stop_instance）
 ```
 
-需要登录态的场景在第 3 步前插入：`login_profile(launch)` → 人工登录 → 关浏览器 → `login_profile(capture)`。
+需要登录态的场景在第 4 步后：实例里人工登录 → 关闭实例（Cookie 自动保存，first-login 默认策略）→ 新实例免登录；需固化基准时 `login_profile(capture, fromInstanceId)`。
 
 > 与 CLI 的取舍：MCP 适合 AI 多轮编排（工具发现 + 结构化错误自决策）；CLI 适合脚本一行式调用与 CI（退出码契约）。两者可混用，状态完全互通。

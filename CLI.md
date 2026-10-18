@@ -292,9 +292,9 @@ ENV_ID=$(chrome-host env list --json | jq -r '.[] | select(.name=="staging") | .
 INS_ID=$(chrome-host instance create "$ENV_ID" --quiet)
 WS=$(chrome-host instance cdp "$INS_ID" --json | jq -r .webSocketUrl)
 
-# 2.5（可选）需要登录态的环境：launch 打开登录浏览器人工登录，
-#        关闭浏览器后 capture 快照，之后 create 的实例自动克隆登录态
-# chrome-host login-profile launch "$ENV_ID"
+# 2.5（可选）需要登录态的环境：实例里人工登录后关闭实例即自动保存，
+#        之后该环境 create 的实例自动克隆登录态（first-login 默认策略）
+# chrome-host env session "$ENV_ID"   # 查看当前代/Cookie 数
 # chrome-host login-profile capture "$ENV_ID" --yes
 
 # 3. 交给自动化（Playwright 连接 CDP）

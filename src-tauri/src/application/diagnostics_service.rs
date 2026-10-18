@@ -75,7 +75,10 @@ impl DiagnosticsService {
         let repo = Arc::clone(&self.repo);
         let registry = Arc::clone(&self.registry);
         let ins_id = ins_id.to_string();
-        tokio::spawn(async move {
+        // tauri::async_runtime::spawn：调用方含 main 的同步启动段（P0-2 重挂）
+        // 与 async 启动路径，tokio::spawn 在同步上下文会 panic（无 reactor）。
+        // tauri runtime 全局常驻，任意线程可调度（与 exit watcher 钩子同款）
+        tauri::async_runtime::spawn(async move {
             watch_loop(ins_id, port, repo, registry, watched).await
         });
     }

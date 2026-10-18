@@ -25,15 +25,15 @@ ENV_ID=$(chrome-host env list --json | jq -r '.[] | select(.name=="staging") | .
 需要免登录的环境走这一步；跳过则每个实例从全新登录开始：
 
 ```bash
-chrome-host login-profile launch "$ENV_ID"    # 打开「母本登录浏览器」
-# → 在弹出的浏览器中人工完成登录，然后关闭该浏览器
-chrome-host login-profile capture "$ENV_ID" --yes
-chrome-host login-profile get "$ENV_ID"       # 查看 status / snapshotVersion
+chrome-host instance create "$ENV_ID" --quiet  # 打开实例，在弹出的 Chrome 里人工登录
+# → 登录完成后关闭实例（或告诉用户直接关窗口）
+chrome-host instance stop "$INS_ID"
+chrome-host env session "$ENV_ID"              # 当前代 / Cookie 数 / 历史代
 ```
 
-之后该环境**每次 `instance create` 的实例自动克隆登录态**。快照过期重新走 launch → capture（覆盖已有快照需 `--yes`）。
+之后该环境**每次 `instance create` 的实例自动克隆登录态**（first-login 默认策略，首个实例退出时自动保存）。快照过期：实例里重新登录并关闭即保存新代；回滚历史代用 `env session-restore`。
 
-> GUI 等价：环境详情 → 登录态 → 打开登录浏览器 / 捕获快照。
+> GUI 等价：环境详情 → 新建实例 → 登录 → 关闭；登录态卡片自动回正。显式固化某实例用 `login-profile capture --from`（0.3.0 起母本 launch 登录浏览器已移除）。
 
 ## 3. 创建并启动实例
 
@@ -94,6 +94,6 @@ chrome-host env delete "$ENV_ID" --yes         # 环境仍有运行实例时会�
 | `exit 8` | 应用未运行，先启动 chrome-host |
 | `exit 5` + `INSTANCE_ALREADY_RUNNING` 等 409 族 | 状态冲突不是错误：按状态机处理（先 stop 或直接复用运行中实例），不要盲目重试 |
 | `instance create` 卡住 | 首次内核下载属正常；CI 里为 create/start/restart 设置作业级超时 |
-| 快照登录态失效 | session cookie 类站点重启即失效（Chrome 标准语义），重新 launch → capture |
+| 快照登录态失效 | session cookie 类站点重启即失效（Chrome 标准语义），实例里重新登录并关闭即保存新代 |
 
 同一闭环在云桌面 / CI 上远程驱动本地浏览器的方式，见[远程接入](./remote-access)。

@@ -99,6 +99,30 @@ fn is_blacklisted(rel: &Path) -> bool {
     false
 }
 
+/// consolidate 原子换名区间（rename dir→old / rename tmp→dir / remove old）的
+/// 崩溃残留处置（P1）：
+/// · old 存在且 dir 缺失 = 崩在两次 rename 之间——old 是唯一完整母本，恢复回位；
+/// · old 存在且 dir 存在 = 固化已成功只是清理未完——old 为残留，删除；
+/// · tmp 残留两形态下都无价值，顺手清除。
+/// 返回是否执行了恢复（true = 母本从 old 回位）
+pub fn resolve_stale_swap(target: &Path) -> std::io::Result<bool> {
+    let name = target.file_name().expect("target 有文件名").to_string_lossy().to_string();
+    let Some(parent) = target.parent() else { return Ok(false) };
+    let old = parent.join(format!(".{name}.old"));
+    let tmp = parent.join(format!(".{name}.capturing"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    if !old.exists() {
+        return Ok(false);
+    }
+    if target.exists() {
+        std::fs::remove_dir_all(&old)?;
+        Ok(false)
+    } else {
+        std::fs::rename(&old, target)?;
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +216,32 @@ mod tests {
         let bytes = execute(&plan, &src, &dest).unwrap();
         assert_eq!(bytes, payload.len() as u64);
         assert_eq!(std::fs::read(dest.join(&plan[0])).unwrap(), payload);
+    }
+
+    /// 换名区间崩溃残留：dir 缺失时 old（唯一完整母本）恢复回位；
+    /// dir 存在时 old 是固化成功后的残留，清除；tmp 恒清除
+    #[test]
+    fn resolve_stale_swap_recovers_or_cleans() {
+        let dir = std::env::temp_dir().join(format!("cem-copier-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("profile");
+        let old = dir.join(".profile.old");
+        let tmp = dir.join(".profile.capturing");
+
+        // 形态 1：崩在两次 rename 之间（dir 缺失，old 完整，tmp 残留）
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("data"), b"vault").unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(resolve_stale_swap(&target).unwrap(), "唯一母本从 old 恢复");
+        assert_eq!(std::fs::read(target.join("data")).unwrap(), b"vault", "内容随恢复完好");
+        assert!(!old.exists() && !tmp.exists());
+
+        // 形态 2：固化已成功（dir 存在），old 只是清理未完的残留
+        std::fs::create_dir_all(&old).unwrap();
+        assert!(!resolve_stale_swap(&target).unwrap(), "有 target 时 old 仅清除");
+        assert!(target.exists() && !old.exists());
+
+        // 形态 3：无残留 → no-op
+        assert!(!resolve_stale_swap(&target).unwrap());
     }
 }

@@ -55,6 +55,10 @@ pub struct SessionService {
     profiles: Arc<ProfileService>,
     paths: AppPaths,
     activity: Arc<Activity>,
+    /// 保险库写互斥（P1）：三条停止路径（stop/stop-all/退出回调/reconciler 关窗）
+    /// 并发触发 promote 时串行化 read_current→write_new 全程，保证代际单调不互覆。
+    /// 进程内锁足够：单实例应用，vault 文件无跨进程写者
+    vault_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SessionService {
@@ -65,7 +69,7 @@ impl SessionService {
         paths: AppPaths,
         activity: Arc<Activity>,
     ) -> Self {
-        SessionService { envs, instances, profiles, paths, activity }
+        SessionService { envs, instances, profiles, paths, activity, vault_lock: Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     /// 停止路径挂钩 A：terminate 之前调用（此时 CDP 仍可达），导出实例私有 Cookie。
@@ -85,7 +89,15 @@ impl SessionService {
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!("[session] 实例 {} Cookie 导出失败（忽略，继续停止）: {e}", ins.id)
+                tracing::warn!("[session] 实例 {} Cookie 导出失败（忽略，继续停止）: {e}", ins.id);
+                // 旧导出文件（上一轮停止遗留）必须删除：promote/显式捕获按文件
+                // 存在性判定，残留会让过期 Cookie 被当成本轮新代提升
+                let stale = self.paths.instance_cookies(&ins.environment_id, &ins.id);
+                match std::fs::remove_file(&stale) {
+                    Ok(()) => tracing::info!("[session] 已删除过期导出: {}", stale.display()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!("[session] 删除过期导出失败: {} - {e}", stale.display()),
+                }
             }
         }
     }
@@ -110,16 +122,20 @@ impl SessionService {
         let env = self.envs.get(env_id)?;
         match env.session_capture {
             SessionCapture::Off => return Ok(()),
-            SessionCapture::FirstLogin => {
-                // 身份层已有有效内容 → 不再自动更新（防登出测试/并行实例污染）
-                let has = session_vault::read_current(&env_dir)
-                    .map(|v| !v.cookies.is_empty())
-                    .unwrap_or(false);
-                if has {
-                    return Ok(());
-                }
+            SessionCapture::FirstLogin | SessionCapture::Always => {}
+        }
+
+        // 全程持锁（M1）：FirstLogin 判空与写入同窗口——此前判空在锁外，
+        // 并发双 promote（两实例同时首登退出）都判空通过、同一身份连升两代
+        let _vault_guard = self.vault_lock.lock().await;
+        if env.session_capture == SessionCapture::FirstLogin {
+            // 身份层已有有效内容 → 不再自动更新（防登出测试/并行实例污染）
+            let has = session_vault::read_current(&env_dir)
+                .map(|v| !v.cookies.is_empty())
+                .unwrap_or(false);
+            if has {
+                return Ok(());
             }
-            SessionCapture::Always => {}
         }
 
         let Some(export) = session_vault::read_instance_export(
@@ -131,7 +147,7 @@ impl SessionService {
             return Ok(()); // 空 Cookie 不升级（避免把空身份写进保险库）
         }
 
-        self.capture_inner(env_id, ins_id, &export.cookies).await?;
+        self.capture_inner_locked(env_id, ins_id, &export.cookies).await?;
         self.activity.record(
             "info",
             "session_captured_from_instance",
@@ -184,7 +200,21 @@ impl SessionService {
     }
 
     /// 两层固化的公共内核：文件层（ProfileService，gate 串行）→ Cookie 层（保险库）
+    /// 捕获入口：拿 vault 锁（显式捕获/restore 等锁外调用方使用）。
+    /// 已持锁的 promote_by_policy 直接走 [`Self::capture_inner_locked`]
+    /// （tokio Mutex 不可重入，重复拿锁会死锁）
     async fn capture_inner(
+        &self,
+        env_id: &str,
+        ins_id: &str,
+        cookies: &[session_vault::CookieRecord],
+    ) -> Result<SessionVault, AppError> {
+        let _vault_guard = self.vault_lock.lock().await;
+        self.capture_inner_locked(env_id, ins_id, cookies).await
+    }
+
+    /// 锁内实现：调用方保证已持有 vault_lock
+    async fn capture_inner_locked(
         &self,
         env_id: &str,
         ins_id: &str,
@@ -233,6 +263,7 @@ impl SessionService {
     pub async fn restore(&self, env_id: &str, generation: i64) -> Result<SessionStatusView, AppError> {
         self.envs.get(env_id)?;
         let env_dir = self.paths.environment_dir(env_id);
+        let _vault_guard = self.vault_lock.lock().await;
         session_vault::restore(&env_dir, generation)?;
         self.activity.record(
             "warn",
@@ -248,6 +279,9 @@ impl SessionService {
     /// 登录浏览器运行中 → 409，不代杀（由 ProfileService.reset 保证）。
     pub async fn reset(&self, env_id: &str) -> Result<serde_json::Value, AppError> {
         let env_dir = self.paths.environment_dir(env_id);
+        // 持锁（M2）：clear 与并发 promote 的 write_new 互斥，防清空后被迟到的
+        // promote 回写旧身份
+        let _vault_guard = self.vault_lock.lock().await;
         session_vault::clear(&env_dir)?;
         self.activity.record(
             "warn",

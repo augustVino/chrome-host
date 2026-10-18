@@ -137,6 +137,20 @@ impl InstanceRepository {
         Ok(())
     }
 
+    /// 停止置位 CAS（P1）：仅当行仍处存活态时置 stopped，返回是否本调用方
+    /// 抢到置位权。停止有多条并发到达路径（stop 主路径 / 进程退出 watcher /
+    /// reconciler 关窗），恰好一方成功——成功方持有 instance-stopped 事件与
+    /// 身份层 promote 的唯一执行权，防双 promote 同一 Cookie 连升两代
+    pub fn mark_stopped_if_alive(&self, id: &str, stopped_at: i64) -> Result<bool, AppError> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE instances SET status = 'stopped', stopped_at = ?1, updated_at = ?1 \
+             WHERE id = ?2 AND status IN ('created', 'starting', 'running', 'stopping')",
+            params![stopped_at, id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn delete(&self, id: &str) -> Result<(), AppError> {
         let conn = self.pool.get()?;
         conn.execute("DELETE FROM instances WHERE id = ?1", params![id])?;

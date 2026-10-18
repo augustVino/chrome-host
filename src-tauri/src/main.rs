@@ -221,6 +221,10 @@ fn main() {
             keep_alive.scan_register();
             // 孤儿物化目录对账（删除编排补齐前的历史残留，一次清）
             instance_service.prune_orphan_generated_extensions();
+            // 存活实例重挂常驻诊断 watcher（应用重启丢进程内 registry）
+            instance_service.reattach_diagnostics_watchers();
+            // Capturing 卡死状态恢复（mark_capturing 与 mark_ready 之间崩溃遗留）
+            profile_service.recover_stale_capturing();
 
             // 自启模式（--hidden）→ 启动即隐藏主窗口，仅托盘常驻
             if std::env::args().any(|a| a == "--hidden") {

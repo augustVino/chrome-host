@@ -310,6 +310,14 @@ impl InstanceService {
                     },
                 )?;
                 self.emit("instance-started", &ins.id);
+                // 清上轮导出残留（P0-3）：export 文件生命周期 = 本轮实例——
+                // 崩溃场景（无新导出）不会把上轮 Cookie 当本轮新代提升
+                let stale = self.paths.instance_cookies(&ins.environment_id, &ins.id);
+                match std::fs::remove_file(&stale) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!("[session] 清理上轮导出残留失败（忽略）: {} - {e}", stale.display()),
+                }
                 // 常驻诊断 watcher（M6）：置 running 后 spawn，不阻塞启动返回路径；
                 // 只订阅不操作，与外部 agent 的 CDP 会话共存
                 self.diagnostics.spawn(&ins.id, ins.cdp_port.unwrap_or_default());
@@ -384,18 +392,17 @@ impl InstanceService {
             self.sessions.on_instance_stopping(&ins).await;
             self.process.terminate(pid)?;
         }
-        self.instances.update_runtime(
-            id,
-            RuntimeUpdate {
-                status: Some(InstanceStatus::Stopped),
-                stopped_at: Some(chrono::Utc::now().timestamp_millis()),
-                ..Default::default()
-            },
-        )?;
-        self.emit("instance-stopped", id);
-        tracing::info!("实例已停止: {id}");
-        // 身份层挂钩 B：按 session_capture 策略升级环境身份（first-login/always）
-        self.sessions.on_instance_stopped(&ins.environment_id, id).await;
+        // CAS 停止置位：退出 watcher 可能已抢先（terminate 后 reaper 回调先到），
+        // 抢不到则事件/promote 由 watcher 持有，本路径不重复执行
+        if self
+            .instances
+            .mark_stopped_if_alive(id, chrono::Utc::now().timestamp_millis())?
+        {
+            self.emit("instance-stopped", id);
+            tracing::info!("实例已停止: {id}");
+            // 身份层挂钩 B：按 session_capture 策略升级环境身份（first-login/always）
+            self.sessions.on_instance_stopped(&ins.environment_id, id).await;
+        }
         Ok(self.instances.get(id)?)
     }
 
@@ -409,21 +416,19 @@ impl InstanceService {
                 continue;
             }
             self.keep_alive.cancel(&ins.id);
-            // 身份层挂钩（同 stop：导出 → 停止 → 策略升级）
+            // 身份层挂钩（同 stop：导出 → 停止 → 策略升级）；CAS 置位防与
+            // 退出 watcher 双 promote（见 stop 的注释）
             self.sessions.on_instance_stopping(&ins).await;
             if let Some(pid) = ins.pid {
                 self.process.terminate(pid)?;
             }
-            self.instances.update_runtime(
-                &ins.id,
-                RuntimeUpdate {
-                    status: Some(InstanceStatus::Stopped),
-                    stopped_at: Some(chrono::Utc::now().timestamp_millis()),
-                    ..Default::default()
-                },
-            )?;
-            self.emit("instance-stopped", &ins.id);
-            self.sessions.on_instance_stopped(&ins.environment_id, &ins.id).await;
+            if self
+                .instances
+                .mark_stopped_if_alive(&ins.id, chrono::Utc::now().timestamp_millis())?
+            {
+                self.emit("instance-stopped", &ins.id);
+                self.sessions.on_instance_stopped(&ins.environment_id, &ins.id).await;
+            }
             stopped.push(ins.id);
         }
         Ok(stopped)
@@ -668,34 +673,73 @@ impl InstanceService {
         }
     }
 
+    /// 启动重挂常驻诊断 watcher（P0）：应用重启丢进程内 registry，对账确认
+    /// 存活的实例补挂，否则 console/network 查询面假空数据。
+    /// main 启动编排（reconcile_all 后）调用
+    pub fn reattach_diagnostics_watchers(&self) {
+        let rows = match self.instances.list_all() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("[diagnostics] 实例表读取失败，跳过 watcher 重挂: {e}");
+                return;
+            }
+        };
+        let mut n = 0;
+        for ins in rows.iter().filter(|i| i.status.is_alive_status()) {
+            if let Some(port) = ins.cdp_port {
+                self.diagnostics.spawn(&ins.id, port);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            tracing::info!("[diagnostics] 启动对账为 {} 个存活实例重挂常驻诊断 watcher", n);
+        }
+    }
+
     /// 进程退出监听：reaper 线程回收子进程（防僵尸）并事件化退出。
     /// 用户手动关闭 Chrome 窗口 → 此回调立即触发 → DB stopped + 事件 → UI 即时回正。
     /// pid 匹配防止旧实例的迟到回调污染 stop/restart 后的状态。
     fn attach_exit_watcher(&self, ins_id: &str, pid: u32) {
         let instances = self.instances.clone();
-        let app = self.app.clone();
+        let sessions = self.sessions.clone();
+        let activity = self.activity.clone();
         let id = ins_id.to_string();
         let result = self.process.attach_exit_watcher(
             pid,
             Box::new(move |_code| {
                 let Ok(row) = instances.get(&id) else { return };
                 if row.pid == Some(pid) && row.status == InstanceStatus::Running {
-                    let _ = instances.update_runtime(
-                        &id,
-                        RuntimeUpdate {
-                            status: Some(InstanceStatus::Stopped),
-                            stopped_at: Some(chrono::Utc::now().timestamp_millis()),
-                            ..Default::default()
-                        },
-                    );
-                    if let Err(e) = tauri::Emitter::emit(
-                        &app,
-                        "instance-stopped",
-                        serde_json::json!({ "id": id }),
-                    ) {
-                        tracing::error!("发送事件 instance-stopped 失败: {e}");
+                    let env_id = row.environment_id.clone();
+                    // CAS 抢置位权：正常 stop 主路径可能已抢先（此时静默退场，
+                    // 事件/promote 由主路径持有）；抢到 = 崩溃/用户关窗场景
+                    let Ok(won) =
+                        instances.mark_stopped_if_alive(&id, chrono::Utc::now().timestamp_millis())
+                    else {
+                        return;
+                    };
+                    if !won {
+                        return;
                     }
+                    // 事件统一走 Activity.record（SSE/落库/Tauri 三路同点；
+                    // 此前直接 app.emit 导致 SSE/审计缺退出路径的 instance-stopped）
+                    activity.record(
+                        "info",
+                        "instance-stopped",
+                        Some(env_id.as_str()),
+                        Some(id.as_str()),
+                        "进程退出（事件驱动检测）",
+                    );
                     tracing::info!("实例进程退出（事件驱动检测）: {id} pid={pid}");
+                    // 身份层挂钩（P1）：仅走 on_instance_stopped 的 promote 判定——
+                    // 进程已死无法导出；旧 export 已在实例启动时清除（见 launch_and_wait），
+                    // 此处读到文件必为本轮 stop 主路径刚写的（正常停止），promote 照常；
+                    // 崩溃场景无 export 自然跳过。reaper 同步回调经 async_runtime 调度。
+                    let sessions = sessions.clone();
+                    let env_id2 = row.environment_id.clone();
+                    let id2 = id.clone();
+                    tauri::async_runtime::spawn(async move {
+                        sessions.on_instance_stopped(&env_id2, &id2).await;
+                    });
                 }
             }),
         );
