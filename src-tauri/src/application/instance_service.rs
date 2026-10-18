@@ -641,10 +641,29 @@ impl InstanceService {
                 tracing::warn!("清理实例 profile 失败（继续删除记录）: {} - {e}", ins.profile_dir);
             }
         }
+        // 物化扩展目录同步清理（与 profile 同生命周期；路径拼接与写入点同源）
+        self.paths.remove_instance_generated_extensions(id);
         self.instances.delete(id)?;
         self.emit("instance-deleted", id);
         tracing::info!("实例已删除: {id}");
         Ok(())
+    }
+
+    /// 启动对账兑底：清 generated-extensions 下不在 instances 表的孤儿目录
+    /// （删除编排补齐前的历史残留）。main 启动编排（reconcile_all 后）调用；
+    /// 表读失败仅告警（对账兑底不应阻断启动）
+    pub fn prune_orphan_generated_extensions(&self) {
+        let live: Vec<String> = match self.instances.list_all() {
+            Ok(rows) => rows.into_iter().map(|i| i.id).collect(),
+            Err(e) => {
+                tracing::warn!("[extensions] 实例表读取失败，跳过孤儿物化目录对账: {e}");
+                return;
+            }
+        };
+        let removed = self.paths.prune_orphan_generated_extensions(&live);
+        if removed > 0 {
+            tracing::info!("[extensions] 启动对账清理孤儿物化目录 {} 个", removed);
+        }
     }
 
     /// 进程退出监听：reaper 线程回收子进程（防僵尸）并事件化退出。

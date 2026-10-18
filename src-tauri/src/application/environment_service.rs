@@ -195,6 +195,7 @@ impl EnvironmentService {
                     tracing::warn!("清理实例 profile 失败（继续）: {} - {e}", ins.profile_dir);
                 }
             }
+            self.paths.remove_instance_generated_extensions(&ins.id);
         }
         self.instances.delete_by_env(id)?;
         // 级联清理登录 profile（浏览器运行中 → 409；否则清目录 + 删行）

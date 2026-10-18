@@ -57,11 +57,17 @@ impl ExtensionService {
 
     /// 启动同步（自动发现 + prune，幂等）：扫描 `resources/extensions/*/manifest.json`
     /// 全部注册为 system 扩展；DB 中 source_path 已不在扫描结果内的 system 行删除
-    /// （版本升级移除了内置目录）。
+    /// （版本升级移除了内置目录）。生产只认编译期源清单 [`extension::BUILTIN_EXTENSION_DIRS`]，
+    /// resources 拷贝产物里清单外的陈旧目录（幽灵）被直接无视。
     /// - 同源目录已注册（无论 system/user）→ 跳过，防重复插入/双重加载
     /// - 个别目录 manifest 损坏 → 告警跳过注册（行保留，读取时惰性标 invalid），不阻断启动
     /// - 资源根目录缺失 → Err（打包破损，快速失败）
     pub fn sync_system_extensions(&self) -> Result<(), AppError> {
+        self.sync_system_extensions_with(extension::BUILTIN_EXTENSION_DIRS)
+    }
+
+    /// 清单可注入版（测试用自定义目录集；生产恒为编译期 BUILTIN_EXTENSION_DIRS）
+    pub fn sync_system_extensions_with(&self, allowed: &[&str]) -> Result<(), AppError> {
         let bundled_root = self.resource_root.join(extension::BUNDLED_EXTENSIONS_DIR);
         let entries = std::fs::read_dir(&bundled_root).map_err(|e| {
             AppError::internal(format!(
@@ -70,13 +76,22 @@ impl ExtensionService {
             ))
         })?;
 
-        // 有效内置目录 = extensions/ 下含 manifest.json 的一级子目录（排序保证注册顺序稳定）
+        // 有效内置目录 = extensions/ 下含 manifest.json 的一级子目录（排序保证注册顺序稳定）；
+        // 再按清单过滤——清单外目录即使残留（拷贝只增不删）也不注册不保留
         let mut dirs: Vec<PathBuf> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() && path.join("manifest.json").is_file() {
-                dirs.push(path);
+            let dir_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !path.is_dir()
+                || !path.join("manifest.json").is_file()
+                || !allowed.contains(&dir_name.as_str())
+            {
+                continue;
             }
+            dirs.push(path);
         }
         dirs.sort();
         let valid_sources: HashSet<String> =
@@ -242,11 +257,9 @@ impl ExtensionService {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let out = self
-                        .data_root
-                        .join("generated-extensions")
-                        .join(&ins.id)
-                        .join(&leaf);
+                    let out =
+                        crate::infrastructure::paths::generated_extensions_dir(&self.data_root, &ins.id)
+                            .join(&leaf);
                     let config_file = meta.config_file.as_deref().unwrap_or(extension::DEFAULT_CONFIG_FILE);
                     let result = self
                         .assemble_config(&leaf, &row.id, env, chrome_index, configs)
@@ -438,6 +451,10 @@ mod tests {
     use crate::infrastructure::db::schema::init_schema;
     use std::path::Path;
 
+    /// 测试清单：setup 造的三个模板目录（sample-static 仅存在于测试资源树，
+    /// 不在编译期 BUILTIN_EXTENSION_DIRS——由 _with 注入才可见）
+    const TPL_LIST: &[&str] = &["environment-label", "net-rules", "sample-static"];
+
     struct Ctx {
         svc: ExtensionService,
         settings: Arc<SettingsService>,
@@ -551,8 +568,8 @@ mod tests {
     #[test]
     fn sync_is_idempotent_prunes_and_locks_system() {
         let ctx = setup();
-        ctx.svc.sync_system_extensions().unwrap();
-        ctx.svc.sync_system_extensions().unwrap(); // 二次幂等
+        ctx.svc.sync_system_extensions_with(TPL_LIST).unwrap();
+        ctx.svc.sync_system_extensions_with(TPL_LIST).unwrap(); // 二次幂等
         let list = ctx.svc.list().unwrap();
         assert_eq!(list.len(), 3, "目录自动发现三个内置 system 扩展");
         assert!(list.iter().all(|e| e.extension_type == ExtensionType::System));
@@ -567,7 +584,7 @@ mod tests {
 
         // prune：目录被移除（模拟升级删除内置扩展）→ 行清理；其余保留
         std::fs::remove_dir_all(ctx.templates.parent().unwrap().join("sample-static")).unwrap();
-        ctx.svc.sync_system_extensions().unwrap();
+        ctx.svc.sync_system_extensions_with(TPL_LIST).unwrap();
         let names: Vec<String> =
             ctx.svc.list().unwrap().into_iter().map(|e| e.name).collect();
         assert!(names.contains(&"Environment Label".to_string()));
@@ -575,6 +592,48 @@ mod tests {
             !names.contains(&"Sample Static".to_string()),
             "目录移除 → 注册行被 prune: {names:?}"
         );
+    }
+
+    /// 清单外目录（resources 拷贝残留的幽灵）被无视：不注册；已有 DB 行被 prune
+    /// ——修复 devtools-unlock 幽灵的根因语义
+    #[test]
+    fn dirs_outside_builtin_list_are_ignored_and_pruned() {
+        let ctx = setup();
+        // 幽灵目录：完整可解析的 manifest，但不在注入清单内
+        let ghost = ctx.templates.parent().unwrap().join("devtools-unlock");
+        std::fs::create_dir_all(&ghost).unwrap();
+        std::fs::write(
+            ghost.join("manifest.json"),
+            r#"{"name":"Devtools Unlock","manifest_version":3}"#,
+        )
+        .unwrap();
+
+        ctx.svc.sync_system_extensions_with(TPL_LIST).unwrap();
+        let names: Vec<String> = ctx.svc.list().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(!names.contains(&"Devtools Unlock".to_string()), "清单外目录不注册: {names:?}");
+
+        // 残留行自愈：模拟旧版本已注册（绕过 sync 直接插行），prune 按「有效扫描集」删除
+        let now = chrono::Utc::now().timestamp_millis();
+        (ctx.svc.repo).insert(&Extension {
+            id: "ext_ghost".into(),
+            name: "Devtools Unlock".into(),
+            description: None,
+            version: None,
+            manifest_version: Some(3),
+            extension_type: ExtensionType::System,
+            source_path: ghost.to_string_lossy().to_string(),
+            enabled: true,
+            status: ExtensionStatus::Ready,
+            configurable: false,
+            config_docs_url: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+        ctx.svc.sync_system_extensions_with(TPL_LIST).unwrap();
+        let names: Vec<String> = ctx.svc.list().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(!names.contains(&"Devtools Unlock".to_string()), "幽灵行被 prune: {names:?}");
+        assert_eq!(names.len(), 3, "清单内三个不受影响: {names:?}");
     }
 
     #[test]
@@ -630,7 +689,7 @@ mod tests {
     #[test]
     fn resolve_dispatches_by_metadata() {
         let ctx = setup();
-        ctx.svc.sync_system_extensions().unwrap();
+        ctx.svc.sync_system_extensions_with(TPL_LIST).unwrap();
         let net_rules_id = ctx
             .svc
             .list()
@@ -727,7 +786,7 @@ mod tests {
     #[test]
     fn config_crud_and_validation() {
         let ctx = setup();
-        ctx.svc.sync_system_extensions().unwrap();
+        ctx.svc.sync_system_extensions_with(TPL_LIST).unwrap();
         let list = ctx.svc.list().unwrap();
         let by_name = |n: &str| list.iter().find(|e| e.name == n).unwrap().clone();
         let net_rules_id = by_name("Net Rules").id;

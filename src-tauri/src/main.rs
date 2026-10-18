@@ -222,6 +222,8 @@ fn main() {
             tauri::async_runtime::block_on(reconciler.reconcile_all());
             profile_service.reattach_all();
             keep_alive.scan_register();
+            // 孤儿物化目录对账（删除编排补齐前的历史残留，一次清）
+            instance_service.prune_orphan_generated_extensions();
 
             // 自启模式（--hidden）→ 启动即隐藏主窗口，仅托盘常驻
             if std::env::args().any(|a| a == "--hidden") {

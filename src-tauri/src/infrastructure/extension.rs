@@ -18,6 +18,11 @@ use crate::error::AppError;
 /// 内置扩展在 resources 下的根目录（tauri.conf bundle.resources 声明整个目录，递归拷贝）
 pub const BUNDLED_EXTENSIONS_DIR: &str = "extensions";
 
+// 编译期内置扩展源清单（build.rs 生成）：与源码树 extensions/ 强一致。
+// sync 只认清单内的目录——resources 拷贝产物（workspace target）只增不删，
+// 源码树已删的内置扩展会在 target 残留，清单过滤后幽灵目录被天然无视
+include!(concat!(env!("OUT_DIR"), "/builtin_extensions.rs"));
+
 /// 自描述元数据文件名（与 manifest.json 同目录；Chrome 忽略未引用文件）
 pub const BUNDLE_META_FILE: &str = "chrome-host.json";
 
@@ -143,6 +148,18 @@ mod tests {
     }
 
     /// 统一管道：模板树原样拷贝 + config.js 为同步赋值语句（同步全局变量，无 fetch）
+    /// 编译期清单与源码树强一致的自检：三个真实内置扩展必须在列
+    ///（build.rs 读不到 extensions/ 会直接 panic，不会静默空清单——
+    /// 此测试防的是生成物被意外破坏/为空的回归）
+    #[test]
+    fn builtin_list_covers_source_tree_entries() {
+        assert_eq!(
+            BUILTIN_EXTENSION_DIRS,
+            ["environment-label", "net-rules", "page-diagnostics"].as_slice(),
+            "清单应与 src-tauri/extensions/ 现状一致（增删内置扩展需同步更新本断言）"
+        );
+    }
+
     #[test]
     fn materialize_copies_tree_and_writes_config() {
         let tmp = std::env::temp_dir().join(format!("cem-ext-{}", uuid::Uuid::new_v4()));
