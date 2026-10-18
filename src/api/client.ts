@@ -115,4 +115,19 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(config),
     }),
+  // 常驻诊断（M6，GUI 消费面 0.3.0 起）
+  getInstanceConsole: (id: string, level?: string, limit?: number) => {
+    const q = [level && `level=${level}`, limit && `limit=${limit}`].filter(Boolean).join('&');
+    return request<{ entries: { ts: number; level: string; text: string; source: string; targetUrl: string }[] }>(
+      `/instances/${id}/console${q ? `?${q}` : ''}`,
+    );
+  },
+  getInstanceNetwork: (id: string, failedOnly?: boolean, limit?: number) => {
+    const q = [failedOnly && 'failedOnly=true', limit && `limit=${limit}`].filter(Boolean).join('&');
+    return request<
+      { entries: { ts: number; method: string; url: string; status: number | null; error: string | null; durationMs: number | null; targetUrl: string }[] }
+    >(`/instances/${id}/network${q ? `?${q}` : ''}`);
+  },
+  getInstanceScreenshot: (id: string) =>
+    request<{ instanceId: string; format: string; data: string }>(`/instances/${id}/screenshot`),
 };

@@ -23,6 +23,107 @@ function displayName(list: Instance[], id: string): string {
   return `Chrome #${idx + 1}`;
 }
 
+const fmtTime = (ts: number) => new Date(ts).toLocaleTimeString();
+
+/** 实例诊断抽屉（M7-C⑤）：console 错误 + 失败请求 + 当前页截图，
+ * 数据源为三个现成常驻诊断端点，零新后端。打开时拉取一次，刷新按钮重拉
+ * （环形缓冲是服务端实时态，不自动轮询——人看到问题去实例里操作才是主路径）。 */
+function DiagnosticsPanel({ insId, onClose }: { insId: string; onClose: () => void }) {
+  const [loading, setLoading] = useState(true);
+  const [errors, setErrors] = useState<{ ts: number; text: string; source: string }[]>([]);
+  const [failed, setFailed] = useState<{ ts: number; method: string; url: string; status: number | null; error: string | null }[]>([]);
+  const [shot, setShot] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setErr(null);
+    try {
+      // 截图失败（无 http 页/连接未就绪）不拖垮面板：静默置空
+      const [c, n, s] = await Promise.all([
+        api.getInstanceConsole(insId, 'error', 50),
+        api.getInstanceNetwork(insId, true, 50),
+        api.getInstanceScreenshot(insId).catch((): null => null),
+      ]);
+      setErrors(c.entries ?? []);
+      setFailed(n.entries ?? []);
+      setShot(s?.data ?? null);
+    } catch (e) {
+      setErr(errorText(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [insId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <div className="mt-2 w-full rounded-lg border border-hairline bg-surface-inset p-3">
+      <div className="mb-2 flex items-center gap-2">
+        <span className="text-xs font-medium text-ink">诊断</span>
+        <span className="text-[11px] text-ink-3">console 错误 / 失败请求 / 当前页截图（进程内态，实例重启即清）</span>
+        <div className="ml-auto flex gap-1.5">
+          <button className={btnGhost} disabled={loading} onClick={load}>
+            刷新
+          </button>
+          <button className={btnGhost} onClick={onClose}>
+            收起
+          </button>
+        </div>
+      </div>
+      {err && <p className="text-xs text-status-error">{err}</p>}
+      {loading && <p className="text-xs text-ink-3">读取中…</p>}
+      {!loading && !err && (
+        <div className="flex flex-wrap items-start gap-3">
+          {shot ? (
+            <img
+              src={`data:image/png;base64,${shot}`}
+              alt="实例当前页面截图"
+              className="w-64 shrink-0 rounded border border-hairline"
+            />
+          ) : (
+            <div className="flex w-64 shrink-0 items-center justify-center rounded border border-hairline bg-surface-card px-2 py-8 text-center text-[11px] text-ink-3">
+              截图不可用（无 http 页或连接未就绪）
+            </div>
+          )}
+          <div className="min-w-0 flex-1 space-y-2">
+            <div>
+              <p className="text-[11px] font-medium text-ink-2">console 错误（最近 {errors.length} 条）</p>
+              {errors.length === 0 ? (
+                <p className="text-[11px] text-ink-3">无</p>
+              ) : (
+                <ul className="max-h-28 space-y-0.5 overflow-y-auto font-mono text-[11px] leading-4 text-ink-2">
+                  {errors.map((e, i) => (
+                    <li key={i} className="truncate" title={`${e.source}: ${e.text}`}>
+                      {fmtTime(e.ts)} [{e.source}] {e.text}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div>
+              <p className="text-[11px] font-medium text-ink-2">失败请求（失败或 HTTP≥400，最近 {failed.length} 条）</p>
+              {failed.length === 0 ? (
+                <p className="text-[11px] text-ink-3">无</p>
+              ) : (
+                <ul className="max-h-28 space-y-0.5 overflow-y-auto font-mono text-[11px] leading-4 text-ink-2">
+                  {failed.map((f, i) => (
+                    <li key={i} className="truncate" title={f.url}>
+                      {fmtTime(f.ts)} {f.method} {f.status ?? `FAIL(${f.error ?? '?'})`} {f.url}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function EnvironmentDetailPage() {
   const { id = '' } = useParams();
   const navigate = useNavigate();
@@ -31,6 +132,7 @@ export default function EnvironmentDetailPage() {
   const instances = instancesByEnv[id] ?? [];
   const [busyId, setBusyId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [diagId, setDiagId] = useState<string | null>(null);
   const [profile, setProfile] = useState<LoginProfileView | null>(null);
   const [profileBusy, setProfileBusy] = useState(false);
   const [activity, setActivity] = useState<AppEvent[]>([]);
@@ -222,12 +324,23 @@ export default function EnvironmentDetailPage() {
                     ○ 未登录
                   </span>
                 )}
+                {diagId === ins.id && (
+                  <DiagnosticsPanel insId={ins.id} onClose={() => setDiagId(null)} />
+                )}
                 {settings?.developerMode && (
                   <div className="w-full font-mono text-[10px] leading-4 text-ink-3">
                     pid {ins.pid ?? '—'} · cdp {ins.cdpPort ?? '—'} · {ins.profileDir}
                   </div>
                 )}
                 <div className="ml-auto flex items-center gap-1.5">
+                  {ins.status === 'running' && (
+                    <button
+                      className={btnGhost}
+                      onClick={() => setDiagId(diagId === ins.id ? null : ins.id)}
+                    >
+                      {diagId === ins.id ? '收起诊断' : '诊断'}
+                    </button>
+                  )}
                   {ins.status === 'running' && (
                     <>
                       <button
