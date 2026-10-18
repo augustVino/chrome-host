@@ -43,7 +43,11 @@
 
 扩展分两类：
 
-- **系统扩展**：应用内置，随启动自动同步，锁定不可禁用/移除（`EXTENSION_SYSTEM_LOCKED`）。当前内置 **Environment Label**（环境标签角标）：按设置的位置/颜色在每个实例窗口叠加环境名，多环境并行时一眼区分；
+- **系统扩展**：应用内置，随启动自动同步，锁定不可禁用/移除（`EXTENSION_SYSTEM_LOCKED`）。当前内置：
+  - **Environment Label**（环境标签角标）：document_start 即在每个实例窗口叠加环境名角标（不等页面加载完成，慢页面/白屏期间即可区分环境），位置/颜色在 Settings 页配置；错误页/崩溃页/about:blank 不运行 content script，无标签；
+  - **Net Rules**（网络规则）：按环境注入 block/redirect/headers 网络规则（浏览器层 DNR 生效，worker 休眠不影响拦截）；配置形状与作用域见 AGENT-API.md Extensions 节（GUI Extensions 页「配置」/ CLI `extension config` / MCP `set_extension_config` 均可写入，per-env 覆盖全局默认）；
+  - **Page Diagnostics**（页面诊断）：在每个 http(s) 页面采集 JS 错误与失败资源（各环形 100 条）+ LCP/FCP，挂载在页面全局供查询端点透传（GUI 无独立入口；CLI `instance diagnostics` / REST `GET /instances/:id/diagnostics` / MCP `get_diagnostics`）；
+  - **常驻诊断**（M6，非扩展）：实例启动后 chrome-host 维持一条只订阅的 CDP 连接（console 500 条 / 请求 1000 条环形缓冲，进程内态重启即清），提供 console/network/screenshot/HAR 查询（`GET /instances/:id/console|network|screenshot|har`，CLI/MCP 同名能力）；
 - **用户扩展**：任意本地扩展目录，GUI Extensions 页选目录注册，或 CLI `extension register`；可启停、可删除。
 
 实例启动时自动以 `--load-extension` 注入当前启用的扩展；全部不可用时不阻断启动。
