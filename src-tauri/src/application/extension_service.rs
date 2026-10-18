@@ -363,6 +363,7 @@ mod tests {
             icon: None,
             startup_args: None,
             keep_alive: false,
+            session_capture: Default::default(),
             created_at: now,
             updated_at: now,
         }

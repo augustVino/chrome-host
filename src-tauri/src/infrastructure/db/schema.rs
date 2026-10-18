@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS environments (
     startup_args     TEXT,
     keep_alive       INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL,
-    updated_at       INTEGER NOT NULL
+    updated_at       INTEGER NOT NULL,
+    session_capture  TEXT NOT NULL DEFAULT 'first-login'
 );
 
 CREATE TABLE IF NOT EXISTS login_profiles (
@@ -95,6 +96,7 @@ pub fn init_schema(pool: &DbPool) -> Result<(), AppError> {
     let conn: PooledConnection<_> = pool.get()?;
     conn.execute_batch(SCHEMA)?;
     drop_legacy_columns(&conn)?;
+    ensure_session_capture_column(&conn)?;
     Ok(())
 }
 
@@ -114,6 +116,25 @@ fn drop_legacy_columns(conn: &PooledConnection<SqliteConnectionManager>) -> Resu
             conn.execute(&format!("ALTER TABLE environments DROP COLUMN {column}"), [])?;
             tracing::info!("[schema] 已删除 environments.{column} 列（历史遗留迁移）");
         }
+    }
+    Ok(())
+}
+
+/// 迁移：为旧库的 environments 补 session_capture 列（身份层回写策略）。
+/// 与 drop_legacy_columns 同款 pragma 检查 + 幂等；列固定加在末尾，
+/// 保证新库（CREATE 内联）与旧库（ALTER 追加）的 SELECT * 列序一致。
+fn ensure_session_capture_column(conn: &PooledConnection<SqliteConnectionManager>) -> Result<(), AppError> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('environments') WHERE name = 'session_capture'",
+        [],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        conn.execute(
+            "ALTER TABLE environments ADD COLUMN session_capture TEXT NOT NULL DEFAULT 'first-login'",
+            [],
+        )?;
+        tracing::info!("[schema] 已为 environments 增加 session_capture 列（默认 first-login）");
     }
     Ok(())
 }
@@ -171,6 +192,7 @@ mod tests {
         let cols = column_names(&conn, "environments");
         assert!(!cols.contains(&"host".to_string()), "host 列已删除: {cols:?}");
         assert!(!cols.contains(&"auto_start".to_string()), "auto_start 列已删除: {cols:?}");
+        assert!(cols.contains(&"session_capture".to_string()), "旧库自动补 session_capture 列: {cols:?}");
         let (name, keep_alive): (String, bool) = conn
             .query_row(
                 "SELECT name, keep_alive FROM environments WHERE id = 'env_old'",
@@ -180,6 +202,14 @@ mod tests {
             .unwrap();
         assert_eq!(name, "老环境");
         assert!(keep_alive, "其余列数据完整");
+        let sc: String = conn
+            .query_row(
+                "SELECT session_capture FROM environments WHERE id = 'env_old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sc, "first-login", "存量行自动取默认档");
     }
 
     /// 幂等：新库重复 init_schema 为 no-op（迁移对新库/已迁移库不动作）

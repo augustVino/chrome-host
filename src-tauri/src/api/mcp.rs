@@ -212,7 +212,7 @@ impl ChromeHostMcp {
         &self,
         Parameters(a): Parameters<CreateEnvironmentArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let input = CreateEnvironmentInput { name: a.name, hosts_source_url: a.hosts_source_url, icon: None };
+        let input = CreateEnvironmentInput { name: a.name, hosts_source_url: a.hosts_source_url, icon: None, session_capture: None };
         run_sync(|| self.state.env_service.create(input))
     }
 

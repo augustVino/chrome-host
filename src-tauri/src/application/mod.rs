@@ -7,6 +7,7 @@ pub mod instance_service;
 pub mod keep_alive;
 pub mod profile_service;
 pub mod reconciler;
+pub mod session_service;
 pub mod settings_service;
 pub mod tray;
 pub mod tunnel;

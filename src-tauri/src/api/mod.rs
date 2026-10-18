@@ -11,3 +11,4 @@ pub mod mcp;
 pub mod remote_access;
 pub mod settings;
 pub mod server;
+pub mod session;

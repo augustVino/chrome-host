@@ -59,6 +59,14 @@ impl EnvironmentService {
         }
 
         let now = chrono::Utc::now().timestamp_millis();
+        let session_capture = match input.session_capture.as_deref() {
+            None => crate::domain::environment::SessionCapture::FirstLogin,
+            Some(s) => crate::domain::environment::SessionCapture::parse(s).ok_or_else(|| {
+                AppError::invalid_request(format!(
+                    "sessionCapture 必须为 off / first-login / always，实际: {s}"
+                ))
+            })?,
+        };
         let env = Environment {
             id: format!("env_{}", Uuid::new_v4()),
             name: name.to_string(),
@@ -66,6 +74,7 @@ impl EnvironmentService {
             icon: input.icon,
             startup_args: None,
             keep_alive: false,
+            session_capture,
             created_at: now,
             updated_at: now,
         };
@@ -102,6 +111,14 @@ impl EnvironmentService {
         }
         if let Some(on) = input.keep_alive {
             env.keep_alive = on;
+        }
+        if let Some(s) = input.session_capture.as_deref() {
+            env.session_capture = crate::domain::environment::SessionCapture::parse(s)
+                .ok_or_else(|| {
+                    AppError::invalid_request(format!(
+                        "sessionCapture 必须为 off / first-login / always，实际: {s}"
+                    ))
+                })?;
         }
         env.updated_at = chrono::Utc::now().timestamp_millis();
 

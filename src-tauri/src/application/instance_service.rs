@@ -24,6 +24,7 @@ use super::extension_service::ExtensionService;
 use super::keep_alive::KeepAliveWatcher;
 use super::profile_service::ProfileService;
 use super::reconciler::Reconciler;
+use super::session_service::SessionService;
 use super::settings_service::SettingsService;
 
 const CDP_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -56,6 +57,7 @@ pub struct InstanceService {
     process: Arc<dyn ProcessManager>,
     reconciler: Arc<Reconciler>,
     profiles: Arc<ProfileService>,
+    sessions: Arc<SessionService>,
     activity: Arc<Activity>,
     keep_alive: Arc<KeepAliveWatcher>,
     extensions: Arc<ExtensionService>,
@@ -73,6 +75,7 @@ impl InstanceService {
         process: Arc<dyn ProcessManager>,
         reconciler: Arc<Reconciler>,
         profiles: Arc<ProfileService>,
+        sessions: Arc<SessionService>,
         activity: Arc<Activity>,
         keep_alive: Arc<KeepAliveWatcher>,
         extensions: Arc<ExtensionService>,
@@ -80,7 +83,7 @@ impl InstanceService {
         paths: AppPaths,
         app: AppHandle,
     ) -> Self {
-        InstanceService { envs, instances, kernel, process, reconciler, profiles, activity, keep_alive, extensions, settings, paths, app }
+        InstanceService { envs, instances, kernel, process, reconciler, profiles, sessions, activity, keep_alive, extensions, settings, paths, app }
     }
 
     /// 创建并启动 Instance。创建非幂等：每调用一次新增一个 Instance。
@@ -347,6 +350,8 @@ impl InstanceService {
         }
 
         if let Some(pid) = ins.pid {
+            // 身份层挂钩 A：terminate 前经 CDP 导出实例 Cookie（尽力而为，不阻塞停止）
+            self.sessions.on_instance_stopping(&ins).await;
             self.process.terminate(pid)?;
         }
         self.instances.update_runtime(
@@ -359,6 +364,8 @@ impl InstanceService {
         )?;
         self.emit("instance-stopped", id);
         tracing::info!("实例已停止: {id}");
+        // 身份层挂钩 B：按 session_capture 策略升级环境身份（first-login/always）
+        self.sessions.on_instance_stopped(&ins.environment_id, id).await;
         Ok(self.instances.get(id)?)
     }
 
@@ -372,6 +379,8 @@ impl InstanceService {
                 continue;
             }
             self.keep_alive.cancel(&ins.id);
+            // 身份层挂钩（同 stop：导出 → 停止 → 策略升级）
+            self.sessions.on_instance_stopping(&ins).await;
             if let Some(pid) = ins.pid {
                 self.process.terminate(pid)?;
             }
@@ -384,6 +393,7 @@ impl InstanceService {
                 },
             )?;
             self.emit("instance-stopped", &ins.id);
+            self.sessions.on_instance_stopped(&ins.environment_id, &ins.id).await;
             stopped.push(ins.id);
         }
         Ok(stopped)
@@ -638,6 +648,7 @@ mod tests {
             icon: None,
             startup_args: None,
             keep_alive: false,
+            session_capture: Default::default(),
             created_at: 0,
             updated_at: 0,
         }

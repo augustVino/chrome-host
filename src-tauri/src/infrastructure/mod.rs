@@ -9,3 +9,4 @@ pub mod platform;
 pub mod process;
 pub mod profile;
 pub mod settings;
+pub mod session_vault;

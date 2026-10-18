@@ -203,6 +203,7 @@ mod tests {
             icon: None,
             startup_args: None,
             keep_alive: false,
+            session_capture: Default::default(),
             created_at: 1,
             updated_at: 1,
         })

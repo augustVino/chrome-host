@@ -20,6 +20,7 @@ use application::keep_alive::KeepAliveWatcher;
 use application::profile_service::ProfileService;
 use application::activity::Activity;
 use application::reconciler::Reconciler;
+use application::session_service::SessionService;
 use application::settings_service::SettingsService;
 use application::tray::{self, TrayState};
 use application::tunnel::TunnelService;
@@ -120,11 +121,8 @@ fn main() {
             let sessions = Arc::new(CdpSessionService::new(activity.clone()));
             sessions.start_sweeper();
 
-            let reconciler = Arc::new(Reconciler::new(
-                ins_repo.clone(),
-                process.clone(),
-                activity.clone(),
-            ));
+            // 装配顺序：profile（身份层文件层）→ session（策略/保险库）→ reconciler（关窗挂钩依赖 session）。
+            // reconciler 原先先于 profile 构造；身份层落地后关窗路径需要 session，顺序调整无循环依赖
             let profile_service = Arc::new(ProfileService::new(
                 env_repo.clone(),
                 ins_repo.clone(),
@@ -134,6 +132,19 @@ fn main() {
                 settings_service.clone(),
                 paths.clone(),
                 handle.clone(),
+            ));
+            let session_service = Arc::new(SessionService::new(
+                env_repo.clone(),
+                ins_repo.clone(),
+                profile_service.clone(),
+                paths.clone(),
+                activity.clone(),
+            ));
+            let reconciler = Arc::new(Reconciler::new(
+                ins_repo.clone(),
+                process.clone(),
+                activity.clone(),
+                session_service.clone(),
             ));
             let extension_service = Arc::new(ExtensionService::new(
                 Arc::new(ExtensionRepository::new(service_pool.clone())),
@@ -180,6 +191,7 @@ fn main() {
                 process,
                 reconciler.clone(),
                 profile_service.clone(),
+                session_service.clone(),
                 activity.clone(),
                 keep_alive.clone(),
                 extension_service.clone(),
@@ -286,6 +298,7 @@ fn main() {
                 env_service,
                 instance_service,
                 profile_service,
+                session_service,
                 settings_service,
                 extension_service,
                 activity,

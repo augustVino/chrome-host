@@ -322,7 +322,46 @@ pub async fn list(&self) -> Result<Vec<LoginProfileRow>, AppError> {
         self.profiles.mark_capturing(&profile.id)?;
         self.emit(env_id);
 
-        match self.consolidate(&profile) {
+        match self.consolidate_from(Path::new(&profile.profile_dir), &profile) {
+            Ok(()) => {
+                self.profiles.mark_ready(&profile.id, profile.snapshot_version + 1)?;
+            }
+            Err(e) => {
+                self.profiles.mark_error(&profile.id)?;
+                self.emit(env_id);
+                return Err(e);
+            }
+        }
+        self.emit(env_id);
+        self.to_view(&self.profiles.find_by_env(env_id)?.expect("行已存在"))
+    }
+
+    /// 从指定来源目录固化文件层快照并迁移状态（gate 串行 + capturing→ready）。
+    /// 来源可以是母本自身（传统捕获）或已停止实例的 profile 目录（实例即登录源）。
+    /// 供 SessionService 调用；失败置 error 态（与显式捕获同语义，失败是准确状态）。
+    pub async fn capture_files_from(
+        &self,
+        env_id: &str,
+        source_dir: &Path,
+    ) -> Result<LoginProfileView, AppError> {
+        let env = self.envs.get(env_id)?;
+        let profile = self.get_or_create(&env)?;
+        let _gate = self.gate.lock().await;
+
+        if profile.status == LoginProfileStatus::Capturing {
+            return Err(AppError::conflict("PROFILE_IN_USE", "快照捕获已在进行中"));
+        }
+        // 母本浏览器运行中 → 409（文件层不可变约定，与 capture 一致）
+        if let Some(pid) = self.memory_alive_pid(&profile)? {
+            return Err(AppError::conflict(
+                "PROFILE_IN_USE",
+                format!("登录浏览器运行中（pid {pid}），请先关闭再捕获"),
+            ));
+        }
+
+        self.profiles.mark_capturing(&profile.id)?;
+        self.emit(env_id);
+        match self.consolidate_from(source_dir, &profile) {
             Ok(()) => {
                 self.profiles.mark_ready(&profile.id, profile.snapshot_version + 1)?;
             }
@@ -337,16 +376,17 @@ pub async fn list(&self) -> Result<Vec<LoginProfileRow>, AppError> {
     }
 
     /// 原地固化：母本目录 = 快照本体（简化决策）。
-    /// 白名单文件拷入同级临时目录 → 原子换名替换母本 → 删除旧目录。
+    /// 白名单文件从来源目录拷入同级临时目录 → 原子换名替换母本 → 删除旧目录。
     /// 效果：缓存等可再生内容出清（体积可控），失败可回滚不丢母本。
-    fn consolidate(&self, profile: &LoginProfile) -> Result<(), AppError> {
+    fn consolidate_from(&self, source: &Path, profile: &LoginProfile) -> Result<(), AppError> {
         let dir = Path::new(&profile.profile_dir);
-        if !dir.exists() {
+        if !source.exists() {
+            // 来源不存在（从未打开过浏览器）：固化即建空母本目录
             std::fs::create_dir_all(dir)?;
-            return Ok(()); // 从未打开过浏览器的空母本：固化即建目录
+            return Ok(());
         }
 
-        let plan = copier::build(dir);
+        let plan = copier::build(source);
         let file_name = dir.file_name().expect("profile_dir 有文件名").to_string_lossy().to_string();
         let parent = dir.parent().expect("profile_dir 有父目录");
         let tmp = parent.join(format!(".{file_name}.capturing"));
@@ -355,12 +395,18 @@ pub async fn list(&self) -> Result<Vec<LoginProfileRow>, AppError> {
         let _ = std::fs::remove_dir_all(&old);
         std::fs::create_dir_all(&tmp)?;
 
-        let bytes = copier::execute(&plan, dir, &tmp)?;
+        let bytes = copier::execute(&plan, source, &tmp)?;
 
-        std::fs::rename(dir, &old)?;
+        // 目标（母本）不存在（新环境首次从实例捕获）：无旧目录可归档，直接换名落位
+        let archived = dir.exists();
+        if archived {
+            std::fs::rename(dir, &old)?;
+        }
         if let Err(e) = std::fs::rename(&tmp, dir) {
             // 回滚：旧目录原位，母本维持 capture 前状态
-            let _ = std::fs::rename(&old, dir);
+            if archived {
+                let _ = std::fs::rename(&old, dir);
+            }
             let _ = std::fs::remove_dir_all(&tmp);
             return Err(AppError::internal(format!("快照固化失败（已回滚）: {e}")));
         }

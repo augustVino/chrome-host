@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 
 use super::activity::Activity;
+use super::session_service::SessionService;
 use crate::domain::instance::{Instance, InstanceStatus, RuntimeUpdate};
 use crate::error::AppError;
 use crate::infrastructure::cdp;
@@ -44,6 +45,7 @@ pub struct Reconciler {
     instances: Arc<InstanceRepository>,
     process: Arc<dyn ProcessManager>,
     activity: Arc<Activity>,
+    sessions: Arc<SessionService>,
 }
 
 impl Reconciler {
@@ -51,8 +53,9 @@ impl Reconciler {
         instances: Arc<InstanceRepository>,
         process: Arc<dyn ProcessManager>,
         activity: Arc<Activity>,
+        sessions: Arc<SessionService>,
     ) -> Self {
-        Reconciler { instances, process, activity }
+        Reconciler { instances, process, activity, sessions }
     }
 
     /// 单实例对账：以真实进程状态回写 DB，返回对账后的最新视图。
@@ -174,6 +177,8 @@ impl Reconciler {
         }
 
         tracing::info!("[reconcile] 实例 {} 的全部窗口已关闭（连续确认），优雅终止进程", ins.id);
+        // 身份层挂钩：导出 Cookie 后再终止（进程活着 CDP 才可达）
+        self.sessions.on_instance_stopping(ins).await;
         if let Some(pid) = ins.pid {
             let _ = self.process.terminate(pid);
         }
@@ -186,6 +191,7 @@ impl Reconciler {
             },
         );
         self.emit("instance-stopped", &ins.id);
+        self.sessions.on_instance_stopped(&ins.environment_id, &ins.id).await;
     }
 
     /// 确认死亡：running → stopped；带 started_at 的按用户关闭语义记 stopped_at

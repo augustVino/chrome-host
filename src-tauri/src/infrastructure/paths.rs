@@ -41,4 +41,10 @@ impl AppPaths {
     pub fn login_profile_dir(&self, env_id: &str) -> std::path::PathBuf {
         self.environment_dir(env_id).join("login-profile")
     }
+
+    /// 实例私有 Cookie 导出（关闭时尽力导出，随实例目录生命周期自动清理）。
+    /// 保险库文件布局（session-vault.json / history）定义于 session_vault.rs，不经由本结构
+    pub fn instance_cookies(&self, env_id: &str, ins_id: &str) -> std::path::PathBuf {
+        self.instance_profile(env_id, ins_id).join("chrome-host-cookies.json")
+    }
 }

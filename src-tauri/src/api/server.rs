@@ -22,6 +22,7 @@ use crate::application::activity::Activity;
 use crate::application::cdp_session::CdpSessionService;
 use crate::application::profile_service::ProfileService;
 use crate::application::settings_service::SettingsService;
+use crate::application::session_service::SessionService;
 use crate::application::tunnel::TunnelService;
 use crate::infrastructure::kernel::KernelManager;
 
@@ -35,6 +36,7 @@ pub struct ApiState {
     pub env_service: Arc<EnvironmentService>,
     pub instance_service: Arc<InstanceService>,
     pub profile_service: Arc<ProfileService>,
+    pub session_service: Arc<SessionService>,
     pub settings_service: Arc<SettingsService>,
     pub extension_service: Arc<ExtensionService>,
     pub activity: Arc<Activity>,
@@ -87,6 +89,14 @@ fn routes(state: ApiState) -> Router {
         .route(
             "/api/v1/environments/{id}/login-profile/reset",
             post(crate::api::login_profiles::reset),
+        )
+        .route(
+            "/api/v1/environments/{id}/session",
+            get(crate::api::session::status),
+        )
+        .route(
+            "/api/v1/environments/{id}/session/restore",
+            post(crate::api::session::restore),
         )
         .route(
             "/api/v1/environments/{environment_id}/instances",
