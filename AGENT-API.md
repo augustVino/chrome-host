@@ -68,7 +68,7 @@
 
 `hostsSourceUrl` 可选（指向返回 **hosts 格式纯文本** 的 http(s) 地址，实例每次启动时拉取注入；非法 URL → `400 HOSTS_SOURCE_INVALID`）。
 
-`sessionCapture`（可选，默认 `first-login`）：身份层回写策略——`off` 不保存；`first-login` 仅首个实例退出时保存；`always` 每个实例退出都保存（详见下方 Session 小节）。
+`sessionCapture`（可选，默认 `first-login`）：身份层回写策略——`off` 不保存；`first-login` 身份层为空时（**文件快照与 Cookie 保险库两层均无内容**）首个退出的实例自动保存，此后不再自动更新；`always` 每个实例退出都保存（详见下方 Login Profile 小节）。
 
 ### `GET /api/v1/environments/{id}` — 详情
 
@@ -127,7 +127,7 @@
 | `GET /api/v1/login-profiles` | 全部快照列表（含环境名，供列表页） |
 | `GET /api/v1/environments/{id}/login-profile` | 单环境视图（惰性建行，从未配置过也返回） |
 | `POST /api/v1/environments/{id}/login-profile/capture` | 捕获快照。**登录浏览器必须已关闭**，运行中 → `409 PROFILE_IN_USE`；可选 body `{ "fromInstanceId": "ins_..." }` 从指定**已停止实例**捕获（实例即登录源，推荐路径） |
-| `POST /api/v1/environments/{id}/login-profile/reset` | 清空快照回到 not_configured |
+| `POST /api/v1/environments/{id}/login-profile/reset` | 清空身份层两层（Cookie 保险库含历史 + 文件快照，回到 not_configured）。遗留登录浏览器运行中 → `409 PROFILE_IN_USE`（校验先于任何清空动作） |
 | `GET /api/v1/environments/{id}/session` | 会话身份层状态：策略（off/first-login/always）/当前代/来源实例/Cookie 数/历史代列表 |
 | `POST /api/v1/environments/{id}/session/restore` | 回滚 Cookie 保险库到历史代：body `{ "generation": <n> }`。不存在 → `404 SESSION_GENERATION_NOT_FOUND`；仅回滚 Cookie 层，文件快照保留当前 |
 
