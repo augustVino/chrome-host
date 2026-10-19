@@ -11,7 +11,7 @@
 
 ## 1. 设计基调
 
-- **Aurora Glass**：流动的极光背景 + 毛玻璃面板 + 渐变高光，亮/暗双主题，层次靠「玻璃 + rim 描边 + 柔和投影」表达。
+- **Aurora Glass**：流动的极光背景 + 整窗一张通透的玻璃面板 + 渐变高光，亮/暗双主题。侧栏与主区**不做独立的圆角分块**，只以一条细线分隔（对标 Finpay 式的大气留白）；层次只在内容卡与英雄卡上表达。
 - **动效是体验的一部分，但永远可降级**：所有动效由 GSAP 驱动，受「动效档位」治理（§3），`static` 档与系统「减少动态效果」下必须完全静态可用。
 - **双窗口同一套 token**：主窗口与 Popover 共享色板，仅材质不同（Popover 在 macOS 上使用原生模糊）。
 - **功能优先**：视觉与动效改动不得影响数据流；动画只由已有状态的变化触发，轮询重渲染不得重放动画。
@@ -43,18 +43,18 @@
 
 | 变量 | Tailwind 类 | 用途 |
 |---|---|---|
-| `--glass` | `bg-surface-sidebar` | 侧栏、主面板玻璃底 |
+| `--glass` | `bg-surface-sidebar` | 整窗玻璃面板底（`.layout`） |
 | `--glass-2` | `bg-surface-card` `bg-surface-raised` | 卡片 / 浮起元素 |
 | `--inset` | `bg-surface-inset` | 卡内嵌套底（代码块、输入框、进度槽） |
 | `--line` `--line-soft` | `border-hairline` `border-hairline-soft` | 描边 / 弱分隔 |
-| `--rim-a/b/c` | —（`.glass::before` 使用） | 玻璃渐变描边 |
 | `--popover-*` | `bg-popover-card` `border-popover-line` 等 | Popover 半透明材质 |
 
 **旧语义名**（`accent` `status-*` `surface-*` `hairline` `ink`）仍保留并映射到新色板，便于未改造代码继承配色；**新代码优先使用上表的新语义名**。
 
-**环境渐变色盘**：`.g1 – .g8`（定义 `--ga` / `--gb`），由 `src/lib/envColor.ts` 的 `envGradient(id)` 按环境 id 哈希确定性取色，不落库。环境首字母头像、卡片 tile、Deck 卡片均使用同一渐变。
+**环境渐变色盘**：`.g1 – .g8`（定义 `--ga` / `--gb`），由 `src/lib/envColor.ts` 的 `envGradient(id)` 按环境 id 哈希确定性取色，不落库。色盘刻意**降饱和、偏蓝紫**（靛紫 / 天蓝 / 玫瑰淡紫 / 青蓝 / 兰花粉 / 蜜桃 / 灰蓝薰衣草），**避开纯绿与纯红**（二者分别表示运行 / 异常）；`.tile` 光晕用 `color-mix(--ga 60%)`。环境首字母头像、卡片 tile、Deck 卡片、Popover 色条均使用同一渐变。新增色盘项时须遵守上述原则。
 
 **使用规则**：
+- **主题色是 brand（靛 → 紫渐变）**：主操作按钮、导航选中态、开关开启态、分段控件选中态一律用 brand。mint 仅用于「运行 / 成功 / 启动」语义（运行状态点、running 徽章、启动按钮）；coral 仅用于异常与危险操作；amber 仅用于启动中与警告。**禁止把 mint 用在通用控件上。**
 - 状态点用 `StatusDot`；对应文字用 `text-run-text`（运行）或 `text-coral`（异常），禁止状态点与文字同色导致对比度不足。
 - 徽章背景用语义色半透明（`bg-mint/15`、`bg-coral/15`、`bg-amber/15`），无需再写 `dark:` 对应值。
 - hover / focus 的中性 overlay 用前景透明度：`hover:bg-ink/5`。
@@ -63,14 +63,14 @@
 
 | 类 | 说明 |
 |---|---|
-| `.glass` | 24px 圆角玻璃：`--glass` 底 + `backdrop-filter: blur(28px) saturate(160%)` + `::before` 渐变 rim 描边 + 柔和投影。用于侧栏与内容主面板 |
-| `.gcard` | 20px 圆角内容卡：`--glass-2` 底 + 1px `--line` 内描边 + 投影。**不叠 `backdrop-filter`** |
+| `.layout` | 整窗玻璃面板：`position:absolute; inset:0`，背景 `--glass`，**无外边距、无圆角、无投影、无 `backdrop-filter`**（极光本身已是柔和渐变，模糊无视觉收益且耗性能） |
+| `.gcard` / `.env-card` / `.side-card` | 20–24px 圆角内容卡：`--glass-2` 底 + 投影。**亮色无描边**，靠 `--card-ambient`（环绕淡影）+ 下方大投影浮起；**暗色**投影不可见，保留 1px `--card-line` 描边。描边/投影统一通过 `--card-line` / `--card-ambient` 变量控制，不要在卡片上单独写 `ring` / `border`。**不叠 `backdrop-filter`** |
 | `.aurora` / `.blob` / `.grain` | 窗口底层的极光 blob 与颗粒噪点；由 `Aurora.tsx` 驱动 |
 | `.inset` 背景 | `bg-surface-inset`，嵌套内容底 |
 
 **性能规则**：
-- 同屏带 `backdrop-filter` 的元素 **≤ 4 个**；`.content` 内的嵌套 `.glass` 不再叠 blur（CSS 已强制）。
-- `static` 档下 `.glass` / `.pop` 自动去掉 blur，换为 `--glass-solid` 不透明底。
+- 主窗口不使用 `backdrop-filter`；如确需（如浮层），同屏 blur 元素 **≤ 4 个**，且不得嵌套。
+- `static` 档下 `.layout` 自动换为 `--glass-solid` 不透明底，`.pop` 去掉 blur。
 - Popover：macOS 根容器**保持透明**（材质来自原生 `NSVisualEffectView`）；非 macOS 使用 `.no-vibrancy`（`--glass-solid` 底 + 投影）。
 
 ### 2.3 字体与排印
@@ -119,7 +119,7 @@
 | 层级 | 常量 / 类 | 场景 |
 |---|---|---|
 | Primary | `btnPrimary`（`btn btn-brand`） | 每屏唯一主操作：Add Environment / Run |
-| Mint | `btnMint`（`btn btn-mint`） | 启动类操作：New Chrome / New |
+| Mint | `btnMint`（`btn btn-mint`） | 启动类操作：New Chrome / New。浅 mint 渐变底 + **深绿字**（`#053b2e`，对比度 >8:1）；浅底配白字对比度不足（<2:1），不要改成白字 |
 | Ghost | `btnGhost` / `btnGhostSm`（`btn-ghost`，`-xs` 小号） | 次操作：Focus / Restart / Stop / 取消 |
 | 危险 | `btnDanger`（实心）/ `btnQuietDanger`（文字，hover 才变色） | 删除 / 确认不可逆操作 |
 | 图标按钮 | `.icon-btn` / `.ib` + `data-tip` | Popover 与卡内紧凑操作 |
@@ -137,7 +137,7 @@
 |---|---|
 | `PageHeader` | 页头：`.title`（SplitText 入场）+ `.sub` + 右侧操作区。**一级页面（Environments / Instances / Login Profiles / Extensions / Agent API / Settings）必须统一使用，必须带一行 `sub` 描述；右侧只放状态或主操作，不得在页头下另放说明框** |
 | `Seg` | 分段控件，带滑动指示器（`.seg` `.seg-ind`） |
-| `Switch` | 开关，开启态走 `--mint` / 渐变，旋钮弹性动画 |
+| `Switch` | 开关，开启态走 brand 渐变（与主题色一致，**不用 mint**），旋钮弹性动画 |
 | `ModalShell` / `Modal` / `Field` | 带进出场动画的弹窗骨架；`ConfirmDialog` 复用 `ModalShell`（`confirm.tsx` 的 store API 不变） |
 | `EmptyState` | 空态：描边环 + 轨道光点（`<path>` + MotionPath） |
 | `Toast` | GSAP 驱动；`compact` 用于 Popover |
@@ -157,9 +157,9 @@
 
 ## 5. 布局骨架
 
-- **主窗口**：`.shell` → `Aurora`（底）→ `.layout`（12px 外边距、12px 间距）→ 左 `.sidebar.glass`（宽 206）+ 右 `.content.glass`（`.scroller` 滚动）。
-- **侧栏**：Logo + 品牌名 → 导航（`.nav-item`，滑动指示器 `.nav-ind`，Instances 项带运行数徽章）→ 底部仅一行版本号 `.side-foot`（`v{app}`）。**内核信息不放侧栏**，仅出现在 Environments 页的内核 pill 与 Settings。
-- **macOS 标题栏**：`tauri.conf.json` 使用 `titleBarStyle: "Overlay"` + `hiddenTitle` + `trafficLightPosition: { x: 30, y: 26 }`，让红绿灯落在侧栏玻璃面板内部、避开圆角；顶部 26px 为拖拽区（`.drag-region`，`data-tauri-drag-region`，仅 Mac 渲染），侧栏顶部留白 50px。窗口拖拽需 capability `core:window:allow-start-dragging`。
+- **主窗口**：`.shell` → `Aurora`（底）→ `.layout`（整窗玻璃面板，无外边距/间距）→ 左 `.sidebar`（宽 214，右侧 1px `--line` 分隔线）+ 右 `.content`（`.scroller` 滚动，内边距 30px）。**禁止给侧栏/主区加圆角、投影或独立背景块。**
+- **侧栏**：Logo + 品牌名 → 导航（`.nav-item`，滑动指示器 `.nav-ind`，Instances 项带运行数徽章）→ 底部区 `.side-bottom`：欢迎卡 `SideHello`（轻量 SVG 插图 + "Welcome back!" + 运行状态摘要 + 「连接 AI Agent」入口；插图漂浮动画挂在 `AMB` 上；窗口高度 < 680px 时自动隐藏）+ 一行版本号 `.side-foot`（`v{app}`）。**内核信息不放侧栏**，仅出现在 Environments 页的内核 pill 与 Settings。
+- **macOS 标题栏**：`tauri.conf.json` 使用 `titleBarStyle: "Overlay"` + `hiddenTitle` + `trafficLightPosition: { x: 22, y: 22 }`，让红绿灯与侧栏品牌区左对齐；顶部 26px 为拖拽区（`.drag-region`，`data-tauri-drag-region`，仅 Mac 渲染），侧栏顶部留白 50px。窗口拖拽需 capability `core:window:allow-start-dragging`。
 - **Popover**：宽 380（Rust 持有），高度由内容自适应 280~540（`ResizeObserver` → `popover-height` 事件，该逻辑不得改动）；结构＝Header（Logo + 品牌 + Open Manager）→ 环境卡列表（滚动区）→ Footer（+ Add Environment）；窗口 `focus` 时重放入场动画。
 
 ## 6. 禁则
@@ -167,7 +167,7 @@
 1. **禁止**引入 token 之外的新色值（含 `bg-[#xxx]` 等 arbitrary value）；确需新语义色 → 先扩 `tailwind.config.js` + `main.css` 变量（亮/暗两值）并更新本文档。
 2. **禁止**在 UI 样式/动效调整中触碰功能逻辑（store 操作、API 调用、事件监听、轮询、条件渲染分支）。
 3. **禁止**给 Popover 根容器（macOS）加不透明背景（会挡住原生模糊材质）。
-4. **禁止**在 `.content` 内嵌套 `backdrop-filter`，同屏 blur 元素不得超过 4 个。
+4. **禁止**把侧栏 / 主区做成独立的圆角块（含投影、rim 描边）；**禁止**嵌套 `backdrop-filter`，同屏 blur 元素不得超过 4 个。
 5. **禁止**直接 `import from 'gsap'` 或重复注册插件；一律经 `src/motion/gsap.ts`。
 6. **禁止**新增不尊重 `qMode()` / 减少动态效果的动画；持续性动画必须可暂停。
 7. **禁止**让轮询导致的重渲染重放动画；动画触发条件必须是明确的状态变化。

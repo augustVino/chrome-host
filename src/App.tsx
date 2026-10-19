@@ -5,6 +5,7 @@ import { useStore } from './store';
 import { startFeed } from './feed';
 import { ConfirmDialog } from './components/confirm';
 import { Toast } from './components/Toast';
+import { SideHello } from './components/SideHello';
 import { Aurora } from './components/Aurora';
 import { GradientDefs, Icon, type IconName } from './components/icons';
 import logoUrl from './assets/logo.png';
@@ -89,7 +90,7 @@ function Sidebar() {
   };
 
   return (
-    <aside className="sidebar glass">
+    <aside className="sidebar">
       <div className="brand" onPointerEnter={onBrandEnter}>
         <img className="logo" src={logoUrl} alt="" draggable={false} />
         <span className="brand-name">Chrome Host</span>
@@ -104,7 +105,10 @@ function Sidebar() {
           </NavLink>
         ))}
       </nav>
-      <div className="side-foot mono">{version ? `v${version}` : ''}</div>
+      <div className="side-bottom">
+        <SideHello />
+        <div className="side-foot mono">{version ? `v${version}` : ''}</div>
+      </div>
     </aside>
   );
 }
@@ -200,7 +204,7 @@ function Shell() {
       gsap.set('.sidebar', { autoAlpha: 0 });
       gsap.set('.content', { autoAlpha: 0 });
       gsap.set('.nav-item', { autoAlpha: 0 });
-      gsap.set('.side-foot', { autoAlpha: 0 });
+      gsap.set('.side-foot, .side-hello', { autoAlpha: 0 });
       gsap.set('.logo', { autoAlpha: 0, scale: 0.4, rotation: -25 });
       const tl = gsap.timeline({ defaults: { ease: 'ch-out' } });
       tl.to('.aurora', { scale: 1, autoAlpha: 1, duration: 1.8, ease: 'power2.out' }, 0)
@@ -210,7 +214,7 @@ function Shell() {
         .from(brand.chars, { yPercent: 100, autoAlpha: 0, duration: 0.6, stagger: 0.03 }, 0.6)
         .to('.nav-item', { autoAlpha: 1, duration: 0.5, stagger: 0.05 }, 0.75)
         .fromTo('.nav-item svg > *', { drawSVG: '0%' }, { drawSVG: '100%', duration: 0.6, stagger: 0.02, ease: 'power2.out' }, 0.75)
-        .to('.side-foot', { autoAlpha: 1, duration: 0.5 }, 1.05)
+        .to('.side-foot, .side-hello', { autoAlpha: 1, duration: 0.5 }, 1.05)
         .fromTo('.content', { autoAlpha: 0, y: 24, scale: 0.985 }, { autoAlpha: 1, y: 0, scale: 1, duration: 0.9 }, 0.7)
         .add(() => brand.revert(), '>');
       // 点击任意处可跳过序曲
@@ -229,7 +233,7 @@ function Shell() {
       {isMac && <div className="drag-region" data-tauri-drag-region />}
       <div className="layout">
         <Sidebar />
-        <main className="content glass">
+        <main className="content">
           <div className="scroller" ref={scrollerRef}>
             <div key={shown.pathname} ref={pageRef}>
               <Routes location={shown}>

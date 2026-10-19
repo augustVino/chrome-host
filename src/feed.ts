@@ -19,6 +19,8 @@ interface FeedStore {
 }
 
 let seq = 0;
+/** 启动提示每个会话只记一次（StrictMode 开发态会重复挂载 effect，避免重复条目） */
+let booted = false;
 const hhmmss = () => new Date().toTimeString().slice(0, 8);
 
 export const useFeed = create<FeedStore>((set) => ({
@@ -30,7 +32,10 @@ export const useFeed = create<FeedStore>((set) => ({
 /** 启动 diff 订阅（主窗口 Shell 挂载时调用，返回取消函数） */
 export function startFeed(): () => void {
   const push = useFeed.getState().push;
-  push('info', 'Chrome Host 已启动 · Agent API 监听 127.0.0.1:17890');
+  if (!booted) {
+    booted = true;
+    push('info', 'Chrome Host 已启动 · Agent API 监听 127.0.0.1:17890');
+  }
 
   // envId → (insId → status)；某环境首次出现只播种不出事件
   const seeded = new Map<string, Map<string, string>>();
