@@ -9,10 +9,14 @@
 //! glob 语义（对外契约，AGENT-API.md 同步记载）：
 //! - block/headers 的 url：可选 scheme 前缀（剥离后按域锚定）；`*.` 前缀或裸域名
 //!   → `||域名`（域及全部子域）；可带路径，路径内 `*` 为通配
-//! - redirect 的 from：全量 glob，每个 `*` 依序成为捕获组（`$1`、`$2`…），
-//!   映射为 regexFilter + regexSubstitution；to 中的 `$N` 展开为第 N 个捕获组
-//!   （实测 CfT 131：DNR 替换语法为 RE2 反引用 `\1` 风格，`$1` 会按字面量输出，
-//!   故编译期把用户契约的 `$N` 翻译为 `\N`）
+//! - redirect 的 from：全量 glob，每个 `*` 依序成为捕获组（`$1`、`$2`…，
+//!   契约支持 $1–$9），映射为 regexFilter + regexSubstitution；to 中的 `$N` 展开
+//!   为第 N 个捕获组，引用不存在的组在编译期拒绝（实测 CfT 131：DNR 替换语法
+//!   为 RE2 反引用 `\1` 风格，`$1` 会按字面量输出，故编译期把用户契约的 `$N`
+//!   翻译为 `\N`）
+//! - 动作优先级：block(2) > redirect(1)——同 URL 同时命中两类动作时更严格的
+//!   block 确定性胜出（DNR 对同优先级冲突动作的胜者无稳定保证）；
+//!   modifyHeaders 与 block/redirect 是叠加维度，不参与该仲裁，保持 1
 
 use serde_json::{Value, json};
 
@@ -109,6 +113,34 @@ fn to_re2_substitution(to: &str) -> String {
     out
 }
 
+/// `to` 中引用的最大 `$N`（无引用 → None）。与 [`to_re2_substitution`] 同一
+/// 解析规则（`$` 后连续数字为一个引用），供编译期校验引用存在性
+fn max_ref(to: &str) -> Option<u32> {
+    let chars: Vec<char> = to.chars().collect();
+    let mut best: Option<u32> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                let n: u32 = chars[i + 1..j]
+                    .iter()
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(u32::MAX);
+                best = Some(best.map_or(n, |b: u32| b.max(n)));
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    best
+}
+
 fn resource_types() -> Value {
     json!(RESOURCE_TYPES)
 }
@@ -143,7 +175,8 @@ pub fn compile(config: &Value) -> Result<Value, AppError> {
             id += 1;
             rules.push(json!({
                 "id": id,
-                "priority": 1,
+                // block 严格动作优先：与 redirect 同 URL 命中时确定性胜出（DNR 同优先级仲裁无稳定保证）
+                "priority": 2,
                 "action": { "type": "block" },
                 "condition": {
                     "urlFilter": to_url_filter(pattern)?,
@@ -167,6 +200,17 @@ pub fn compile(config: &Value) -> Result<Value, AppError> {
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| invalid("redirect 条目缺少非空 to"))?;
+            // 引用校验（复审 P3-2）：$N 必须指向存在的捕获组（from 的 * 数），
+            // 契约支持 $1–$9。悬空引用在 Chrome 侧行为未定义——若 updateDynamicRules
+            // 判非法会整批失败，该实例全部 net-rules 静默失效，故编译期拦截
+            let groups = from.matches('*').count().min(9);
+            if let Some(n) = max_ref(to) {
+                if n == 0 || n as usize > groups {
+                    return Err(invalid(format!(
+                        "redirect 的 to 引用 ${n}，但 from「{from}」只提供 {groups} 个捕获组（支持 $1–$9）"
+                    )));
+                }
+            }
             id += 1;
             rules.push(json!({
                 "id": id,
@@ -243,6 +287,7 @@ mod tests {
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["id"], 1, "id 连续分配");
         assert_eq!(arr[0]["action"]["type"], "block");
+        assert_eq!(arr[0]["priority"], 2, "block 严格动作优先（与 redirect 冲突时确定性胜出）");
         assert_eq!(arr[0]["condition"]["urlFilter"], "||google-analytics.com");
         assert_eq!(
             arr[0]["condition"]["resourceTypes"].as_array().unwrap().len(),
@@ -251,6 +296,7 @@ mod tests {
         );
 
         assert_eq!(arr[1]["action"]["type"], "redirect");
+        assert_eq!(arr[1]["priority"], 1, "redirect 低于 block；headers 不参与 block/redirect 仲裁保持 1");
         assert_eq!(
             arr[1]["condition"]["regexFilter"],
             "^https://api\\.foo\\.com/(.*)$",
@@ -267,6 +313,29 @@ mod tests {
         assert_eq!(arr[2]["action"]["requestHeaders"][0]["header"], "X-Debug-Uid");
         assert_eq!(arr[2]["action"]["requestHeaders"][0]["operation"], "set");
         assert_eq!(arr[2]["action"]["requestHeaders"][0]["value"], "42");
+    }
+
+    /// 引用校验（复审 P3-2）：$N 越界 / $0 / 超出 $1–$9 契约 → 编译期拒绝；
+    /// 合法引用与字面量 `$` 不受影响。悬空引用若流入 Chrome，
+    /// updateDynamicRules 可能整批失败致该实例全部 net-rules 静默失效
+    #[test]
+    fn redirect_refs_beyond_groups_are_rejected() {
+        let beyond = json!({"redirect": [{"from": "https://a.com/*/x", "to": "https://b.com/$5"}]});
+        assert!(compile(&beyond).is_err(), "$5 越界（from 只有 1 个捕获组）");
+
+        let zero = json!({"redirect": [{"from": "https://a.com/*/x", "to": "https://b.com/$0"}]});
+        assert!(compile(&zero).is_err(), "$0 不是合法引用");
+
+        let ten = json!({"redirect": [
+            {"from": "https://a.com/*/*/*/*/*/*/*/*/*/*/x", "to": "https://b.com/$10"}
+        ]});
+        assert!(compile(&ten).is_err(), "契约上限 $1–$9（10 个组也不开放 $10）");
+
+        let ok = json!({"redirect": [{"from": "https://a.com/*/*/x", "to": "https://b.com/$2/$1"}]});
+        assert!(compile(&ok).is_ok(), "组内引用合法");
+
+        let literal = json!({"redirect": [{"from": "https://a.com/*/x", "to": "https://b.com/a$b"}]});
+        assert!(compile(&literal).is_ok(), "$ 后非数字是字面量，不参与校验");
     }
 
     /// 空对象/空数组 → 空规则（扩展加载后清空既有 dynamic rules，配置删除即回到无拦截）

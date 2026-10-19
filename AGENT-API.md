@@ -243,8 +243,9 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 ```
 
 - `block`/`headers[].url`：域锚定匹配，可选 scheme 前缀与路径通配（`*.` 与裸域名均匹配域及全部子域）；
-- `redirect[].from`：全量 glob，`*` 依序对应 `$1`、`$2`…；`to` 中的 `$N` 展开为第 N 个捕获组（无数字后缀的 `$` 为字面量）；
+- `redirect[].from`：全量 glob，`*` 依序对应 `$1`、`$2`…（支持 `$1`–`$9`）；`to` 中的 `$N` 展开为第 N 个捕获组（无数字后缀的 `$` 为字面量），**引用不存在的组 → 写入/编译期 400 拒绝**；
 - `headers[].set`：注入请求头（服务端可见）；
+- 同一 URL 同时命中 `block` 与 `redirect` 时 **block 确定性优先**（更严格的动作胜出）；
 - 规则在浏览器层（DNR）生效，service worker 休眠不影响拦截。
 
 ## Settings — 应用设置
