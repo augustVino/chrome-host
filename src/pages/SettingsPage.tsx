@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { api, errorText } from '../api/client';
 import type { RemoteAccessStatus } from '../api/types';
 import { copyText } from '../lib/clipboard';
 import { useStore } from '../store';
-import { btnGhost, btnPrimary, inputCls } from '../components/ui';
+import { PageHeader, Seg, Switch, btnGhost, btnPrimary, inputCls } from '../components/ui';
+import { usePageEnter } from '../motion/hooks';
+import { useQuality, type QualityPref } from '../motion/quality';
 import { confirm } from '../components/confirm';
 import { disable as autostartDisable, enable as autostartEnable, isEnabled as autostartIsEnabled } from '@tauri-apps/plugin-autostart';
 import {
@@ -36,6 +38,9 @@ type CliToolStatus = {
 export default function SettingsPage() {
   const { kernel, kernelProgress, fetchKernel, showToast, settings, fetchSettings, updateSettings } = useStore();
   const [busy, setBusy] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  usePageEnter(root);
+  const { pref: motionPref, mode: motionMode, setPref: setMotionPref } = useQuality();
   /** 开机自启：null=读取中，true/false=OS LoginItem 实际状态 */
   const [autoStart, setAutoStart] = useState<boolean | null>(null);
   /** 应用更新状态机：dev 模式下检查会静默失败，不影响其余功能 */
@@ -247,11 +252,11 @@ export default function SettingsPage() {
   }, [updateState]);
 
   return (
-    <div className="mx-auto max-w-2xl">
-      <h1 className="mb-5 text-base font-semibold text-ink">Settings</h1>
+    <div ref={root} className="mx-auto max-w-3xl">
+      <PageHeader title="Settings" sub="内核、远程接入、更新与外观偏好" />
 
       {/* 内核卡 */}
-      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
+      <section className="gcard row-in mb-4 p-5">
         <h2 className="text-sm font-medium text-ink">浏览器内核（Chrome for Testing）</h2>
         {!kernel ? (
           <p className="mt-2 text-xs text-ink-3">Agent API 未连接，无法读取内核状态。</p>
@@ -291,7 +296,7 @@ export default function SettingsPage() {
               <p className="text-run-text">✓ 内核已就绪</p>
             ) : (
               <div className="flex items-center gap-2">
-                <span className={kernel.upgradeAvailable ? 'text-amber-600' : 'text-ink-2'}>
+                <span className={kernel.upgradeAvailable ? 'text-amber' : 'text-ink-2'}>
                   {kernel.upgradeAvailable ? '有可用升级（pinned 版本更新）' : '内核未安装'}
                 </span>
                 <button className={btnPrimary} disabled={busy} onClick={download}>
@@ -304,7 +309,7 @@ export default function SettingsPage() {
       </section>
 
       {/* 默认起始页（实例/登录浏览器启动页；环境专属 host 优先） */}
-      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
+      <section className="gcard row-in mb-4 p-5">
         <h2 className="text-sm font-medium text-ink">默认起始页</h2>
         <p className="mt-0.5 text-xs text-ink-3">
           新建环境无需再填起始页：实例与登录浏览器打开时使用此地址，留空则打开 about:blank。
@@ -332,7 +337,7 @@ export default function SettingsPage() {
       </section>
 
       {/* Developer Mode */}
-      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
+      <section className="gcard row-in mb-4 p-5">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-sm font-medium text-ink">Developer Mode</h2>
@@ -340,25 +345,12 @@ export default function SettingsPage() {
               开启后实例行显示 PID / CDP 端口 / Profile 目录等技术字段
             </p>
           </div>
-          <button
-            role="switch"
-            aria-checked={settings?.developerMode ?? false}
-            className={`relative h-5 w-9 shrink-0 rounded-full transition ${
-              settings?.developerMode ? 'bg-status-running' : 'bg-status-stopped'
-            }`}
-            onClick={() => updateSettings({ developerMode: !settings?.developerMode })}
-          >
-            <span
-              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${
-                settings?.developerMode ? 'left-[18px]' : 'left-0.5'
-              }`}
-            />
-          </button>
+          <Switch checked={settings?.developerMode ?? false} onClick={() => updateSettings({ developerMode: !settings?.developerMode })} />
         </div>
       </section>
 
       {/* 远程接入（云桌面 / CI）：单端口 SSH 隧道 + Bearer 鉴权 + CDP 会话代理（方案 v2） */}
-      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
+      <section className="gcard row-in mb-4 p-5">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-sm font-medium text-ink">远程接入（云桌面 / CI）</h2>
@@ -367,20 +359,7 @@ export default function SettingsPage() {
               实例 CDP 由会话代理提供，不开放额外端口。
             </p>
           </div>
-          <button
-            role="switch"
-            aria-checked={settings?.remoteAccessEnabled ?? false}
-            className={`relative h-5 w-9 shrink-0 rounded-full transition ${
-              settings?.remoteAccessEnabled ? 'bg-status-running' : 'bg-status-stopped'
-            }`}
-            onClick={toggleRemote}
-          >
-            <span
-              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${
-                settings?.remoteAccessEnabled ? 'left-[18px]' : 'left-0.5'
-              }`}
-            />
-          </button>
+          <Switch checked={settings?.remoteAccessEnabled ?? false} onClick={toggleRemote} />
         </div>
         <div className="mt-3 flex gap-2">
           <input
@@ -451,7 +430,7 @@ export default function SettingsPage() {
       </section>
 
       {/* 应用更新 */}
-      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
+      <section className="gcard row-in mb-4 p-5">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-sm font-medium text-ink">应用更新</h2>
@@ -494,7 +473,7 @@ export default function SettingsPage() {
       </section>
 
       {/* 开机自启 */}
-      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
+      <section className="gcard row-in mb-4 p-5">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-sm font-medium text-ink">开机自启</h2>
@@ -502,26 +481,12 @@ export default function SettingsPage() {
               登录系统后自动启动 Chrome Host：主窗口隐藏，仅托盘常驻
             </p>
           </div>
-          <button
-            role="switch"
-            aria-checked={autoStart === true}
-            disabled={autoStart === null}
-            className={`relative h-5 w-9 shrink-0 rounded-full transition disabled:opacity-50 ${
-              autoStart ? 'bg-status-running' : 'bg-status-stopped'
-            }`}
-            onClick={toggleAutoStart}
-          >
-            <span
-              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${
-                autoStart ? 'left-[18px]' : 'left-0.5'
-              }`}
-            />
-          </button>
+          <Switch checked={autoStart === true} onClick={toggleAutoStart} disabled={autoStart === null} />
         </div>
       </section>
 
       {/* 命令行工具（CLI 随应用打包，symlink 安装到 PATH） */}
-      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
+      <section className="gcard row-in mb-4 p-5">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
             <h2 className="text-sm font-medium text-ink">命令行工具（chrome-host CLI）</h2>
@@ -538,7 +503,7 @@ export default function SettingsPage() {
               </p>
             )}
             {!cliTool?.upToDate && cliTool?.symlinkTarget && (
-              <p className="mt-1 text-[11px] text-amber-600">
+              <p className="mt-1 text-[11px] text-amber">
                 链接指向 <span className="font-mono">{cliTool.symlinkTarget}</span>（旧版本或已失效），安装后可修复
               </p>
             )}
@@ -568,15 +533,38 @@ export default function SettingsPage() {
         </div>
       </section>
 
+      {/* 外观与动效（纯前端偏好，localStorage；不涉及后端） */}
+      <section className="gcard row-in mb-4 p-5">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-sm font-medium text-ink">动效档位</h2>
+            <p className="mt-0.5 text-xs text-ink-3">
+              Auto 按帧率自动降级；Lite 关闭视差/倾斜/粒子；Static 无环境动画与模糊。系统开启「减少动态效果」时强制 Static。
+              当前生效：<span className="font-mono">{motionMode}</span>
+            </p>
+          </div>
+          <Seg<QualityPref>
+            value={motionPref}
+            onChange={setMotionPref}
+            options={[
+              ['auto', 'Auto'],
+              ['full', 'Full'],
+              ['lite', 'Lite'],
+              ['static', 'Static'],
+            ]}
+          />
+        </div>
+      </section>
+
       {/* 环境标识卡（位置/颜色可配） */}
-      <section className="mb-4 rounded-xl border border-hairline bg-surface-card p-4">
-        <h2 className="text-sm font-medium text-neutral-700 dark:text-neutral-200">环境标识（Environment Label）</h2>
-        <p className="mt-0.5 text-xs text-neutral-400 dark:text-neutral-500">
+      <section className="gcard row-in mb-4 p-5">
+        <h2 className="text-sm font-medium text-ink">环境标识（Environment Label）</h2>
+        <p className="mt-0.5 text-xs text-ink-3">
           实例页面角落显示环境标签，便于区分多实例。修改后对新启动的实例生效。
         </p>
         <div className="mt-3 space-y-3 text-xs">
           <div>
-            <p className="mb-1.5 text-neutral-500 dark:text-neutral-400">位置</p>
+            <p className="mb-1.5 text-ink-2">位置</p>
             <div className="flex gap-1.5">
               {([
                 ['top-left', '左上'],
@@ -586,10 +574,10 @@ export default function SettingsPage() {
               ] as const).map(([value, label]) => (
                 <button
                   key={value}
-                  className={`rounded-md border px-2.5 py-1 transition ${
+                  className={`rounded-full px-3.5 py-1.5 font-semibold transition ${
                     settings?.envLabelPosition === value
-                      ? 'border-neutral-800 bg-neutral-800 text-white dark:border-neutral-100 dark:bg-neutral-100 dark:text-neutral-800'
-                      : 'border-neutral-200 text-neutral-600 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800'
+                      ? 'bg-gradient-to-br from-brand to-brand-2 text-white shadow-[0_8px_18px_-6px_rgb(var(--brand)/0.7)]'
+                      : 'bg-surface-inset text-ink-2 hover:text-ink'
                   }`}
                   onClick={() => updateSettings({ envLabelPosition: value })}
                 >
@@ -599,7 +587,7 @@ export default function SettingsPage() {
             </div>
           </div>
           <div>
-            <p className="mb-1.5 text-neutral-500 dark:text-neutral-400">颜色</p>
+            <p className="mb-1.5 text-ink-2">颜色</p>
             <div className="flex gap-1.5">
               {([
                 ['red', 'rgb(239,68,68)', '红'],
@@ -609,10 +597,10 @@ export default function SettingsPage() {
               ] as const).map(([value, swatch, label]) => (
                 <button
                   key={value}
-                  className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1 transition ${
+                  className={`flex items-center gap-1.5 rounded-full px-3.5 py-1.5 font-semibold transition ${
                     settings?.envLabelColor === value
-                      ? 'border-neutral-800 bg-neutral-800 text-white dark:border-neutral-100 dark:bg-neutral-100 dark:text-neutral-800'
-                      : 'border-neutral-200 text-neutral-600 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800'
+                      ? 'bg-gradient-to-br from-brand to-brand-2 text-white shadow-[0_8px_18px_-6px_rgb(var(--brand)/0.7)]'
+                      : 'bg-surface-inset text-ink-2 hover:text-ink'
                   }`}
                   onClick={() => updateSettings({ envLabelColor: value })}
                 >
@@ -626,7 +614,7 @@ export default function SettingsPage() {
       </section>
 
       {/* Agent API 卡 */}
-      <section className="rounded-xl border border-hairline bg-surface-card p-4">
+      <section className="gcard row-in p-5">
         <h2 className="text-sm font-medium text-ink">Agent API</h2>
         <div className="mt-3 space-y-1.5 text-xs text-ink-2">
           <p className="flex items-center gap-2">

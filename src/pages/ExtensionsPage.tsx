@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { api, errorText } from '../api/client';
 import { useStore } from '../store';
 import { confirm } from '../components/confirm';
-import { btnGhost, btnPrimary, inputCls } from '../components/ui';
+import { PageHeader, btnGhostSm, btnPrimary, btnQuietDanger, inputCls } from '../components/ui';
+import { usePageEnter } from '../motion/hooks';
 import type { Extension } from '../api/types';
 
 /** 展示层状态 → 语义色（DESIGN.md：状态点 bg-status-*，异常文字加深） */
@@ -66,7 +67,7 @@ function ConfigEditor({ ext, onClose }: { ext: Extension; onClose: () => void })
   }, [text, scope, ext.id, showToast, onClose]);
 
   return (
-    <div className="mx-4 mb-3 rounded-lg border border-hairline bg-surface-inset p-3">
+    <div className="mx-4 mb-3 rounded-2xl bg-surface-inset p-3">
       {ext.configDocsUrl && ext.configDocsUrl.length > 0 && (
         <p className="mb-2 text-xs text-ink-2">
           配置语法参考：
@@ -83,7 +84,7 @@ function ConfigEditor({ ext, onClose }: { ext: Extension; onClose: () => void })
       <div className="mb-2 flex items-center gap-2">
         <span className="text-xs text-ink-2">作用域</span>
         <select
-          className="rounded-lg border border-hairline bg-surface-raised px-2 py-1 text-xs"
+          className="rounded-xl bg-surface-raised px-2.5 py-1.5 text-xs font-semibold outline-none ring-1 ring-hairline"
           value={scope}
           onChange={(e) => setScope(e.target.value)}
         >
@@ -104,7 +105,7 @@ function ConfigEditor({ ext, onClose }: { ext: Extension; onClose: () => void })
         spellCheck={false}
       />
       <div className="mt-2 flex justify-end gap-1.5">
-        <button className={btnGhost} onClick={onClose}>
+        <button className={btnGhostSm} onClick={onClose}>
           取消
         </button>
         <button className={btnPrimary} onClick={save}>
@@ -167,22 +168,19 @@ function ExtensionRow({ ext }: { ext: Extension }) {
         </div>
         <div className="flex shrink-0 items-center gap-1.5 pt-0.5">
           {ext.type === 'system' && ext.configurable && (
-            <button className={btnGhost} onClick={() => setEditing((v) => !v)}>
+            <button className={btnGhostSm} onClick={() => setEditing((v) => !v)}>
               配置
             </button>
           )}
           {ext.type === 'user' && (
             <>
-              <button className={btnGhost} onClick={toggle}>
+              <button className={btnGhostSm} onClick={toggle}>
                 {ext.enabled ? '禁用' : '启用'}
               </button>
-              <button className={btnGhost} onClick={openFolder}>
+              <button className={btnGhostSm} onClick={openFolder}>
                 Open Folder
               </button>
-              <button
-                className="rounded-lg px-2.5 py-1.5 text-xs text-ink-2 transition hover:bg-red-50 hover:text-status-error dark:hover:bg-red-500/15"
-                onClick={remove}
-              >
+              <button className={btnQuietDanger} onClick={remove}>
                 移除
               </button>
             </>
@@ -197,7 +195,7 @@ function ExtensionRow({ ext }: { ext: Extension }) {
 function GroupCard({ title, items }: { title: string; items: Extension[] }) {
   if (items.length === 0) return null;
   return (
-    <section className="mb-4 rounded-xl border border-hairline bg-surface-card">
+    <section className="gcard row-in mb-4">
       <div className="flex items-center justify-between px-4 pt-4 pb-2">
         <h2 className="text-sm font-medium text-ink">{title}</h2>
         <span className="text-[11px] text-ink-3">{items.length} 项</span>
@@ -230,21 +228,23 @@ export default function ExtensionsPage() {
     }
   }, [fetchExtensions, showToast]);
 
+  const root = useRef<HTMLDivElement>(null);
+  usePageEnter(root);
+
   const system = extensions.filter((e) => e.type === 'system');
   const user = extensions.filter((e) => e.type === 'user');
 
   return (
-    <div className="mx-auto max-w-2xl">
-      <div className="mb-5 flex items-center justify-between">
-        <h1 className="text-base font-semibold text-ink">Extensions</h1>
-        <button className={btnPrimary} onClick={add}>
-          + Add Extension
-        </button>
-      </div>
-
-      <p className="mb-4 rounded-lg border border-hairline bg-surface-inset px-3 py-2 text-xs text-ink-2">
-        启用的扩展会自动加载进每个新启动的 Chrome 实例；配置变化只影响之后启动的实例。
-      </p>
+    <div ref={root} className="mx-auto max-w-4xl">
+      <PageHeader
+        title="Extensions"
+        sub="启用的扩展会自动加载进每个新启动的 Chrome 实例；配置变化只影响之后启动的实例"
+        right={
+          <button className={`${btnPrimary} btn-lg`} onClick={add}>
+            + Add Extension
+          </button>
+        }
+      />
 
       <GroupCard title="System" items={system} />
       <GroupCard title="User" items={user} />

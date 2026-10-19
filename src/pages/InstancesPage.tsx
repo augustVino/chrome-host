@@ -1,15 +1,18 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, errorText } from '../api/client';
 import { copyText } from '../lib/clipboard';
 import { useStore } from '../store';
-import { EmptyState, StatusDot, btnGhost } from '../components/ui';
+import { EmptyState, PageHeader, StatusDot, btnGhostSm } from '../components/ui';
+import { usePageEnter } from '../motion/hooks';
 
 /** 全局实例视图（轻量列表，非重表格） */
 export default function InstancesPage() {
   const { envs, instancesByEnv, fetchEnvs, fetchInstances, showToast } = useStore();
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
+  const root = useRef<HTMLDivElement>(null);
+  usePageEnter(root);
 
   const refresh = useCallback(() => {
     fetchEnvs();
@@ -61,24 +64,22 @@ export default function InstancesPage() {
   const toggle = (envId: string) => setExpanded((m) => ({ ...m, [envId]: !m[envId] }));
 
   return (
-    <div className="mx-auto max-w-2xl">
-      <div className="mb-5">
-        <h1 className="text-base font-semibold text-ink">All Instances</h1>
-        <p className="mt-0.5 text-xs text-ink-3">
-          {rows.length} 个实例 · {rows.filter((r) => r.ins.status === 'running').length} running
-        </p>
-      </div>
+    <div ref={root} className="mx-auto max-w-4xl">
+      <PageHeader
+        title="All Instances"
+        sub={`${rows.length} 个实例 · ${rows.filter((r) => r.ins.status === 'running').length} running`}
+      />
 
       {rows.length === 0 ? (
         <EmptyState title="No instances" desc="还没有任何 Chrome 实例。前往 Environments 创建。" />
       ) : (
-        <ul className="space-y-1">
+        <ul className="space-y-3">
           {envs.map((env) => {
             const list = instancesByEnv[env.id] ?? [];
             if (list.length === 0) return null;
             const open = expanded[env.id] ?? true;
             return (
-              <li key={env.id} className="rounded-xl border border-hairline bg-surface-card">
+              <li key={env.id} className="gcard row-in">
                 <button
                   className="flex w-full items-center gap-2 px-4 py-2.5 text-left"
                   onClick={() => toggle(env.id)}
@@ -109,21 +110,21 @@ export default function InstancesPage() {
                           {ins.status === 'running' && (
                             <>
                               <button
-                                className={btnGhost}
+                                className={btnGhostSm}
                                 disabled={busyId === ins.id}
                                 onClick={() => copyCdp(ins.id)}
                               >
                                 Copy CDP
                               </button>
                               <button
-                                className={btnGhost}
+                                className={btnGhostSm}
                                 disabled={busyId === ins.id}
                                 onClick={() => act(ins.id, () => api.restartInstance(ins.id))}
                               >
                                 Restart
                               </button>
                               <button
-                                className={btnGhost}
+                                className={btnGhostSm}
                                 disabled={busyId === ins.id}
                                 onClick={() => act(ins.id, () => api.stopInstance(ins.id))}
                               >
@@ -133,7 +134,7 @@ export default function InstancesPage() {
                           )}
                           {(ins.status === 'stopped' || ins.status === 'error') && (
                             <button
-                              className={btnGhost}
+                              className={btnGhostSm}
                               disabled={busyId === ins.id}
                               onClick={() => act(ins.id, () => api.startInstance(ins.id), '实例已启动')}
                             >

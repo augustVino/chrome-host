@@ -8,36 +8,51 @@ export default {
     darkMode: 'media',
     theme: {
         extend: {
+            fontFamily: {
+                sans: ['var(--ff)'],
+                mono: ['var(--mono)'],
+            },
             colors: {
-                // 设计规范见 DESIGN.md（macOS HIG 风格，与 docs/design/chrome-host-ui.pen 同源）。
+                // 设计规范见 DESIGN.md（v2 Aurora Glass）。
                 // 亮/暗双值定义在 src/main.css 的 CSS 变量里，语义类自动跟随系统主题；
-                // 禁止写死十六进制，禁止 token 之外的新色值（豁免灰阶须配 dark: 补丁）。
+                // 禁止写死十六进制，禁止 token 之外的新色值。
+                brand: {
+                    DEFAULT: 'rgb(var(--brand) / <alpha-value>)',
+                    2: 'rgb(var(--brand-2) / <alpha-value>)',
+                },
+                mint: 'rgb(var(--mint) / <alpha-value>)',
+                peach: 'rgb(var(--peach) / <alpha-value>)',
+                sky: 'rgb(var(--sky) / <alpha-value>)',
+                coral: 'rgb(var(--coral) / <alpha-value>)',
+                amber: 'rgb(var(--amber) / <alpha-value>)',
+                // 旧语义名 → 新色板映射（未改造页面自动继承）
                 accent: {
-                    DEFAULT: 'rgb(var(--accent) / <alpha-value>)',
-                    hover: 'rgb(var(--accent-hover) / <alpha-value>)',
+                    DEFAULT: 'rgb(var(--brand) / <alpha-value>)',
+                    hover: 'rgb(var(--brand-hover) / <alpha-value>)',
                 },
                 ink: {
                     DEFAULT: 'rgb(var(--ink) / <alpha-value>)',
                     2: 'rgb(var(--ink-2) / <alpha-value>)',
                     3: 'rgb(var(--ink-3) / <alpha-value>)',
                 },
+                // 描边/玻璃类为完整颜色值（含 alpha），不支持 /alpha modifier
                 hairline: {
-                    DEFAULT: 'rgb(var(--hairline) / <alpha-value>)',
-                    soft: 'rgb(var(--hairline-soft) / <alpha-value>)',
+                    DEFAULT: 'var(--line)',
+                    soft: 'var(--line-soft)',
                 },
                 surface: {
-                    DEFAULT: 'rgb(var(--surface) / <alpha-value>)', // 窗口内容区底
-                    sidebar: 'rgb(var(--surface-sidebar) / <alpha-value>)',
-                    card: 'rgb(var(--surface-card) / <alpha-value>)',
-                    raised: 'rgb(var(--surface-raised) / <alpha-value>)',
-                    inset: 'rgb(var(--surface-inset) / <alpha-value>)',
+                    DEFAULT: 'rgb(var(--bg) / <alpha-value>)', // 窗口底
+                    sidebar: 'var(--glass)',
+                    card: 'var(--glass-2)',
+                    raised: 'var(--glass-2)',
+                    inset: 'var(--inset)',
                 },
                 toast: 'rgb(var(--toast) / <alpha-value>)',
                 status: {
-                    running: 'rgb(var(--status-running) / <alpha-value>)',
-                    starting: 'rgb(var(--status-starting) / <alpha-value>)',
-                    stopped: 'rgb(var(--status-stopped) / <alpha-value>)',
-                    error: 'rgb(var(--status-error) / <alpha-value>)',
+                    running: 'rgb(var(--mint) / <alpha-value>)',
+                    starting: 'rgb(var(--amber) / <alpha-value>)',
+                    stopped: 'rgb(var(--ink-3) / <alpha-value>)',
+                    error: 'rgb(var(--coral) / <alpha-value>)',
                 },
                 'run-text': 'rgb(var(--run-text) / <alpha-value>)',
                 // Popover 半透明材质（完整颜色值变量，不支持 /alpha modifier）
