@@ -1,5 +1,6 @@
+import { useRef } from 'react';
 import { create } from 'zustand';
-import { btnGhost } from './ui';
+import { ModalShell, btnDanger, btnGhost } from './ui';
 
 /**
  * 应用内确认对话框：Tauri WKWebView 不支持 window.confirm/alert（点击无反应的根因），
@@ -47,36 +48,32 @@ export function confirm(opts: ConfirmOptions): Promise<boolean> {
 
 export function ConfirmDialog() {
   const { st, answer } = useConfirmStore();
-  if (!st) return null;
-  const { options, resolve } = st;
+  // 退场动画期间 st 已为 null：保留最后一次内容，直到弹层卸载
+  const last = useRef<ConfirmOptions | null>(null);
+  if (st) last.current = st.options;
+  const options = last.current;
+  if (!options) return null;
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/25 p-4 dark:bg-black/50"
-      onClick={() => resolve?.(false)}
-    >
-      <div
-        className="w-[380px] rounded-xl bg-surface-card p-5 shadow-xl ring-1 ring-hairline"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 className="mb-2 text-sm font-semibold text-ink">{options.title}</h2>
-        <div className="space-y-0.5 text-xs leading-5 text-ink-2">
-          {options.message.map((m, i) => (
-            <p key={i}>{m}</p>
-          ))}
-        </div>
-        <div className="mt-4 flex justify-end gap-2">
-          <button className={btnGhost} onClick={() => answer(false)}>
-            取消
-          </button>
-          <button
-            className="inline-flex items-center gap-1 rounded-lg bg-status-error px-2.5 py-1.5 text-xs font-medium text-white transition hover:brightness-90"
-            onClick={() => answer(true)}
-          >
-            {options.confirmText ?? '确定'}
-          </button>
-        </div>
+    <ModalShell open={!!st} onBackdrop={() => st?.resolve?.(false)} width={400}>
+      <svg className="m-ic" viewBox="0 0 24 24" aria-hidden>
+        <path d="M12 3.5l9.5 16.5h-19z" />
+        <path d="M12 10v4.5M12 17.4v.1" />
+      </svg>
+      <h2>{options.title}</h2>
+      <div className="space-y-0.5">
+        {options.message.map((m, i) => (
+          <p key={i}>{m}</p>
+        ))}
       </div>
-    </div>
+      <div className="mf">
+        <button className={btnGhost} onClick={() => answer(false)}>
+          取消
+        </button>
+        <button className={btnDanger} onClick={() => answer(true)}>
+          {options.confirmText ?? '确定'}
+        </button>
+      </div>
+    </ModalShell>
   );
 }
 

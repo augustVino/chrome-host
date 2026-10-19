@@ -163,6 +163,10 @@ async fn reader_loop(read: SplitStream<WsStream>, pending: Pending, events: Opti
                 };
                 let Some(id) = v.get("id").and_then(|x| x.as_u64()) else {
                     if let Some(tx) = &events {
+                        // unbounded 是权衡后的选择（复审 P3-3）：诊断消费端是纯内存
+                        // 解析 + 定长环形，速率远高于事件到达；连接断开 reader 结束、
+                        // 通道整体 drop，无累积泄漏路径。若未来接重消费者再改
+                        // bounded + try_send 丢弃计数（诊断数据可丢，连接保活优先）
                         let _ = tx.send(v);
                     }
                     continue;

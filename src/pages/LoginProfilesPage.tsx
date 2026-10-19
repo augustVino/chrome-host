@@ -1,17 +1,20 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Link } from 'react-router-dom';
 import { api, errorText } from '../api/client';
 import type { LoginProfileRow } from '../api/types';
 import { useStore } from '../store';
-import { ConfirmDialog, confirm } from '../components/confirm';
-import { btnGhost } from '../components/ui';
+import { confirm } from '../components/confirm';
+import { PageHeader, btnGhostSm } from '../components/ui';
+import { usePageEnter } from '../motion/hooks';
 
 /** Login Profiles 页：全部环境登录态总览（实例即登录源：在实例里登录 → 关闭即保存） */
 export default function LoginProfilesPage() {
   const { showToast } = useStore();
   const [rows, setRows] = useState<LoginProfileRow[] | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
+  const root = useRef<HTMLDivElement>(null);
+  usePageEnter(root);
 
   const fetchRows = useCallback(async () => {
     try {
@@ -64,11 +67,8 @@ export default function LoginProfilesPage() {
   );
 
   return (
-    <div className="mx-auto max-w-2xl">
-      <h1 className="mb-1 text-base font-semibold text-ink">Login Profiles</h1>
-      <p className="mb-5 text-xs text-ink-3">
-        登录浏览器登录 → 捕获快照 → 之后创建的实例自动免登录
-      </p>
+    <div ref={root} className="mx-auto max-w-4xl">
+      <PageHeader title="Login Profiles" sub="登录浏览器登录 → 捕获快照 → 之后创建的实例自动免登录" />
 
       {rows === null ? (
         <p className="text-xs text-ink-3">加载中…</p>
@@ -79,7 +79,7 @@ export default function LoginProfilesPage() {
       ) : (
         <ul className="space-y-3">
           {rows.map((p) => (
-            <li key={p.id} className="rounded-xl border border-hairline bg-surface-card p-4">
+            <li key={p.id} className="gcard row-in p-4">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <p className="truncate text-sm font-medium text-ink">🔐 {p.name}</p>
@@ -97,11 +97,11 @@ export default function LoginProfilesPage() {
                   </p>
                 </div>
                 <span
-                  className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${
+                  className={`shrink-0 rounded-full px-2.5 py-0.5 text-[10.5px] font-bold ${
                     p.snapshotVersion > 0
-                      ? 'bg-emerald-50 text-run-text dark:bg-emerald-500/15'
+                      ? 'bg-mint/15 text-run-text'
                       : p.status === 'error'
-                        ? 'bg-red-50 text-status-error dark:bg-red-500/15'
+                        ? 'bg-coral/15 text-status-error'
                         : 'bg-surface-inset text-ink-2'
                   }`}
                 >
@@ -111,7 +111,7 @@ export default function LoginProfilesPage() {
 
               <div className="mt-3 flex items-center gap-1.5">
                 <button
-                  className={btnGhost}
+                  className={btnGhostSm}
                   disabled={busyKey !== null || p.status === 'capturing'}
                   onClick={() => reset(p.name, () => api.resetLoginProfile(p.environmentId))}
                 >
@@ -122,8 +122,6 @@ export default function LoginProfilesPage() {
           ))}
         </ul>
       )}
-
-      <ConfirmDialog />
     </div>
   );
 }

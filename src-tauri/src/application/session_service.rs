@@ -129,11 +129,16 @@ impl SessionService {
         // 并发双 promote（两实例同时首登退出）都判空通过、同一身份连升两代
         let _vault_guard = self.vault_lock.lock().await;
         if env.session_capture == SessionCapture::FirstLogin {
-            // 身份层已有有效内容 → 不再自动更新（防登出测试/并行实例污染）
-            let has = session_vault::read_current(&env_dir)
+            // 身份层已有有效内容 → 不再自动更新（防登出测试/并行实例污染）。
+            // 两层任一有内容即视为已有身份（复审 P2-2）：仅查 Cookie 层时，
+            // 「文件层有登录、vault 为空」的环境会被一个零操作实例的停止
+            // 占用首登槽位（其导出的持久 Cookie 来自克隆的文件层），
+            // 之后的真实首登不再自动捕获
+            let vault_has = session_vault::read_current(&env_dir)
                 .map(|v| !v.cookies.is_empty())
                 .unwrap_or(false);
-            if has {
+            let file_has = self.profiles.has_ready_snapshot(env_id)?;
+            if vault_has || file_has {
                 return Ok(());
             }
         }
@@ -278,6 +283,16 @@ impl SessionService {
     /// 清空身份层两层：Cookie 保险库（含历史）+ 文件快照母本（回到 not_configured）。
     /// 登录浏览器运行中 → 409，不代杀（由 ProfileService.reset 保证）。
     pub async fn reset(&self, env_id: &str) -> Result<serde_json::Value, AppError> {
+        // 前置可失败检查（复审 P1-1）：vault clear 不可逆，404/409 必须发生在任何
+        // 变更之前——否则「报错但保险库已清」的部分成功态会让用户误以为未重置，
+        // 下个实例静默空登录态启动。预检与 reset 内部检查同源，双保险
+        self.envs.get(env_id)?;
+        if self.profiles.has_orphan_login_browser(env_id)? {
+            return Err(AppError::conflict(
+                "PROFILE_IN_USE",
+                "遗留登录浏览器运行中（旧版本 launch 遗留），请先关闭该浏览器窗口",
+            ));
+        }
         let env_dir = self.paths.environment_dir(env_id);
         // 持锁（M2）：clear 与并发 promote 的 write_new 互斥，防清空后被迟到的
         // promote 回写旧身份

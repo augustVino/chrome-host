@@ -49,3 +49,43 @@ pub struct LoginProfile {
     pub created_at: i64,
     pub updated_at: i64,
 }
+
+impl LoginProfile {
+    /// 文件层身份是否有效：ready 且至少固化过一次。
+    /// 身份层两层语义（文件快照 / Cookie 保险库）的文件侧判定——first-login
+    /// 判空等场景要求两层任一有效即视为「已有身份」
+    pub fn has_effective_snapshot(&self) -> bool {
+        self.status == LoginProfileStatus::Ready && self.snapshot_version > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(status: LoginProfileStatus, version: i64) -> LoginProfile {
+        LoginProfile {
+            id: "lp_x".into(),
+            environment_id: "env_x".into(),
+            name: "X".into(),
+            profile_dir: "/tmp/x".into(),
+            snapshot_version: version,
+            status,
+            last_captured_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// 「已有身份」的文件层判定：ready 且 v>0 才算——ready(v0) 是首固中崩溃的
+    /// 恢复残留（recover_stale_capturing 会归位 not_configured，但判定自身必须
+    /// 防御），capturing/error 一律不算有效身份
+    #[test]
+    fn effective_snapshot_requires_ready_and_version() {
+        assert!(row(LoginProfileStatus::Ready, 1).has_effective_snapshot());
+        assert!(!row(LoginProfileStatus::Ready, 0).has_effective_snapshot(), "v0 无快照内容");
+        assert!(!row(LoginProfileStatus::NotConfigured, 3).has_effective_snapshot());
+        assert!(!row(LoginProfileStatus::Capturing, 3).has_effective_snapshot());
+        assert!(!row(LoginProfileStatus::Error, 3).has_effective_snapshot());
+    }
+}

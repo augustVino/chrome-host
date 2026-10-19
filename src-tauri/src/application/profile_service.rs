@@ -111,6 +111,27 @@ impl ProfileService {
         self.to_view(&profile)
     }
 
+    /// 文件层身份是否有效（供 SessionService 的 first-login 判空）：
+    /// ready 且至少固化过一次。无行（从未配置）视为无身份
+    pub fn has_ready_snapshot(&self, env_id: &str) -> Result<bool, AppError> {
+        Ok(self
+            .profiles
+            .find_by_env(env_id)?
+            .map(|p| p.has_effective_snapshot())
+            .unwrap_or(false))
+    }
+
+    /// 身份层不可逆操作（vault clear）前的预检：母本目录上是否有遗留登录浏览器
+    /// （旧版 launch 升级遗留）。只读探测，不动文件、不拿 gate；与 reset 内部
+    /// 检查同源，把「报错但已部分清空」的窗口压到微秒级 TOCTOU
+    pub fn has_orphan_login_browser(&self, env_id: &str) -> Result<bool, AppError> {
+        Ok(self
+            .profiles
+            .find_by_env(env_id)?
+            .map(|p| self.orphan_pid(Path::new(&p.profile_dir)).is_some())
+            .unwrap_or(false))
+    }
+
     fn to_view(&self, profile: &LoginProfile) -> Result<LoginProfileView, AppError> {
         Ok(LoginProfileView {
             id: profile.id.clone(),

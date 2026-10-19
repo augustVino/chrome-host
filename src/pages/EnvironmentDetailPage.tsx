@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api, errorText, RequestError } from '../api/client';
@@ -7,7 +7,12 @@ import { confirm } from '../components/confirm';
 import { confirmDeleteEnv, deleteEnv } from '../lib/deleteEnv';
 import type { AppEvent, Instance, LoginProfileView } from '../api/types';
 import { useStore } from '../store';
-import { EmptyState, StatusDot, btnGhost, btnPrimary } from '../components/ui';
+import { EmptyState, StatusDot, btnGhostSm, btnPrimary, btnQuietDanger } from '../components/ui';
+import { envGradient, envInitial } from '../lib/envColor';
+import { Flip, useGSAP } from '../motion/gsap';
+import { qMode } from '../motion/quality';
+import { usePageEnter } from '../motion/hooks';
+import { markLaunch, peekPendingFlip } from '../motion/launch';
 
 /** 状态已变的冲突（Chrome 已退出/实例已不在）不是用户错误：静默刷新而非报错 */
 function isStaleConflict(e: unknown): boolean {
@@ -60,15 +65,15 @@ function DiagnosticsPanel({ insId, onClose }: { insId: string; onClose: () => vo
   }, [load]);
 
   return (
-    <div className="mt-2 w-full rounded-lg border border-hairline bg-surface-inset p-3">
+    <div className="mt-2 w-full rounded-2xl bg-surface-inset p-3">
       <div className="mb-2 flex items-center gap-2">
         <span className="text-xs font-medium text-ink">诊断</span>
         <span className="text-[11px] text-ink-3">console 错误 / 失败请求 / 当前页截图（进程内态，实例重启即清）</span>
         <div className="ml-auto flex gap-1.5">
-          <button className={btnGhost} disabled={loading} onClick={load}>
+          <button className={btnGhostSm} disabled={loading} onClick={load}>
             刷新
           </button>
-          <button className={btnGhost} onClick={onClose}>
+          <button className={btnGhostSm} onClick={onClose}>
             收起
           </button>
         </div>
@@ -81,10 +86,10 @@ function DiagnosticsPanel({ insId, onClose }: { insId: string; onClose: () => vo
             <img
               src={`data:image/png;base64,${shot}`}
               alt="实例当前页面截图"
-              className="w-64 shrink-0 rounded border border-hairline"
+              className="w-64 shrink-0 rounded-xl ring-1 ring-hairline"
             />
           ) : (
-            <div className="flex w-64 shrink-0 items-center justify-center rounded border border-hairline bg-surface-card px-2 py-8 text-center text-[11px] text-ink-3">
+            <div className="flex w-64 shrink-0 items-center justify-center rounded-xl bg-surface-card px-2 py-8 text-center text-[11px] text-ink-3 ring-1 ring-hairline">
               截图不可用（无 http 页或连接未就绪）
             </div>
           )}
@@ -136,6 +141,17 @@ export default function EnvironmentDetailPage() {
   const [profile, setProfile] = useState<LoginProfileView | null>(null);
   const [profileBusy, setProfileBusy] = useState(false);
   const [activity, setActivity] = useState<AppEvent[]>([]);
+  const root = useRef<HTMLDivElement>(null);
+  // 卡片 → 详情共享元素（tile / 名称）：有 Flip 状态时标题跳过 SplitText 入场
+  const hadFlip = useRef(peekPendingFlip() !== null);
+  usePageEnter(root, { skipTitle: hadFlip.current });
+  useGSAP(
+    () => {
+      const st = peekPendingFlip<ReturnType<typeof Flip.getState>>();
+      if (st && qMode() !== 'static') Flip.from(st, { duration: 0.9, ease: 'ch-out', scale: true });
+    },
+    { scope: root },
+  );
 
   const fetchProfile = useCallback(async () => {
     try {
@@ -265,16 +281,26 @@ export default function EnvironmentDetailPage() {
   }
 
   return (
-    <div className="mx-auto max-w-2xl">
-      <Link to="/" className="text-xs text-ink-3 hover:text-ink-2">
+    <div ref={root} className="mx-auto max-w-3xl">
+      <Link to="/" className="rv inline-flex items-center gap-1 text-xs font-semibold text-ink-3 transition hover:text-ink-2">
         ← Environments
       </Link>
-      <div className="mb-6 mt-2 flex items-start justify-between">
-        <div>
-          <h1 className="text-base font-semibold text-ink">{env.name}</h1>
+      <header className="ph rv mb-6 mt-3">
+        <div className="flex min-w-0 items-center gap-4">
+          <span className={`tile g${envGradient(env.id)}`} style={{ width: 52, height: 52, fontSize: 22 }} data-flip-id={`tile-${env.id}`}>
+            {envInitial(env.name)}
+          </span>
+          <div className="min-w-0">
+            <h1 className="title truncate" style={{ fontSize: 26 }} data-flip-id={`name-${env.id}`}>
+              {env.name}
+            </h1>
+            <p className="sub">
+              {instances.filter((i) => i.status === 'running').length} running / {instances.length} instances
+            </p>
+          </div>
         </div>
         <button
-          className="rounded-md px-2 py-1 text-xs text-ink-2 transition hover:bg-red-50 hover:text-status-error dark:hover:bg-red-500/15"
+          className={btnQuietDanger}
           onClick={async () => {
             const running = instances.filter((i) => i.status === 'running').length;
             if (!(await confirmDeleteEnv(env.name, running))) return;
@@ -290,11 +316,11 @@ export default function EnvironmentDetailPage() {
         >
           删除环境
         </button>
-      </div>
+      </header>
 
       {/* Instances */}
-      <div className="mb-6">
-        <div className="mb-2 flex items-center justify-between">
+      <div className="rv mb-6">
+        <div className="mb-3 flex items-center justify-between">
           <h2 className="text-sm font-medium text-ink">
             Instances
             {instances.length > 0 && (
@@ -303,7 +329,14 @@ export default function EnvironmentDetailPage() {
               </span>
             )}
           </h2>
-          <button className={btnPrimary} disabled={creating} onClick={createInstance}>
+          <button
+            className={btnPrimary}
+            disabled={creating}
+            onClick={(e) => {
+              markLaunch(id, e.currentTarget);
+              void createInstance();
+            }}
+          >
             {creating ? 'Creating…' : '+ New Instance'}
           </button>
         </div>
@@ -311,10 +344,10 @@ export default function EnvironmentDetailPage() {
         {instances.length === 0 ? (
           <EmptyState title="No Chrome instances" desc="为此环境启动一个隔离的浏览器实例。" />
         ) : (
-          <ul className="divide-y divide-hairline-soft rounded-xl border border-hairline bg-surface-card">
+          <ul className="gcard divide-y divide-hairline-soft">
             {instances.map((ins) => (
               <li key={ins.id} className="flex flex-wrap items-center gap-3 px-4 py-2.5">
-                <StatusDot status={ins.status} />
+                <StatusDot status={ins.status} insId={ins.id} flyFromEnv={id} />
                 <span className="w-24 truncate text-sm text-ink">
                   {displayName(instances, ins.id)}
                 </span>
@@ -335,7 +368,7 @@ export default function EnvironmentDetailPage() {
                 <div className="ml-auto flex items-center gap-1.5">
                   {ins.status === 'running' && (
                     <button
-                      className={btnGhost}
+                      className={btnGhostSm}
                       onClick={() => setDiagId(diagId === ins.id ? null : ins.id)}
                     >
                       {diagId === ins.id ? '收起诊断' : '诊断'}
@@ -344,28 +377,28 @@ export default function EnvironmentDetailPage() {
                   {ins.status === 'running' && (
                     <>
                       <button
-                        className={btnGhost}
+                        className={btnGhostSm}
                         disabled={busyId === ins.id}
                         onClick={() => act(ins.id, 'focus')}
                       >
                         Focus
                       </button>
                       <button
-                        className={btnGhost}
+                        className={btnGhostSm}
                         disabled={busyId === ins.id}
                         onClick={() => copyCdp(ins.id)}
                       >
                         Copy CDP
                       </button>
                       <button
-                        className={btnGhost}
+                        className={btnGhostSm}
                         disabled={busyId === ins.id}
                         onClick={() => act(ins.id, 'restart')}
                       >
                         Restart
                       </button>
                       <button
-                        className={btnGhost}
+                        className={btnGhostSm}
                         disabled={busyId === ins.id}
                         onClick={() => act(ins.id, 'stop')}
                       >
@@ -376,14 +409,14 @@ export default function EnvironmentDetailPage() {
                   {(ins.status === 'stopped' || ins.status === 'error') && (
                     <>
                       <button
-                        className={btnGhost}
+                        className={btnGhostSm}
                         disabled={busyId === ins.id}
                         onClick={() => act(ins.id, 'start')}
                       >
                         Start
                       </button>
                       <button
-                        className={btnGhost}
+                        className={btnGhostSm}
                         disabled={busyId === ins.id}
                         onClick={() => act(ins.id, 'delete')}
                       >
@@ -399,7 +432,7 @@ export default function EnvironmentDetailPage() {
       </div>
 
       {/* Login Profile（实例即登录源：在实例里登录 → 关闭，登录态自动保存） */}
-      <div className="mb-6 rounded-xl border border-hairline bg-surface-card p-4">
+      <div className="gcard rv mb-6 p-5">
         <h2 className="text-sm font-medium text-ink">🔐 {profile?.name ?? 'Login Profile'}</h2>
         {profile ? (
           <>
@@ -424,7 +457,7 @@ export default function EnvironmentDetailPage() {
             </div>
             <div className="mt-3 flex items-center gap-1.5">
               <button
-                className={btnGhost}
+                className={btnGhostSm}
                 disabled={profileBusy || profile.status === 'capturing'}
                 onClick={() => profileAct()}
               >
@@ -442,7 +475,7 @@ export default function EnvironmentDetailPage() {
       </div>
 
       {/* Activity 流 */}
-      <div className="mb-6 rounded-xl border border-hairline bg-surface-card p-4">
+      <div className="gcard rv mb-6 p-5">
         <h2 className="text-sm font-medium text-ink">Activity</h2>
         {activity.length === 0 ? (
           <p className="mt-2 text-xs text-ink-3">暂无事件</p>
@@ -472,7 +505,7 @@ export default function EnvironmentDetailPage() {
       </div>
 
       {/* Hosts Mapping */}
-      <div className="rounded-xl border border-hairline bg-surface-card p-4">
+      <div className="gcard rv p-5">
         <h2 className="text-sm font-medium text-ink">Hosts Mapping</h2>
         {env.hostsSourceUrl ? (
           <div className="mt-1.5 space-y-1 text-xs text-ink-2">
