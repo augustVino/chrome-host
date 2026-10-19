@@ -91,7 +91,7 @@
 
 ### `DELETE /api/v1/environments/{id}` — 删除
 
-有运行中实例 → `409 ENVIRONMENT_HAS_RUNNING_INSTANCES`（先调 stop-all）。成功返回 `{ "ok": true }`。
+有运行中实例 → `409 ENVIRONMENT_HAS_RUNNING_INSTANCES`（先调 stop-all；清理途中检测到并发启动的实例同样中止并返回 409，停止后重试即收敛）。成功返回 `{ "ok": true }`。
 
 ### `GET /api/v1/environments/{id}/status` — 运行时摘要
 

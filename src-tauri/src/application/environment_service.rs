@@ -189,6 +189,22 @@ impl EnvironmentService {
 
         // 级联清理：先删 profile 目录（best effort），再删记录
         for ins in self.instances.list_by_env(id)? {
+            // 竞争复查（复审 P2-1）：上方 count 检查与目录删除之间可能插入并发
+            // create（starting 也计入存活）——逐例行级复查，出现存活实例即中止。
+            // 已删目录不恢复（停止实例的目录可由 Chrome 重建，数据一致性以 DB
+            // 为准），用户停止实例后重试删除即收敛；并发 create 落在循环之后的
+            // 残余窗口由 FK 拦住 envs.delete（删除响亮失败而非静默孤儿）
+            let fresh = match self.instances.get(&ins.id) {
+                Ok(fresh) => fresh,
+                Err(e) if e.code() == "INSTANCE_NOT_FOUND" => continue, // 行已被并发路径清理
+                Err(e) => return Err(e),
+            };
+            if fresh.status.is_alive_status() {
+                return Err(AppError::conflict(
+                    "ENVIRONMENT_HAS_RUNNING_INSTANCES",
+                    "环境仍有运行中的实例，请先停止",
+                ));
+            }
             let dir = std::path::Path::new(&ins.profile_dir);
             if let Err(e) = std::fs::remove_dir_all(dir) {
                 if e.kind() != std::io::ErrorKind::NotFound {
