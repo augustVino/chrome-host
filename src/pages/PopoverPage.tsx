@@ -365,7 +365,7 @@ function PopEnv({ g, instances, loaded, busyId, onRelease, onNew, onDelete, act 
       <i className="bar" />
       <div className="flex items-center gap-2">
         <b className="min-w-0 flex-1 truncate text-[13px] font-bold">{env.name}</b>
-        <small className={`text-[10.5px] font-bold ${running ? 'text-run-text' : 'text-ink-3'}`}>
+        <small className={`text-[10.5px] font-bold ${running ? 'text-run-text' : 'text-ink-3 dark:text-ink-2'}`}>
           {running ? `● ${running} running` : instances.length ? '○ idle' : '○ empty'}
         </small>
         <button

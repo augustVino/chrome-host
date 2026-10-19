@@ -25,33 +25,35 @@ body,
   --a-coral: 0;
   --vb: 0;
 
-  --bg: 232 235 250;
-  --ink: 23 23 43;
-  --ink-2: 94 96 120;
-  --ink-3: 154 156 181;
-  --brand: 91 95 239;
-  --brand-hover: 76 80 224;
-  --brand-2: 139 92 246;
-  --mint: 45 212 167;
-  --peach: 255 181 154;
-  --sky: 125 211 252;
-  --coral: 255 107 107;
-  --amber: 245 158 11;
+  --bg: 231 234 245;
+  --ink: 26 27 48;
+  --ink-2: 98 101 122;
+  --ink-3: 163 166 186;
+  --brand: 79 91 224;
+  --brand-hover: 66 78 205;
+  /* brand-2 与 brand 色相仅差约 8°：渐变近乎纯色（对标 Finpay 的扁平主色），需要彻底纯色时令其等于 --brand */
+  --brand-2: 96 106 232;
+  --mint: 46 204 168;
+  --peach: 255 208 196;
+  /* sky 在亮/暗主题中均取淡薰衣草紫（极光左下色块），名称沿用以免改动引用处 */
+  --sky: 196 186 255;
+  --coral: 238 108 112;
+  --amber: 240 163 40;
   --run-text: 17 140 108;
   --hl: 255 255 255;
-  --toast: 23 23 43;
-  --k: 1;
+  --toast: 26 27 48;
+  --k: 0.65;
 
   --glass: rgba(255, 255, 255, 0.58);
-  --glass-solid: #f4f5fd;
-  --glass-2: rgba(255, 255, 255, 0.72);
-  --shadow-c: 91 95 239;
+  --glass-solid: #f4f5fb;
+  --glass-2: rgba(255, 255, 255, 0.78);
+  --shadow-c: 79 91 224;
   --line: rgba(23, 23, 43, 0.08);
   --line-soft: rgba(23, 23, 43, 0.05);
   --inset: rgba(23, 23, 43, 0.045);
   /* 卡片：亮色靠投影浮起（无描边），暗色投影不可见，保留描边 */
   --card-line: transparent;
-  --card-ambient: 0 0 0 0.5px rgba(23, 23, 43, 0.035), 0 2px 12px -2px rgb(var(--shadow-c) / 0.12);
+  --card-ambient: 0 0 0 0.5px rgba(23, 23, 43, 0.035), 0 2px 12px -2px rgb(var(--shadow-c) / 0.08);
 
   --popover-card: rgba(255, 255, 255, 0.6);
   --popover-line: rgba(0, 0, 0, 0.08);
@@ -63,24 +65,24 @@ body,
   :root {
     color-scheme: dark;
 
-    --bg: 12 12 20;
-    --ink: 244 244 251;
-    --ink-2: 176 178 204;
-    --ink-3: 134 136 165;
-    --brand: 124 127 255;
-    --brand-hover: 150 152 255;
-    --brand-2: 167 139 250;
-    --mint: 52 224 180;
-    --peach: 255 158 125;
-    --sky: 56 189 248;
-    --coral: 255 122 122;
-    --amber: 251 176 36;
-    --run-text: 52 224 180;
-    --toast: 43 43 66;
+    --bg: 17 18 28;
+    --ink: 240 241 249;
+    --ink-2: 172 175 199;
+    --ink-3: 130 133 160;
+    --brand: 122 130 238;
+    --brand-hover: 142 149 245;
+    --brand-2: 138 146 244;
+    --mint: 58 208 175;
+    --peach: 240 170 150;
+    --sky: 150 140 230;
+    --coral: 240 128 128;
+    --amber: 244 178 60;
+    --run-text: 58 208 175;
+    --toast: 43 44 66;
     --k: 0.5;
 
     --glass: rgba(255, 255, 255, 0.055);
-    --glass-solid: #181826;
+    --glass-solid: #1c1d2c;
     --glass-2: rgba(255, 255, 255, 0.085);
     --shadow-c: 0 0 0;
     --line: rgba(255, 255, 255, 0.09);
@@ -97,14 +99,14 @@ body,
 }
 
 /* 环境渐变色盘（按环境 id 哈希确定性取色，不落库）：降饱和、偏蓝紫，避开纯绿/纯红（它们在界面里分别表示运行/异常） */
-.g1 { --ga: #6b6ee8; --gb: #9168f0; }
-.g2 { --ga: #5aa3e8; --gb: #6f8cf0; }
-.g3 { --ga: #e58fa8; --gb: #b98af0; }
-.g4 { --ga: #4cb5c4; --gb: #5f9be8; }
-.g5 { --ga: #d9779c; --gb: #c26fd8; }
-.g6 { --ga: #e8a272; --gb: #e68a8a; }
-.g7 { --ga: #7ab6e8; --gb: #7778e6; }
-.g8 { --ga: #7d8bb0; --gb: #9a86e0; }
+.g1 { --ga: #6c71e0; --gb: #8c70e8; }
+.g2 { --ga: #62a3e0; --gb: #738ee8; }
+.g3 { --ga: #dd97ab; --gb: #b793e8; }
+.g4 { --ga: #5bb3c0; --gb: #6a9ee0; }
+.g5 { --ga: #d283a2; --gb: #bd7bd0; }
+.g6 { --ga: #e0a67f; --gb: #de9392; }
+.g7 { --ga: #84b6e0; --gb: #8081de; }
+.g8 { --ga: #8591b0; --gb: #9d8fdb; }
 
 body {
   font-family: var(--ff);
@@ -174,7 +176,7 @@ kbd {
     height: var(--s);
     left: var(--x);
     top: var(--y);
-    background: radial-gradient(circle at 50% 50%, rgb(var(--c) / 0.9), rgb(var(--c) / 0) 68%);
+    background: radial-gradient(circle at 50% 50%, rgb(var(--c) / 0.7), rgb(var(--c) / 0) 68%);
     will-change: transform;
   }
   .b-brand { --c: var(--brand); --s: 62%; --x: -12%; --y: -22%; }
@@ -184,9 +186,9 @@ kbd {
   .b-mint { --c: var(--mint); --s: 44%; --x: 34%; --y: 38%; opacity: calc(var(--a-mint) * var(--k, 1)); }
   .b-coral { --c: var(--coral); --s: 38%; --x: 52%; --y: 20%; opacity: calc(var(--a-coral) * var(--k, 1)); }
   @media (prefers-color-scheme: dark) {
-    .b-peach { opacity: 0.45; }
-    .b-sky { opacity: 0.4; }
-    .b-brand2 { opacity: 0.55; }
+    .b-peach { opacity: 0.35; }
+    .b-sky { opacity: 0.3; }
+    .b-brand2 { opacity: 0.45; }
   }
   .grain {
     position: absolute;
@@ -225,7 +227,7 @@ kbd {
   .gcard {
     border-radius: 20px;
     background: var(--glass-2);
-    box-shadow: inset 0 0 0 1px var(--card-line), var(--card-ambient), 0 18px 36px -24px rgb(var(--shadow-c) / 0.4);
+    box-shadow: inset 0 0 0 1px var(--card-line), var(--card-ambient), 0 18px 36px -24px rgb(var(--shadow-c) / 0.25);
   }
 
   /* ───────── 侧栏 ───────── */
@@ -276,7 +278,7 @@ kbd {
     border-radius: 14px;
     z-index: 0;
     background: linear-gradient(135deg, rgb(var(--brand)), rgb(var(--brand-2)));
-    box-shadow: 0 10px 24px -8px rgb(var(--brand) / 0.65);
+    box-shadow: 0 10px 24px -8px rgb(var(--brand) / 0.4);
   }
   .nav-item {
     position: relative;
@@ -487,18 +489,18 @@ kbd {
   .btn-brand {
     color: #fff;
     background: linear-gradient(135deg, rgb(var(--brand)), rgb(var(--brand-2)));
-    box-shadow: 0 10px 24px -8px rgb(var(--brand) / 0.7);
+    box-shadow: 0 10px 24px -8px rgb(var(--brand) / 0.42);
   }
   .btn-brand:hover {
-    box-shadow: 0 14px 32px -8px rgb(var(--brand) / 0.85);
+    box-shadow: 0 14px 32px -8px rgb(var(--brand) / 0.5);
   }
   .btn-mint {
     color: #053b2e;
-    background: linear-gradient(135deg, rgb(var(--mint)), #6ee7c8);
-    box-shadow: 0 10px 24px -8px rgb(var(--mint) / 0.75);
+    background: linear-gradient(135deg, rgb(var(--mint)), color-mix(in srgb, rgb(var(--mint)) 80%, white));
+    box-shadow: 0 10px 24px -8px rgb(var(--mint) / 0.45);
   }
   .btn-mint:hover {
-    box-shadow: 0 14px 32px -8px rgb(var(--mint) / 0.9);
+    box-shadow: 0 14px 32px -8px rgb(var(--mint) / 0.55);
   }
   .btn-ghost {
     background: var(--glass-2);
@@ -510,8 +512,8 @@ kbd {
   }
   .btn-danger {
     color: #fff;
-    background: linear-gradient(135deg, rgb(var(--coral)), #ff8e72);
-    box-shadow: 0 10px 24px -8px rgb(var(--coral) / 0.7);
+    background: linear-gradient(135deg, rgb(var(--coral)), color-mix(in srgb, rgb(var(--coral)) 80%, white));
+    box-shadow: 0 10px 24px -8px rgb(var(--coral) / 0.42);
   }
   /* 无底色的危险文字按钮（删除环境等低强调破坏性操作） */
   .btn-quiet-danger {
@@ -649,7 +651,7 @@ kbd {
     width: 0;
     border-radius: 99px;
     background: linear-gradient(135deg, rgb(var(--brand)), rgb(var(--brand-2)));
-    box-shadow: 0 8px 18px -6px rgb(var(--brand) / 0.7);
+    box-shadow: 0 8px 18px -6px rgb(var(--brand) / 0.42);
   }
 
   /* ───────── Hero ───────── */
@@ -673,10 +675,10 @@ kbd {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    background: radial-gradient(500px 240px at 90% 0%, rgba(110, 231, 200, 0.55), transparent 70%),
-      radial-gradient(420px 260px at 0% 100%, rgba(255, 170, 200, 0.35), transparent 70%),
-      linear-gradient(135deg, #4f46e5, #7c3aed 62%, #9b5cf6);
-    box-shadow: 0 30px 60px -26px rgb(var(--brand) / 0.8), 0 0 0 1px rgba(255, 255, 255, 0.18) inset;
+    background: radial-gradient(500px 240px at 90% 0%, rgb(var(--mint) / 0.3), transparent 70%),
+      radial-gradient(420px 260px at 0% 100%, rgb(var(--peach) / 0.25), transparent 70%),
+      linear-gradient(135deg, rgb(var(--brand)), rgb(var(--brand-2)));
+    box-shadow: 0 30px 60px -26px rgb(var(--brand) / 0.5), 0 0 0 1px rgba(255, 255, 255, 0.18) inset;
   }
   .hero::after {
     content: '';
@@ -829,11 +831,11 @@ kbd {
     cursor: pointer;
     --ang: 0deg;
     background: var(--glass-2);
-    box-shadow: inset 0 0 0 1px var(--card-line), var(--card-ambient), 0 18px 36px -24px rgb(var(--shadow-c) / 0.4);
+    box-shadow: inset 0 0 0 1px var(--card-line), var(--card-ambient), 0 18px 36px -24px rgb(var(--shadow-c) / 0.25);
     transition: box-shadow 0.3s;
   }
   .env-card:hover {
-    box-shadow: inset 0 0 0 1px var(--card-line), var(--card-ambient), 0 30px 60px -24px rgb(var(--shadow-c) / 0.5);
+    box-shadow: inset 0 0 0 1px var(--card-line), var(--card-ambient), 0 30px 60px -24px rgb(var(--shadow-c) / 0.32);
   }
   .edge {
     position: absolute;
@@ -1033,7 +1035,7 @@ kbd {
     padding: 20px;
     border-radius: 24px;
     background: var(--glass-2);
-    box-shadow: inset 0 0 0 1px var(--card-line), var(--card-ambient), 0 18px 36px -24px rgb(var(--shadow-c) / 0.4);
+    box-shadow: inset 0 0 0 1px var(--card-line), var(--card-ambient), 0 18px 36px -24px rgb(var(--shadow-c) / 0.25);
   }
   .side-card .eyebrow {
     margin-bottom: 12px;
@@ -1269,7 +1271,7 @@ kbd {
   }
   .sw.on {
     background: linear-gradient(135deg, rgb(var(--brand)), rgb(var(--brand-2)));
-    box-shadow: 0 8px 18px -6px rgb(var(--brand) / 0.7);
+    box-shadow: 0 8px 18px -6px rgb(var(--brand) / 0.42);
   }
   .sw i {
     position: absolute;
@@ -1423,7 +1425,7 @@ kbd {
     box-shadow: 0 24px 50px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px rgb(var(--mint) / 0.5), 0 0 30px -6px rgb(var(--mint) / 0.6);
   }
   .toast.err {
-    background: linear-gradient(135deg, rgb(var(--coral)), #ff8e72);
+    background: linear-gradient(135deg, rgb(var(--coral)), color-mix(in srgb, rgb(var(--coral)) 80%, white));
   }
   .toast .tp {
     position: absolute;

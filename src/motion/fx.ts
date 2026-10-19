@@ -14,9 +14,9 @@ function layer(): HTMLElement {
   return el;
 }
 
-export const MINT = 'rgb(45,212,167)';
-export const CORAL = 'rgb(255,107,107)';
-export const GREY = 'rgb(154,156,181)';
+export const MINT = 'rgb(46,204,168)';
+export const CORAL = 'rgb(238,108,112)';
+export const GREY = 'rgb(163,166,186)';
 
 export function centerOf(el: Element) {
   const r = el.getBoundingClientRect();

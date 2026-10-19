@@ -11,7 +11,7 @@
 
 ## 1. 设计基调
 
-- **Aurora Glass**：流动的极光背景 + 整窗一张通透的玻璃面板 + 渐变高光，亮/暗双主题。侧栏与主区**不做独立的圆角分块**，只以一条细线分隔（对标 Finpay 式的大气留白）；层次只在内容卡与英雄卡上表达。
+- **Aurora Glass**：流动的极光背景（柔和低饱和）+ 整窗一张通透的玻璃面板 + 克制的高光，亮/暗双主题。侧栏与主区**不做独立的圆角分块**，只以一条细线分隔（对标 Finpay 式的大气留白）；层次只在内容卡与英雄卡上表达。
 - **动效是体验的一部分，但永远可降级**：所有动效由 GSAP 驱动，受「动效档位」治理（§3），`static` 档与系统「减少动态效果」下必须完全静态可用。
 - **双窗口同一套 token**：主窗口与 Popover 共享色板，仅材质不同（Popover 在 macOS 上使用原生模糊）。
 - **功能优先**：视觉与动效改动不得影响数据流；动画只由已有状态的变化触发，轮询重渲染不得重放动画。
@@ -29,11 +29,11 @@
 
 | 语义 | 变量 | Tailwind 类 | 用途 |
 |---|---|---|---|
-| brand / brand-2 | `--brand` `--brand-2` | `bg-brand` `bg-brand-2` `text-brand` | 主操作、选中态、品牌渐变（靛 → 紫） |
+| brand / brand-2 | `--brand` `--brand-2` | `bg-brand` `bg-brand-2` `text-brand` | 主操作、选中态、品牌色（靛蓝；brand → brand-2 为近乎纯色的极淡渐变） |
 | mint | `--mint` | `text-mint` `bg-mint/15` | 运行中、成功、启动按钮 |
 | coral | `--coral` | `text-coral` | 异常、危险操作 |
 | amber | `--amber` | `text-amber` | 启动中/停止中、警告 |
-| peach / sky | `--peach` `--sky` | `text-peach` `text-sky` | 极光与装饰辅助色 |
+| peach / sky | `--peach` `--sky` | `text-peach` `text-sky` | 极光与装饰辅助色（peach = 淡粉桃，sky = 淡薰衣草紫，名称为历史沿用） |
 | ink / ink-2 / ink-3 | `--ink*` | `text-ink` `text-ink-2` `text-ink-3` | 标题 / 次要 / 辅助文字 |
 | run-text | `--run-text` | `text-run-text` | 运行中文字（亮底加深以保证对比度） |
 | toast | `--toast` | `bg-toast` | Toast 底 |
@@ -51,10 +51,18 @@
 
 **旧语义名**（`accent` `status-*` `surface-*` `hairline` `ink`）仍保留并映射到新色板，便于未改造代码继承配色；**新代码优先使用上表的新语义名**。
 
-**环境渐变色盘**：`.g1 – .g8`（定义 `--ga` / `--gb`），由 `src/lib/envColor.ts` 的 `envGradient(id)` 按环境 id 哈希确定性取色，不落库。色盘刻意**降饱和、偏蓝紫**（靛紫 / 天蓝 / 玫瑰淡紫 / 青蓝 / 兰花粉 / 蜜桃 / 灰蓝薰衣草），**避开纯绿与纯红**（二者分别表示运行 / 异常）；`.tile` 光晕用 `color-mix(--ga 60%)`。环境首字母头像、卡片 tile、Deck 卡片、Popover 色条均使用同一渐变。新增色盘项时须遵守上述原则。
+**环境渐变色盘**：`.g1 – .g8`（定义 `--ga` / `--gb`），由 `src/lib/envColor.ts` 的 `envGradient(id)` 按环境 id 哈希确定性取色，不落库。色盘刻意**降饱和、偏蓝紫**（靛紫 / 天蓝 / 玫瑰淡紫 / 青蓝 / 兰花粉 / 蜜桃 / 灰蓝薰衣草，v2.1 再整体降约 10% 饱和度），**避开纯绿与纯红**（二者分别表示运行 / 异常）；`.tile` 光晕用 `color-mix(--ga 60%)`。环境首字母头像、卡片 tile、Deck 卡片、Popover 色条均使用同一渐变。新增色盘项时须遵守上述原则。
+
+**色板基调（柔和、低饱和，对标 Finpay）**：
+- 底色为低饱和蓝灰；极光色块只用「淡粉桃 + 淡薰衣草紫 + 靛蓝」，平铺、无高光；主色为单一靛蓝，薄荷绿为唯一强调色。
+- 亮色（节选，RGB）：`--bg 231 234 245`、`--brand 79 91 224`（≈ `#4F5BE0`）、`--brand-2 96 106 232`、`--mint 46 204 168`、`--peach 255 208 196`、`--sky 196 186 255`、`--coral 238 108 112`、`--amber 240 163 40`。
+- 暗色（节选，RGB）：`--bg 17 18 28`（非纯黑，略带蓝）、`--brand 122 130 238`、`--brand-2 138 146 244`、`--mint 58 208 175`、`--peach 240 170 150`、`--sky 150 140 230`、`--coral 240 128 128`、`--amber 244 178 60`。
+- 强度由 `--k` 统一缩放极光中的彩色光（亮 0.65 / 暗 0.5），`.blob` 中心 alpha 0.7；彩色光晕（按钮 / 选中指示器 / 开关 / Hero）阴影 alpha 控制在 **0.4 ~ 0.55**，卡片投影 alpha 0.25 ~ 0.32，**不要再把光晕调回 0.7 以上**。
+- 若需要主按钮 / 选中态彻底纯色，只需令 `--brand-2` 等于 `--brand`（亮 / 暗各一处），无需改任何组件。
+- 少数 JS/TS 里无法引用 CSS 变量的色值（`src/motion/fx.ts` 的 `MINT` / `CORAL` / `GREY`、`icons.tsx` 的 `#ch-lg` 渐变 stop）为亮色值的镜像，**改 token 时需同步**。
 
 **使用规则**：
-- **主题色是 brand（靛 → 紫渐变）**：主操作按钮、导航选中态、开关开启态、分段控件选中态一律用 brand。mint 仅用于「运行 / 成功 / 启动」语义（运行状态点、running 徽章、启动按钮）；coral 仅用于异常与危险操作；amber 仅用于启动中与警告。**禁止把 mint 用在通用控件上。**
+- **主题色是 brand（靛蓝，近乎纯色）**：主操作按钮、导航选中态、开关开启态、分段控件选中态一律用 brand。mint 仅用于「运行 / 成功 / 启动」语义（运行状态点、running 徽章、启动按钮）；coral 仅用于异常与危险操作；amber 仅用于启动中与警告。**禁止把 mint 用在通用控件上。**
 - 状态点用 `StatusDot`；对应文字用 `text-run-text`（运行）或 `text-coral`（异常），禁止状态点与文字同色导致对比度不足。
 - 徽章背景用语义色半透明（`bg-mint/15`、`bg-coral/15`、`bg-amber/15`），无需再写 `dark:` 对应值。
 - hover / focus 的中性 overlay 用前景透明度：`hover:bg-ink/5`。
@@ -119,7 +127,7 @@
 | 层级 | 常量 / 类 | 场景 |
 |---|---|---|
 | Primary | `btnPrimary`（`btn btn-brand`） | 每屏唯一主操作：Add Environment / Run |
-| Mint | `btnMint`（`btn btn-mint`） | 启动类操作：New Chrome / New。浅 mint 渐变底 + **深绿字**（`#053b2e`，对比度 >8:1）；浅底配白字对比度不足（<2:1），不要改成白字 |
+| Mint | `btnMint`（`btn btn-mint`） | 启动类操作：New Chrome / New。浅 mint 渐变底（`--mint` → `color-mix` 提亮 20%）+ **深绿字**（`#053b2e`，对比度 >8:1）；浅底配白字对比度不足（<2:1），不要改成白字 |
 | Ghost | `btnGhost` / `btnGhostSm`（`btn-ghost`，`-xs` 小号） | 次操作：Focus / Restart / Stop / 取消 |
 | 危险 | `btnDanger`（实心）/ `btnQuietDanger`（文字，hover 才变色） | 删除 / 确认不可逆操作 |
 | 图标按钮 | `.icon-btn` / `.ib` + `data-tip` | Popover 与卡内紧凑操作 |
@@ -137,7 +145,7 @@
 |---|---|
 | `PageHeader` | 页头：`.title`（SplitText 入场）+ `.sub` + 右侧操作区。**一级页面（Environments / Instances / Login Profiles / Extensions / Agent API / Settings）必须统一使用，必须带一行 `sub` 描述；右侧只放状态或主操作，不得在页头下另放说明框** |
 | `Seg` | 分段控件，带滑动指示器（`.seg` `.seg-ind`） |
-| `Switch` | 开关，开启态走 brand 渐变（与主题色一致，**不用 mint**），旋钮弹性动画 |
+| `Switch` | 开关，开启态走 brand（与主题色一致，**不用 mint**），旋钮弹性动画 |
 | `ModalShell` / `Modal` / `Field` | 带进出场动画的弹窗骨架；`ConfirmDialog` 复用 `ModalShell`（`confirm.tsx` 的 store API 不变） |
 | `EmptyState` | 空态：描边环 + 轨道光点（`<path>` + MotionPath） |
 | `Toast` | GSAP 驱动；`compact` 用于 Popover |

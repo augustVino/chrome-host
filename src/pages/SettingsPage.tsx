@@ -576,7 +576,7 @@ export default function SettingsPage() {
                   key={value}
                   className={`rounded-full px-3.5 py-1.5 font-semibold transition ${
                     settings?.envLabelPosition === value
-                      ? 'bg-gradient-to-br from-brand to-brand-2 text-white shadow-[0_8px_18px_-6px_rgb(var(--brand)/0.7)]'
+                      ? 'bg-gradient-to-br from-brand to-brand-2 text-white shadow-[0_8px_18px_-6px_rgb(var(--brand)/0.42)]'
                       : 'bg-surface-inset text-ink-2 hover:text-ink'
                   }`}
                   onClick={() => updateSettings({ envLabelPosition: value })}
@@ -599,7 +599,7 @@ export default function SettingsPage() {
                   key={value}
                   className={`flex items-center gap-1.5 rounded-full px-3.5 py-1.5 font-semibold transition ${
                     settings?.envLabelColor === value
-                      ? 'bg-gradient-to-br from-brand to-brand-2 text-white shadow-[0_8px_18px_-6px_rgb(var(--brand)/0.7)]'
+                      ? 'bg-gradient-to-br from-brand to-brand-2 text-white shadow-[0_8px_18px_-6px_rgb(var(--brand)/0.42)]'
                       : 'bg-surface-inset text-ink-2 hover:text-ink'
                   }`}
                   onClick={() => updateSettings({ envLabelColor: value })}
