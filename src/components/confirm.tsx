@@ -5,7 +5,7 @@ import { ModalShell, btnDanger, btnGhost } from './ui';
 /**
  * 应用内确认对话框：Tauri WKWebView 不支持 window.confirm/alert（点击无反应的根因），
  * 全部原生确认流改走本组件。Promise 风格：await confirm(opts) → true/false。
- * 每个窗口（main / popover）各自渲染一个 <ConfirmDialog /> 实例。
+ * 主窗口渲染实例（App 顶层）；popover 的删除走原地两段式确认，不经本组件。
  */
 
 interface ConfirmOptions {
@@ -54,7 +54,7 @@ export function ConfirmDialog() {
   const options = last.current;
   if (!options) return null;
   return (
-    <ModalShell open={!!st} onBackdrop={() => st?.resolve?.(false)} width={400}>
+    <ModalShell open={!!st} onBackdrop={() => st?.resolve?.(false)} width="min(400px, 100%)">
       <svg className="m-ic" viewBox="0 0 24 24" aria-hidden>
         <path d="M12 3.5l9.5 16.5h-19z" />
         <path d="M12 10v4.5M12 17.4v.1" />

@@ -5,9 +5,8 @@ import type { EnvironmentSummary, Instance } from '../api/types';
 import { useStore } from '../store';
 import { openManager } from '../lib/windows';
 import { copyText } from '../lib/clipboard';
-import { confirmDeleteEnv, deleteEnv } from '../lib/deleteEnv';
-import { ConfirmDialog } from '../components/confirm';
-import { Icon, StatusDot, btnGhost, btnPrimary, btnQuietDanger } from '../components/ui';
+import { deleteEnv } from '../lib/deleteEnv';
+import { Icon, StatusDot, btnDanger, btnGhost, btnPrimary, btnQuietDanger } from '../components/ui';
 import { GradientDefs } from '../components/icons';
 import logoUrl from '../assets/logo.png';
 import { Toast } from '../components/Toast';
@@ -28,7 +27,8 @@ function displayName(list: Instance[], id: string): string {
 }
 
 /**
- * 托盘 Popover 内容：只做高频四件事——查看摘要 / New / Focus / Stop。
+ * 托盘 Popover 内容：高频四件事——查看摘要 / New / Focus / Stop；
+ * 删除为低频高危入口，采用原地两段式确认（无弹层，见 PopEnv）。
  * 数据通道不变（HTTP API + 后端事件）；窗口隐藏时 JS 持续轮询，弹出即最新。
  */
 export default function PopoverPage() {
@@ -108,13 +108,15 @@ export default function PopoverPage() {
   );
 
   const removeEnv = useCallback(
-    async (envId: string, name: string, running: number) => {
-      if (!(await confirmDeleteEnv(name, running))) return;
+    async (envId: string, running: number) => {
+      setBusyId(envId);
       try {
         await deleteEnv(envId, running);
         showToast('ok', '环境已删除');
       } catch (e) {
         showToast('err', errorText(e));
+      } finally {
+        setBusyId(null);
       }
       refresh();
     },
@@ -181,7 +183,7 @@ export default function PopoverPage() {
                 }, env.id);
               }}
               onDelete={(env, instances) =>
-                removeEnv(env.id, env.name, instances.filter((i) => i.status === 'running').length)
+                removeEnv(env.id, instances.filter((i) => i.status === 'running').length)
               }
               act={act}
             />
@@ -196,7 +198,6 @@ export default function PopoverPage() {
       </div>
 
       <Toast compact />
-      <ConfirmDialog />
     </div>
   );
 }
@@ -302,6 +303,9 @@ function PopRow({ ins, name, envId, busy, g, onRelease, act }: {
   );
 }
 
+/** 删除按钮 armed 态自动复位时限（ms）：超时未确认回到"删除" */
+const ARM_TIMEOUT = 3000;
+
 function PopEnv({ g, instances, loaded, busyId, onRelease, onNew, onDelete, act }: {
   g: GhostItem<EnvironmentSummary>;
   instances: Instance[];
@@ -316,6 +320,29 @@ function PopEnv({ g, instances, loaded, busyId, onRelease, onNew, onDelete, act 
   const el = useRef<HTMLDivElement>(null);
   const running = instances.filter((i) => i.status === 'running').length;
   const rows = useGhostList(instances, (i) => i.id, loaded);
+  /** 两段式删除：首次点击 arm（实心 danger 确认态），再次点击执行；超时/失焦/窗口隐藏自动复位 */
+  const [armed, setArmed] = useState(false);
+  const armTimer = useRef(0);
+  const disarm = useCallback(() => {
+    clearTimeout(armTimer.current);
+    setArmed(false);
+  }, []);
+  const arm = () => {
+    clearTimeout(armTimer.current);
+    armTimer.current = window.setTimeout(disarm, ARM_TIMEOUT);
+    setArmed(true);
+  };
+  useEffect(() => {
+    // popover 隐藏/切窗会触发 blur，重新唤起会触发 focus：两时机都复位，
+    // 防止确认态残留到下次弹出（叠加 3s 超时兑底）
+    window.addEventListener('blur', disarm);
+    window.addEventListener('focus', disarm);
+    return () => {
+      window.removeEventListener('blur', disarm);
+      window.removeEventListener('focus', disarm);
+      clearTimeout(armTimer.current);
+    };
+  }, [disarm]);
 
   useGSAP(
     () => {
@@ -341,8 +368,14 @@ function PopEnv({ g, instances, loaded, busyId, onRelease, onNew, onDelete, act 
         <small className={`text-[10.5px] font-bold ${running ? 'text-run-text' : 'text-ink-3'}`}>
           {running ? `● ${running} running` : instances.length ? '○ idle' : '○ empty'}
         </small>
-        <button className={btnQuietDanger} title="删除环境" onClick={() => onDelete(env, instances)}>
-          删除
+        <button
+          className={armed ? `${btnDanger} btn-xs` : btnQuietDanger}
+          title={armed ? '将删除登录快照与全部实例数据，不可恢复' : '删除环境'}
+          disabled={busyId === env.id}
+          onBlur={disarm}
+          onClick={() => (armed ? (disarm(), onDelete(env, instances)) : arm())}
+        >
+          {busyId === env.id ? '…' : armed ? (running ? '停止并删除' : '确认删除') : '删除'}
         </button>
         <button className={`${btnPrimary} btn-xs`} disabled={busyId === env.id} onClick={(e) => onNew(env, e.currentTarget)}>
           {busyId === env.id ? '…' : '+ New'}

@@ -19,7 +19,7 @@ export function ModalShell({
   open: boolean;
   onBackdrop: () => void;
   children: ReactNode;
-  width?: number;
+  width?: number | string;
 }) {
   const [mounted, setMounted] = useState(open);
   const root = useRef<HTMLDivElement>(null);
