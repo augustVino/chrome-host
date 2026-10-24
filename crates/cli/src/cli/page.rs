@@ -591,12 +591,17 @@ fn snap_text(resp: &serde_json::Value) -> String {
 }
 
 /// click/fill/press/wait/eval/clickxy/loadall/type 的主结果行（服务端 result
-/// 字段；缺字段时不装作成功）。
+/// 字段；缺字段时不装作成功）。raw 的 result 是对象（CDP 原始 result 透传）
+/// → pretty JSON 多行串；其余命令 result 恒为字符串。
 fn result_line(resp: &serde_json::Value) -> String {
-    resp.get("result")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(响应缺少 result 字段)")
-        .to_string()
+    match resp.get("result") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v @ serde_json::Value::Object(_) | v @ serde_json::Value::Array(_)) => {
+            serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+        }
+        Some(other) => other.to_string(),
+        None => "(响应缺少 result 字段)".to_string(),
+    }
 }
 
 /// 命令期间自动应答了对话框时的提示行（仅 table 模式调用；None = 无附注）。

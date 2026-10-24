@@ -743,14 +743,16 @@ async fn on_attached(watched: &Watched, params: &Value) {
     let Some(conn) = watched.conn.lock().unwrap().clone() else {
         return;
     };
+    // L3：盲探测必须**先于** enable 发出——对话框悬挂时唯一不被 renderer
+    // 阻塞的命令就是 handleJavaScriptDialog（Page/Runtime.enable 等都会挂起
+    // 至超时）；若 alert 挂着，先探测 accept 再 enable 才能全部成功。探测
+    // 与常规事件驱动路径互不干扰（无对话框时 -32602 静默）。
+    probe_reconnected_dialog(watched, &conn, tid, sid).await;
     for method in ["Page.enable", "DOM.enable"] {
         if let Err(e) = cdp_send(&conn, method, json!({}), Some(sid)).await {
             tracing::debug!("[page] session {sid} {method} 失败: {e}");
         }
     }
-    // L3：探测在 Page.enable 之后、attach 握手内顺序完成（&self 并发 send，
-    // 不阻塞其他 in-flight 命令）；常规对话框路径事件驱动，互不干扰
-    probe_reconnected_dialog(watched, &conn, tid, sid).await;
 }
 
 /// L3 重连对话框盲探测：CDP 断连重连后**不重播** javascriptDialogOpening——
@@ -2852,7 +2854,9 @@ mod tests {
         assert_eq!(handles.len(), 1, "attach 后恰好盲发一次");
         assert_eq!(handles[0].params, json!({ "accept": true }));
         assert_eq!(handles[0].session.as_deref(), Some("S1"));
-        // 探测在 Page.enable 之后（enable → DOM.enable → 探测的握手顺序）
+        // 探测必须**先于** enable（对话框悬挂时 handleJavaScriptDialog 是唯一
+        // 不被 renderer 阻塞的命令；先探测 accept 再 enable 才能全部成功
+        // ——孤儿对话框真机验证 2026-10-25）
         let order = |m: &str| {
             calls
                 .lock()
@@ -2861,7 +2865,7 @@ mod tests {
                 .position(|r| r.method == m)
                 .unwrap()
         };
-        assert!(order("Page.enable") < order("Page.handleJavaScriptDialog"));
+        assert!(order("Page.handleJavaScriptDialog") < order("Page.enable"));
         // 保守默认入缓冲：alert / 固定文案 / accepted / sequence 顺延起 1
         let dialogs = watched.dialogs.lock().unwrap();
         let b = dialogs.get("T1").expect("成功探测入缓冲");
