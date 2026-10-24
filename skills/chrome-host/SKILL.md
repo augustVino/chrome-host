@@ -1,6 +1,6 @@
 ---
 name: chrome-host
-description: chrome-host 桌面应用的完整 agent 技能：编排多环境隔离 Chrome 实例（查/建环境、启停实例、开标签页、登录态快照、hosts 注入、扩展与内核管理），并用内置 cdp.mjs 直接做页面自动化（截图、可访问性树、eval、点击、输入）。只要用户提到"用 XX 环境打开/排查/测试"（qa、sandbox 等环境名）、需要独立 profile / hosts 注入 / 免登录的浏览器、管理 chrome-host 的环境或实例、或要求在隔离浏览器里截图/操作页面/读 DOM，就必须使用本 skill。与本机手动以 --remote-debugging-port 启动、与 chrome-host 无关的调试 Chrome 相关的纯页面操作不走本 skill。
+description: chrome-host 桌面应用的完整 agent 技能：编排多环境隔离 Chrome 实例（查/建环境、启停实例、开标签页、登录态快照、hosts 注入、扩展与内核管理），并用内置 cdp.mjs 直接做页面自动化（截图、可访问性树 @eN 引用、eval、原生点击、表单填写 fill/press、元素等待 wait、弹窗接管）。只要用户提到"用 XX 环境打开/排查/测试"（qa、sandbox 等环境名）、需要独立 profile / hosts 注入 / 免登录的浏览器、在隔离浏览器里点按钮/填表单/提交/截图/读 DOM，或管理 chrome-host 的环境实例，就必须使用本 skill。与本机手动以 --remote-debugging-port 启动、与 chrome-host 无关的调试 Chrome 相关的纯页面操作不走本 skill。
 ---
 
 # Chrome Host — 隔离 Chrome 编排 + 页面自动化
@@ -114,13 +114,16 @@ cdp.mjs 全部命令（`<target>` 是 `list` 输出中的 targetId 唯一前缀�
 ```bash
 node scripts/cdp.mjs list                       # 列页面
 node scripts/cdp.mjs shot  <target> [file]      # 视口截图（仅视口，长页先滚动）
-node scripts/cdp.mjs snap  <target> [--compact] # 可访问性树（看结构优先用它）
+node scripts/cdp.mjs snap  <target> [--compact] # 可访问性树 + @eN 引用（看结构/找元素优先用它）
 node scripts/cdp.mjs eval  <target> <expr>      # 执行 JS
 node scripts/cdp.mjs html  <target> [selector]  # 页面/元素 HTML
 node scripts/cdp.mjs nav   <target> <url>       # 导航并等加载
-node scripts/cdp.mjs click <target> <selector>  # 按 CSS 选择器点击
+node scripts/cdp.mjs click <target> <sel|@eN>   # 原生输入点击（选择器或 @eN 引用；--unsafe-synth 回退合成点击，仅 selector）
+node scripts/cdp.mjs fill  <target> <sel|@eN> <text>   # 聚焦+清空+输入+回读校验（表单填写用它，别 eval 手写）
+node scripts/cdp.mjs press <target> <key> [--target <sel|@eN>]  # 按键：Enter/Tab/Escape/箭头/F1-F12/Control+A 等组合键
+node scripts/cdp.mjs wait  <target> <sel> [--state visible|hidden|attached|detached] [--timeout 10s]  # 等元素状态（SPA 渲染等待用它，别 sleep）
 node scripts/cdp.mjs clickxy <target> <x> <y>   # 按坐标点击（CSS 像素）
-node scripts/cdp.mjs type  <target> <text>      # 输入文本（当前焦点处）
+node scripts/cdp.mjs type  <target> <text>      # 焦点处输入（跨域 iframe 用它）
 node scripts/cdp.mjs loadall <target> <sel> [ms]  # 反复点"加载更多"直到消失
 node scripts/cdp.mjs evalraw <target> <method> [json]  # 原始 CDP 命令透传
 node scripts/cdp.mjs dialogs <target> [--since N]   # 查自动接管的 JS 弹窗记录（近 32 条）
@@ -130,8 +133,9 @@ node scripts/cdp.mjs stop   [target]            # 停后台 daemon
 
 关键陷阱（断链几乎都出在这里）：
 
+- **元素定位优先 @eN 引用**：`snap` 给可交互节点（button/link/textbox/checkbox…）编号输出 `@e3 [button] 提交`，`click`/`fill`/`press --target` 直接吃引用，比 CSS 选择器稳（不受 CSS-in-JS hash、动态列表位移影响）。导航后引用整表失效（报 `ref_stale`）——这是特性：重新 `snap` 再操作，不要对旧引用重试。操作循环：`snap → 用 @eN 操作 → 页面变化后重 snap`。
+- **错误看 [CODE] 前缀分支处置**，不要解析文案：`element_blocked`（被浮层遮挡，先处理遮挡）/ `element_not_visible` / `ref_not_found`/`ref_stale`（重 snap）/ `target_not_fillable` / `fill_value_mismatch`（写入可能部分生效，先观察再重试）/ `wait_timeout` / `dispatch_failed`（附 effect_state：none=未发出可重试，unknown=已发出禁盲目重试）。
 - **坐标换算**：截图按原生分辨率保存（图像像素 = CSS 像素 × DPR），CDP 点击吃 CSS 像素。`shot` 输出会带当前页 DPR，Retina（DPR=2）除以 2 再点击。
-- **eval 索引漂移**：多次 `eval` 之间 DOM 会变（如点掉一个卡片后全体系号位移），跨调用别用 `querySelectorAll(...)[i]`——一次 eval 收齐数据，或用稳定选择器。
 - **跨域 iframe 输入**：`eval` 进不去跨域 iframe，用 `click`/`clickxy` 聚焦后 `type`（Input.insertText，不受同源限制）。
 - **不存在 "Allow debugging" 授权弹窗**：实例内核是 Chrome for Testing，CDP 访问不弹任何授权框，无需用户点允许——操作失败时别往“用户未授权”归因，按端口/实例/会话逐层排查。cdp.mjs 页面命令经 per-tab 后台 daemon 保持 CDP 会话，daemon 空闲 20 分钟自动退出。页面 alert/confirm/prompt/beforeunload 会被 daemon 自动 accept（beforeunload=放行离开，prompt 提交默认文本），不再阻塞命令；期间弹窗会以 `dialogs_seen` 附在响应里（CLI 以 stderr 提示行展示），`dialogs` 命令可查历史。
 - **会话过期**（仅 CDP_BASE 模式，404 `SESSION_NOT_FOUND`）→ 重新 `cdp-session` 即可，无需重建实例。
