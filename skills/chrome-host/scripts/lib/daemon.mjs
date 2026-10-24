@@ -53,7 +53,12 @@ async function dispatchCommand(cdp, sessionId, targetId, { cmd, args }, dialogs)
       case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
       case 'nav': case 'navigate': result = await navStr(cdp, sessionId, args[0]); break;
       case 'net': case 'network': result = await netStr(cdp, sessionId); break;
-      case 'click': result = await clickStr(cdp, sessionId, args[0]); break;
+      case 'click': {
+        const unsafe = args.includes('--unsafe-synth');
+        const selector = args.find(a => a !== '--unsafe-synth');
+        result = await clickStr(cdp, sessionId, selector, unsafe);
+        break;
+      }
       case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
       case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
       case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
@@ -64,7 +69,9 @@ async function dispatchCommand(cdp, sessionId, targetId, { cmd, args }, dialogs)
     }
     return { ok: true, result: result ?? '' };
   } catch (e) {
-    return { ok: false, error: e.message };
+    // Coded errors (e.g. ClickError) carry their machine-readable code through
+    // the daemon protocol; the CLI prints them as "[CODE] message".
+    return { ok: false, error: e.message, ...(e.code ? { code: e.code } : {}) };
   }
 }
 
