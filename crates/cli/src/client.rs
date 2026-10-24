@@ -804,8 +804,9 @@ impl AgentClient {
     /// （reqwest 总超时归类 Unreachable → exit 8「应用未运行」，误导）；
     /// 连接超时 3s 仍保护真正的「应用未运行」场景。
     ///
-    /// tab 缺省（None → 服务端空串）= 最近打开（attach）的页面标签（活跃
-    /// tab 近似，P2-F F1；显式前缀仍是无匹配 404 / 多匹配 409）。响应为服务端
+    /// tab 缺省（None → 服务端空串）= 唯一页面标签时自动选中；多标签 → 409
+    /// PAGE_TAB_AMBIGUOUS（message 列出全部 targetId 供显式指定，P2-F F1；
+    /// 显式前缀仍是无匹配 404 / 多匹配 409）。响应为服务端
     /// 原样 JSON（result/instanceId/targetId，snap 另含 text/refs_count/generation）。
     fn page_path(id: &str, tool: &str) -> String {
         format!("/api/v1/instances/{id}/page/{tool}")

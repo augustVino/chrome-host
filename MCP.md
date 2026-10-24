@@ -147,8 +147,8 @@ accept，命令期间新弹的附在成功响应 `dialogs_seen`，历史查 `pag
 | `page_wait` | `instanceId`, `selector`；可选 `state`, `timeout`, `tab` | 轮询等待（250ms）；timeout 如 `"10s"`（裸数字 = ms），缺省 10s |
 | `page_dialogs` | `instanceId`；可选 `tab`, `since` | 已自动应答的对话框日志（cursor + entries；since 游标增量拉取，缓冲 32 条） |
 
-`tab` = targetId 或唯一前缀（`list_tabs` 获得）；省略 = 最近打开（attach）的
-页面标签（活跃 tab 近似）。错误处置看 code 分支：`PAGE_REF_STALE`/
+`tab` = targetId 或唯一前缀（`list_tabs` 获得）；省略 = 唯一页面标签自动选中，
+多标签 409 并在 message 列出全部 targetId。错误处置看 code 分支：`PAGE_REF_STALE`/
 `PAGE_REF_NOT_FOUND` 重 snap；`PAGE_ELEMENT_BLOCKED` 先处理遮挡；
 `PAGE_FILL_VALUE_MISMATCH` 写入可能已部分生效，先观察再决定；
 `PAGE_DISPATCH_FAILED` 附 effect_state（none 可重试 / unknown 禁盲目重试）。

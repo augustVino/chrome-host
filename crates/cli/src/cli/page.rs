@@ -23,9 +23,9 @@ use super::GlobalArgs;
 use crate::client::AgentClient;
 use crate::error::CliError;
 
-/// page 子命令树。tab 参数（targetId 或唯一前缀）缺省 = 服务端取最近打开
-/// （attach）的页面标签（活跃 tab 近似；显式前缀仍是无匹配 404 /
-/// 多匹配 409，P2-F F1）。
+/// page 子命令树。tab 参数（targetId 或唯一前缀）缺省 = 唯一页面标签自动
+/// 选中，多标签 → 409 PAGE_TAB_AMBIGUOUS 且 message 列出全部 targetId
+///（P2-F F1；显式前缀仍是无匹配 404 / 多匹配 409）。
 #[derive(Debug, Subcommand)]
 pub enum PageCommands {
     /// 可访问性树快照 + @eN 引用（操作循环起点；导航后引用整表失效）
@@ -33,7 +33,7 @@ pub enum PageCommands {
     Snap {
         /// 实例 id
         id: String,
-        /// 目标标签页（targetId 或唯一前缀，由 instance tabs 获得；缺省 = 最近打开的页面标签）
+        /// 目标标签页（targetId 或唯一前缀，由 instance tabs 获得；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(value_name = "TAB_ID")]
         tab: Option<String>,
     },
@@ -45,7 +45,7 @@ pub enum PageCommands {
         id: String,
         /// 点击目标：@eN 引用（上次 snap 产生）或 CSS 选择器
         target: String,
-        /// 目标标签页（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
@@ -61,7 +61,7 @@ pub enum PageCommands {
         target: String,
         /// 填入文本（空串 = 仅清空）
         value: String,
-        /// 目标标签页（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
@@ -76,7 +76,7 @@ pub enum PageCommands {
         /// 可选聚焦目标：@eN 引用或 CSS 选择器
         #[arg(long, value_name = "SEL|@eN")]
         target: Option<String>,
-        /// 目标标签页（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
@@ -96,7 +96,7 @@ pub enum PageCommands {
         /// 超时时长：10s / 250ms / 裸数字=ms（缺省 10s）
         #[arg(long)]
         timeout: Option<String>,
-        /// 目标标签页（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
@@ -108,7 +108,7 @@ pub enum PageCommands {
     Dialogs {
         /// 实例 id
         id: String,
-        /// 目标标签页（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
         /// 游标：只返回 sequence 严格大于 N 的条目（缺省全部）

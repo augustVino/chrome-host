@@ -2,6 +2,11 @@
 //! 订阅（连上 → 事件透传 → 断线由调用方重连）两种形态同一实现：无 id 帧是否
 //! 有消费方由 [`EventSink`] 决定，命令路径完全一致。
 //!
+//! 并发模型（P2-F 根治）：`send` 为 `&self`——多条命令可同时 in-flight（写帧
+//! 短锁 + id 关联的响应路由）。&mut self 时代「发送+等响应」全程独占连接，
+//! in-flight 长命令（如 click 卡在被 alert 阻塞的页面至 15s 超时）会阻塞同
+//! 连接上的对话框 handle 等一切并发命令，真机冒烟实测错过对话框黄金窗口。
+//!
 //! 与 proxy.rs 的帧级桥共用 tokio-tungstenite；短连接面向 chrome-host 侧的
 //! 一次性主动命令（Cookie 导出/注入、diagnostics evaluate），常驻形态面向
 //! M6 诊断订阅（console/network 事件）。
@@ -10,9 +15,11 @@
 //! - 目标恒为本机回环的 CDP 端口，connect_async 直连 TCP、不经系统代理——
 //!   与 client.rs 的 no_proxy 同源约定；
 //! - `session_id` 参数服务于常驻 flatten 模式（Target.setAutoAttach）：
-//!   Network/Runtime 的命令与事件都是 per-target session 维度。
+//!   Network/Runtime 的命令与事件都是 per-target session 维度（session 是
+//!   连接级作用域，跨连接复用 sessionId 必 -32001 Session not found）。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,10 +40,12 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, 
 /// 常驻连接的事件出口：无 id 帧（CDP 事件）透传给消费者
 pub type EventSink = mpsc::UnboundedSender<serde_json::Value>;
 
-/// 一次性 CDP 命令连接。不实现 Clone：调用方独占写半部，用完即弃。
+/// 一次性 CDP 命令连接（可共享：`Arc<CdpConnection>` 直接发命令，无锁包裹）。
 pub struct CdpConnection {
-    write: SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>,
-    next_id: u64,
+    /// 写半部短锁：只覆盖「写一帧」，不等响应——若把等响应也留在锁内，
+    /// in-flight 长命令会重新串行化整条连接（P2-F 根治的关键点）。
+    write: tokio::sync::Mutex<SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>,
+    next_id: AtomicU64,
     pending: Pending,
     timeout: Duration,
 }
@@ -48,7 +57,11 @@ impl CdpConnection {
     pub async fn connect(port: u16) -> Result<Self, AppError> {
         let v = super::client::version(port).await?;
         let url = v.web_socket_url.ok_or_else(|| {
-            AppError::business(500, "CDP_CONNECTION_FAILED", "CDP 未提供 webSocketDebuggerUrl")
+            AppError::business(
+                500,
+                "CDP_CONNECTION_FAILED",
+                "CDP 未提供 webSocketDebuggerUrl",
+            )
         })?;
         Self::connect_ws(&url, DEFAULT_TIMEOUT).await
     }
@@ -63,7 +76,11 @@ impl CdpConnection {
     pub async fn connect_eventing(port: u16, events: EventSink) -> Result<Self, AppError> {
         let v = super::client::version(port).await?;
         let url = v.web_socket_url.ok_or_else(|| {
-            AppError::business(500, "CDP_CONNECTION_FAILED", "CDP 未提供 webSocketDebuggerUrl")
+            AppError::business(
+                500,
+                "CDP_CONNECTION_FAILED",
+                "CDP 未提供 webSocketDebuggerUrl",
+            )
         })?;
         Self::connect_ws_eventing(&url, DEFAULT_TIMEOUT, Some(events)).await
     }
@@ -73,29 +90,39 @@ impl CdpConnection {
         timeout: Duration,
         events: Option<EventSink>,
     ) -> Result<Self, AppError> {
-        let (ws, _resp) = tokio_tungstenite::connect_async(ws_url).await.map_err(|e| {
-            AppError::business(500, "CDP_CONNECTION_FAILED", format!("CDP WS 连接失败: {e}"))
-        })?;
+        let (ws, _resp) = tokio_tungstenite::connect_async(ws_url)
+            .await
+            .map_err(|e| {
+                AppError::business(
+                    500,
+                    "CDP_CONNECTION_FAILED",
+                    format!("CDP WS 连接失败: {e}"),
+                )
+            })?;
         let (write, read) = ws.split();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(reader_loop(read, Arc::clone(&pending), events));
-        Ok(Self { write, next_id: 0, pending, timeout })
+        Ok(Self {
+            write: tokio::sync::Mutex::new(write),
+            next_id: AtomicU64::new(0),
+            pending,
+            timeout,
+        })
     }
 
-    /// 发送命令并等待响应。
+    /// 发送命令并等待响应（`&self`：多条命令可并发 in-flight，见模块注释）。
     ///
     /// - `params` 传 `()` 表示无参数命令（序列化为 null，Chrome 接受）；
     /// - `session_id` 供 flatten 模式的 per-target 命令；browser 级命令传 None；
     /// - Chrome 侧返回 error、命令超时、连接中断统一归为
     ///   `CDP_COMMAND_FAILED`（调用方按可降级路径处理，区分码无消费方）。
     pub async fn send<T: serde::de::DeserializeOwned>(
-        &mut self,
+        &self,
         method: &str,
         params: impl Serialize,
         session_id: Option<&str>,
     ) -> Result<T, AppError> {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let mut payload = serde_json::json!({
             "id": id,
@@ -109,13 +136,19 @@ impl CdpConnection {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
 
-        self.write
-            .send(tokio_tungstenite::tungstenite::Message::Text(payload.to_string().into()))
-            .await
-            .map_err(|e| {
-                self.pending.lock().unwrap().remove(&id);
-                AppError::business(500, "CDP_COMMAND_FAILED", format!("CDP 命令发送失败: {e}"))
-            })?;
+        {
+            // 写帧短锁：发送完成即释放，等响应不持锁（并发 in-flight 的前提）
+            let mut write = self.write.lock().await;
+            write
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    payload.to_string().into(),
+                ))
+                .await
+                .map_err(|e| {
+                    self.pending.lock().unwrap().remove(&id);
+                    AppError::business(500, "CDP_COMMAND_FAILED", format!("CDP 命令发送失败: {e}"))
+                })?;
+        }
 
         let outcome = tokio::time::timeout(self.timeout, rx).await;
         match outcome {
@@ -211,16 +244,20 @@ mod tests {
         while let Some(Ok(msg)) = socket.recv().await {
             let Message::Text(text) = msg else { continue };
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-            let Some(id) = v.get("id").and_then(|x| x.as_u64()) else { continue };
+            let Some(id) = v.get("id").and_then(|x| x.as_u64()) else {
+                continue;
+            };
             let reply = match v["method"].as_str() {
                 Some("Echo.ok") => json!({ "id": id, "result": v["params"] }),
                 Some("Echo.session") => json!({
                     "id": id,
                     "result": { "sessionId": v.get("sessionId").cloned().unwrap_or(Value::Null) }
                 }),
-                Some("Echo.fail") => json!({ "id": id, "error": { "code": -32000, "message": "boom" } }),
+                Some("Echo.fail") => {
+                    json!({ "id": id, "error": { "code": -32000, "message": "boom" } })
+                }
                 Some("Echo.close") => break, // 直接断开：验证等待者立即失败而非等到超时
-                _ => continue, // Echo.hang 等：不响应
+                _ => continue,               // Echo.hang 等：不响应
             };
             let _ = socket.send(Message::Text(reply.to_string().into())).await;
         }
@@ -243,7 +280,9 @@ mod tests {
     #[tokio::test]
     async fn command_roundtrip_deserializes_response() {
         let url = spawn_mock().await;
-        let mut conn = CdpConnection::connect_ws(&url, DEFAULT_TIMEOUT).await.unwrap();
+        let conn = CdpConnection::connect_ws(&url, DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
         let out: Value = conn
             .send("Echo.ok", json!({ "hello": "world", "n": 42 }), None)
             .await
@@ -255,9 +294,17 @@ mod tests {
     #[tokio::test]
     async fn sequential_commands_no_cross_talk() {
         let url = spawn_mock().await;
-        let mut conn = CdpConnection::connect_ws(&url, DEFAULT_TIMEOUT).await.unwrap();
-        let a: Value = conn.send("Echo.ok", json!({ "seq": 1 }), None).await.unwrap();
-        let b: Value = conn.send("Echo.ok", json!({ "seq": 2 }), None).await.unwrap();
+        let conn = CdpConnection::connect_ws(&url, DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        let a: Value = conn
+            .send("Echo.ok", json!({ "seq": 1 }), None)
+            .await
+            .unwrap();
+        let b: Value = conn
+            .send("Echo.ok", json!({ "seq": 2 }), None)
+            .await
+            .unwrap();
         assert_eq!(a["seq"], 1);
         assert_eq!(b["seq"], 2);
     }
@@ -265,7 +312,9 @@ mod tests {
     #[tokio::test]
     async fn chrome_error_maps_to_command_failed() {
         let url = spawn_mock().await;
-        let mut conn = CdpConnection::connect_ws(&url, DEFAULT_TIMEOUT).await.unwrap();
+        let conn = CdpConnection::connect_ws(&url, DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
         let err = conn.send::<Value>("Echo.fail", (), None).await.unwrap_err();
         assert_eq!(err.code(), "CDP_COMMAND_FAILED");
         assert!(err.to_string().contains("boom"));
@@ -274,7 +323,9 @@ mod tests {
     #[tokio::test]
     async fn timeout_maps_to_command_failed() {
         let url = spawn_mock().await;
-        let mut conn = CdpConnection::connect_ws(&url, Duration::from_millis(300)).await.unwrap();
+        let conn = CdpConnection::connect_ws(&url, Duration::from_millis(300))
+            .await
+            .unwrap();
         let err = conn.send::<Value>("Echo.hang", (), None).await.unwrap_err();
         assert_eq!(err.code(), "CDP_COMMAND_FAILED");
         assert!(err.to_string().contains("超时"));
@@ -283,7 +334,9 @@ mod tests {
     #[tokio::test]
     async fn session_id_passthrough() {
         let url = spawn_mock().await;
-        let mut conn = CdpConnection::connect_ws(&url, DEFAULT_TIMEOUT).await.unwrap();
+        let conn = CdpConnection::connect_ws(&url, DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
         let out: Value = conn
             .send("Echo.session", (), Some("target-session-1"))
             .await
@@ -296,10 +349,101 @@ mod tests {
         let url = spawn_mock().await;
         // 超时设 10s：若断开路径失效，本测试会挂满 10s 才超时失败——断言快速失败即证明
         // reader 的 pending 清理逻辑生效
-        let mut conn = CdpConnection::connect_ws(&url, Duration::from_secs(10)).await.unwrap();
-        let err = conn.send::<Value>("Echo.close", (), None).await.unwrap_err();
+        let conn = CdpConnection::connect_ws(&url, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let err = conn
+            .send::<Value>("Echo.close", (), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "CDP_COMMAND_FAILED");
         assert!(err.to_string().contains("关闭"));
+    }
+
+    /// P2-F 根治回归：send 并发 in-flight——gated 命令响应被服务端扣住期间，
+    /// 同连接另一条命令必须能正常完成。&mut self 时代（或任何把「等响应」
+    /// 留在锁内的实现）第二条要等第一条超时（15s），500ms 预算直接判负。
+    #[tokio::test]
+    async fn concurrent_sends_do_not_serialize_on_inflight_response() {
+        // mock：Echo.gated 扣住响应；Echo.release 到达后补发 gated 的响应
+        async fn gated_socket(mut socket: WebSocket) {
+            let mut stashed: Option<u64> = None;
+            while let Some(Ok(msg)) = socket.recv().await {
+                let Message::Text(text) = msg else { continue };
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let Some(id) = v.get("id").and_then(|x| x.as_u64()) else {
+                    continue;
+                };
+                match v["method"].as_str() {
+                    Some("Echo.gated") => stashed = Some(id),
+                    Some("Echo.release") => {
+                        if let Some(gid) = stashed.take() {
+                            let _ = socket
+                                .send(Message::Text(
+                                    json!({ "id": gid, "result": { "released": true } })
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await;
+                        }
+                        let _ = socket
+                            .send(Message::Text(
+                                json!({ "id": id, "result": {} }).to_string().into(),
+                            ))
+                            .await;
+                    }
+                    _ => {
+                        let _ = socket
+                            .send(Message::Text(
+                                json!({ "id": id, "result": v["params"].clone() })
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await;
+                    }
+                }
+            }
+        }
+        let app = Router::new().route(
+            "/ws",
+            get(|ws: WebSocketUpgrade| async move { ws.on_upgrade(gated_socket) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("ws://127.0.0.1:{}/ws", addr.port());
+
+        let conn = Arc::new(
+            CdpConnection::connect_ws(&url, DEFAULT_TIMEOUT)
+                .await
+                .unwrap(),
+        );
+        // gated 后台 in-flight：spawn 后留一拍（current_thread runtime 下 sleep
+        // 让任务跑到等响应处），确保它已发出且响应被扣住
+        let c = Arc::clone(&conn);
+        let gated = tokio::spawn(async move {
+            c.send::<Value>("Echo.gated", json!({ "slow": true }), None)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let ok = tokio::time::timeout(
+            Duration::from_millis(500),
+            conn.send::<Value>("Echo.ok", json!({ "n": 7 }), None),
+        )
+        .await
+        .expect("in-flight 命令不得阻塞同连接的其他 send")
+        .unwrap();
+        assert_eq!(ok["n"], 7);
+
+        // 放行：gated 收到补发响应（id 路由正确性）
+        conn.send::<Value>("Echo.release", (), None).await.unwrap();
+        let gated_out = tokio::time::timeout(Duration::from_secs(2), gated)
+            .await
+            .expect("release 后 gated 应收到补发响应")
+            .unwrap()
+            .unwrap();
+        assert_eq!(gated_out["released"], true);
     }
 
     /// 常驻形态：事件帧（无 id）透传给 EventSink，命令路径不变；
@@ -312,12 +456,18 @@ mod tests {
             while let Some(Ok(msg)) = socket.recv().await {
                 let Message::Text(text) = msg else { continue };
                 let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-                let Some(id) = v.get("id").and_then(|x| x.as_u64()) else { continue };
+                let Some(id) = v.get("id").and_then(|x| x.as_u64()) else {
+                    continue;
+                };
                 match v["method"].as_str() {
                     Some("Echo.event") => {
                         let event = json!({ "method": "Test.event", "params": { "n": 7 }, "sessionId": "sess-1" });
                         let _ = socket.send(Message::Text(event.to_string().into())).await;
-                        let _ = socket.send(Message::Text(json!({ "id": id, "result": {} }).to_string().into())).await;
+                        let _ = socket
+                            .send(Message::Text(
+                                json!({ "id": id, "result": {} }).to_string().into(),
+                            ))
+                            .await;
                     }
                     Some("Echo.close") => break,
                     _ => {}
@@ -334,7 +484,7 @@ mod tests {
         let url = format!("ws://127.0.0.1:{}/ws", addr.port());
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut conn = CdpConnection::connect_ws_eventing(&url, DEFAULT_TIMEOUT, Some(tx))
+        let conn = CdpConnection::connect_ws_eventing(&url, DEFAULT_TIMEOUT, Some(tx))
             .await
             .unwrap();
 
@@ -343,7 +493,10 @@ mod tests {
         let event = rx.recv().await.expect("事件帧应透传");
         assert_eq!(event["method"], "Test.event");
         assert_eq!(event["params"]["n"], 7);
-        assert_eq!(event["sessionId"], "sess-1", "session 维度保留（常驻订阅核心）");
+        assert_eq!(
+            event["sessionId"], "sess-1",
+            "session 维度保留（常驻订阅核心）"
+        );
 
         // 连接关闭 → 通道 drop → recv None（重连循环的退出信号）
         let _ = conn.send::<Value>("Echo.close", (), None).await;

@@ -11,8 +11,9 @@
 //!   None，与 diagnostics 同信号）时清理登记，下一条命令重建。
 //! - **targetId 路由**（决策 2）：autoAttach 的 attachedToTarget 事件维护
 //!   `targetId → sessionId` 映射；命令入参的 targetId 支持唯一前缀（对齐 TS
-//!   resolvePrefix：无匹配 404 / 多匹配 409）。空 target 不参与前缀匹配——
-//!   取**最近 attach 的 page target**（活跃 tab 近似，P2-F F1）。
+//!   resolvePrefix：无匹配 404 / 多匹配 409）。空 target 不参与前缀匹配
+//!   ——唯一 page target 自动选中，多个 409 并列出全部 targetId（P2-F F1，
+//!   真机复测后放弃「最近 attach」近似）。
 //! - **per-instance 命令串行**（决策 3）：一条 tokio Mutex 串行整实例的全部
 //!   page 命令（含建连），正确性优先；并发需求出现后可演进为 per-tab 锁。
 //! - **per-tab RefStore / DialogBuffer**（决策 4）：snap 整表替换，导航/文档
@@ -22,12 +23,12 @@
 //! 测试注入 fake 即可覆盖全部编排路径，不依赖真 Chrome。
 //!
 //! 与 TS 的已知偏差（详见各处注释及任务报告）：
-//! - 对话框应答走**独立一次性短连接**（P2-F F2，真机冒烟修复）：主连接
-//!   Rust 侧 send 串行（&mut self），工具命令 in-flight 期间（如 click 卡在
-//!   被 alert 阻塞的页面直至 15s 超时）走主连接的应答等锁、错过对话框黄金
-//!   窗口，迟到的应答被 Chrome 以 -32602 "No dialog is showing" 拒绝、缓冲
-//!   零记录。on_dialog_opening 现经注入 Connector 另起短连接 handle（连上
-//!   → handle → drop），主连接事件流不受影响；ws.rs 未动。
+//! - 对话框应答与命令共用一条连接且天然并发（P2-F 根治）：ws.rs 的 send
+//!   由 &mut self 改 &self（写帧短锁 + AtomicU64 id），in-flight 工具命令
+//!   （如 click 卡在被 alert 阻塞的页面至 15s 超时）不再阻塞同连接的
+//!   Page.handleJavaScriptDialog。真机曾证伪的中转方案：旁路短连接——CDP
+//!   sessionId 是**连接级作用域**，携主连接 sessionId 必 -32001
+//!   Session not found，已回滚。
 //! - dialogs_seen 仅附在成功响应上（TS 对错误响应也附；AppError 无扩展字段，
 //!   P2-C 若需可扩展错误负载）。
 //! - focus 类错误码（PAGE_FOCUS_FAILED / PAGE_FILL_FOCUS_LOST）与
@@ -106,22 +107,23 @@ fn tool_timeout(tool: &str, budget: Duration) -> AppError {
 
 /// per-instance page tab 表：`(targetId, sessionId)` 按 attach 先后保序。
 ///
-/// P2-F F1（真机冒烟修复）：此前是裸 HashMap，空 target 按前缀 "" 匹配全部
-/// → 多 tab 必 409 `PAGE_TAB_AMBIGUOUS`。设计语义是缺省 = 活跃 tab，但 CDP
-/// 无 browser 级「active tab」直查 API，取近似：**最近 attach 的 page
-/// target**（重 attach 刷新 recency；detach 后回退次新）。表长 = 标签数
-/// （个位数），线性扫描即可，不引入有序 Map 依赖。
+/// 空 target 语义（P2-F）：唯一 page target 自动选中；多个 → 409 并在错误
+/// message 列出全部 targetId（曾试过「最近 attach」近似活跃 tab，真机复测
+/// 取错页面，改为诚实语义）。列表需稳定可读，HashMap 迭代序随机故用 Vec；
+/// 表长 = 标签数（个位数），线性扫描即可。
 #[derive(Default)]
 struct TabTable {
-    /// (targetId, sessionId)，attach 先后序，尾部 = 最近 attach
+    /// (targetId, sessionId)，attach 先后序（错误信息列表稳定）
     rows: Vec<(String, String)>,
 }
 
 impl TabTable {
-    /// attach/重 attach：更新 sessionId 并移到尾部（刷新 recency）
+    /// attach/重 attach：已存在则原位更新 sessionId（列表顺序稳定）
     fn attach(&mut self, tid: &str, sid: &str) {
-        self.rows.retain(|(t, _)| t.as_str() != tid);
-        self.rows.push((tid.to_string(), sid.to_string()));
+        match self.rows.iter_mut().find(|(t, _)| t.as_str() == tid) {
+            Some(entry) => entry.1 = sid.to_string(),
+            None => self.rows.push((tid.to_string(), sid.to_string())),
+        }
     }
 
     fn detach(&mut self, tid: &str) {
@@ -132,11 +134,6 @@ impl TabTable {
         self.rows.clear();
     }
 
-    /// 最近 attach 的条目（空 target 的路由目标；表空 = None）
-    fn latest(&self) -> Option<&(String, String)> {
-        self.rows.last()
-    }
-
     fn target_of_session(&self, sid: &str) -> Option<&str> {
         self.rows
             .iter()
@@ -145,35 +142,21 @@ impl TabTable {
     }
 }
 
-/// 对话框 handle 的旁路通道（P2-F F2）：经注入 Connector 另起**一次性短
-/// 连接**发 Page.handleJavaScriptDialog（连上 → handle → drop），不与主
-/// 连接的命令锁竞争——真机实测主锁被 in-flight 工具命令持有至 15s 超时时，
-/// 走主连接的应答错过对话框黄金窗口（见模块注释偏差项）。事件本身仍经主
-/// 连接 reader → EventSink 到达（reader 独立于命令锁），handle 旁路后链路
-/// 无锁竞争窗口。
-#[derive(Clone)]
-struct DialogBypass {
-    connector: Connector,
-    port: u16,
-}
-
 /// 一个实例的全部 page 控制运行态。
 struct Watched {
-    /// 当前连接（断连置 None，重建整体替换）。std Mutex 只做槽位读写，
-    /// 真正的收发在 [`PageCdp`]（tokio Mutex）里。
+    /// 当前连接（断连置 None，重建整体替换）。std Mutex 只做槽位读写；
+    /// 收发在 [`PageCdp`]（&self 并发 send，无锁包裹）里。
     conn: Mutex<Option<SharedPageConn>>,
     /// per-instance 命令串行（决策 3）：锁的获取即建连检查点——并发首命令
     /// 只有先拿到锁的那个建连，其余直接复用（防双连接竞态）。
     cmd_lock: Arc<tokio::sync::Mutex<()>>,
-    /// autoAttach 维护的 targetId → sessionId（仅 type=page），按 attach
-    /// 先后保序（尾部 = 最近 attach，空 target 路由用，见 [`TabTable`]）
+    /// autoAttach 维护的 targetId → sessionId（仅 type=page），attach 序
+    /// 保序（空 target 唯一性路由用，见 [`TabTable`]）
     tabs: Mutex<TabTable>,
     /// per-tab @eN ref 表（snap 整表替换，事件定向失效）
     refs: Mutex<HashMap<String, RefStore>>,
     /// per-tab 对话框缓冲（应答成功才入档）
     dialogs: Mutex<HashMap<String, DialogBuffer>>,
-    /// 对话框旁路通道（establish 随主连接一起装填；watch_loop 消费）
-    dialog_bypass: Mutex<Option<DialogBypass>>,
     /// 代际计数：每次建连 +1。旧代 watch_loop 在清理点核对代际，新一代已
     /// 接管时不动登记表/连接槽（防僵尸 loop 误删新代状态）。
     generation: AtomicU64,
@@ -187,7 +170,6 @@ impl Watched {
             tabs: Mutex::new(TabTable::default()),
             refs: Mutex::new(HashMap::new()),
             dialogs: Mutex::new(HashMap::new()),
-            dialog_bypass: Mutex::new(None),
             generation: AtomicU64::new(0),
         }
     }
@@ -273,11 +255,6 @@ impl PageService {
         watched.refs.lock().unwrap().clear();
         watched.dialogs.lock().unwrap().clear();
         *watched.conn.lock().unwrap() = Some(Arc::clone(&conn));
-        // F2：对话框旁路通道随主连接一起装填（重连时随新代整体替换）
-        *watched.dialog_bypass.lock().unwrap() = Some(DialogBypass {
-            connector: Arc::clone(&self.connector),
-            port,
-        });
         tauri::async_runtime::spawn(watch_loop(
             ins_id.to_string(),
             Arc::clone(&self.watched),
@@ -645,9 +622,9 @@ fn invalidate_refs(watched: &Watched, tid: &str, reason: &str) {
 /// defaultPrompt ?? ""，P2-A 构造）；**成功后**才入缓冲——失败仅日志，
 /// 对话框保持打开、CDP 命令继续阻塞直至各自超时（与上游一致）。
 ///
-/// handle 经 [`DialogBypass`] 的一次性短连接发出（P2-F F2），不经主连接——
-/// 主连接命令锁可能正被 in-flight 工具命令持有（真机形态：click 卡在被
-/// alert 阻塞的页面直至 15s 超时），等锁的应答错过对话框黄金窗口。
+/// handle 走主连接（P2-F 根治）：send 已 &self 并发化，与 in-flight 工具
+/// 命令天然并发——sessionId 是**连接级作用域**，换连接发必 -32001
+/// Session not found（旁路短连接方案真机已证伪并回滚）。
 async fn on_dialog_opening(watched: &Watched, session_id: &str, params: &Value) {
     let tid = watched
         .tabs
@@ -658,16 +635,19 @@ async fn on_dialog_opening(watched: &Watched, session_id: &str, params: &Value) 
     let Some(tid) = tid else {
         return; // 未映射 session（attach 竞态/非 page target）：无法归属 tab
     };
-    let bypass = watched.dialog_bypass.lock().unwrap().clone();
-    let Some(bypass) = bypass else {
-        // establish 装填在 spawn watch_loop 之前，运行中的 loop 恒可见；
-        // 兜底 WARN（对话框保持打开，与 handle 失败同族路径）
-        tracing::warn!("[page] 对话框旁路通道未就绪，对话框保持打开");
+    let Some(conn) = watched.conn.lock().unwrap().clone() else {
         return;
     };
     let info = parse_dialog_opening(params);
     let accept = dialog_accept_params(&info);
-    match dialog_bypass_handle(&bypass, session_id, accept).await {
+    match cdp_send(
+        &conn,
+        "Page.handleJavaScriptDialog",
+        accept,
+        Some(session_id),
+    )
+    .await
+    {
         Ok(_) => {
             watched
                 .dialogs
@@ -685,44 +665,34 @@ async fn on_dialog_opening(watched: &Watched, session_id: &str, params: &Value) 
     }
 }
 
-/// F2 旁路发送：经 Connector 另起短连接发一条 handleJavaScriptDialog，随函数
-/// 返回 drop（连上 → handle → 弃）。事件透传端即建即弃：reader 把事件帧发向
-/// 已关闭通道时静默丢弃（ws.rs reader_loop 的 `let _ = tx.send(v)`），连接
-/// 行为等同 `CdpConnection::connect` 的短连接形态，但保留经注入 Connector
-/// 的可测性（fake 即可覆盖，不需要真 Chrome）。最坏耗时 = 探活 1.5s +
-/// WS 握手 + 命令超时 15s（有界，watch_loop 不会因此挂死）。
-async fn dialog_bypass_handle(
-    bypass: &DialogBypass,
-    session_id: &str,
-    params: Value,
-) -> Result<Value, AppError> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    drop(rx);
-    let conn = (bypass.connector)(bypass.port, tx).await?;
-    cdp_send(
-        &conn,
-        "Page.handleJavaScriptDialog",
-        params,
-        Some(session_id),
-    )
-    .await
-}
-
 // ============================================================================
 // 3. tab 路由与共享小件
 // ============================================================================
 
 /// targetId 唯一前缀解析（对齐 TS pages.mjs resolvePrefix：大小写不敏感；
-/// 无匹配 404 / 多匹配 409）。空 target 不参与前缀匹配：取最近 attach 的
-/// page target（F1 活跃 tab 近似），表空仍 404（与显式未命中同码）。
+/// 无匹配 404 / 多匹配 409）。空 target 不参与前缀匹配（P2-F F1 真机复测
+/// 修正）：唯一 page target 自动选中；多个 → 409 并在 message 列出全部
+/// targetId（不猜「最近 attach」近似——真机会取错页面）；无 target → 404。
 fn resolve_target(tabs: &TabTable, input: &str) -> Result<(String, String), AppError> {
     if input.is_empty() {
-        return tabs.latest().cloned().ok_or_else(|| {
-            AppError::not_found(
+        return match tabs.rows.as_slice() {
+            [] => Err(AppError::not_found(
                 "PAGE_TAB_NOT_FOUND",
                 "no page targets attached yet — open a tab or retry shortly",
-            )
-        });
+            )),
+            [one] => Ok(one.clone()),
+            many => Err(AppError::conflict(
+                "PAGE_TAB_AMBIGUOUS",
+                format!(
+                    "Ambiguous tab: {} page targets attached [{}] — pass an explicit tab (targetId or unique prefix, from instance tabs)",
+                    many.len(),
+                    many.iter()
+                        .map(|(t, _)| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )),
+        };
     }
     let upper = input.to_uppercase();
     let matches: Vec<&(String, String)> = tabs
@@ -763,16 +733,16 @@ fn require_conn(watched: &Watched) -> Result<SharedPageConn, AppError> {
         .ok_or_else(|| unavailable("page 控制连接未就绪（建立中或已断开），稍后重试"))
 }
 
-/// 单发：per-send 拿锁（不跨 sleep 持有）——wait 轮询间隔与 click 的
-/// 50ms 释放间隙里，对话框应答仍能抢到连接（见模块注释偏差项）。
+/// 发送：连接 send 已 &self 并发化（P2-F 根治，无锁包裹）——wait 轮询间隔、
+/// click 释放间隙、对话框 handle 与 in-flight 工具命令全部天然并发，不再
+/// 依赖「per-send 拿锁不跨 sleep」的间隙仲裁。
 async fn cdp_send(
     conn: &SharedPageConn,
     method: &str,
     params: Value,
     session_id: Option<&str>,
 ) -> Result<Value, AppError> {
-    let mut g = conn.lock().await;
-    g.send_value(method, params, session_id).await
+    conn.send_value(method, params, session_id).await
 }
 
 /// JS Number 的 toString 形态（150.0 → "150"）：结果文案里的坐标格式与 TS 一致。
@@ -1884,17 +1854,22 @@ mod tests {
     type Calls = Arc<Mutex<Vec<Recorded>>>;
     type Script = Arc<Mutex<HashMap<String, VecDeque<Result<Value, String>>>>>;
     type EventTap = Arc<Mutex<Option<EventSink>>>;
+    /// 方法 → 完成闸门：send 记录调用后先等闸门放行再回脚本响应（模拟服务端
+    /// 响应延迟，构造「命令 in-flight 未完成」形态——P2-F 并发回归的靶子）。
+    /// 发送端 drop（测试结束）也视为放行，无死锁残留。
+    type Gates = Arc<Mutex<HashMap<String, VecDeque<tokio::sync::oneshot::Receiver<()>>>>>;
 
     struct FakeCdp {
         calls: Calls,
         script: Script,
         /// 持有事件通道发送端：保活 watch_loop（通道不因 factory 返回而关闭）
         events: Option<EventSink>,
+        gates: Gates,
     }
 
     impl PageCdp for FakeCdp {
         fn send_value<'a>(
-            &'a mut self,
+            &'a self,
             method: &'a str,
             params: Value,
             session_id: Option<&'a str>,
@@ -1907,6 +1882,15 @@ mod tests {
                     params,
                     session: sid,
                 });
+                let gate = self
+                    .gates
+                    .lock()
+                    .unwrap()
+                    .get_mut(&method)
+                    .and_then(VecDeque::pop_front);
+                if let Some(rx) = gate {
+                    let _ = rx.await; // 闸门放行（或发送端 drop）才继续
+                }
                 let mut script = self.script.lock().unwrap();
                 match script.get_mut(&method).and_then(VecDeque::pop_front) {
                     Some(Ok(v)) => Ok(v),
@@ -1918,13 +1902,18 @@ mod tests {
         }
     }
 
-    fn fake_conn(calls: &Calls, script: &Script, events: Option<EventSink>) -> SharedPageConn {
-        let boxed: Box<dyn PageCdp> = Box::new(FakeCdp {
+    fn fake_conn(
+        calls: &Calls,
+        script: &Script,
+        events: Option<EventSink>,
+        gates: &Gates,
+    ) -> SharedPageConn {
+        Arc::new(FakeCdp {
             calls: Arc::clone(calls),
             script: Arc::clone(script),
             events,
-        });
-        Arc::new(tokio::sync::Mutex::new(boxed))
+            gates: Arc::clone(gates),
+        })
     }
 
     /// fake connector：记录连接次数、暴露事件通道 tap（测试注入事件）。
@@ -1938,33 +1927,31 @@ mod tests {
         let calls: Calls = Arc::default();
         let script: Script = Arc::default();
         let tap: EventTap = Arc::default();
+        let gates: Gates = Arc::default();
         let c2 = Arc::clone(&calls);
         let s2 = Arc::clone(&script);
         let t2 = Arc::clone(&tap);
+        let g2 = Arc::clone(&gates);
         let connector: Connector = Arc::new(move |_port, events| {
             *t2.lock().unwrap() = Some(events.clone());
             let c = Arc::clone(&c2);
             let s = Arc::clone(&s2);
-            async move { Ok(fake_conn(&c, &s, Some(events))) }.boxed()
+            let g = Arc::clone(&g2);
+            async move { Ok(fake_conn(&c, &s, Some(events), &g)) }.boxed()
         });
         (calls, script, tap, connector)
     }
 
-    /// 预置武装服务：Watched 直接登记（连接/映射/旁路就位），绕过 establish 的
-    /// spawn 路径——工具编排测试全确定性。tabs：T1→S1、TAB2→S2（attach 序，
-    /// TAB2 = 最近 attach → 空 target 的路由目标）。
+    /// 预置武装服务：Watched 直接登记（连接/映射就位），绕过 establish 的
+    /// spawn 路径——工具编排测试全确定性。tabs：T1→S1、TAB2→S2 两 target
+    ///（空 target → 409；前缀 "TA" 唯一解析 TAB2）。
     fn armed() -> (PageService, Arc<Watched>, Calls, Script) {
         let (calls, script, _tap, connector) = fake_connector();
-        let svc = PageService::with_connector(setup_running(), Arc::clone(&connector));
+        let svc = PageService::with_connector(setup_running(), connector);
         let watched = Arc::new(Watched::new());
-        *watched.conn.lock().unwrap() = Some(fake_conn(&calls, &script, None));
+        *watched.conn.lock().unwrap() = Some(fake_conn(&calls, &script, None, &Gates::default()));
         watched.tabs.lock().unwrap().attach("T1", "S1");
         watched.tabs.lock().unwrap().attach("TAB2", "S2");
-        // F2：对话框 handle 旁路（生产由 establish 随主连接装填，武装路径对齐）
-        *watched.dialog_bypass.lock().unwrap() = Some(DialogBypass {
-            connector,
-            port: PORT,
-        });
         svc.watched
             .lock()
             .unwrap()
@@ -2046,16 +2033,15 @@ mod tests {
         let amb = resolve_target(&tabs, "T").unwrap_err();
         assert_eq!((amb.code(), amb.status()), ("PAGE_TAB_AMBIGUOUS", 409));
         assert!(amb.to_string().contains("matches 2 targets"));
-        // 空 target 的语义变更见 resolve_target_empty_input_takes_latest_attached
-        //（P2-F F1：不再「空前缀匹配全部 → 409」，取最近 attach）
+        // 空 target 的语义见 resolve_target_empty_input_selects_unique_or_lists_all
+        //（P2-F F1：不参与前缀匹配，唯一自动选中 / 多个 409 列全表）
     }
 
-    /// F1（真机冒烟修复）：空 target = 最近 attach 的 page target（活跃 tab
-    /// 近似，无 CDP 直查 API）；重 attach 刷新 recency；最近者 detach 后回退
-    /// 次新；表空 → 404（与显式前缀未命中同码）。修复前空 target 按空前缀
-    /// 匹配全部 → 多 tab 必 409 `PAGE_TAB_AMBIGUOUS`。
+    /// F1（真机复测修正）：空 target 不猜页面——唯一 page target 自动选中；
+    /// 多个 → 409 `PAGE_TAB_AMBIGUOUS` 且 message 列出全部 targetId 供选择
+    ///（「最近 attach」近似真机取错页面，已放弃）；表空 → 404。
     #[test]
-    fn resolve_target_empty_input_takes_latest_attached() {
+    fn resolve_target_empty_input_selects_unique_or_lists_all() {
         let mut tabs = TabTable::default();
         assert_eq!(
             resolve_target(&tabs, "").unwrap_err().code(),
@@ -2063,23 +2049,28 @@ mod tests {
             "表空 → 404"
         );
         tabs.attach("TAB1", "S1");
+        assert_eq!(
+            resolve_target(&tabs, "").unwrap(),
+            ("TAB1".into(), "S1".into()),
+            "唯一 page target 自动选中"
+        );
         tabs.attach("TAB2", "S2");
+        tabs.attach("TAB3", "S3");
+        let amb = resolve_target(&tabs, "").unwrap_err();
+        assert_eq!((amb.code(), amb.status()), ("PAGE_TAB_AMBIGUOUS", 409));
+        let msg = amb.to_string();
+        for tid in ["TAB1", "TAB2", "TAB3"] {
+            assert!(
+                msg.contains(tid),
+                "错误信息应列出全部 targetId（缺 {tid}）: {msg}"
+            );
+        }
+        // 唯一者 detach 后回到自动选中
+        tabs.detach("TAB2");
+        tabs.detach("TAB3");
         assert_eq!(
             resolve_target(&tabs, "").unwrap(),
-            ("TAB2".into(), "S2".into()),
-            "空 target 取最近 attach"
-        );
-        tabs.attach("TAB1", "S1b");
-        assert_eq!(
-            resolve_target(&tabs, "").unwrap(),
-            ("TAB1".into(), "S1b".into()),
-            "重 attach 刷新 recency 与 sessionId"
-        );
-        tabs.detach("TAB1");
-        assert_eq!(
-            resolve_target(&tabs, "").unwrap(),
-            ("TAB2".into(), "S2".into()),
-            "最近者已 detach → 回退次新"
+            ("TAB1".into(), "S1".into())
         );
     }
 
@@ -2460,23 +2451,52 @@ mod tests {
         assert_eq!(after, (before, 1), "失败不移动游标不入档");
     }
 
-    /// F2（真机形态）：主连接命令锁被 in-flight 工具命令持有时（真机 = click
-    /// 卡在被 alert 阻塞的页面至 15s 超时），对话框 handle 必须走旁路短连接
-    /// 完成——旧实现等主连接锁，迟到的应答被 Chrome 以 -32602
-    /// "No dialog is showing" 拒绝、缓冲零记录，alert 无人处理则页面挂死。
-    /// 主锁被测试持有时 handle 仍能在预算内完成 + 入缓冲 = 旁路已被使用
-    ///（主连接 send 不可行，handle 调用只可能出自旁路连接）。
+    /// F2（真机形态，根治回归）：工具命令 in-flight（响应被闸门挂住——真机
+    /// = click 卡在被 alert 阻塞的页面，命令响应迟迟不回）期间，对话框
+    /// 事件到达，handle 必须在同一条连接上立即发出并完成，不等该命令。
+    /// 连接被锁包裹（或 send 串行化）的旧实现会在等锁/等命令中错过对话框
+    /// 黄金窗口，迟到的应答被 Chrome -32602 拒绝、缓冲零记录。
     #[tokio::test]
-    async fn dialog_handle_bypasses_locked_main_connection() {
-        let (_svc, watched, calls, script) = armed();
+    async fn dialog_handle_completes_while_command_in_flight() {
+        let calls: Calls = Arc::default();
+        let script: Script = Arc::default();
+        let gates: Gates = Arc::default();
         given(&script, "Page.handleJavaScriptDialog", vec![Ok(json!({}))]);
+        given(
+            &script,
+            "Accessibility.getFullAXTree",
+            vec![Ok(json!({ "nodes": [] }))],
+        );
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        gates
+            .lock()
+            .unwrap()
+            .insert("Accessibility.getFullAXTree".into(), VecDeque::from([held]));
 
-        // 模拟 in-flight 工具命令占用主连接（send 需先抢到 tokio 锁）
-        let main = watched.conn.lock().unwrap().clone().unwrap();
-        let guard = main.lock_owned().await;
+        let watched = Arc::new(Watched::new());
+        *watched.conn.lock().unwrap() = Some(fake_conn(&calls, &script, None, &gates));
+        watched.tabs.lock().unwrap().attach("T1", "S1");
 
+        // in-flight 命令：后台发出并停在闸门（响应未回）
+        let conn = watched.conn.lock().unwrap().clone().unwrap();
+        let inflight_conn = Arc::clone(&conn);
+        let inflight = tokio::spawn(async move {
+            cdp_send(
+                &inflight_conn,
+                "Accessibility.getFullAXTree",
+                json!({}),
+                Some("S1"),
+            )
+            .await
+        });
+        eventually("in-flight 命令已发出并停在闸门", || {
+            calls_of(&calls, "Accessibility.getFullAXTree").len() == 1
+        })
+        .await;
+
+        // 对话框事件到达：handle 不等 in-flight 命令，立即完成并入缓冲
         let handled = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(1),
             handle_event(
                 &watched,
                 &json!({
@@ -2486,65 +2506,45 @@ mod tests {
             ),
         )
         .await;
-        drop(guard);
-        assert!(handled.is_ok(), "handle 不得等待主连接锁，必须走旁路短连接");
-
-        let handles = calls_of(&calls, "Page.handleJavaScriptDialog");
-        assert_eq!(handles.len(), 1, "旁路连接已发出 handle");
-        assert_eq!(handles[0].session.as_deref(), Some("S1"));
+        assert!(
+            handled.is_ok(),
+            "handle 不得等 in-flight 命令完成（send &self 并发）"
+        );
         assert_eq!(
             watched.dialogs.lock().unwrap().get("T1").map(|b| b.len()),
             Some(1),
             "handle 成功 → 入缓冲（§1.5）"
         );
+        assert_eq!(calls_of(&calls, "Page.handleJavaScriptDialog").len(), 1);
+
+        // 放行闸门：in-flight 命令正常完成（未被 handle 影响）
+        release.send(()).unwrap();
+        inflight.await.unwrap().unwrap();
     }
 
-    /// F2：旁路建连失败（探活/握手不可达）→ WARN 不入缓冲，事件处理正常
-    /// 返回（watch_loop 不因旁路失败中断，对话框保持打开）
+    /// F1 端到端：空 target 唯一 page target 时自动选中；多 target → 409 且
+    /// message 列出全部 targetId（不再猜「最近 attach」）。
     #[tokio::test]
-    async fn dialog_bypass_connect_failure_records_nothing() {
-        let watched = Arc::new(Watched::new());
-        let failing: Connector = Arc::new(|_port, _events| {
-            Box::pin(async {
-                Err(AppError::business(
-                    500,
-                    "CDP_CONNECTION_FAILED",
-                    "bypass down",
-                ))
-            })
-        });
-        *watched.dialog_bypass.lock().unwrap() = Some(DialogBypass {
-            connector: failing,
-            port: PORT,
-        });
-        watched.tabs.lock().unwrap().attach("T1", "S1");
-
-        handle_event(
-            &watched,
-            &json!({
-                "method": "Page.javascriptDialogOpening", "sessionId": "S1",
-                "params": { "type": "alert", "message": "x" }
-            }),
-        )
-        .await;
-        assert!(
-            watched.dialogs.lock().unwrap().get("T1").is_none(),
-            "旁路建连失败不入缓冲"
-        );
-    }
-
-    /// F1 端到端：snap 空 target 路由到最近 attach 的 tab（armed：TAB2 后于
-    /// T1 attach）——修复前多 tab 时空 target 报 409 PAGE_TAB_AMBIGUOUS。
-    #[tokio::test]
-    async fn empty_tab_targets_latest_attached_tab() {
-        let (svc, _w, _calls, script) = armed();
+    async fn empty_tab_selects_unique_target_or_lists_all() {
+        let (svc, watched, _calls, script) = armed();
         given(
             &script,
             "Accessibility.getFullAXTree",
             vec![Ok(json!({ "nodes": [] }))],
         );
+        // armed 有 T1/TAB2 两 target → 409 列全表
+        let amb = svc.snap(INS, "").await.unwrap_err();
+        assert_eq!((amb.code(), amb.status()), ("PAGE_TAB_AMBIGUOUS", 409));
+        let msg = amb.to_string();
+        assert!(
+            msg.contains("T1") && msg.contains("TAB2"),
+            "附 tab 列表: {msg}"
+        );
+
+        // 剩唯一 target → 自动选中
+        watched.tabs.lock().unwrap().detach("TAB2");
         let resp = svc.snap(INS, "").await.unwrap();
-        assert_eq!(resp["targetId"], json!("TAB2"));
+        assert_eq!(resp["targetId"], json!("T1"));
     }
 
     /// 根 frame 导航失效 ref；子 frame 导航不失效；文档事件按各自 reason
@@ -2639,7 +2639,7 @@ mod tests {
         let (calls, script, _tap, _connector) = fake_connector();
         let registry: Arc<Mutex<HashMap<String, Arc<Watched>>>> = Arc::default();
         let watched = Arc::new(Watched::new());
-        let conn = fake_conn(&calls, &script, None);
+        let conn = fake_conn(&calls, &script, None, &Gates::default());
         *watched.conn.lock().unwrap() = Some(Arc::clone(&conn));
         registry
             .lock()
@@ -2670,7 +2670,7 @@ mod tests {
         let (calls, script, _tap, _connector) = fake_connector();
         let registry: Arc<Mutex<HashMap<String, Arc<Watched>>>> = Arc::default();
         let watched = Arc::new(Watched::new());
-        let old_conn = fake_conn(&calls, &script, None);
+        let old_conn = fake_conn(&calls, &script, None, &Gates::default());
         *watched.conn.lock().unwrap() = Some(Arc::clone(&old_conn));
         registry
             .lock()
@@ -2689,7 +2689,7 @@ mod tests {
             1,
         ));
         // 模拟断连后命令重建：换新连接 + 代际 +1（establish 的效果）
-        let new_conn = fake_conn(&calls, &script, None);
+        let new_conn = fake_conn(&calls, &script, None, &Gates::default());
         *watched.conn.lock().unwrap() = Some(Arc::clone(&new_conn));
         watched.generation.fetch_add(1, Ordering::Relaxed);
         drop(tx);

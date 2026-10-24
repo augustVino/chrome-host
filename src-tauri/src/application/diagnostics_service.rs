@@ -35,8 +35,9 @@ fn unavailable(message: impl Into<String>) -> AppError {
 
 struct Watched {
     buffer: Arc<Mutex<DiagBuffer>>,
-    /// 当前代连接（断线置 None，重连整体替换）；截图查询复用它发命令
-    conn: Mutex<Option<Arc<tokio::sync::Mutex<CdpConnection>>>>,
+    /// 当前代连接（断线置 None，重连整体替换）；截图查询复用它发命令。
+    /// send 已 &self 并发化（P2-F 根治），裸 Arc 直发、无锁包裹。
+    conn: Mutex<Option<Arc<CdpConnection>>>,
     /// 代际守卫：restart 产生新一代后旧代自行退出（防双 watcher 双缓冲）
     current: AtomicBool,
 }
@@ -171,8 +172,7 @@ impl DiagnosticsService {
             .unwrap()
             .pick_page_session()
             .ok_or_else(|| unavailable("无可截图的 http(s) 页面目标"))?;
-        let mut conn = shared.lock().await;
-        let resp: Value = conn
+        let resp: Value = shared
             .send(
                 "Page.captureScreenshot",
                 json!({ "format": "png" }),
@@ -274,12 +274,11 @@ async fn start_session(
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>, AppError> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = CdpConnection::connect_eventing(port, tx).await?;
-    let shared = Arc::new(tokio::sync::Mutex::new(conn));
+    let shared = Arc::new(conn);
     *watched.conn.lock().unwrap() = Some(Arc::clone(&shared));
-    let mut g = shared.lock().await;
     // waitForDebuggerOnStart 在 CfT 131 为必填参数（缺省即 -32602 Invalid parameters，
     // 实测确认）；false = attach 不暂停目标页，符合「只订阅不操作」纪律
-    let _: Value = g
+    let _: Value = shared
         .send(
             "Target.setAutoAttach",
             json!({ "autoAttach": true, "flatten": true, "waitForDebuggerOnStart": false }),
@@ -295,9 +294,8 @@ async fn enable_session(watched: &Watched, session_id: &str) {
     let Some(shared) = watched.conn.lock().unwrap().clone() else {
         return;
     };
-    let mut g = shared.lock().await;
     for method in ["Runtime.enable", "Network.enable", "Log.enable"] {
-        if let Err(e) = g.send::<Value>(method, (), Some(session_id)).await {
+        if let Err(e) = shared.send::<Value>(method, (), Some(session_id)).await {
             tracing::debug!("[diagnostics] session {session_id} {method} 失败: {e}");
         }
     }

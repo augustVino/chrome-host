@@ -10,6 +10,7 @@ use crate::domain::environment::Environment;
 use crate::domain::instance::{Instance, InstanceStatus, RuntimeUpdate};
 use crate::error::AppError;
 use crate::infrastructure::cdp;
+use crate::infrastructure::cdp::ws::CdpConnection;
 use crate::infrastructure::db::repositories::environment_repository::EnvironmentRepository;
 use crate::infrastructure::db::repositories::extension_config_repository::ExtensionConfigRepository;
 use crate::infrastructure::db::repositories::instance_repository::InstanceRepository;
@@ -20,7 +21,6 @@ use crate::infrastructure::platform;
 use crate::infrastructure::process::port_allocator;
 use crate::infrastructure::process::{LaunchSpec, ProcessManager};
 use crate::infrastructure::session_vault;
-use crate::infrastructure::cdp::ws::CdpConnection;
 
 use super::activity::Activity;
 use super::diagnostics_service::DiagnosticsService;
@@ -93,7 +93,23 @@ impl InstanceService {
         paths: AppPaths,
         app: AppHandle,
     ) -> Self {
-        InstanceService { envs, instances, kernel, process, reconciler, profiles, sessions, activity, keep_alive, extensions, diagnostics, extension_configs, settings, paths, app }
+        InstanceService {
+            envs,
+            instances,
+            kernel,
+            process,
+            reconciler,
+            profiles,
+            sessions,
+            activity,
+            keep_alive,
+            extensions,
+            diagnostics,
+            extension_configs,
+            settings,
+            paths,
+            app,
+        }
     }
 
     /// 创建并启动 Instance。创建非幂等：每调用一次新增一个 Instance。
@@ -142,13 +158,18 @@ impl InstanceService {
     /// start 前的端口预检：被占时先尝试清理本实例残留进程并等待释放（Chrome 退出异步），
     /// 仍被外部进程占用才报 409。
     async fn ensure_port_ready(&self, ins: &Instance) -> Result<(), AppError> {
-        let port = ins.cdp_port.ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
+        let port = ins
+            .cdp_port
+            .ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
         if port_allocator::is_free(port).await {
             return Ok(());
         }
         // 可能是本实例旧进程未退透：终止并等待端口释放（≤3s）
         if let Some(pid) = ins.pid {
-            if self.process.is_alive(pid, std::path::Path::new(&ins.profile_dir))? {
+            if self
+                .process
+                .is_alive(pid, std::path::Path::new(&ins.profile_dir))?
+            {
                 tracing::info!("[start] 端口 {port} 被本实例旧进程占用，先终止: pid={pid}");
                 self.process.terminate(pid)?;
             }
@@ -200,7 +221,11 @@ impl InstanceService {
 
     /// 公共启动流程：内核就绪 → hosts 解析注入 → spawn → 等 CDP。
     /// 调用方保证实例记录已存在（starting 状态），失败路径由本方法统一置 error。
-    async fn launch_and_wait(&self, env: &Environment, ins: &Instance) -> Result<Instance, AppError> {
+    async fn launch_and_wait(
+        &self,
+        env: &Environment,
+        ins: &Instance,
+    ) -> Result<Instance, AppError> {
         // 1. hosts 解析（在 spawn 之前；失败即失败，不起"缺环境"的实例）
         let rules = match hosts::resolver::resolve(env.hosts_source_url.as_deref()).await {
             Ok(r) => r,
@@ -212,9 +237,16 @@ impl InstanceService {
         if let Some(rules) = &rules {
             self.instances.update_runtime(
                 &ins.id,
-                RuntimeUpdate { host_rules: Some(rules.to_snapshot_json()), ..Default::default() },
+                RuntimeUpdate {
+                    host_rules: Some(rules.to_snapshot_json()),
+                    ..Default::default()
+                },
             )?;
-            self.emit_with("hosts-resolved", &ins.id, &format!("{} 条映射", rules.len()));
+            self.emit_with(
+                "hosts-resolved",
+                &ins.id,
+                &format!("{} 条映射", rules.len()),
+            );
         }
 
         // 2. 内核就绪（未装则下载，进度经 kernel-download 事件推送）
@@ -229,7 +261,10 @@ impl InstanceService {
         // 3. 启动参数：DNS 注入与 no-proxy 成对出现
         let mut extra_args: Vec<String> = Vec::new();
         if let Some(rules) = &rules {
-            extra_args.push(format!("--host-resolver-rules={}", rules.to_resolver_rules()));
+            extra_args.push(format!(
+                "--host-resolver-rules={}",
+                rules.to_resolver_rules()
+            ));
             extra_args.push("--no-proxy-server".to_string());
         }
         if let Some(args) = &env.startup_args {
@@ -253,7 +288,9 @@ impl InstanceService {
                 tracing::warn!("扩展配置读取失败（按空配置继续）: {e}");
                 Default::default()
             });
-        let ext_paths = self.extensions.resolve_for_runtime(env, ins, chrome_index, &ext_configs);
+        let ext_paths = self
+            .extensions
+            .resolve_for_runtime(env, ins, chrome_index, &ext_configs);
         if !ext_paths.is_empty() {
             let joined = ext_paths
                 .iter()
@@ -283,8 +320,13 @@ impl InstanceService {
             }
         };
         self.attach_exit_watcher(&ins.id, pid);
-        self.instances
-            .update_runtime(&ins.id, RuntimeUpdate { pid: Some(pid), ..Default::default() })?;
+        self.instances.update_runtime(
+            &ins.id,
+            RuntimeUpdate {
+                pid: Some(pid),
+                ..Default::default()
+            },
+        )?;
 
         // 5. 等 CDP 就绪（不能仅凭 spawn 成功判断 Runtime 成功）
         match cdp::client::wait_until_ready(ins.cdp_port.unwrap_or_default(), CDP_READY_TIMEOUT)
@@ -316,12 +358,20 @@ impl InstanceService {
                 match std::fs::remove_file(&stale) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => tracing::warn!("[session] 清理上轮导出残留失败（忽略）: {} - {e}", stale.display()),
+                    Err(e) => tracing::warn!(
+                        "[session] 清理上轮导出残留失败（忽略）: {} - {e}",
+                        stale.display()
+                    ),
                 }
                 // 常驻诊断 watcher（M6）：置 running 后 spawn，不阻塞启动返回路径；
                 // 只订阅不操作，与外部 agent 的 CDP 会话共存
-                self.diagnostics.spawn(&ins.id, ins.cdp_port.unwrap_or_default());
-                tracing::info!("实例启动成功: {} pid={pid} cdp={}", ins.id, ins.cdp_port.unwrap_or_default());
+                self.diagnostics
+                    .spawn(&ins.id, ins.cdp_port.unwrap_or_default());
+                tracing::info!(
+                    "实例启动成功: {} pid={pid} cdp={}",
+                    ins.id,
+                    ins.cdp_port.unwrap_or_default()
+                );
             }
             Err(_) => {
                 // 起了但 CDP 不可达：杀进程 + error
@@ -401,7 +451,9 @@ impl InstanceService {
             self.emit("instance-stopped", id);
             tracing::info!("实例已停止: {id}");
             // 身份层挂钩 B：按 session_capture 策略升级环境身份（first-login/always）
-            self.sessions.on_instance_stopped(&ins.environment_id, id).await;
+            self.sessions
+                .on_instance_stopped(&ins.environment_id, id)
+                .await;
         }
         Ok(self.instances.get(id)?)
     }
@@ -427,7 +479,9 @@ impl InstanceService {
                 .mark_stopped_if_alive(&ins.id, chrono::Utc::now().timestamp_millis())?
             {
                 self.emit("instance-stopped", &ins.id);
-                self.sessions.on_instance_stopped(&ins.environment_id, &ins.id).await;
+                self.sessions
+                    .on_instance_stopped(&ins.environment_id, &ins.id)
+                    .await;
             }
             stopped.push(ins.id);
         }
@@ -454,7 +508,9 @@ impl InstanceService {
                 format!("实例 {id} 未在运行，页面诊断仅对运行中实例可用"),
             ));
         }
-        let port = ins.cdp_port.ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
+        let port = ins
+            .cdp_port
+            .ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
         let targets = cdp::client::list_targets(port).await?;
         let target = pick_diagnostic_target(&targets).ok_or_else(|| {
             AppError::conflict(
@@ -465,7 +521,7 @@ impl InstanceService {
         // 页面级 WS 端点为 ws://.../devtools/page/<targetId>（Chrome 稳定约定，
         // 与 /json 返回的 webSocketDebuggerUrl 同构），免扩 Target 结构
         let ws_url = format!("ws://127.0.0.1:{port}/devtools/page/{}", target.id);
-        let mut conn = CdpConnection::connect_ws(&ws_url, Duration::from_secs(5)).await?;
+        let conn = CdpConnection::connect_ws(&ws_url, Duration::from_secs(5)).await?;
         let resp: serde_json::Value = conn
             .send(
                 "Runtime.evaluate",
@@ -491,7 +547,9 @@ impl InstanceService {
     /// 分批防单帧超限；CookieRecord 与 Storage.setCookies 入参同构，
     /// session cookie 的 expires=-1 原样回传（这正是文件层拿不到的部分）。
     async fn inject_session_cookies(&self, ins: &Instance) -> Result<(), AppError> {
-        let Some(port) = ins.cdp_port else { return Ok(()) };
+        let Some(port) = ins.cdp_port else {
+            return Ok(());
+        };
         let env_dir = self.paths.environment_dir(&ins.environment_id);
         let Some(vault) = session_vault::read_current(&env_dir) else {
             return Ok(()); // 从未捕获：空身份，正常路径
@@ -499,7 +557,7 @@ impl InstanceService {
         if vault.cookies.is_empty() {
             return Ok(());
         }
-        let mut conn = CdpConnection::connect(port).await?;
+        let conn = CdpConnection::connect(port).await?;
         let params = session_vault::to_set_cookie_params(&vault.cookies);
         for chunk in params.chunks(100) {
             conn.send::<serde_json::Value>(
@@ -527,9 +585,15 @@ impl InstanceService {
                 format!("实例 {id} 未在运行"),
             ));
         }
-        let port = ins.cdp_port.ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
+        let port = ins
+            .cdp_port
+            .ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
         let version = cdp::client::version(port).await.map_err(|_| {
-            AppError::business(500, "CDP_CONNECTION_FAILED", format!("CDP 端口 {port} 不可达"))
+            AppError::business(
+                500,
+                "CDP_CONNECTION_FAILED",
+                format!("CDP 端口 {port} 不可达"),
+            )
         })?;
         Ok(CdpEndpoint {
             instance_id: ins.id,
@@ -549,7 +613,9 @@ impl InstanceService {
                 format!("实例 {id} 未在运行，无法唤出"),
             ));
         }
-        let port = ins.cdp_port.ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
+        let port = ins
+            .cdp_port
+            .ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
 
         let activated = (|| async {
             let targets = cdp::client::list_targets(port).await.ok()?;
@@ -578,7 +644,9 @@ impl InstanceService {
                 format!("实例 {id} 未在运行"),
             ));
         }
-        let port = ins.cdp_port.ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
+        let port = ins
+            .cdp_port
+            .ok_or_else(|| AppError::internal("实例缺少 CDP 端口"))?;
         Ok((ins, port))
     }
 
@@ -594,7 +662,10 @@ impl InstanceService {
     pub async fn list_tabs(&self, id: &str) -> Result<Vec<cdp::client::Target>, AppError> {
         let (_, port) = self.require_running(id).await?;
         let targets = cdp::client::list_targets(port).await?;
-        Ok(targets.into_iter().filter(|t| t.target_type == "page").collect())
+        Ok(targets
+            .into_iter()
+            .filter(|t| t.target_type == "page")
+            .collect())
     }
 
     fn validate_http_url(url: &str) -> Result<(), AppError> {
@@ -643,7 +714,10 @@ impl InstanceService {
         let dir = std::path::Path::new(&ins.profile_dir);
         if let Err(e) = std::fs::remove_dir_all(dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("清理实例 profile 失败（继续删除记录）: {} - {e}", ins.profile_dir);
+                tracing::warn!(
+                    "清理实例 profile 失败（继续删除记录）: {} - {e}",
+                    ins.profile_dir
+                );
             }
         }
         // 物化扩展目录同步清理（与 profile 同生命周期；路径拼接与写入点同源）
@@ -692,7 +766,10 @@ impl InstanceService {
             }
         }
         if n > 0 {
-            tracing::info!("[diagnostics] 启动对账为 {} 个存活实例重挂常驻诊断 watcher", n);
+            tracing::info!(
+                "[diagnostics] 启动对账为 {} 个存活实例重挂常驻诊断 watcher",
+                n
+            );
         }
     }
 
@@ -751,7 +828,10 @@ impl InstanceService {
     fn mark_error(&self, id: &str) {
         let _ = self.instances.update_runtime(
             id,
-            RuntimeUpdate { status: Some(InstanceStatus::Error), ..Default::default() },
+            RuntimeUpdate {
+                status: Some(InstanceStatus::Error),
+                ..Default::default()
+            },
         );
         self.emit("instance-error", id);
     }
@@ -845,12 +925,18 @@ mod tests {
         let ctx = setup();
         ctx.envs.insert(&sample_env("env_alive", "qa-a")).unwrap();
         ctx.envs.insert(&sample_env("env_gone", "qa-b")).unwrap();
-        ctx.instances.insert(&sample_ins("ins_a", "env_alive", 1)).unwrap();
-        ctx.instances.insert(&sample_ins("ins_b", "env_gone", 2)).unwrap();
+        ctx.instances
+            .insert(&sample_ins("ins_a", "env_alive", 1))
+            .unwrap();
+        ctx.instances
+            .insert(&sample_ins("ins_b", "env_gone", 2))
+            .unwrap();
         // 绕过外键直接删环境行，复现「实例行的 environment_id 悬挂」的孤儿场景
         let guard = ctx.pool.get().unwrap();
         guard.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        guard.execute("DELETE FROM environments WHERE id = 'env_gone'", []).unwrap();
+        guard
+            .execute("DELETE FROM environments WHERE id = 'env_gone'", [])
+            .unwrap();
         guard.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         drop(guard);
 

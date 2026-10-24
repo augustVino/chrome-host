@@ -221,10 +221,10 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 | `page wait <ID> <selector> [--state V] [--timeout 10s] [--tab T]` | 轮询等待（250ms 间隔）；state = visible（缺省）/hidden/attached/detached；超时 → 409 exit 5 |
 | `page dialogs <ID> [--tab T] [--since N]` | 已自动应答的对话框日志（SEQ/TYPE/MESSAGE 表 + cursor 行；`--since` 增量拉取） |
 
-`tab` 取值 = targetId 或唯一前缀（`instance tabs` 获得）；省略 = 最近打开
-（attach）的页面标签（活跃 tab 近似语义——CDP 无 browser 级 active tab 直查
-API，取最近 attach 的 page target 近似；最近者关闭后回退次新）。显式前缀仍
-是无匹配 404 / 多匹配 409 `PAGE_TAB_AMBIGUOUS`（exit 5）。`--timeout`
+`tab` 取值 = targetId 或唯一前缀（`instance tabs` 获得）；省略 = 唯一页面标签
+时自动选中，多标签 → 409 `PAGE_TAB_AMBIGUOUS` 且错误 message 列出全部
+targetId（诚实语义：不猜活跃 tab，避免取错页面；真机复测后从「最近打开」
+近似改为唯一性）。显式前缀仍是无匹配 404 / 多匹配 409（exit 5）。`--timeout`
 接受 `10s` / `250ms` / 裸数字（= 毫秒），缺省 10s。
 
 错误看 `[PAGE_XXX]` 前缀分支处置（不解析文案）：`ref_stale`/`ref_not_found` 重

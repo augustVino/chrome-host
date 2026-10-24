@@ -69,14 +69,24 @@ impl SessionService {
         paths: AppPaths,
         activity: Arc<Activity>,
     ) -> Self {
-        SessionService { envs, instances, profiles, paths, activity, vault_lock: Arc::new(tokio::sync::Mutex::new(())) }
+        SessionService {
+            envs,
+            instances,
+            profiles,
+            paths,
+            activity,
+            vault_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     /// 停止路径挂钩 A：terminate 之前调用（此时 CDP 仍可达），导出实例私有 Cookie。
     /// 尽力而为：任何失败仅告警，绝不阻塞停止流程。
     pub async fn on_instance_stopping(&self, ins: &Instance) {
         let Some(port) = ins.cdp_port else { return };
-        match self.export_instance_cookies(port, &ins.environment_id, &ins.id).await {
+        match self
+            .export_instance_cookies(port, &ins.environment_id, &ins.id)
+            .await
+        {
             Ok(n) if n > 0 => {
                 tracing::info!("[session] 实例 {} 导出 {} 条 Cookie", ins.id, n);
                 self.activity.record(
@@ -89,14 +99,19 @@ impl SessionService {
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!("[session] 实例 {} Cookie 导出失败（忽略，继续停止）: {e}", ins.id);
+                tracing::warn!(
+                    "[session] 实例 {} Cookie 导出失败（忽略，继续停止）: {e}",
+                    ins.id
+                );
                 // 旧导出文件（上一轮停止遗留）必须删除：promote/显式捕获按文件
                 // 存在性判定，残留会让过期 Cookie 被当成本轮新代提升
                 let stale = self.paths.instance_cookies(&ins.environment_id, &ins.id);
                 match std::fs::remove_file(&stale) {
                     Ok(()) => tracing::info!("[session] 已删除过期导出: {}", stale.display()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => tracing::warn!("[session] 删除过期导出失败: {} - {e}", stale.display()),
+                    Err(e) => {
+                        tracing::warn!("[session] 删除过期导出失败: {} - {e}", stale.display())
+                    }
                 }
             }
         }
@@ -143,22 +158,27 @@ impl SessionService {
             }
         }
 
-        let Some(export) = session_vault::read_instance_export(
-            &self.paths.instance_cookies(env_id, ins_id),
-        ) else {
+        let Some(export) =
+            session_vault::read_instance_export(&self.paths.instance_cookies(env_id, ins_id))
+        else {
             return Ok(()); // 无导出（崩溃路径/导出失败）：跳过，不算错误
         };
         if export.cookies.is_empty() {
             return Ok(()); // 空 Cookie 不升级（避免把空身份写进保险库）
         }
 
-        self.capture_inner_locked(env_id, ins_id, &export.cookies).await?;
+        self.capture_inner_locked(env_id, ins_id, &export.cookies)
+            .await?;
         self.activity.record(
             "info",
             "session_captured_from_instance",
             Some(env_id),
             Some(ins_id),
-            if env.session_capture == SessionCapture::Always { "策略 always" } else { "首登引导" },
+            if env.session_capture == SessionCapture::Always {
+                "策略 always"
+            } else {
+                "首登引导"
+            },
         );
         Ok(())
     }
@@ -172,7 +192,10 @@ impl SessionService {
     ) -> Result<serde_json::Value, AppError> {
         let ins = self.instances.get(ins_id)?;
         if ins.environment_id != env_id {
-            return Err(AppError::not_found("INSTANCE_NOT_FOUND", "该实例不属于此环境"));
+            return Err(AppError::not_found(
+                "INSTANCE_NOT_FOUND",
+                "该实例不属于此环境",
+            ));
         }
         if ins.status.is_alive_status() {
             return Err(AppError::conflict(
@@ -180,15 +203,14 @@ impl SessionService {
                 "实例运行中，请先停止再捕获（文件层快照要求进程退出）",
             ));
         }
-        let export = session_vault::read_instance_export(
-            &self.paths.instance_cookies(env_id, ins_id),
-        )
-        .ok_or_else(|| {
-            AppError::conflict(
-                "SESSION_CAPTURE_FAILED",
-                "该实例没有已导出的 Cookie（可能异常退出）；先正常停止实例后再捕获",
-            )
-        })?;
+        let export =
+            session_vault::read_instance_export(&self.paths.instance_cookies(env_id, ins_id))
+                .ok_or_else(|| {
+                    AppError::conflict(
+                        "SESSION_CAPTURE_FAILED",
+                        "该实例没有已导出的 Cookie（可能异常退出）；先正常停止实例后再捕获",
+                    )
+                })?;
         if export.cookies.is_empty() {
             return Err(AppError::conflict(
                 "SESSION_CAPTURE_FAILED",
@@ -229,7 +251,9 @@ impl SessionService {
         let source_dir = std::path::PathBuf::from(&ins.profile_dir);
 
         // 文件层：白名单固化进母本目录 + 状态机迁移
-        self.profiles.capture_files_from(env_id, &source_dir).await?;
+        self.profiles
+            .capture_files_from(env_id, &source_dir)
+            .await?;
 
         // Cookie 层：写保险库（旧版自动入档）。失败时文件层已成功——如实报错，
         // 身份层处于"文件已固化但 Cookie 未更新"的部分成功态，重试捕获即可收敛
@@ -265,7 +289,11 @@ impl SessionService {
     /// POST /environments/:id/session/restore：回滚 Cookie 保险库到指定历史代。
     /// 边界（文档披露）：仅回滚 Cookie 层；文件层快照（IndexedDB/localStorage）
     /// 保留当前版本——多数站点的登录态以 Cookie 为主，此覆盖足够恢复典型污染。
-    pub async fn restore(&self, env_id: &str, generation: i64) -> Result<SessionStatusView, AppError> {
+    pub async fn restore(
+        &self,
+        env_id: &str,
+        generation: i64,
+    ) -> Result<SessionStatusView, AppError> {
         self.envs.get(env_id)?;
         let env_dir = self.paths.environment_dir(env_id);
         let _vault_guard = self.vault_lock.lock().await;
@@ -314,9 +342,8 @@ impl SessionService {
         env_id: &str,
         ins_id: &str,
     ) -> Result<usize, AppError> {
-        let mut conn = CdpConnection::connect(port).await?;
-        let result: serde_json::Value =
-            conn.send("Storage.getCookies", json!({}), None).await?;
+        let conn = CdpConnection::connect(port).await?;
+        let result: serde_json::Value = conn.send("Storage.getCookies", json!({}), None).await?;
         let cookies = session_vault::parse_cdp_cookies(&result);
         let path = self.paths.instance_cookies(env_id, ins_id);
         session_vault::write_instance_export(&path, ins_id, &cookies)?;

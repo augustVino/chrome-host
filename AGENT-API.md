@@ -230,10 +230,10 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 
 参数语义：
 
-- **`tab`**：targetId 或唯一前缀（由 `GET .../tabs` 获得）；省略 = 最近打开
-  （attach）的页面标签（活跃 tab 近似语义：CDP 无 browser 级 active tab 直查
-  API，取最近 attach 的 page target，最近者关闭后回退次新）；显式前缀未命中
-  → `404 PAGE_TAB_NOT_FOUND`、多匹配 → `409 PAGE_TAB_AMBIGUOUS`。
+- **`tab`**：targetId 或唯一前缀（由 `GET .../tabs` 获得）；省略 = 唯一页面
+  标签时自动选中，多标签 → `409 PAGE_TAB_AMBIGUOUS`（message 列出全部
+  targetId 供显式指定——不猜活跃 tab，避免取错页面）；显式前缀未命中
+  → `404 PAGE_TAB_NOT_FOUND`。
 - **`target`**：`@eN` 引用（上次 snap 产生；导航/文档替换后整表失效 → `PAGE_REF_STALE`，
   需重新 snap 而非对旧引用重试）或 CSS 选择器两种形态。
 - **`state`**：`visible`（缺省）/ `hidden` / `attached` / `detached`；非法 → `400 INVALID_REQUEST`。
@@ -447,7 +447,7 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 404 | `SESSION_GENERATION_NOT_FOUND` | session/restore 目标历史代不存在 |
 | 400 | `PAGE_KEY_UNKNOWN` | page press 键名不认识（支持命名键/单字符/组合键） |
 | 404 | `PAGE_TAB_NOT_FOUND` / `PAGE_REF_NOT_FOUND` / `PAGE_ELEMENT_NOT_FOUND` | page 族：tab 路由未命中 / @eN 引用不在上次 snap 表 / 选择器未命中 |
-| 409 | `PAGE_TAB_AMBIGUOUS` / `PAGE_SERVICE_UNAVAILABLE` | page 族：tab 前缀多匹配（仅显式前缀；省略 tab 取最近 attach 不再歧义）/ 实例未运行或无 CDP 端口 |
+| 409 | `PAGE_TAB_AMBIGUOUS` / `PAGE_SERVICE_UNAVAILABLE` | page 族：tab 前缀多匹配，或省略 tab 且存在多个页面标签（message 列出全部 targetId）/ 实例未运行或无 CDP 端口 |
 | 409 | `PAGE_REF_STALE` / `PAGE_TARGET_MOVED` | @eN 引用已因导航/文档替换失效（重 snap）/ 引用节点不再可解析 |
 | 409 | `PAGE_ELEMENT_BLOCKED` / `PAGE_FILL_VALUE_MISMATCH` / `PAGE_WAIT_TIMEOUT` | 点击点被遮挡 / fill 回读不一致（写入可能已部分生效，先观察再决定）/ 等待超时 |
 | 409 | `PAGE_FOCUS_FAILED` / `PAGE_FILL_FOCUS_LOST` | page press/fill 焦点失败 / 页面在 fill 过程中抢走焦点 |
