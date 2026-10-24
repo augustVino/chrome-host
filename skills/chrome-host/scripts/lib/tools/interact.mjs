@@ -2,23 +2,48 @@
 
 import { sleep } from '../paths.mjs';
 import { evalStr } from './evaluate.mjs';
+import {
+  ClickError, evalJson, locateExpr, hitTestExpr,
+  classifyLocate, classifyHit, dispatchClickAtPoint,
+} from './click-native.mjs';
 
-// Click element by CSS selector
-export async function clickStr(cdp, sid, selector) {
+// Click element by CSS selector via the native Input event chain
+// (BEHAVIOR-SPEC §2): locate + scrollIntoView + visibility check → hit-test
+// the center point → Input.dispatchMouseEvent. unsafeSynth keeps the legacy
+// el.click() path for pages that deliberately hook untrusted (synthetic)
+// clicks, e.g. test hooks.
+export async function clickStr(cdp, sid, selector, unsafeSynth = false) {
   if (!selector) throw new Error('CSS selector required');
+  if (unsafeSynth) return synthClickStr(cdp, sid, selector);
+
+  const located = classifyLocate(await evalJson(cdp, sid, locateExpr(selector)), selector);
+  classifyHit(await evalJson(cdp, sid, hitTestExpr(selector, located.x, located.y)), selector);
+  try {
+    await dispatchClickAtPoint(cdp, sid, located.x, located.y);
+  } catch (e) {
+    throw new ClickError('dispatch_failed', `${e.message} (effect_state: ${
+      e.pressSent ? 'unknown — mousePressed was already dispatched' : 'none — no input was dispatched'})`);
+  }
+  return `Clicked <${located.tag}> "${located.text}" (native input @${located.x},${located.y})`;
+}
+
+// Legacy synthetic path (--unsafe-synth): el.click() produces an untrusted
+// event that skips the native pipeline — wrong by default, but occasionally
+// the only thing a page's test hook responds to.
+async function synthClickStr(cdp, sid, selector) {
   const expr = `
     (function() {
       const el = document.querySelector(${JSON.stringify(selector)});
-      if (!el) return { ok: false, error: 'Element not found: ' + ${JSON.stringify(selector)} };
+      if (!el) return JSON.stringify({ error: 'not_found' });
       el.scrollIntoView({ block: 'center' });
       el.click();
-      return { ok: true, tag: el.tagName, text: el.textContent.trim().substring(0, 80) };
+      return JSON.stringify({ ok: true, tag: el.tagName, text: (el.textContent || '').trim().substring(0, 80) });
     })()
   `;
-  const result = await evalStr(cdp, sid, expr);
-  const r = JSON.parse(result);
-  if (!r.ok) throw new Error(r.error);
-  return `Clicked <${r.tag}> "${r.text}"`;
+  const r = await evalJson(cdp, sid, expr);
+  if (r && r.error === 'not_found') throw new ClickError('element_not_found', `Element not found: ${selector}`);
+  if (!r || !r.ok) throw new Error(`click: unexpected eval result for ${selector}`);
+  return `Clicked <${r.tag}> "${r.text}" (synthetic el.click())`;
 }
 
 // Click at CSS pixel coordinates using Input.dispatchMouseEvent
@@ -26,11 +51,7 @@ export async function clickXyStr(cdp, sid, x, y) {
   const cx = parseFloat(x);
   const cy = parseFloat(y);
   if (isNaN(cx) || isNaN(cy)) throw new Error('x and y must be numbers (CSS pixels)');
-  const base = { x: cx, y: cy, button: 'left', clickCount: 1, modifiers: 0 };
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' }, sid);
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sid);
-  await sleep(50);
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sid);
+  await dispatchClickAtPoint(cdp, sid, cx, cy);
   return `Clicked at CSS (${cx}, ${cy})`;
 }
 

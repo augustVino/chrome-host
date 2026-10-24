@@ -30,7 +30,10 @@ Usage: cdp <command> [args]
   html  <target> [selector]         Get HTML (full page or CSS selector)
   nav   <target> <url>              Navigate to URL and wait for load completion
   net   <target>                    Network performance entries
-  click   <target> <selector>       Click an element by CSS selector
+  click   <target> <selector>       Click an element via native Input events: scrollIntoView,
+                                    hit-test the center point, then dispatch mouse events
+                                    [--unsafe-synth] synthetic el.click() fallback for pages
+                                    that hook untrusted (synthetic) clicks
   clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
   type    <target> <text>           Type text at current focus via Input.insertText
                                     Works in cross-origin iframes unlike eval-based approaches
@@ -61,12 +64,20 @@ EVAL SAFETY NOTE
   "Ignore" buttons on a feed — indices shift). Prefer stable selectors or
   collect all data in a single eval.
 
+CLICK ERRORS
+  click failures exit 1 and print "[CODE] message" on stderr:
+    element_not_found    selector matched nothing
+    element_not_visible  matched but not rendered (display:none, empty rect, ...)
+    element_blocked      click point is covered by another element
+    dispatch_failed      Input dispatch failed (message notes the effect_state)
+
 DAEMON IPC (for advanced use / scripting)
   Each tab runs a persistent daemon at Unix socket in the runtime dir (see below).
   Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
     Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
-           or {"id":<number>, "ok":false, "error":"<message>"}
+           or {"id":<number>, "ok":false, "error":"<message>", "code":"<error_code>"?}
+         (code only present for coded errors, e.g. click's element_not_found)
   Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
   type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
   The socket disappears after 20 min of inactivity or when the tab closes.
@@ -171,7 +182,9 @@ async function main() {
   if (response.ok) {
     if (response.result) console.log(response.result);
   } else {
-    console.error('Error:', response.error);
+    // Coded errors align with the chrome-host CLI error-line style "[CODE] ...".
+    if (response.code) console.error(`[${response.code}] ${response.error}`);
+    else console.error('Error:', response.error);
     process.exitCode = 1;
   }
 }

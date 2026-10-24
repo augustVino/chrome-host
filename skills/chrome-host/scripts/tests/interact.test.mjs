@@ -6,29 +6,38 @@ import assert from 'node:assert/strict';
 import { clickStr, clickXyStr, typeStr, loadAllStr } from '../lib/tools/interact.mjs';
 import { FakeCdp } from './helpers.mjs';
 
-function cdpEvalValue(value) {
-  return new FakeCdp(async (method) => {
-    if (method === 'Runtime.enable') return {};
-    if (method === 'Runtime.evaluate') return { result: { value } };
-    throw new Error('unexpected ' + method);
-  });
-}
-
 test('clickStr requires a selector', async () => {
   await assert.rejects(clickStr(new FakeCdp(), 's', undefined), { message: 'CSS selector required' });
 });
 
-test('clickStr clicks and reports the tag/text reported by the page', async () => {
-  const cdp = cdpEvalValue(JSON.stringify({ ok: true, tag: 'BUTTON', text: '  Submit  ' }));
-  assert.equal(await clickStr(cdp, 'SID', 'button.primary'), 'Clicked <BUTTON> "  Submit  "');
-  const expr = cdp.calls[1].params.expression;
+function nativeClickCdp(locateJson, hitJson) {
+  return new FakeCdp(async (method, params) => {
+    if (method === 'Runtime.enable') return {};
+    if (method === 'Runtime.evaluate') {
+      const value = params.expression.includes('elementFromPoint') ? hitJson : locateJson;
+      return { result: { value } };
+    }
+    return {};
+  });
+}
+
+test('clickStr clicks natively and reports tag/text plus the dispatch point', async () => {
+  const cdp = nativeClickCdp(
+    JSON.stringify({ x: 100.5, y: 40, tag: 'BUTTON', text: 'Submit' }),
+    JSON.stringify({ hit: true }),
+  );
+  assert.equal(await clickStr(cdp, 'SID', 'button.primary'),
+    'Clicked <BUTTON> "Submit" (native input @100.5,40)');
+  const expr = cdp.calls[1].params.expression; // locate eval
   assert.ok(expr.includes('document.querySelector("button.primary")'));
   assert.ok(expr.includes('scrollIntoView'));
+  assert.ok(cdp.calls.some(c => c.method === 'Input.dispatchMouseEvent')); // native, not el.click()
 });
 
 test('clickStr surfaces "Element not found" from the page', async () => {
-  const cdp = cdpEvalValue(JSON.stringify({ ok: false, error: 'Element not found: .gone' }));
-  await assert.rejects(clickStr(cdp, 's', '.gone'), { message: 'Element not found: .gone' });
+  const cdp = nativeClickCdp(JSON.stringify({ error: 'not_found' }), '');
+  await assert.rejects(clickStr(cdp, 's', '.gone'),
+    { code: 'element_not_found', message: 'Element not found: .gone' });
 });
 
 test('clickXyStr rejects non-numeric coordinates', async () => {
