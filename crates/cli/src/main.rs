@@ -57,6 +57,9 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, CliError> {
         Some(Commands::Instance { command }) => {
             cli::instance::run(command, globals, &client).map(|_| ExitCode::SUCCESS)
         }
+        Some(Commands::Page { command }) => {
+            cli::page::run(command, globals, &client).map(|_| ExitCode::SUCCESS)
+        }
         Some(Commands::Extension { command }) => {
             cli::extension::run(command, globals, &client).map(|_| ExitCode::SUCCESS)
         }

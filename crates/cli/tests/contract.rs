@@ -560,6 +560,101 @@ fn fixture_router() -> Router {
             "/api/v1/kernel/cancel",
             post(|| async { Json(json!({ "ok": true })) }),
         )
+        // —— page 控制命令族（P2-C）：正常响应 + 参数透传 echo + 错误样本 ——
+        .route(
+            "/api/v1/instances/ins_x/page/snap",
+            post(|| async {
+                Json(json!({
+                    "instanceId": "ins_x",
+                    "targetId": "TAB9F",
+                    "text": "[WebArea] Home\n  @e1 [button] OK\n  @e2 [textbox] q",
+                    "refs_count": 2,
+                    "generation": 1
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/click",
+            post(|| async { Json(json!({ "result": "Clicked @e1 \"OK\" at CSS (100, 50)", "instanceId": "ins_x", "targetId": "TAB9F" })) }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/fill",
+            post(|| async { Json(json!({ "result": "Filled <INPUT> \"q\" with \"\" (0 chars)", "instanceId": "ins_x", "targetId": "TAB9F" })) }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/press",
+            post(|| async { Json(json!({ "result": "Pressed Enter", "instanceId": "ins_x", "targetId": "TAB9F", "dialogs_seen": [
+                { "tab_id": "TAB9F", "type": "alert", "message": "hi", "handled": "accepted", "sequence": 1 }
+            ] })) }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/wait",
+            post(|| async { Json(json!({ "result": "Waited: .ready is visible (after 120ms, 1 polls)", "instanceId": "ins_x", "targetId": "TAB9F" })) }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/dialogs",
+            get(|Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                Json(json!({
+                    "instanceId": "ins_x",
+                    "targetId": "TAB9F",
+                    "cursor": 2,
+                    "entries": [
+                        { "tab_id": "TAB9F", "type": "prompt", "message": "名字？", "handled": "accepted", "sequence": 1, "default_prompt": "Bob" },
+                        { "tab_id": "TAB9F", "type": "alert", "message": "m2", "handled": "accepted", "sequence": 2 }
+                    ],
+                    "meta": { "since": q.get("since"), "tab": q.get("tab") }
+                }))
+            }),
+        )
+        // 参数透传 echo：请求体原样回显（验证 client 拼的 body 形状，同 capture_from 先例）
+        .route(
+            "/api/v1/instances/ins_pg/page/click",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_pg/page/fill",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_pg/page/press",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_pg/page/wait",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
+        // 错误样本：page 族四类代表映射（404→3 / 409→5 / 422→7 / 504→5 运行时码表）
+        .route(
+            "/api/v1/instances/err_tab/page/click",
+            post(|| async { (StatusCode::NOT_FOUND, Json(error_body("PAGE_TAB_NOT_FOUND"))) }),
+        )
+        .route(
+            "/api/v1/instances/err_stale/page/click",
+            post(|| async { (StatusCode::CONFLICT, Json(error_body("PAGE_REF_STALE"))) }),
+        )
+        .route(
+            "/api/v1/instances/err_vis/page/click",
+            post(|| async {
+                (StatusCode::UNPROCESSABLE_ENTITY, Json(error_body("PAGE_ELEMENT_NOT_VISIBLE")))
+            }),
+        )
+        .route(
+            "/api/v1/instances/err_busy/page/click",
+            post(|| async {
+                (
+                    StatusCode::from_u16(504).unwrap(),
+                    Json(error_body("PAGE_TOOL_TIMEOUT")),
+                )
+            }),
+        )
 }
 
 /// 启动 fixture server 并阻塞等待其就绪（经 channel 传回实际绑定地址），返回基地址。
@@ -1102,6 +1197,111 @@ fn kernel_download_and_cancel_decode() {
     // 只含 ok 的响应体能正常解码（联合 DTO 假设下此行必炸 Protocol）
     let cancelled = client.kernel_cancel().expect("kernel_cancel 应成功");
     assert!(cancelled.ok);
+}
+
+/// page 控制命令族（P2-C）全方法面：正常响应解包、请求体/query 透传
+/// （echo 路由验证服务端确实收到 tab/target/value/key/timeout/since）、
+/// 四类代表错误码的 exit 映射（404→3 / 409→5 / 422→7 / 504→5 运行时码表）
+#[test]
+fn page_endpoints_contract() {
+    let client = test_client();
+
+    // snap：文本树 + 引用计数 + 代次（@eN 操作循环的起点）
+    let snap = client.page_snap("ins_x", None).expect("snap 应成功");
+    assert_eq!(snap["targetId"], "TAB9F");
+    assert_eq!(snap["refs_count"], 2);
+    assert_eq!(snap["generation"], 1);
+    assert!(snap["text"].as_str().unwrap().contains("@e1 [button] OK"));
+
+    // click：result 行 + 参数透传（target 与显式 tab 均进 body）
+    let click = client
+        .page_click("ins_x", "@e1", Some("TAB9F"))
+        .expect("click 应成功");
+    assert_eq!(click["result"], "Clicked @e1 \"OK\" at CSS (100, 50)");
+    let echo = client
+        .page_click("ins_pg", "#save", Some("TAB"))
+        .expect("click echo 应成功");
+    assert_eq!(echo["echo"]["target"], "#save");
+    assert_eq!(echo["echo"]["tab"], "TAB");
+
+    // fill：空串 value 必须原样透传（空串 = 仅清空的服务端语义）
+    let echo = client
+        .page_fill("ins_pg", "#q", "", None)
+        .expect("fill echo 应成功");
+    assert_eq!(echo["echo"]["target"], "#q");
+    assert_eq!(echo["echo"]["value"], "");
+    assert_eq!(
+        echo["echo"]["tab"],
+        serde_json::json!(null),
+        "缺省 tab 序列化为 null 而非省略"
+    );
+
+    // press：key + 可选 target；wait：selector/state/timeout（时长字符串原样透传）
+    let echo = client
+        .page_press("ins_pg", "Control+A", Some("@e2"), Some("TAB"))
+        .expect("press echo 应成功");
+    assert_eq!(echo["echo"]["key"], "Control+A");
+    assert_eq!(echo["echo"]["target"], "@e2");
+    let echo = client
+        .page_wait("ins_pg", ".ready", Some("visible"), Some("10s"), None)
+        .expect("wait echo 应成功");
+    assert_eq!(echo["echo"]["selector"], ".ready");
+    assert_eq!(echo["echo"]["state"], "visible");
+    assert_eq!(echo["echo"]["timeout"], "10s");
+
+    // press 正常路径：dialogs_seen 附在成功响应（snake_case 条目，同 dialogs 端点）
+    let press = client
+        .page_press("ins_x", "Enter", None, None)
+        .expect("应成功");
+    assert_eq!(press["result"], "Pressed Enter");
+    assert_eq!(press["dialogs_seen"][0]["type"], "alert");
+
+    // wait 正常路径：人性化结果串
+    let wait = client
+        .page_wait("ins_x", ".ready", None, None, None)
+        .expect("wait 应成功");
+    assert!(wait["result"].as_str().unwrap().contains("is visible"));
+
+    // dialogs：cursor/entries + query 透传（tab/since，同 console 的 meta echo 先例）
+    let dialogs = client
+        .page_dialogs("ins_x", Some("TAB9F"), Some(1))
+        .expect("dialogs 应成功");
+    assert_eq!(dialogs["cursor"], 2);
+    let entries = dialogs["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["type"], "prompt");
+    assert_eq!(entries[0]["default_prompt"], "Bob");
+    assert_eq!(entries[1]["sequence"], 2);
+    assert_eq!(dialogs["meta"]["tab"], "TAB9F");
+    assert_eq!(dialogs["meta"]["since"], "1");
+
+    // 错误映射：404 tab 路由未命中 → exit 3
+    let err = client.page_click("err_tab", "@e1", None).unwrap_err();
+    match &err {
+        CliError::Api { status, code, .. } => {
+            assert_eq!((*status, code.as_str()), (404, "PAGE_TAB_NOT_FOUND"));
+        }
+        other => panic!("应为 Api 变体: {other:?}"),
+    }
+    assert_eq!(exit::from_cli_error(&err).as_u8(), 3);
+
+    // 409 引用失效 → exit 5（重 snap 而非重试）
+    let err = client.page_click("err_stale", "@e1", None).unwrap_err();
+    assert_eq!(exit::from_cli_error(&err).as_u8(), 5);
+
+    // 422 元素不可见 → exit 7（未知 4xx → VALIDATION 兑底）
+    let err = client.page_click("err_vis", ".x", None).unwrap_err();
+    assert_eq!(exit::from_cli_error(&err).as_u8(), 7);
+
+    // 504 工具预算超时 → exit 5（RUNTIME_ERROR_CODES 显式条目，非 GENERAL 兑底）
+    let err = client.page_click("err_busy", ".x", None).unwrap_err();
+    match &err {
+        CliError::Api { status, code, .. } => {
+            assert_eq!((*status, code.as_str()), (504, "PAGE_TOOL_TIMEOUT"));
+        }
+        other => panic!("应为 Api 变体: {other:?}"),
+    }
+    assert_eq!(exit::from_cli_error(&err).as_u8(), 5);
 }
 
 // ---------------------------------------------------------------------------

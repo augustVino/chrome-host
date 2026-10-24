@@ -50,6 +50,12 @@ const RUNTIME_ERROR_CODES: &[&str] = &[
     "CDP_PORT_UNAVAILABLE",
     "CDP_CONNECTION_FAILED",
     "HOSTS_FETCH_FAILED",
+    // page 控制族（P2-B/P2-C）：Input 派发失败 / 工具预算超时 / 页内 eval 失败 /
+    // CDP 发送失败——均为已知运行时故障，不落入 GENERAL 兑底
+    "PAGE_DISPATCH_FAILED",
+    "PAGE_TOOL_TIMEOUT",
+    "PAGE_EVAL_FAILED",
+    "CDP_COMMAND_FAILED",
 ];
 
 /// 预留的「资源已存在」错误码后缀：命中即 → 4，优先级高于 status 分支
@@ -226,6 +232,78 @@ mod tests {
             (
                 "500 HOSTS_FETCH_FAILED",
                 api(500, "HOSTS_FETCH_FAILED"),
+                ExitCode::RUNTIME,
+            ),
+            // —— page 控制族（P2-C）：按 status 归类（404→3 / 409→5 / 400·422→7）——
+            (
+                "404 PAGE_TAB_NOT_FOUND（tab 路由未命中）",
+                api(404, "PAGE_TAB_NOT_FOUND"),
+                ExitCode::NOT_FOUND,
+            ),
+            (
+                "404 PAGE_REF_NOT_FOUND（引用不在上次 snap 表中）",
+                api(404, "PAGE_REF_NOT_FOUND"),
+                ExitCode::NOT_FOUND,
+            ),
+            (
+                "404 PAGE_ELEMENT_NOT_FOUND（选择器未命中）",
+                api(404, "PAGE_ELEMENT_NOT_FOUND"),
+                ExitCode::NOT_FOUND,
+            ),
+            (
+                "409 PAGE_REF_STALE（导航后引用失效，重 snap）",
+                api(409, "PAGE_REF_STALE"),
+                ExitCode::RUNTIME,
+            ),
+            (
+                "409 PAGE_TAB_AMBIGUOUS（多 tab 且未指定）",
+                api(409, "PAGE_TAB_AMBIGUOUS"),
+                ExitCode::RUNTIME,
+            ),
+            (
+                "409 PAGE_ELEMENT_BLOCKED（点击点被遮挡）",
+                api(409, "PAGE_ELEMENT_BLOCKED"),
+                ExitCode::RUNTIME,
+            ),
+            (
+                "409 PAGE_FILL_VALUE_MISMATCH（回读不一致，先观察再重试）",
+                api(409, "PAGE_FILL_VALUE_MISMATCH"),
+                ExitCode::RUNTIME,
+            ),
+            (
+                "409 PAGE_WAIT_TIMEOUT（等待超时）",
+                api(409, "PAGE_WAIT_TIMEOUT"),
+                ExitCode::RUNTIME,
+            ),
+            (
+                "409 PAGE_SERVICE_UNAVAILABLE（实例未运行/无 CDP 端口）",
+                api(409, "PAGE_SERVICE_UNAVAILABLE"),
+                ExitCode::RUNTIME,
+            ),
+            (
+                "400 PAGE_KEY_UNKNOWN（键名不识别）",
+                api(400, "PAGE_KEY_UNKNOWN"),
+                ExitCode::VALIDATION,
+            ),
+            (
+                "422 PAGE_ELEMENT_NOT_VISIBLE（元素不可见）",
+                api(422, "PAGE_ELEMENT_NOT_VISIBLE"),
+                ExitCode::VALIDATION,
+            ),
+            (
+                "422 PAGE_TARGET_NOT_FILLABLE（目标不可编辑）",
+                api(422, "PAGE_TARGET_NOT_FILLABLE"),
+                ExitCode::VALIDATION,
+            ),
+            // —— page 控制族：5xx 运行时码表（非 GENERAL 兑底）——
+            (
+                "500 PAGE_DISPATCH_FAILED（Input 派发失败，附 effect_state）",
+                api(500, "PAGE_DISPATCH_FAILED"),
+                ExitCode::RUNTIME,
+            ),
+            (
+                "504 PAGE_TOOL_TIMEOUT（工具预算超时）",
+                api(504, "PAGE_TOOL_TIMEOUT"),
                 ExitCode::RUNTIME,
             ),
             // —— Api 500：INTERNAL_ERROR / 未知 5xx 兜底 → 1 ——

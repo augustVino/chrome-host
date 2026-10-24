@@ -8,11 +8,12 @@
 
 - [连接配置](#连接配置)
 - [通用行为约定](#通用行为约定)
-- [工具总览（33 个）](#工具总览33-个)
+- [工具总览（39 个）](#工具总览39-个)
 - [内核](#内核)
 - [环境](#环境)
 - [实例](#实例)
 - [标签页](#标签页)
+- [页面控制](#页面控制)
 - [登录态](#登录态)
 - [扩展](#扩展)
 - [典型编排闭环](#典型编排闭环)
@@ -65,15 +66,16 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 4. **内核未装时 `create_instance` 会阻塞于首次下载**（约 150MB）——复杂任务先调 `kernel_status` 预判。
 5. 扩展启停只影响**之后启动的实例**；实例创建非幂等（每次新增一个）。
 
-## 工具总览（33 个）
+## 工具总览（39 个）
 
 | 分组 | 工具 |
 |---|---|
 | 内核（1） | `kernel_status` |
 | 环境（6） | `list_environments` · `create_environment` · `delete_environment` · `set_keep_alive` · `stop_all_for_environment` · `activity` |
-| 实例（10） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
+| 实例（9） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
 | 常驻诊断（5） | `get_diagnostics` · `get_console` · `get_network` · `get_screenshot` · `get_har` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
+| 页面控制（6） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_wait` · `page_dialogs` |
 | 登录态（2） | `login_profile`（action: get / capture / reset） · `session_status` |
 | 扩展（7） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` · `get_extension_config` · `set_extension_config` |
 
@@ -124,7 +126,32 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | `open_tab` | `instanceId`, `url`（须含协议） | 新开标签页并导航 |
 | `navigate` | `instanceId`, `tabId`, `url` | 导航既有标签页（new+close 组合近似：丢失旧页历史） |
 
-> MCP 不直接返回页面内容；读页面走 `get_cdp` 拿到 WebSocket URL 后由客户端 CDP 能力（如 Runtime.evaluate）完成，或结合 `list_tabs` 的 title/url 做轻量判断。
+> MCP 读页面内容优先 `page_snap`（AX 文本树 + @eN 引用）；需要自由 CDP 能力
+> （Runtime.evaluate 等）时走 `get_cdp` 拿 WebSocket URL 由客户端连接，或结合
+> `list_tabs` 的 title/url 做轻量判断。
+
+## 页面控制
+
+实例级常驻连接上的页面操作面（与 CLI `page` 命令族、REST `/instances/{id}/page/*`
+同源）。操作循环：`page_snap` 拿 @eN 引用 → `page_click`/`page_fill`/`page_press`
+用引用操作 → 页面变化后重新 `page_snap`（导航后引用整表失效 → 409 `PAGE_REF_STALE`，
+重 snap 而非对旧引用重试）。对话框（alert/confirm/prompt/beforeunload）自动
+accept，命令期间新弹的附在成功响应 `dialogs_seen`，历史查 `page_dialogs`。
+
+| 工具 | 输入 | 说明 |
+|---|---|---|
+| `page_snap` | `instanceId`；可选 `tab` | AX 树快照：精简文本树（@e1..@eN 内联）+ `refs_count` + `generation` |
+| `page_click` | `instanceId`, `target`；可选 `tab` | 原生输入点击；target 支持 @eN 引用（导航后失效需重新 snap）与 CSS 选择器 |
+| `page_fill` | `instanceId`, `target`, `value`；可选 `tab` | 聚焦→清空→输入→回读校验；空 value = 仅清空 |
+| `page_press` | `instanceId`, `key`；可选 `target`, `tab` | 三段键盘事件（组合键如 Control+A）；target 先聚焦 |
+| `page_wait` | `instanceId`, `selector`；可选 `state`, `timeout`, `tab` | 轮询等待（250ms）；timeout 如 `"10s"`（裸数字 = ms），缺省 10s |
+| `page_dialogs` | `instanceId`；可选 `tab`, `since` | 已自动应答的对话框日志（cursor + entries；since 游标增量拉取，缓冲 32 条） |
+
+`tab` = targetId 或唯一前缀（`list_tabs` 获得）；省略 = 唯一页面标签，多标签时
+409 `PAGE_TAB_AMBIGUOUS`。错误处置看 code 分支：`PAGE_REF_STALE`/
+`PAGE_REF_NOT_FOUND` 重 snap；`PAGE_ELEMENT_BLOCKED` 先处理遮挡；
+`PAGE_FILL_VALUE_MISMATCH` 写入可能已部分生效，先观察再决定；
+`PAGE_DISPATCH_FAILED` 附 effect_state（none 可重试 / unknown 禁盲目重试）。
 
 ## 登录态
 

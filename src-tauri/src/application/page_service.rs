@@ -30,10 +30,8 @@
 //!   PAGE_TAB_AMBIGUOUS / PAGE_TOOL_TIMEOUT 为本层新增：P2-A 错误表未含 TS 的
 //!   focus_failed / fill_focus_lost（domain 已冻结，编排在 application 层补齐）。
 
-// P2-C（api 层接线）尚未落地，本模块当前唯一消费者是文件内测试；bin crate 下
-// pub 不豁免 dead_code。接线后删除本 allow（同 domain/page_control.rs）。
-#![allow(dead_code)]
-
+// P2-C 已接线（api/pages.rs + api/mcp.rs）：仅测试注入构造 with_connector
+// 仍无生产调用方，逐项 allow（不再整模块豁免，防新死代码静默滑入）。
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -145,7 +143,9 @@ impl PageService {
         Self::with_connector(repo, production_connector())
     }
 
-    /// 注入连接工厂的构造（测试用 fake CDP，不依赖真 Chrome）。
+    /// 注入连接工厂的构造（测试用 fake CDP，不依赖真 Chrome）。生产构造走
+    /// [`PageService::new`]；本方法仅文件内测试调用，dead_code 逐项豁免。
+    #[allow(dead_code)]
     pub fn with_connector(repo: Arc<InstanceRepository>, connector: Connector) -> Self {
         PageService {
             watched: Arc::new(Mutex::new(HashMap::new())),

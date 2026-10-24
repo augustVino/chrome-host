@@ -793,4 +793,107 @@ impl AgentClient {
     pub fn kernel_cancel(&self) -> Result<KernelCancelResult, CliError> {
         Self::decode(self.send(Method::POST, "/api/v1/kernel/cancel", None, false))
     }
+
+    // -----------------------------------------------------------------------
+    // page 命令组（P2-C）
+    // -----------------------------------------------------------------------
+
+    /// page 命令族统一 **long = true（无总超时）**，why：服务端有自己的预算
+    /// （工具 30s；wait = 用户 timeout + 5s，可远超 30s），客户端 30s 总超时
+    /// 与服务端预算赛跑会在边界把 PAGE_TOOL_TIMEOUT 误判成传输层超时
+    /// （reqwest 总超时归类 Unreachable → exit 8「应用未运行」，误导）；
+    /// 连接超时 3s 仍保护真正的「应用未运行」场景。
+    ///
+    /// tab 缺省（None）时服务端把空串当作「匹配全部 tab 的前缀」：唯一 page tab
+    /// 直接解析；多 tab → 409 PAGE_TAB_AMBIGUOUS（需显式指定）。响应为服务端
+    /// 原样 JSON（result/instanceId/targetId，snap 另含 text/refs_count/generation）。
+    fn page_path(id: &str, tool: &str) -> String {
+        format!("/api/v1/instances/{id}/page/{tool}")
+    }
+
+    /// POST /api/v1/instances/{id}/page/snap —— body `{tab?}`
+    pub fn page_snap(&self, id: &str, tab: Option<&str>) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "snap"), Some(body), true))
+    }
+
+    /// POST /api/v1/instances/{id}/page/click —— body `{target, tab?}`
+    pub fn page_click(
+        &self,
+        id: &str,
+        target: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "click"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/fill —— body `{target, value, tab?}`
+    /// （value 空串 = 仅清空，服务端语义）
+    pub fn page_fill(
+        &self,
+        id: &str,
+        target: &str,
+        value: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "value": value, "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "fill"), Some(body), true))
+    }
+
+    /// POST /api/v1/instances/{id}/page/press —— body `{key, target?, tab?}`
+    pub fn page_press(
+        &self,
+        id: &str,
+        key: &str,
+        target: Option<&str>,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "key": key, "target": target, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "press"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/wait —— body `{selector, state?, timeout?, tab?}`
+    /// （timeout 为时长字符串："10s"/"250ms"/裸数字=ms，服务端解析，CLI 不做本地解析）
+    pub fn page_wait(
+        &self,
+        id: &str,
+        selector: &str,
+        state: Option<&str>,
+        timeout: Option<&str>,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "selector": selector, "state": state, "timeout": timeout, "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "wait"), Some(body), true))
+    }
+
+    /// GET /api/v1/instances/{id}/page/dialogs —— query `tab?&since=`（GET 查询面）
+    pub fn page_dialogs(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+        since: Option<u64>,
+    ) -> Result<serde_json::Value, CliError> {
+        let query = join_query([
+            tab.map(|t| format!("tab={t}")),
+            since.map(|n| format!("since={n}")),
+            None,
+        ]);
+        Self::decode(self.send(
+            Method::GET,
+            &format!("{}{query}", Self::page_path(id, "dialogs")),
+            None,
+            true,
+        ))
+    }
 }

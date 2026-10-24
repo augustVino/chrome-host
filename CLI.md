@@ -16,6 +16,7 @@
 - [命令参考](#命令参考)
   - [env — 环境管理](#env--环境管理)
   - [instance — 实例管理](#instance--实例管理)
+  - [page — 页面控制](#page--页面控制)
   - [extension — 扩展管理](#extension--扩展管理)
   - [login-profile — 登录态生命周期](#login-profile--登录态生命周期)
   - [settings — 全局设置](#settings--全局设置)
@@ -120,11 +121,11 @@ env_d4285b49-...
 | 0 | 成功 | — |
 | 1 | 一般错误 | 响应协议破坏、未知 5xx、doctor 存在失败检查项 |
 | 2 | 参数错误 | clap 解析失败、`--json --quiet` 互斥、非 TTY 危险操作缺 `--yes`、本地校验失败（如 `instance open` 的 URL 缺协议） |
-| 3 | 资源不存在 | `ENVIRONMENT_NOT_FOUND` / `INSTANCE_NOT_FOUND` / `EXTENSION_NOT_FOUND` 等 404 族 |
+| 3 | 资源不存在 | `ENVIRONMENT_NOT_FOUND` / `INSTANCE_NOT_FOUND` / `EXTENSION_NOT_FOUND` 等 404 族（含 page 族 `PAGE_TAB_NOT_FOUND` / `PAGE_REF_NOT_FOUND` / `PAGE_ELEMENT_NOT_FOUND`） |
 | 4 | 资源已存在 | 预留（服务端当前无此码，映射规则先行） |
-| 5 | 运行时状态冲突 / 运行时错误 | 409 族（`INSTANCE_ALREADY_RUNNING`、`INSTANCE_NOT_RUNNING`、`PROFILE_IN_USE`、`ENVIRONMENT_HAS_RUNNING_INSTANCES`）+ 500 运行时族（`KERNEL_NOT_READY`、`INSTANCE_START_FAILED`、`CDP_PORT_UNAVAILABLE`、`CDP_CONNECTION_FAILED`、`HOSTS_FETCH_FAILED`） |
+| 5 | 运行时状态冲突 / 运行时错误 | 409 族（`INSTANCE_ALREADY_RUNNING`、`INSTANCE_NOT_RUNNING`、`PROFILE_IN_USE`、`ENVIRONMENT_HAS_RUNNING_INSTANCES`、page 族 `PAGE_REF_STALE` / `PAGE_TAB_AMBIGUOUS` / `PAGE_WAIT_TIMEOUT` 等）+ 500/504 运行时族（`KERNEL_NOT_READY`、`INSTANCE_START_FAILED`、`CDP_PORT_UNAVAILABLE`、`CDP_CONNECTION_FAILED`、`HOSTS_FETCH_FAILED`、`PAGE_DISPATCH_FAILED`、`PAGE_TOOL_TIMEOUT`） |
 | 6 | 权限拒绝 | `EXTENSION_SYSTEM_LOCKED`（内置扩展锁定） |
-| 7 | 请求校验失败 | 400 族（`INVALID_REQUEST`、`HOSTS_SOURCE_INVALID` 等） |
+| 7 | 请求校验失败 | 400 族（`INVALID_REQUEST`、`HOSTS_SOURCE_INVALID` 等）与 422 族（page 族 `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_TARGET_NOT_FILLABLE`） |
 | 8 | 服务不可达 | Agent API 连接拒绝 / 连接超时（桌面应用未运行） |
 | 9 | CLI 侧等待超时（`runtime install --timeout` 轮询超时） | 下载未在 `--timeout`（缺省 900s，0 = 无限等待）内完成；CLI 停止等待，服务端下载仍在后台进行，可用 `runtime install --cancel` 中止 |
 | 10 | 未授权（401 `UNAUTHORIZED`） | 远程访问令牌缺失/错误。**隧道与桌面应用均在线**（仅凭证问题）——与 exit 8（不可达）构成三态诊断；0–9 冻结契约的追加项 |
@@ -201,6 +202,44 @@ chrome-host env delete <id> --yes
 | `instance delete <ID> [--yes]` | 删除实例（含 profile 数据）。运行中实例：`--yes` 自动 stop → delete；stop 失败则原样报错 |
 
 实例状态机：`starting → running → stopped`，异常路径 `error / crashed`。读路径全部经过对账（以真实进程为准，不轻信数据库）。
+
+### page — 页面控制
+
+页面操作面（P2-C；仅运行中实例，否则 409 exit 5）。操作循环：`page snap` 拿
+@eN 引用 → `page click/fill/press --target` 用引用操作 → 页面变化后重新 `snap`
+（导航后引用整表失效，报 `PAGE_REF_STALE` / `PAGE_REF_NOT_FOUND` → **重 snap，
+不要对旧引用重试**）。对话框（alert/confirm/prompt/beforeunload）会被自动
+accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示行，历史用
+`page dialogs` 查。
+
+| 命令 | 说明 |
+|---|---|
+| `page snap <ID> [TAB_ID]` | AX 树文本快照（可交互节点内联 @e1..@eN 引用）+ 元信息行（targetId/refs/generation）；`--quiet` 输出 targetId |
+| `page click <ID> <sel\|@eN> [--tab T]` | 原生输入点击（三段鼠标事件，非 el.click()）；selector 路径带可见性/遮挡校验 |
+| `page fill <ID> <sel\|@eN> <value> [--tab T]` | 聚焦→全选清空→输入→回读校验；空 value = 仅清空；不可编辑 → 422 exit 7 |
+| `page press <ID> <key> [--target <sel\|@eN>] [--tab T]` | 三段键盘事件；key 支持 Enter/Tab/单字符/组合键（`Control+A`）；`--target` 先聚焦 |
+| `page wait <ID> <selector> [--state V] [--timeout 10s] [--tab T]` | 轮询等待（250ms 间隔）；state = visible（缺省）/hidden/attached/detached；超时 → 409 exit 5 |
+| `page dialogs <ID> [--tab T] [--since N]` | 已自动应答的对话框日志（SEQ/TYPE/MESSAGE 表 + cursor 行；`--since` 增量拉取） |
+
+`tab` 取值 = targetId 或唯一前缀（`instance tabs` 获得）；省略 = 唯一页面标签
+直接解析，多标签 → 409 `PAGE_TAB_AMBIGUOUS`（exit 5，需显式指定）。`--timeout`
+接受 `10s` / `250ms` / 裸数字（= 毫秒），缺省 10s。
+
+错误看 `[PAGE_XXX]` 前缀分支处置（不解析文案）：`ref_stale`/`ref_not_found` 重
+snap；`element_blocked` 先处理遮挡；`element_not_visible`/`target_not_fillable`
+检查页面状态；`fill_value_mismatch` 写入可能已部分生效，先观察再决定；
+`dispatch_failed` 附 effect_state（`none`=未发出可重试 / `unknown`=已发出禁盲目重试）；
+`tool_timeout` 连接停滞或页面无响应。
+
+```bash
+# 典型循环：snap → 引用操作 → 变化后重 snap
+chrome-host page snap ins_xxx
+chrome-host page click ins_xxx @e3
+chrome-host page fill ins_xxx '#search input' 'hello world'
+chrome-host page press ins_xxx Enter --target @e2
+chrome-host page wait ins_xxx '.result-item' --state visible --timeout 15s
+chrome-host page dialogs ins_xxx --since 3
+```
 
 ### extension — 扩展管理
 

@@ -1,7 +1,7 @@
 //! clap 命令树根 + 全局参数 + 危险操作确认流。
 //!
-//! 子命令树：env / instance / extension / login-profile / settings / runtime 六组，
-//! 外加 status / doctor（实现分布见 cli/ 各文件）。
+//! 子命令树：env / instance / page / extension / login-profile / settings / runtime
+//! 七组，外加 status / doctor（实现分布见 cli/ 各文件）。
 //! 全局参数封装在 [`GlobalArgs`]，子命令经 `#[command(flatten)]` 复用同一结构，
 //! 保证 `--json` / `--quiet` / `--verbose` 等语义在所有命令上只定义一次。
 
@@ -22,6 +22,7 @@ pub mod env;
 pub mod extension;
 pub mod instance;
 pub mod login_profile;
+pub mod page;
 pub mod runtime;
 pub mod settings;
 
@@ -50,8 +51,8 @@ pub struct Cli {
     /// 全局参数：flatten 在根上，位于子命令名之前。
     #[command(flatten)]
     pub globals: GlobalArgs,
-    /// 子命令树：env / instance / extension / login-profile / settings / runtime
-    /// 六组 + status / doctor。
+    /// 子命令树：env / instance / page / extension / login-profile / settings /
+    /// runtime 七组 + status / doctor。
     /// Option：`chrome-host --json` 这类「只有全局 flag」的调用落入 None，
     /// 由 main.rs dispatch 按用法错误（exit 2）处理。
     #[command(subcommand)]
@@ -73,6 +74,12 @@ pub enum Commands {
         /// instance 子命令（list/get/create/start/stop/restart/open/cdp/delete）
         #[command(subcommand)]
         command: instance::InstanceCommands,
+    },
+    /// 页面控制（snap 拿 @eN 引用 → click/fill/press 操作 → 变化后重 snap）
+    Page {
+        /// page 子命令（snap/click/fill/press/wait/dialogs）
+        #[command(subcommand)]
+        command: page::PageCommands,
     },
     /// 扩展管理
     Extension {

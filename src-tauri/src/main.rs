@@ -18,6 +18,7 @@ use application::extension_service::ExtensionService;
 use application::health_service::HealthService;
 use application::instance_service::InstanceService;
 use application::keep_alive::KeepAliveWatcher;
+use application::page_service::PageService;
 use application::profile_service::ProfileService;
 use application::activity::Activity;
 use application::reconciler::Reconciler;
@@ -174,6 +175,9 @@ fn main() {
                 ins_repo.clone(),
                 app_version.clone(),
             ));
+            // page 控制（P2-C）：实例级常驻 CDP 连接 + per-tab ref/对话框状态。
+            // 连接惰性建立（首次 page 命令时），无构造期副作用
+            let page = Arc::new(PageService::new(ins_repo.clone()));
             let health = Arc::new(HealthService::new(
                 pool.clone(),
                 kernel.clone(),
@@ -319,6 +323,7 @@ fn main() {
                 settings_service,
                 extension_service,
                 diagnostics,
+                page,
                 activity,
                 health,
                 kernel,

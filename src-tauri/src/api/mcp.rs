@@ -223,6 +223,93 @@ struct SetExtensionEnabledArgs {
     enabled: bool,
 }
 
+// ---------- page 控制参数（P2-C，与 REST /instances/{id}/page/* 对齐） ----------
+
+/// tab 路由参数的统一描述：targetId 或唯一前缀；省略 = 唯一 page tab
+/// （多 tab 时 409 PAGE_TAB_AMBIGUOUS）。targetId 由 list_tabs 获得。
+const TAB_ARG_DESC: &str =
+    "目标标签页（targetId 或唯一前缀，由 list_tabs 获得）；省略 = 唯一页面标签，多标签时需显式指定";
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageSnapArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageClickArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "点击目标：@eN 引用（上次 page_snap 产生，导航后失效需重新 snap）或 CSS 选择器"
+    )]
+    target: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageFillArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "填写目标：@eN 引用（上次 page_snap 产生，导航后失效需重新 snap）或 CSS 选择器"
+    )]
+    target: String,
+    #[schemars(description = "填入文本；空串 = 仅清空")]
+    value: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PagePressArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "键名：Enter/Tab/Escape/单字符/组合键（Control+A、Meta+V 等）；未知 → 400 PAGE_KEY_UNKNOWN"
+    )]
+    key: String,
+    #[schemars(description = "可选聚焦目标：@eN 引用或 CSS 选择器（先 focus 再按键）")]
+    target: Option<String>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageWaitArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = "CSS 选择器")]
+    selector: String,
+    #[schemars(description = "等待状态：visible（缺省）/ hidden / attached / detached")]
+    state: Option<String>,
+    #[schemars(description = "超时时长字符串：如 \"10s\"、\"250ms\"，裸数字 = 毫秒；缺省 10s")]
+    timeout: Option<String>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageDialogsArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+    #[schemars(
+        description = "游标：只返回 sequence 严格大于 N 的条目；缺省 0 = 全部（缓冲上限 32 条）"
+    )]
+    since: Option<u64>,
+}
+
 // ---------- MCP Server ----------
 
 #[derive(Clone)]
@@ -633,6 +720,108 @@ impl ChromeHostMcp {
                 &body,
             )
         })
+    }
+
+    // ── 页面控制（P2-C）───────────────────────────────────────
+
+    #[tool(
+        description = "可访问性树快照：返回精简文本树（可交互节点带 @e1..@eN 引用，内联 role/name/value）+ refs_count + generation。操作循环的起点：snap → 用 @eN 引用 click/fill/press → 页面变化后重新 snap（导航会使全部引用失效 → 409 PAGE_REF_STALE，需重 snap 而非重试）"
+    )]
+    async fn page_snap(
+        &self,
+        Parameters(a): Parameters<PageSnapArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .snap(&a.instance_id, a.tab.as_deref().unwrap_or(""))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "原生输入点击（mouseMoved→mousePressed→mouseReleased，非 el.click()）：target 支持 @eN 引用（上次 page_snap 产生，导航后失效需重新 snap）与 CSS 选择器两种形态；selector 路径带可见性/遮挡校验（422 PAGE_ELEMENT_NOT_VISIBLE / 409 PAGE_ELEMENT_BLOCKED）。实例须运行中（409 PAGE_SERVICE_UNAVAILABLE）"
+    )]
+    async fn page_click(
+        &self,
+        Parameters(a): Parameters<PageClickArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .click(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.target)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "填写输入框：target 支持 @eN 引用（上次 page_snap 产生，导航后失效需重新 snap）与 CSS 选择器；聚焦→全选清空→Input.insertText→回读校验，value 空串 = 仅清空。不可编辑 → 422 PAGE_TARGET_NOT_FILLABLE；回读不一致 → 409 PAGE_FILL_VALUE_MISMATCH（写入可能已部分生效，先观察再决定）"
+    )]
+    async fn page_fill(
+        &self,
+        Parameters(a): Parameters<PageFillArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.fill(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.target,
+                &a.value,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "按键（rawKeyDown/char/keyUp 三段，IME 安全）：key 支持 Enter/Tab/Escape/Backspace/Delete/Home/End/PageUp/PageDown/ArrowUp…/Space/F1-F12、单字符、组合键（Control+A / Meta+V / Shift+ArrowDown）；未知键名 → 400 PAGE_KEY_UNKNOWN。可选 target 先聚焦（@eN 引用或 CSS 选择器）再按键"
+    )]
+    async fn page_press(
+        &self,
+        Parameters(a): Parameters<PagePressArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.press(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.key,
+                a.target.as_deref(),
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "轮询等待元素状态（250ms 间隔）：state = visible（缺省）/ hidden / attached / detached，timeout 时长字符串（如 \"10s\"、\"250ms\"，裸数字 = 毫秒，缺省 10s）。超时 → 409 PAGE_WAIT_TIMEOUT（附最后观察态与轮询数）"
+    )]
+    async fn page_wait(
+        &self,
+        Parameters(a): Parameters<PageWaitArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.wait(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.selector,
+                a.state.as_deref(),
+                a.timeout.as_deref(),
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "查询已自动应答的对话框日志（alert/confirm/prompt/beforeunload 均无条件 accept，prompt 提交默认文本）：返回 cursor + entries（sequence/type/message/handled）；since 游标增量拉取，缓冲上限 32 条。命令期间新弹的对话框会附在成功响应的 dialogs_seen 字段"
+    )]
+    async fn page_dialogs(
+        &self,
+        Parameters(a): Parameters<PageDialogsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .dialogs(&a.instance_id, a.tab.as_deref().unwrap_or(""), a.since)
+        })
+        .await
     }
 }
 

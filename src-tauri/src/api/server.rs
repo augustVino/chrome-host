@@ -33,6 +33,7 @@ use crate::application::environment_service::EnvironmentService;
 use crate::application::extension_service::ExtensionService;
 use crate::application::health_service::HealthService;
 use crate::application::instance_service::InstanceService;
+use crate::application::page_service::PageService;
 use crate::application::profile_service::ProfileService;
 use crate::application::settings_service::SettingsService;
 use crate::application::session_service::SessionService;
@@ -54,6 +55,8 @@ pub struct ApiState {
     pub extension_service: Arc<ExtensionService>,
     /// 常驻诊断（M6）：console/network/screenshot/har 查询面
     pub diagnostics: Arc<DiagnosticsService>,
+    /// page 控制（P2-C）：snap/click/fill/press/wait/dialogs 工具面
+    pub page: Arc<PageService>,
     pub activity: Arc<Activity>,
     pub health: Arc<HealthService>,
     pub kernel: Arc<KernelManager>,
@@ -149,6 +152,16 @@ fn routes(state: ApiState) -> Router {
             get(crate::api::instances::tabs).post(crate::api::instances::open_tab),
         )
         .route("/api/v1/instances/{id}/navigate", post(crate::api::instances::navigate))
+        // page 控制命令族（P2-C）：handler 薄透传，语义全在 page_service
+        .route("/api/v1/instances/{id}/page/snap", post(crate::api::pages::snap))
+        .route("/api/v1/instances/{id}/page/click", post(crate::api::pages::click))
+        .route("/api/v1/instances/{id}/page/fill", post(crate::api::pages::fill))
+        .route("/api/v1/instances/{id}/page/press", post(crate::api::pages::press))
+        .route("/api/v1/instances/{id}/page/wait", post(crate::api::pages::wait))
+        .route(
+            "/api/v1/instances/{id}/page/dialogs",
+            get(crate::api::pages::dialogs),
+        )
         .route(
             "/api/v1/login-profiles",
             get(crate::api::login_profiles::list),

@@ -9,6 +9,7 @@ pub mod instances;
 pub mod kernel;
 pub mod login_profiles;
 pub mod mcp;
+pub mod pages;
 pub mod remote_access;
 pub mod settings;
 pub mod server;

@@ -37,7 +37,7 @@
 { "error": { "code": "INSTANCE_NOT_RUNNING", "message": "实例 ins_xxx 未运行" } }
 ```
 
-状态码语义：`400` 请求体校验失败 · `403` 权限（内置扩展锁定）· `404` 资源不存在 · `409` 运行时状态冲突 · `500` 运行时错误。完整错误码见[错误码总表](#错误码总表)。
+状态码语义：`400` 请求体校验失败 · `403` 权限（内置扩展锁定）· `404` 资源不存在 · `409` 运行时状态冲突 · `422` 请求语义校验失败（page 族可见性/可编辑性）· `500` 运行时错误 · `504` 工具预算超时（page 族）。完整错误码见[错误码总表](#错误码总表)。
 
 ## Environments — 环境
 
@@ -211,6 +211,58 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 （隐藏页面可能拍到空白帧，与浏览器行为一致）。
 
 拿到 `webSocketUrl` 后可直接接入 Playwright（`connectOverCDP`）/ Puppeteer / chrome-remote-interface。
+
+### 页面控制（Page Control）
+
+实例级常驻 CDP 连接上的页面操作面：`snap` 产生 @eN 引用，`click`/`fill`/`press`
+消费引用或 CSS 选择器，`wait` 轮询等待，`dialogs` 读自动应答的对话框日志。连接
+惰性建立（实例首次 page 命令时），与常驻诊断连接互不干扰；仅对运行中实例可用
+（否则 `409 PAGE_SERVICE_UNAVAILABLE`）。
+
+| 端点 | 说明 |
+|---|---|
+| `POST /api/v1/instances/{id}/page/snap` | AX 树快照 + @eN ref 整表替换。body `{ "tab?": ... }` |
+| `POST /api/v1/instances/{id}/page/click` | 原生输入点击（三段鼠标事件，非 `el.click()`）。body `{ "target", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/fill` | 聚焦→全选清空→insertText→回读校验。body `{ "target", "value", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/press` | 键盘三段序列。body `{ "key", "target?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/wait` | 轮询等待元素状态（250ms 间隔）。body `{ "selector", "state?", "timeout?", "tab?" }` |
+| `GET /api/v1/instances/{id}/page/dialogs` | 已自动应答的对话框日志。query `tab?&since=` |
+
+参数语义：
+
+- **`tab`**：targetId 或唯一前缀（由 `GET .../tabs` 获得）；省略 = 唯一 `type:page`
+  标签时直接解析，多标签 → `409 PAGE_TAB_AMBIGUOUS`；未命中 → `404 PAGE_TAB_NOT_FOUND`。
+- **`target`**：`@eN` 引用（上次 snap 产生；导航/文档替换后整表失效 → `PAGE_REF_STALE`，
+  需重新 snap 而非对旧引用重试）或 CSS 选择器两种形态。
+- **`state`**：`visible`（缺省）/ `hidden` / `attached` / `detached`；非法 → `400 INVALID_REQUEST`。
+- **`timeout`**：时长字符串（`"10s"` / `"250ms"`，裸数字 = 毫秒），缺省 10s；工具级
+  预算 = timeout + 5s。
+- **`since`**：对话框游标，只返回 `sequence` 严格大于 N 的条目；缓冲上限 32 条。
+
+```json
+// POST .../page/snap 响应（蛇形键对齐 TS wire 字段）
+{ "instanceId": "ins_...", "targetId": "ABC123",
+  "text": "[WebArea] Example Domain\n  @e1 [link] More information...",
+  "refs_count": 1, "generation": 1 }
+
+// POST .../page/click 响应（fill/press/wait 同为 result 单行形态）
+{ "result": "Clicked <BUTTON> \"Save\" (native input @150,130)",
+  "instanceId": "ins_...", "targetId": "ABC123" }
+
+// 命令期间自动应答了对话框时，成功响应附 dialogs_seen（snake_case 条目，同 dialogs 端点）
+{ "result": "Pressed Enter", "instanceId": "ins_...", "targetId": "ABC123",
+  "dialogs_seen": [ { "tab_id": "ABC123", "type": "prompt", "message": "名称?",
+    "handled": "accepted", "sequence": 1, "default_prompt": "Bob" } ] }
+
+// GET .../page/dialogs?since=1 响应
+{ "cursor": 2, "entries": [ { "tab_id": "ABC123", "type": "alert", "message": "m2",
+    "handled": "accepted", "sequence": 2 } ],
+  "instanceId": "ins_...", "targetId": "ABC123" }
+```
+
+对话框接管：alert/confirm/prompt/beforeunload 一律自动 `accept: true`（prompt 提交
+默认文本，beforeunload = 放行离开）；应答成功才入档，缓冲按 tab 隔离、上限 32 条
+FIFO。响应为服务层原样（与 console/network 等端点一致，无额外包裹层）。
 
 ## Extensions — 扩展
 
@@ -391,6 +443,16 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `PROFILE_IN_USE` | 快照操作进行中，或遗留登录浏览器（旧版本 launch 遗留）运行中 |
 | 409 | `SESSION_CAPTURE_FAILED` | 从实例捕获登录态失败（实例目录无导出文件，或导出 Cookie 为空） |
 | 404 | `SESSION_GENERATION_NOT_FOUND` | session/restore 目标历史代不存在 |
+| 400 | `PAGE_KEY_UNKNOWN` | page press 键名不认识（支持命名键/单字符/组合键） |
+| 404 | `PAGE_TAB_NOT_FOUND` / `PAGE_REF_NOT_FOUND` / `PAGE_ELEMENT_NOT_FOUND` | page 族：tab 路由未命中 / @eN 引用不在上次 snap 表 / 选择器未命中 |
+| 409 | `PAGE_TAB_AMBIGUOUS` / `PAGE_SERVICE_UNAVAILABLE` | page 族：tab 前缀多匹配（含省略 tab 且多页面标签）/ 实例未运行或无 CDP 端口 |
+| 409 | `PAGE_REF_STALE` / `PAGE_TARGET_MOVED` | @eN 引用已因导航/文档替换失效（重 snap）/ 引用节点不再可解析 |
+| 409 | `PAGE_ELEMENT_BLOCKED` / `PAGE_FILL_VALUE_MISMATCH` / `PAGE_WAIT_TIMEOUT` | 点击点被遮挡 / fill 回读不一致（写入可能已部分生效，先观察再决定）/ 等待超时 |
+| 409 | `PAGE_FOCUS_FAILED` / `PAGE_FILL_FOCUS_LOST` | page press/fill 焦点失败 / 页面在 fill 过程中抢走焦点 |
+| 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / fill 目标不可编辑 |
+| 500 | `PAGE_DISPATCH_FAILED` | Input 派发失败（message 附 effect_state：`none`=未发出可重试 / `unknown`=已发出禁盲目重试） |
+| 500 | `PAGE_EVAL_FAILED` / `CDP_COMMAND_FAILED` | page 工具页内 eval 失败 / CDP 发送失败 |
+| 504 | `PAGE_TOOL_TIMEOUT` | page 工具超出预算（常规 30s；wait = 用户 timeout + 5s） |
 | 409 | `CDP_PORT_UNAVAILABLE` | 实例 start 时 CDP 端口被外部进程占用 |
 | 500 | `CDP_PORT_UNAVAILABLE` | 创建实例时端口窗口耗尽（9222–9421 全部不可用） |
 | 500 | `KERNEL_NOT_READY` | 内核未就绪（未安装/下载中） |
