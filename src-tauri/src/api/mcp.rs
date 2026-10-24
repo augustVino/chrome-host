@@ -225,10 +225,10 @@ struct SetExtensionEnabledArgs {
 
 // ---------- page 控制参数（P2-C，与 REST /instances/{id}/page/* 对齐） ----------
 
-/// tab 路由参数的统一描述：targetId 或唯一前缀；省略 = 唯一 page tab
-/// （多 tab 时 409 PAGE_TAB_AMBIGUOUS）。targetId 由 list_tabs 获得。
+/// tab 路由参数的统一描述：targetId 或唯一前缀；省略 = 最近打开（attach）
+/// 的页面标签（活跃 tab 近似，P2-F F1）。targetId 由 list_tabs 获得。
 const TAB_ARG_DESC: &str =
-    "目标标签页（targetId 或唯一前缀，由 list_tabs 获得）；省略 = 唯一页面标签，多标签时需显式指定";
+    "目标标签页（targetId 或唯一前缀，由 list_tabs 获得）；省略 = 最近打开的页面标签";
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]

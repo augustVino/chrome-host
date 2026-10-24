@@ -5,9 +5,9 @@
 //! （P2-B）。响应体为 service 返回原样（与 console/network/screenshot 等
 //! 既有端点一致，无额外包裹层）。
 //!
-//! `tab` 缺省语义（service 侧 `resolve_target("")`）：实例只有一个 page tab 时
-//! 直接解析到它；多 tab 时 409 `PAGE_TAB_AMBIGUOUS`（前缀 "" 匹配全部），
-//! 需显式指定 tab。
+//! `tab` 缺省语义（service 侧 `resolve_target("")`，P2-F F1）：取最近
+//! 打开（attach）的页面标签（活跃 tab 近似——CDP 无 browser 级 active tab
+//! 直查 API）；显式前缀仍是无匹配 404 / 多匹配 409。
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -21,7 +21,7 @@ use super::server::ApiState;
 /// POST /api/v1/instances/{id}/page/snap —— AX 树快照 + @eN ref 整表替换。
 #[derive(Deserialize)]
 pub struct SnapBody {
-    /// 目标 tab（targetId 或唯一前缀；缺省 = 唯一 page tab，多 tab 时 409）
+    /// 目标 tab（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
     pub tab: Option<String>,
 }
 

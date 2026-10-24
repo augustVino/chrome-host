@@ -11,7 +11,8 @@
 //!   None，与 diagnostics 同信号）时清理登记，下一条命令重建。
 //! - **targetId 路由**（决策 2）：autoAttach 的 attachedToTarget 事件维护
 //!   `targetId → sessionId` 映射；命令入参的 targetId 支持唯一前缀（对齐 TS
-//!   resolvePrefix：无匹配 404 / 多匹配 409）。
+//!   resolvePrefix：无匹配 404 / 多匹配 409）。空 target 不参与前缀匹配——
+//!   取**最近 attach 的 page target**（活跃 tab 近似，P2-F F1）。
 //! - **per-instance 命令串行**（决策 3）：一条 tokio Mutex 串行整实例的全部
 //!   page 命令（含建连），正确性优先；并发需求出现后可演进为 per-tab 锁。
 //! - **per-tab RefStore / DialogBuffer**（决策 4）：snap 整表替换，导航/文档
@@ -21,9 +22,12 @@
 //! 测试注入 fake 即可覆盖全部编排路径，不依赖真 Chrome。
 //!
 //! 与 TS 的已知偏差（详见各处注释及任务报告）：
-//! - 对话框应答与命令共用一条连接，且 Rust 侧 send 串行（&mut self）——对话框
-//!   恰逢命令 in-flight 时，应答要等该命令超时（≤15s）释放锁后才能发出；TS
-//!   客户端允许并发 in-flight 无此延迟。ws.rs 支持 &self 并发 send 后可消除。
+//! - 对话框应答走**独立一次性短连接**（P2-F F2，真机冒烟修复）：主连接
+//!   Rust 侧 send 串行（&mut self），工具命令 in-flight 期间（如 click 卡在
+//!   被 alert 阻塞的页面直至 15s 超时）走主连接的应答等锁、错过对话框黄金
+//!   窗口，迟到的应答被 Chrome 以 -32602 "No dialog is showing" 拒绝、缓冲
+//!   零记录。on_dialog_opening 现经注入 Connector 另起短连接 handle（连上
+//!   → handle → drop），主连接事件流不受影响；ws.rs 未动。
 //! - dialogs_seen 仅附在成功响应上（TS 对错误响应也附；AppError 无扩展字段，
 //!   P2-C 若需可扩展错误负载）。
 //! - focus 类错误码（PAGE_FOCUS_FAILED / PAGE_FILL_FOCUS_LOST）与
@@ -100,6 +104,59 @@ fn tool_timeout(tool: &str, budget: Duration) -> AppError {
 // 1. 实例级 Watched：连接槽 + per-tab 状态
 // ============================================================================
 
+/// per-instance page tab 表：`(targetId, sessionId)` 按 attach 先后保序。
+///
+/// P2-F F1（真机冒烟修复）：此前是裸 HashMap，空 target 按前缀 "" 匹配全部
+/// → 多 tab 必 409 `PAGE_TAB_AMBIGUOUS`。设计语义是缺省 = 活跃 tab，但 CDP
+/// 无 browser 级「active tab」直查 API，取近似：**最近 attach 的 page
+/// target**（重 attach 刷新 recency；detach 后回退次新）。表长 = 标签数
+/// （个位数），线性扫描即可，不引入有序 Map 依赖。
+#[derive(Default)]
+struct TabTable {
+    /// (targetId, sessionId)，attach 先后序，尾部 = 最近 attach
+    rows: Vec<(String, String)>,
+}
+
+impl TabTable {
+    /// attach/重 attach：更新 sessionId 并移到尾部（刷新 recency）
+    fn attach(&mut self, tid: &str, sid: &str) {
+        self.rows.retain(|(t, _)| t.as_str() != tid);
+        self.rows.push((tid.to_string(), sid.to_string()));
+    }
+
+    fn detach(&mut self, tid: &str) {
+        self.rows.retain(|(t, _)| t.as_str() != tid);
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+    }
+
+    /// 最近 attach 的条目（空 target 的路由目标；表空 = None）
+    fn latest(&self) -> Option<&(String, String)> {
+        self.rows.last()
+    }
+
+    fn target_of_session(&self, sid: &str) -> Option<&str> {
+        self.rows
+            .iter()
+            .find(|(_, s)| s.as_str() == sid)
+            .map(|(t, _)| t.as_str())
+    }
+}
+
+/// 对话框 handle 的旁路通道（P2-F F2）：经注入 Connector 另起**一次性短
+/// 连接**发 Page.handleJavaScriptDialog（连上 → handle → drop），不与主
+/// 连接的命令锁竞争——真机实测主锁被 in-flight 工具命令持有至 15s 超时时，
+/// 走主连接的应答错过对话框黄金窗口（见模块注释偏差项）。事件本身仍经主
+/// 连接 reader → EventSink 到达（reader 独立于命令锁），handle 旁路后链路
+/// 无锁竞争窗口。
+#[derive(Clone)]
+struct DialogBypass {
+    connector: Connector,
+    port: u16,
+}
+
 /// 一个实例的全部 page 控制运行态。
 struct Watched {
     /// 当前连接（断连置 None，重建整体替换）。std Mutex 只做槽位读写，
@@ -108,12 +165,15 @@ struct Watched {
     /// per-instance 命令串行（决策 3）：锁的获取即建连检查点——并发首命令
     /// 只有先拿到锁的那个建连，其余直接复用（防双连接竞态）。
     cmd_lock: Arc<tokio::sync::Mutex<()>>,
-    /// autoAttach 维护的 targetId → sessionId（仅 type=page）
-    tabs: Mutex<HashMap<String, String>>,
+    /// autoAttach 维护的 targetId → sessionId（仅 type=page），按 attach
+    /// 先后保序（尾部 = 最近 attach，空 target 路由用，见 [`TabTable`]）
+    tabs: Mutex<TabTable>,
     /// per-tab @eN ref 表（snap 整表替换，事件定向失效）
     refs: Mutex<HashMap<String, RefStore>>,
     /// per-tab 对话框缓冲（应答成功才入档）
     dialogs: Mutex<HashMap<String, DialogBuffer>>,
+    /// 对话框旁路通道（establish 随主连接一起装填；watch_loop 消费）
+    dialog_bypass: Mutex<Option<DialogBypass>>,
     /// 代际计数：每次建连 +1。旧代 watch_loop 在清理点核对代际，新一代已
     /// 接管时不动登记表/连接槽（防僵尸 loop 误删新代状态）。
     generation: AtomicU64,
@@ -124,9 +184,10 @@ impl Watched {
         Watched {
             conn: Mutex::new(None),
             cmd_lock: Arc::new(tokio::sync::Mutex::new(())),
-            tabs: Mutex::new(HashMap::new()),
+            tabs: Mutex::new(TabTable::default()),
             refs: Mutex::new(HashMap::new()),
             dialogs: Mutex::new(HashMap::new()),
+            dialog_bypass: Mutex::new(None),
             generation: AtomicU64::new(0),
         }
     }
@@ -212,6 +273,11 @@ impl PageService {
         watched.refs.lock().unwrap().clear();
         watched.dialogs.lock().unwrap().clear();
         *watched.conn.lock().unwrap() = Some(Arc::clone(&conn));
+        // F2：对话框旁路通道随主连接一起装填（重连时随新代整体替换）
+        *watched.dialog_bypass.lock().unwrap() = Some(DialogBypass {
+            connector: Arc::clone(&self.connector),
+            port,
+        });
         tauri::async_runtime::spawn(watch_loop(
             ins_id.to_string(),
             Arc::clone(&self.watched),
@@ -519,11 +585,7 @@ async fn on_attached(watched: &Watched, params: &Value) {
     if ty != "page" {
         return; // iframe/worker 等 target 不参与 page 命令路由
     }
-    watched
-        .tabs
-        .lock()
-        .unwrap()
-        .insert(tid.to_string(), sid.to_string());
+    watched.tabs.lock().unwrap().attach(tid, sid);
     let Some(conn) = watched.conn.lock().unwrap().clone() else {
         return;
     };
@@ -537,7 +599,7 @@ async fn on_attached(watched: &Watched, params: &Value) {
 /// detachedFromTarget / targetDestroyed 的共同清理：映射 + 该 tab 的
 /// RefStore / DialogBuffer 一起删（会话已死，状态随之作废）。
 fn drop_tab(watched: &Watched, tid: &str) {
-    watched.tabs.lock().unwrap().remove(tid);
+    watched.tabs.lock().unwrap().detach(tid);
     watched.refs.lock().unwrap().remove(tid);
     watched.dialogs.lock().unwrap().remove(tid);
 }
@@ -548,12 +610,12 @@ fn on_detached(watched: &Watched, params: &Value) {
     match (tid, sid) {
         (Some(t), _) => drop_tab(watched, t),
         (None, Some(s)) => {
-            let target = {
-                let tabs = watched.tabs.lock().unwrap();
-                tabs.iter()
-                    .find(|(_, v)| v.as_str() == s)
-                    .map(|(k, _)| k.clone())
-            };
+            let target = watched
+                .tabs
+                .lock()
+                .unwrap()
+                .target_of_session(s)
+                .map(str::to_string);
             if let Some(t) = target {
                 drop_tab(watched, &t);
             }
@@ -565,10 +627,12 @@ fn on_detached(watched: &Watched, params: &Value) {
 /// 顶层 sessionId → targetId（session 维度事件定位 tab 用）。
 fn tab_of_session(watched: &Watched, event: &Value) -> Option<String> {
     let sid = event.get("sessionId").and_then(Value::as_str)?;
-    let tabs = watched.tabs.lock().unwrap();
-    tabs.iter()
-        .find(|(_, v)| v.as_str() == sid)
-        .map(|(k, _)| k.clone())
+    watched
+        .tabs
+        .lock()
+        .unwrap()
+        .target_of_session(sid)
+        .map(str::to_string)
 }
 
 fn invalidate_refs(watched: &Watched, tid: &str, reason: &str) {
@@ -580,29 +644,30 @@ fn invalidate_refs(watched: &Watched, tid: &str, reason: &str) {
 /// 对话框接管（§1.4/§1.5）：无条件 accept（prompt 带 promptText =
 /// defaultPrompt ?? ""，P2-A 构造）；**成功后**才入缓冲——失败仅日志，
 /// 对话框保持打开、CDP 命令继续阻塞直至各自超时（与上游一致）。
+///
+/// handle 经 [`DialogBypass`] 的一次性短连接发出（P2-F F2），不经主连接——
+/// 主连接命令锁可能正被 in-flight 工具命令持有（真机形态：click 卡在被
+/// alert 阻塞的页面直至 15s 超时），等锁的应答错过对话框黄金窗口。
 async fn on_dialog_opening(watched: &Watched, session_id: &str, params: &Value) {
-    let tid = {
-        let tabs = watched.tabs.lock().unwrap();
-        tabs.iter()
-            .find(|(_, v)| v.as_str() == session_id)
-            .map(|(k, _)| k.clone())
-    };
+    let tid = watched
+        .tabs
+        .lock()
+        .unwrap()
+        .target_of_session(session_id)
+        .map(str::to_string);
     let Some(tid) = tid else {
         return; // 未映射 session（attach 竞态/非 page target）：无法归属 tab
     };
-    let Some(conn) = watched.conn.lock().unwrap().clone() else {
+    let bypass = watched.dialog_bypass.lock().unwrap().clone();
+    let Some(bypass) = bypass else {
+        // establish 装填在 spawn watch_loop 之前，运行中的 loop 恒可见；
+        // 兜底 WARN（对话框保持打开，与 handle 失败同族路径）
+        tracing::warn!("[page] 对话框旁路通道未就绪，对话框保持打开");
         return;
     };
     let info = parse_dialog_opening(params);
     let accept = dialog_accept_params(&info);
-    match cdp_send(
-        &conn,
-        "Page.handleJavaScriptDialog",
-        accept,
-        Some(session_id),
-    )
-    .await
-    {
+    match dialog_bypass_handle(&bypass, session_id, accept).await {
         Ok(_) => {
             watched
                 .dialogs
@@ -620,24 +685,54 @@ async fn on_dialog_opening(watched: &Watched, session_id: &str, params: &Value) 
     }
 }
 
+/// F2 旁路发送：经 Connector 另起短连接发一条 handleJavaScriptDialog，随函数
+/// 返回 drop（连上 → handle → 弃）。事件透传端即建即弃：reader 把事件帧发向
+/// 已关闭通道时静默丢弃（ws.rs reader_loop 的 `let _ = tx.send(v)`），连接
+/// 行为等同 `CdpConnection::connect` 的短连接形态，但保留经注入 Connector
+/// 的可测性（fake 即可覆盖，不需要真 Chrome）。最坏耗时 = 探活 1.5s +
+/// WS 握手 + 命令超时 15s（有界，watch_loop 不会因此挂死）。
+async fn dialog_bypass_handle(
+    bypass: &DialogBypass,
+    session_id: &str,
+    params: Value,
+) -> Result<Value, AppError> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(rx);
+    let conn = (bypass.connector)(bypass.port, tx).await?;
+    cdp_send(
+        &conn,
+        "Page.handleJavaScriptDialog",
+        params,
+        Some(session_id),
+    )
+    .await
+}
+
 // ============================================================================
 // 3. tab 路由与共享小件
 // ============================================================================
 
 /// targetId 唯一前缀解析（对齐 TS pages.mjs resolvePrefix：大小写不敏感；
-/// 无匹配 404 / 多匹配 409）。
-fn resolve_target(
-    tabs: &HashMap<String, String>,
-    input: &str,
-) -> Result<(String, String), AppError> {
+/// 无匹配 404 / 多匹配 409）。空 target 不参与前缀匹配：取最近 attach 的
+/// page target（F1 活跃 tab 近似），表空仍 404（与显式未命中同码）。
+fn resolve_target(tabs: &TabTable, input: &str) -> Result<(String, String), AppError> {
+    if input.is_empty() {
+        return tabs.latest().cloned().ok_or_else(|| {
+            AppError::not_found(
+                "PAGE_TAB_NOT_FOUND",
+                "no page targets attached yet — open a tab or retry shortly",
+            )
+        });
+    }
     let upper = input.to_uppercase();
-    let matches: Vec<(&String, &String)> = tabs
+    let matches: Vec<&(String, String)> = tabs
+        .rows
         .iter()
         .filter(|(k, _)| k.to_uppercase().starts_with(&upper))
         .collect();
     match matches.as_slice() {
         [] => Err(PageControlError::tab_not_found(input).into()),
-        [(tid, sid)] => Ok(((*tid).clone(), (*sid).clone())),
+        [one] => Ok((one.0.clone(), one.1.clone())),
         many => Err(AppError::conflict(
             "PAGE_TAB_AMBIGUOUS",
             format!(
@@ -1855,23 +1950,21 @@ mod tests {
         (calls, script, tap, connector)
     }
 
-    /// 预置武装服务：Watched 直接登记（连接/映射就位），绕过 establish 的
-    /// spawn 路径——工具编排测试全确定性。tabs：T1→S1、TAB2→S2。
+    /// 预置武装服务：Watched 直接登记（连接/映射/旁路就位），绕过 establish 的
+    /// spawn 路径——工具编排测试全确定性。tabs：T1→S1、TAB2→S2（attach 序，
+    /// TAB2 = 最近 attach → 空 target 的路由目标）。
     fn armed() -> (PageService, Arc<Watched>, Calls, Script) {
         let (calls, script, _tap, connector) = fake_connector();
-        let svc = PageService::with_connector(setup_running(), connector);
+        let svc = PageService::with_connector(setup_running(), Arc::clone(&connector));
         let watched = Arc::new(Watched::new());
         *watched.conn.lock().unwrap() = Some(fake_conn(&calls, &script, None));
-        watched
-            .tabs
-            .lock()
-            .unwrap()
-            .insert("T1".into(), "S1".into());
-        watched
-            .tabs
-            .lock()
-            .unwrap()
-            .insert("TAB2".into(), "S2".into());
+        watched.tabs.lock().unwrap().attach("T1", "S1");
+        watched.tabs.lock().unwrap().attach("TAB2", "S2");
+        // F2：对话框 handle 旁路（生产由 establish 随主连接装填，武装路径对齐）
+        *watched.dialog_bypass.lock().unwrap() = Some(DialogBypass {
+            connector,
+            port: PORT,
+        });
         svc.watched
             .lock()
             .unwrap()
@@ -1894,6 +1987,18 @@ mod tests {
             .filter(|r| r.method == method)
             .cloned()
             .collect()
+    }
+
+    /// Watched.tabs 的测试读法：targetId → sessionId（无 = None）
+    fn tab_session(watched: &Watched, tid: &str) -> Option<String> {
+        watched
+            .tabs
+            .lock()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|(t, _)| t.as_str() == tid)
+            .map(|(_, s)| s.clone())
     }
 
     fn eval_response(payload: Value) -> Result<Value, String> {
@@ -1922,9 +2027,9 @@ mod tests {
 
     #[test]
     fn resolve_target_routes_exact_and_prefix_and_errors() {
-        let mut tabs = HashMap::new();
-        tabs.insert("T1ABC".to_string(), "s1".to_string());
-        tabs.insert("TAB2".to_string(), "s2".to_string());
+        let mut tabs = TabTable::default();
+        tabs.attach("T1ABC", "s1");
+        tabs.attach("TAB2", "s2");
         // 精确 / 唯一前缀（大小写不敏感）
         assert_eq!(
             resolve_target(&tabs, "T1ABC").unwrap(),
@@ -1941,10 +2046,40 @@ mod tests {
         let amb = resolve_target(&tabs, "T").unwrap_err();
         assert_eq!((amb.code(), amb.status()), ("PAGE_TAB_AMBIGUOUS", 409));
         assert!(amb.to_string().contains("matches 2 targets"));
-        // 空输入匹配所有 → 多匹配（TS 同）
+        // 空 target 的语义变更见 resolve_target_empty_input_takes_latest_attached
+        //（P2-F F1：不再「空前缀匹配全部 → 409」，取最近 attach）
+    }
+
+    /// F1（真机冒烟修复）：空 target = 最近 attach 的 page target（活跃 tab
+    /// 近似，无 CDP 直查 API）；重 attach 刷新 recency；最近者 detach 后回退
+    /// 次新；表空 → 404（与显式前缀未命中同码）。修复前空 target 按空前缀
+    /// 匹配全部 → 多 tab 必 409 `PAGE_TAB_AMBIGUOUS`。
+    #[test]
+    fn resolve_target_empty_input_takes_latest_attached() {
+        let mut tabs = TabTable::default();
         assert_eq!(
             resolve_target(&tabs, "").unwrap_err().code(),
-            "PAGE_TAB_AMBIGUOUS"
+            "PAGE_TAB_NOT_FOUND",
+            "表空 → 404"
+        );
+        tabs.attach("TAB1", "S1");
+        tabs.attach("TAB2", "S2");
+        assert_eq!(
+            resolve_target(&tabs, "").unwrap(),
+            ("TAB2".into(), "S2".into()),
+            "空 target 取最近 attach"
+        );
+        tabs.attach("TAB1", "S1b");
+        assert_eq!(
+            resolve_target(&tabs, "").unwrap(),
+            ("TAB1".into(), "S1b".into()),
+            "重 attach 刷新 recency 与 sessionId"
+        );
+        tabs.detach("TAB1");
+        assert_eq!(
+            resolve_target(&tabs, "").unwrap(),
+            ("TAB2".into(), "S2".into()),
+            "最近者已 detach → 回退次新"
         );
     }
 
@@ -2200,19 +2335,8 @@ mod tests {
         tx.send(attach_event("TAB_A", "SES_A", "page")).unwrap();
         tx.send(attach_event("TAB_B", "SES_B", "iframe")).unwrap();
 
-        eventually("TAB_A 入表", || {
-            watched.tabs.lock().unwrap().contains_key("TAB_A")
-        })
-        .await;
-        assert_eq!(
-            watched
-                .tabs
-                .lock()
-                .unwrap()
-                .get("TAB_A")
-                .map(String::as_str),
-            Some("SES_A")
-        );
+        eventually("TAB_A 入表", || tab_session(&watched, "TAB_A").is_some()).await;
+        assert_eq!(tab_session(&watched, "TAB_A").as_deref(), Some("SES_A"));
         // iframe 等 target 不参与 page 命令路由（enable 只对 page session 发）
         eventually("双 enable 已发出", || {
             calls_of(&calls, "Page.enable").len() == 1
@@ -2226,7 +2350,7 @@ mod tests {
             calls_of(&calls, "DOM.enable")[0].session.as_deref(),
             Some("SES_A")
         );
-        assert!(!watched.tabs.lock().unwrap().contains_key("TAB_B"));
+        assert!(tab_session(&watched, "TAB_B").is_none());
         assert_eq!(
             calls_of(&calls, "Page.enable").len(),
             1,
@@ -2254,16 +2378,12 @@ mod tests {
             &json!({ "method": "Target.detachedFromTarget", "params": { "sessionId": "S1", "targetId": "T1" } }),
         )
         .await;
-        assert!(watched.tabs.lock().unwrap().get("T1").is_none());
+        assert!(tab_session(&watched, "T1").is_none());
         assert!(watched.refs.lock().unwrap().get("T1").is_none());
         assert!(watched.dialogs.lock().unwrap().get("T1").is_none());
 
         // 仅带 sessionId 的 detach：按映射反查清理
-        watched
-            .tabs
-            .lock()
-            .unwrap()
-            .insert("T2".into(), "S9".into());
+        watched.tabs.lock().unwrap().attach("T2", "S9");
         watched
             .refs
             .lock()
@@ -2274,14 +2394,10 @@ mod tests {
             &json!({ "method": "Target.detachedFromTarget", "params": { "sessionId": "S9" } }),
         )
         .await;
-        assert!(watched.tabs.lock().unwrap().get("T2").is_none());
+        assert!(tab_session(&watched, "T2").is_none());
 
         // targetDestroyed 同路径
-        watched
-            .tabs
-            .lock()
-            .unwrap()
-            .insert("T3".into(), "S3".into());
+        watched.tabs.lock().unwrap().attach("T3", "S3");
         watched
             .refs
             .lock()
@@ -2292,7 +2408,7 @@ mod tests {
             &json!({ "method": "Target.targetDestroyed", "params": { "targetId": "T3" } }),
         )
         .await;
-        assert!(watched.tabs.lock().unwrap().get("T3").is_none());
+        assert!(tab_session(&watched, "T3").is_none());
         assert!(watched.refs.lock().unwrap().get("T3").is_none());
     }
 
@@ -2342,6 +2458,93 @@ mod tests {
             (b.cursor(), b.len())
         };
         assert_eq!(after, (before, 1), "失败不移动游标不入档");
+    }
+
+    /// F2（真机形态）：主连接命令锁被 in-flight 工具命令持有时（真机 = click
+    /// 卡在被 alert 阻塞的页面至 15s 超时），对话框 handle 必须走旁路短连接
+    /// 完成——旧实现等主连接锁，迟到的应答被 Chrome 以 -32602
+    /// "No dialog is showing" 拒绝、缓冲零记录，alert 无人处理则页面挂死。
+    /// 主锁被测试持有时 handle 仍能在预算内完成 + 入缓冲 = 旁路已被使用
+    ///（主连接 send 不可行，handle 调用只可能出自旁路连接）。
+    #[tokio::test]
+    async fn dialog_handle_bypasses_locked_main_connection() {
+        let (_svc, watched, calls, script) = armed();
+        given(&script, "Page.handleJavaScriptDialog", vec![Ok(json!({}))]);
+
+        // 模拟 in-flight 工具命令占用主连接（send 需先抢到 tokio 锁）
+        let main = watched.conn.lock().unwrap().clone().unwrap();
+        let guard = main.lock_owned().await;
+
+        let handled = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle_event(
+                &watched,
+                &json!({
+                    "method": "Page.javascriptDialogOpening", "sessionId": "S1",
+                    "params": { "type": "alert", "message": "hi" }
+                }),
+            ),
+        )
+        .await;
+        drop(guard);
+        assert!(handled.is_ok(), "handle 不得等待主连接锁，必须走旁路短连接");
+
+        let handles = calls_of(&calls, "Page.handleJavaScriptDialog");
+        assert_eq!(handles.len(), 1, "旁路连接已发出 handle");
+        assert_eq!(handles[0].session.as_deref(), Some("S1"));
+        assert_eq!(
+            watched.dialogs.lock().unwrap().get("T1").map(|b| b.len()),
+            Some(1),
+            "handle 成功 → 入缓冲（§1.5）"
+        );
+    }
+
+    /// F2：旁路建连失败（探活/握手不可达）→ WARN 不入缓冲，事件处理正常
+    /// 返回（watch_loop 不因旁路失败中断，对话框保持打开）
+    #[tokio::test]
+    async fn dialog_bypass_connect_failure_records_nothing() {
+        let watched = Arc::new(Watched::new());
+        let failing: Connector = Arc::new(|_port, _events| {
+            Box::pin(async {
+                Err(AppError::business(
+                    500,
+                    "CDP_CONNECTION_FAILED",
+                    "bypass down",
+                ))
+            })
+        });
+        *watched.dialog_bypass.lock().unwrap() = Some(DialogBypass {
+            connector: failing,
+            port: PORT,
+        });
+        watched.tabs.lock().unwrap().attach("T1", "S1");
+
+        handle_event(
+            &watched,
+            &json!({
+                "method": "Page.javascriptDialogOpening", "sessionId": "S1",
+                "params": { "type": "alert", "message": "x" }
+            }),
+        )
+        .await;
+        assert!(
+            watched.dialogs.lock().unwrap().get("T1").is_none(),
+            "旁路建连失败不入缓冲"
+        );
+    }
+
+    /// F1 端到端：snap 空 target 路由到最近 attach 的 tab（armed：TAB2 后于
+    /// T1 attach）——修复前多 tab 时空 target 报 409 PAGE_TAB_AMBIGUOUS。
+    #[tokio::test]
+    async fn empty_tab_targets_latest_attached_tab() {
+        let (svc, _w, _calls, script) = armed();
+        given(
+            &script,
+            "Accessibility.getFullAXTree",
+            vec![Ok(json!({ "nodes": [] }))],
+        );
+        let resp = svc.snap(INS, "").await.unwrap();
+        assert_eq!(resp["targetId"], json!("TAB2"));
     }
 
     /// 根 frame 导航失效 ref；子 frame 导航不失效；文档事件按各自 reason

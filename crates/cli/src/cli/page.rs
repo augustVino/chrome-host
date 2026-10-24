@@ -11,8 +11,10 @@
 //!   `Clicked <BUTTON> "Save" (native input @150,130)`）；命令期间自动应答了
 //!   对话框时追加一行提示（dialogs_seen）；
 //! - dialogs：SEQ TYPE MESSAGE 表 + cursor 行（增量拉取的 --since 值）；
-//! - 三态：`--json` 响应原样透传；`--quiet` 输出单行主结果（snap = targetId，
-//!   其余 = result 行），供 `$(...)` 捕获。
+//! - 三态：`--json` 响应原样透传（P2-F F3 修复：snap 与 result 型命令的
+//!   shell 此前缺 --json 分支，文本树直接打到 stdout，管道侧拿不到合法
+//!   JSON；分流收敛在 [`snap_out`]/[`result_out`] 纯函数）；`--quiet` 输出
+//!   单行主结果（snap = targetId，其余 = result 行），供 `$(...)` 捕获。
 
 use clap::Subcommand;
 
@@ -21,8 +23,9 @@ use super::GlobalArgs;
 use crate::client::AgentClient;
 use crate::error::CliError;
 
-/// page 子命令树。tab 参数（targetId 或唯一前缀）缺省 = 唯一 page tab
-/// （多 tab 时服务端 409 PAGE_TAB_AMBIGUOUS，需显式指定）。
+/// page 子命令树。tab 参数（targetId 或唯一前缀）缺省 = 服务端取最近打开
+/// （attach）的页面标签（活跃 tab 近似；显式前缀仍是无匹配 404 /
+/// 多匹配 409，P2-F F1）。
 #[derive(Debug, Subcommand)]
 pub enum PageCommands {
     /// 可访问性树快照 + @eN 引用（操作循环起点；导航后引用整表失效）
@@ -30,7 +33,7 @@ pub enum PageCommands {
     Snap {
         /// 实例 id
         id: String,
-        /// 目标标签页（targetId 或唯一前缀，由 instance tabs 获得；缺省 = 唯一页面标签）
+        /// 目标标签页（targetId 或唯一前缀，由 instance tabs 获得；缺省 = 最近打开的页面标签）
         #[arg(value_name = "TAB_ID")]
         tab: Option<String>,
     },
@@ -42,7 +45,7 @@ pub enum PageCommands {
         id: String,
         /// 点击目标：@eN 引用（上次 snap 产生）或 CSS 选择器
         target: String,
-        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签）
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
@@ -58,7 +61,7 @@ pub enum PageCommands {
         target: String,
         /// 填入文本（空串 = 仅清空）
         value: String,
-        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签）
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
@@ -73,7 +76,7 @@ pub enum PageCommands {
         /// 可选聚焦目标：@eN 引用或 CSS 选择器
         #[arg(long, value_name = "SEL|@eN")]
         target: Option<String>,
-        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签）
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
@@ -93,7 +96,7 @@ pub enum PageCommands {
         /// 超时时长：10s / 250ms / 裸数字=ms（缺省 10s）
         #[arg(long)]
         timeout: Option<String>,
-        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签）
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
@@ -105,7 +108,7 @@ pub enum PageCommands {
     Dialogs {
         /// 实例 id
         id: String,
-        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签）
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 最近打开的页面标签）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
         /// 游标：只返回 sequence 严格大于 N 的条目（缺省全部）
@@ -155,7 +158,7 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
 }
 
 /// `page snap <ID> [TAB_ID]`：文本树 + 元信息行。quiet 输出 targetId
-/// （后续命令 `--tab $(...)` 的取值源）。
+/// （后续命令 `--tab $(...)` 的取值源）；json 响应原样透传（F3）。
 fn snap(
     globals: &GlobalArgs,
     client: &AgentClient,
@@ -164,25 +167,15 @@ fn snap(
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
     let resp = client.page_snap(id, tab)?;
-    if out.quiet {
-        out.print_id(resp.get("targetId").and_then(|v| v.as_str()).unwrap_or(""));
-        return Ok(());
-    }
-    out.render_text(snap_text(&resp));
+    print_page_out(&out, snap_out(&resp, &out));
     Ok(())
 }
 
-/// click/fill/press/wait 共用渲染：一行 result + 可选 dialogs_seen 提示。
-/// quiet 输出 result 行（变更类无 id 可捕获，结果串即主产物）。
+/// click/fill/press/wait 共用渲染：quiet 输出 result 行（变更类无 id 可捕获，
+/// 结果串即主产物）；json 响应原样透传；table = result 行 + 可选
+/// dialogs_seen 提示行。
 fn render_result(out: &OutputCtx, resp: &serde_json::Value) {
-    if out.quiet {
-        out.print_id(&result_line(resp));
-        return;
-    }
-    out.render_text(result_line(resp));
-    if let Some(note) = dialogs_seen_note(resp) {
-        out.render_text(note);
-    }
+    print_page_out(out, result_out(resp, out));
 }
 
 /// `page click <ID> <sel|@eN> [--tab T]`
@@ -274,6 +267,62 @@ fn dialogs(
 // 渲染纯函数（`*_text` / `*_rows` / `*_note`：只渲染不打印，单测直接断言；
 // 服务端响应为自由形状 Value（同 diagnostics 先例），提取全部防御式缺省）
 // ---------------------------------------------------------------------------
+
+/// page 组三态分流产物：命令 shell 只调 [`print_page_out`] 打印，不自行决策
+///（F3 根因即 shell 漏判 --json，分流收敛为纯函数后单测可断言）。
+#[derive(Debug)]
+enum PageOut {
+    /// quiet 单行（snap = targetId；click/fill/press/wait = result 行）
+    Quiet(String),
+    /// json：服务端响应原样（pretty 落地归 OutputCtx::render_kv，同 instance
+    /// screenshot/har 的 json 分支先例）
+    Json(serde_json::Value),
+    /// table：自由文本（snap = 元信息 + 树；其余 = result + 可选附注）
+    Text(String),
+}
+
+/// 三态分流薄壳：按模式落 stdout（println 仍收敛在 output.rs）。
+fn print_page_out(out: &OutputCtx, rendered: PageOut) {
+    match rendered {
+        PageOut::Quiet(line) => out.print_id(&line),
+        PageOut::Json(resp) => out.render_kv(&[], resp),
+        PageOut::Text(text) => out.render_text(text),
+    }
+}
+
+/// snap 三态：quiet → targetId；json → 响应原样；table → 元信息 + 文本树。
+fn snap_out(resp: &serde_json::Value, out: &OutputCtx) -> PageOut {
+    if out.quiet {
+        return PageOut::Quiet(
+            resp.get("targetId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    if out.json {
+        return PageOut::Json(resp.clone());
+    }
+    PageOut::Text(snap_text(resp))
+}
+
+/// result 型命令（click/fill/press/wait）三态：json 原样（dialogs_seen 已在
+/// 响应体内，透传自然携带）；table = result 行 + 附注行（单字符串两行，与
+/// 逐行 println 字节等价）。
+fn result_out(resp: &serde_json::Value, out: &OutputCtx) -> PageOut {
+    if out.quiet {
+        return PageOut::Quiet(result_line(resp));
+    }
+    if out.json {
+        return PageOut::Json(resp.clone());
+    }
+    let mut text = result_line(resp);
+    if let Some(note) = dialogs_seen_note(resp) {
+        text.push('\n');
+        text.push_str(&note);
+    }
+    PageOut::Text(text)
+}
 
 /// snap 的 table 模式输出：元信息行 + 文本树。树是主产物（@eN 引用内联），
 /// 元信息行放前面供脚本 grep（targetId / refs_count / generation）。
@@ -390,6 +439,98 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("@e1 [button] OK"), "树体必须原样保留: {text}");
+    }
+
+    /// F3（真机冒烟修复）：snap 三态分流——json 模式必须是响应原样 JSON
+    ///（`--json | jq` 可用），修复前 shell 无 --json 分支，输出的是元信息行 +
+    /// 文本树（非合法 JSON，管道侧表现为拿不到数据）。
+    #[test]
+    fn snap_out_routes_three_modes() {
+        let resp = json!({
+            "instanceId": "ins_1",
+            "targetId": "TAB9F",
+            "text": "[WebArea] Home\n  @e1 [button] OK",
+            "refs_count": 1,
+            "generation": 1
+        });
+        match snap_out(
+            &resp,
+            &OutputCtx {
+                json: true,
+                quiet: false,
+            },
+        ) {
+            PageOut::Json(v) => assert_eq!(v, resp, "json 模式 = 响应原样透传"),
+            other => panic!("json 模式应走 Json 分支: {other:?}"),
+        }
+        match snap_out(
+            &resp,
+            &OutputCtx {
+                json: false,
+                quiet: true,
+            },
+        ) {
+            PageOut::Quiet(line) => assert_eq!(line, "TAB9F", "quiet = targetId"),
+            other => panic!("quiet 模式应输出 targetId: {other:?}"),
+        }
+        match snap_out(
+            &resp,
+            &OutputCtx {
+                json: false,
+                quiet: false,
+            },
+        ) {
+            PageOut::Text(t) => assert!(
+                t.starts_with("targetId: \"TAB9F\"") && t.contains("@e1 [button] OK"),
+                "table = 元信息 + 树: {t}"
+            ),
+            other => panic!("table 模式应输出文本树: {other:?}"),
+        }
+    }
+
+    /// result 型命令同补三态：json 原样（dialogs_seen 在响应体内自然携带）；
+    /// table = result 行 + 附注行两行（与逐行 println 字节等价）；quiet =
+    /// result 行。
+    #[test]
+    fn result_out_routes_json_and_merges_note() {
+        let resp = json!({
+            "result": "Pressed Enter",
+            "dialogs_seen": [ { "type": "alert", "message": "hi" } ]
+        });
+        match result_out(
+            &resp,
+            &OutputCtx {
+                json: true,
+                quiet: false,
+            },
+        ) {
+            PageOut::Json(v) => assert_eq!(v, resp, "json 模式 = 响应原样透传"),
+            other => panic!("json 模式应走 Json 分支: {other:?}"),
+        }
+        match result_out(
+            &resp,
+            &OutputCtx {
+                json: false,
+                quiet: false,
+            },
+        ) {
+            PageOut::Text(t) => {
+                assert!(t.starts_with("Pressed Enter"), "{t}");
+                assert!(t.contains("dialogs_seen: 1"), "{t}");
+                assert_eq!(t.lines().count(), 2, "result + 附注两行: {t}");
+            }
+            other => panic!("table 模式应输出 result + 附注: {other:?}"),
+        }
+        match result_out(
+            &resp,
+            &OutputCtx {
+                json: false,
+                quiet: true,
+            },
+        ) {
+            PageOut::Quiet(line) => assert_eq!(line, "Pressed Enter"),
+            other => panic!("quiet 模式应输出 result 行: {other:?}"),
+        }
     }
 
     /// result 行：正常提取；缺 result 字段时显式暴露而非空串（防契约漂移静默）。
