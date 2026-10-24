@@ -34,6 +34,14 @@
 //! - focus 类错误码（PAGE_FOCUS_FAILED / PAGE_FILL_FOCUS_LOST）与
 //!   PAGE_TAB_AMBIGUOUS / PAGE_TOOL_TIMEOUT 为本层新增：P2-A 错误表未含 TS 的
 //!   focus_failed / fill_focus_lost（domain 已冻结，编排在 application 层补齐）。
+//! - **L2 attach 握手窗口**（冒烟遗留）：连接建立后首批 attachedToTarget 异步
+//!   到达，立即执行首条命令会 PAGE_TAB_NOT_FOUND——ensure 的建连分支在返回
+//!   前短轮询 tabs 表（≤300ms / 10ms 间隔）等首个 page target 入表；超时也
+//!   放行（保留 retry shortly 兜底），连接已在位的命令不经过这段（不阻塞）。
+//! - **L3 重连对话框盲探测**（冒烟遗留）：CDP 不重播 javascriptDialogOpening，
+//!   重连前已挂着的 JS 对话框对新连接失明（tab 永久卡死）——on_attached 对
+//!   每个 page session 在 Page.enable 后盲发一次 handleJavaScriptDialog，
+//!   成功 = 历史对话框已被接管（保守默认入缓冲），失败静默（无对话框为常态）。
 
 // P2-C 已接线（api/pages.rs + api/mcp.rs）：仅测试注入构造 with_connector
 // 仍无生产调用方，逐项 allow（不再整模块豁免，防新死代码静默滑入）。
@@ -51,8 +59,8 @@ use crate::domain::instance::InstanceStatus;
 use crate::domain::page_control::{
     dialog_accept_params, fill_fillable_check_expr, hit_test_expr, largest_quad_centroid,
     locate_expr, normalize_ref, observed_matches_state, parse_dialog_opening, parse_duration,
-    parse_key, wait_observe_expr, DialogBuffer, ObservedState, PageControlError, Point, RefStore,
-    WaitState,
+    parse_key, wait_observe_expr, DialogBuffer, DialogInfo, ObservedState, PageControlError, Point,
+    RefStore, WaitState,
 };
 use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::{connect_page, SharedPageConn};
@@ -73,6 +81,17 @@ const DEFAULT_LOADALL_INTERVAL: Duration = Duration::from_millis(1500);
 /// loadall 缺省点击上限。TS 是 5min 硬顶（200 × 1500ms = 5min，量级对齐），
 /// max-clicks × interval 组合等价但更可控（任务决策，报告披露）。
 const DEFAULT_LOADALL_MAX_CLICKS: u32 = 200;
+/// L2 attach 握手窗口上界（owner 真机冒烟定调）：establish 完成（连接 +
+/// setAutoAttach + watch_loop 就位）后首批 attachedToTarget 仍异步在途，立即
+/// 路由首条命令会 PAGE_TAB_NOT_FOUND。ensure 的建连分支在返回前短轮询 tabs
+/// 表，首个 page target 入表即放行；窗口耗尽也放行（不报错——兜底仍是
+/// PAGE_TAB_NOT_FOUND 的 retry shortly 语义）。300ms 依据：真机首条 attach
+/// 事件观测为毫秒级偶发延迟，300ms 覆盖冷启动抖动仍远低于可感知卡顿；
+/// 命令预算 30s，占用可忽略。
+const ATTACH_HANDSHAKE_WINDOW: Duration = Duration::from_millis(300);
+/// 握手窗口的轮询间隔：10ms 在「attach 到表即响应」与「空转次数」间折中
+///（300ms 窗口至多 30 次查询，tabs 表是个位数行的 Vec 线性判空）。
+const ATTACH_HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// 连接工厂：生产 = connect_page（browser 级 eventing WS），测试注入 fake。
 type Connector = Arc<
@@ -137,6 +156,11 @@ impl TabTable {
 
     fn clear(&mut self) {
         self.rows.clear();
+    }
+
+    /// L2 握手窗口的判空探针：任一 page target 已入表即视作首批 attach 已到
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
     }
 
     fn target_of_session(&self, sid: &str) -> Option<&str> {
@@ -230,6 +254,10 @@ impl PageService {
         let serial = watched.cmd_lock.clone().lock_owned().await;
         if watched.conn.lock().unwrap().is_none() {
             self.establish(ins_id, &watched, port).await?;
+            // L2：establish 返回 ≠ 首批 attachedToTarget 已入表（事件异步在
+            // 途），建连分支内短等首个 page target 再放行（见常量注释）。
+            // 仅建连分支调用：连接已在位（已有命令在跑）时不经过这里，无额外阻塞。
+            wait_first_attach(&watched).await;
         }
         Ok((watched, serial))
     }
@@ -570,6 +598,20 @@ async fn within_budget<T, F: Future<Output = Result<T, AppError>>>(
     }
 }
 
+/// L2 attach 握手窗口：短轮询 tabs 表至首个 page target 入表，或窗口
+///（300ms）耗尽——先到者为准。超时不报错：保留现有 PAGE_TAB_NOT_FOUND 的
+/// retry shortly 语义兑底（无 tab 开着 / attach 事件丢失都落到这里）。
+/// 只在 ensure 的建连分支调用（连接已在位 = 已有命令在跑，不经过这里）。
+async fn wait_first_attach(watched: &Watched) {
+    let deadline = Instant::now() + ATTACH_HANDSHAKE_WINDOW;
+    while watched.tabs.lock().unwrap().is_empty() {
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(ATTACH_HANDSHAKE_POLL_INTERVAL).await;
+    }
+}
+
 // ============================================================================
 // 2. watch_loop：事件消费（对接 P2-A 模型）
 // ============================================================================
@@ -657,8 +699,9 @@ async fn handle_event(watched: &Watched, event: &Value) {
 }
 
 /// attachedToTarget：type=page 建 targetId→sessionId 映射，并对该 session
-/// 补 Page.enable（对话框事件前置）+ DOM.enable（documentUpdated 前置）。
-/// best-effort：enable 失败只缺对应事件流，不影响命令路径。
+/// 补 Page.enable（对话框事件前置）+ DOM.enable（documentUpdated 前置）+
+/// 重连对话框盲探测（L3，见 [`probe_reconnected_dialog`]）。best-effort：
+/// enable/探测失败只缺对应能力，不影响命令路径。
 async fn on_attached(watched: &Watched, params: &Value) {
     let ty = params
         .pointer("/targetInfo/type")
@@ -683,6 +726,50 @@ async fn on_attached(watched: &Watched, params: &Value) {
     for method in ["Page.enable", "DOM.enable"] {
         if let Err(e) = cdp_send(&conn, method, json!({}), Some(sid)).await {
             tracing::debug!("[page] session {sid} {method} 失败: {e}");
+        }
+    }
+    // L3：探测在 Page.enable 之后、attach 握手内顺序完成（&self 并发 send，
+    // 不阻塞其他 in-flight 命令）；常规对话框路径事件驱动，互不干扰
+    probe_reconnected_dialog(watched, &conn, tid, sid).await;
+}
+
+/// L3 重连对话框盲探测：CDP 断连重连后**不重播** javascriptDialogOpening——
+/// 重连前已挂着的 JS 对话框对 PageService 失明（无事件可驱动
+/// [`on_dialog_opening`]，该 tab 的全部 CDP 命令被阻塞至超时、永久卡死）。
+/// 故每个新 page session 在 Page.enable 后盲发一次 handleJavaScriptDialog
+///（accept）充当探测：
+/// - 成功 = 真有挂着的历史对话框，已被本探测接管——无事件参数可得，用保守
+///   默认构造 DialogInfo（type=alert、message 固定文案）入缓冲，sequence 随
+///   [`DialogBuffer::record`] 顺延；
+/// - 失败（无对话框时 Chrome 回 -32602 No dialog is showing，或其他错误）→
+///   debug 日志静默忽略（首连/无对话框的常态路径，不 Warning 刷屏）。
+async fn probe_reconnected_dialog(watched: &Watched, conn: &SharedPageConn, tid: &str, sid: &str) {
+    match cdp_send(
+        conn,
+        "Page.handleJavaScriptDialog",
+        json!({ "accept": true }),
+        Some(sid),
+    )
+    .await
+    {
+        Ok(_) => {
+            tracing::debug!("[page] session {sid} 探测接管了重连前挂着的历史对话框（tab {tid}）");
+            watched
+                .dialogs
+                .lock()
+                .unwrap()
+                .entry(tid.to_string())
+                .or_insert_with(|| DialogBuffer::new(tid.to_string()))
+                .record(DialogInfo {
+                    r#type: "alert".to_string(),
+                    message: "reconnected dialog (auto-accepted)".to_string(),
+                    url: None,
+                    default_prompt: None,
+                    has_browser_handler: None,
+                });
+        }
+        Err(e) => {
+            tracing::debug!("[page] session {sid} 无挂着的历史对话框（探测静默）: {e}");
         }
     }
 }
@@ -2139,7 +2226,9 @@ mod tests {
     struct FakeCdp {
         calls: Calls,
         script: Script,
-        /// 持有事件通道发送端：保活 watch_loop（通道不因 factory 返回而关闭）
+        /// 持有事件通道发送端：保活 watch_loop（通道不因 factory 返回而关闭）。
+        /// 只写不读（持有的目的就是保活），dead_code 豁免。
+        #[allow(dead_code)]
         events: Option<EventSink>,
         gates: Gates,
     }
@@ -2626,6 +2715,196 @@ mod tests {
         );
     }
 
+    /// L2（冒烟遗留）：首条 attachedToTarget 延迟 100ms 到达（真机形态：事件
+    /// 异步在途）——ensure 的建连分支在握手窗口内等它入表，紧随其后的 snap
+    /// 不再 PAGE_TAB_NOT_FOUND；连接已在位后（已有命令在跑）不再重等窗口。
+    #[tokio::test]
+    async fn ensure_handshake_window_absorbs_late_first_attach() {
+        let calls: Calls = Arc::default();
+        let script: Script = Arc::default();
+        // 无对话框场景：attach 后的 L3 探测被 Chrome 拒（-32602 形态，静默）
+        given(
+            &script,
+            "Page.handleJavaScriptDialog",
+            vec![Err("No dialog is showing".into())],
+        );
+        given(
+            &script,
+            "Accessibility.getFullAXTree",
+            vec![Ok(json!({ "nodes": [] })), Ok(json!({ "nodes": [] }))],
+        );
+        // 自建 connector：连接建立后 100ms 才送达首条 attach（事件异步延迟）
+        let c2 = Arc::clone(&calls);
+        let s2 = Arc::clone(&script);
+        let connector: Connector = Arc::new(move |_port, events| {
+            let tx = events.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = tx.send(attach_event("TAB_LATE", "SES_LATE", "page"));
+            });
+            let c = Arc::clone(&c2);
+            let s = Arc::clone(&s2);
+            async move { Ok(fake_conn(&c, &s, Some(events), &Gates::default())) }.boxed()
+        });
+        let svc = PageService::with_connector(setup_running(), connector);
+
+        let t0 = Instant::now();
+        let resp = svc
+            .snap(INS, "")
+            .await
+            .expect("握手窗口等到迟到 attach，不再 NOT_FOUND");
+        assert_eq!(
+            resp["targetId"],
+            json!("TAB_LATE"),
+            "空 target 唯一自动选中"
+        );
+        assert!(
+            t0.elapsed() >= Duration::from_millis(100),
+            "确实等到了迟到的事件（{:?}）",
+            t0.elapsed()
+        );
+        assert!(resp.get("dialogs_seen").is_none(), "探测失败不入缓冲");
+        eventually("attach 探测已发出（L3 联动）", || {
+            calls_of(&calls, "Page.handleJavaScriptDialog").len() == 1
+        })
+        .await;
+
+        // 连接已在位（tabs 非空）→ 后续命令不重等窗口（ensure 只在建连分支等）
+        let t1 = Instant::now();
+        let resp2 = svc.snap(INS, "").await.unwrap();
+        assert_eq!(resp2["targetId"], json!("TAB_LATE"));
+        assert!(
+            t1.elapsed() < ATTACH_HANDSHAKE_WINDOW,
+            "连接在位不阻塞（{:?}）",
+            t1.elapsed()
+        );
+    }
+
+    /// L2 兑底：窗口内无任何 attach 到达 → 300ms 到点放行（不报错不悬挂），
+    /// snap 报 PAGE_TAB_NOT_FOUND，保留 retry shortly 语义。
+    #[tokio::test]
+    async fn ensure_handshake_window_times_out_into_retry_semantics() {
+        let (svc, _calls, _script, _tap) = fake_service();
+        let t0 = Instant::now();
+        let err = svc.snap(INS, "").await.unwrap_err();
+        assert_eq!((err.code(), err.status()), ("PAGE_TAB_NOT_FOUND", 404));
+        assert!(
+            err.to_string().contains("retry shortly"),
+            "保留既有兑底文案: {err}"
+        );
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= ATTACH_HANDSHAKE_WINDOW,
+            "窗口确实等满（{elapsed:?}）"
+        );
+        assert!(elapsed < Duration::from_secs(5), "到点即返回，不悬挂");
+    }
+
+    /// L3（冒烟遗留）：session attach 时盲发一次 handleJavaScriptDialog——
+    /// 成功 = 重连前挂着的历史对话框已被接管，无事件参数可得，用保守默认
+    /// 构造 DialogInfo 入缓冲（Page.enable 之后、握手内顺序完成）。
+    #[tokio::test]
+    async fn attach_probe_adopts_stale_dialog_with_conservative_defaults() {
+        let (_svc, watched, calls, script) = armed();
+        given(&script, "Page.handleJavaScriptDialog", vec![Ok(json!({}))]);
+
+        handle_event(&watched, &attach_event("T1", "S1", "page")).await;
+
+        let handles = calls_of(&calls, "Page.handleJavaScriptDialog");
+        assert_eq!(handles.len(), 1, "attach 后恰好盲发一次");
+        assert_eq!(handles[0].params, json!({ "accept": true }));
+        assert_eq!(handles[0].session.as_deref(), Some("S1"));
+        // 探测在 Page.enable 之后（enable → DOM.enable → 探测的握手顺序）
+        let order = |m: &str| {
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .position(|r| r.method == m)
+                .unwrap()
+        };
+        assert!(order("Page.enable") < order("Page.handleJavaScriptDialog"));
+        // 保守默认入缓冲：alert / 固定文案 / accepted / sequence 顺延起 1
+        let dialogs = watched.dialogs.lock().unwrap();
+        let b = dialogs.get("T1").expect("成功探测入缓冲");
+        let e = b.since(0)[0];
+        assert_eq!(e.r#type, "alert");
+        assert_eq!(e.message, "reconnected dialog (auto-accepted)");
+        assert_eq!(e.handled, "accepted");
+        assert_eq!(e.sequence, 1);
+    }
+
+    /// L3：无对话框（Chrome 回 -32602 No dialog is showing 形态）→ 静默忽略：
+    /// 不建缓冲、不影响映射建立；其他错误同样吞掉（best-effort 探测）。
+    #[tokio::test]
+    async fn attach_probe_silent_when_no_dialog_showing() {
+        let (_svc, watched, _calls, script) = armed();
+        given(
+            &script,
+            "Page.handleJavaScriptDialog",
+            vec![Err("No dialog is showing".into())],
+        );
+
+        handle_event(&watched, &attach_event("T9", "S9", "page")).await;
+
+        assert!(
+            watched.dialogs.lock().unwrap().get("T9").is_none(),
+            "无对话框 → 不建缓冲"
+        );
+        assert_eq!(
+            tab_session(&watched, "T9").as_deref(),
+            Some("S9"),
+            "映射与 enable 照常建立，探测不影响 attach 路径"
+        );
+    }
+
+    /// L3 与常规对话框路径互不干扰：探测接管历史对话框（seq 1，保守默认）
+    /// 后，新对话框仍走事件驱动应答（seq 2，真实参数），sequence 顺延不断档。
+    #[tokio::test]
+    async fn attach_probe_coexists_with_event_driven_dialog_flow() {
+        let (_svc, watched, calls, script) = armed();
+        given(
+            &script,
+            "Page.handleJavaScriptDialog",
+            vec![Ok(json!({})), Ok(json!({}))],
+        );
+        // 重连握手：探测接管重连前挂着的历史对话框
+        handle_event(&watched, &attach_event("T1", "S1", "page")).await;
+        // 常规路径：新对话框事件到达，带真实参数应答（F2 后事件驱动照旧）
+        handle_event(
+            &watched,
+            &json!({
+                "method": "Page.javascriptDialogOpening", "sessionId": "S1",
+                "params": { "type": "confirm", "message": "leave?" }
+            }),
+        )
+        .await;
+
+        let dialogs = watched.dialogs.lock().unwrap();
+        let b = dialogs.get("T1").unwrap();
+        let entries = b.since(0);
+        assert_eq!(entries.len(), 2, "探测 + 事件各入一条");
+        assert_eq!(
+            (
+                entries[0].sequence,
+                entries[0].r#type.as_str(),
+                entries[0].message.as_str()
+            ),
+            (1, "alert", "reconnected dialog (auto-accepted)")
+        );
+        assert_eq!(
+            (
+                entries[1].sequence,
+                entries[1].r#type.as_str(),
+                entries[1].message.as_str()
+            ),
+            (2, "confirm", "leave?")
+        );
+        drop(dialogs);
+        // 两次 handle：探测 1 次 + 事件应答 1 次，互不吞并
+        assert_eq!(calls_of(&calls, "Page.handleJavaScriptDialog").len(), 2);
+    }
+
     /// detachedFromTarget / targetDestroyed：映射 + RefStore + DialogBuffer 同清
     #[tokio::test]
     async fn detached_and_destroyed_drop_tab_state() {
@@ -2705,12 +2984,13 @@ mod tests {
             "prompt 应答带 promptText = defaultPrompt ?? \"\"（§1.4）"
         );
         assert_eq!(handles[0].session.as_deref(), Some("S1"));
-        let buf = watched.dialogs.lock().unwrap();
-        let b = buf.get("T1").expect("成功后入缓冲");
-        assert_eq!(b.len(), 1);
+        let len = {
+            let buf = watched.dialogs.lock().unwrap();
+            buf.get("T1").expect("成功后入缓冲").len()
+        };
+        assert_eq!(len, 1);
 
         // 失败路径：不 record（游标不动，对话框保持打开——§1.5 协议）
-        drop(buf);
         let before = watched.dialogs.lock().unwrap().get("T1").unwrap().cursor();
         handle_event(
             &watched,
@@ -3581,7 +3861,7 @@ mod tests {
     /// §1.6：命令期间新应答的对话框附 dialogs_seen（仅成功响应）
     #[tokio::test]
     async fn command_attaches_dialogs_seen_on_success() {
-        let (svc, watched, _calls, _script) = armed();
+        let (svc, _watched, _calls, _script) = armed();
         let resp = svc
             .command(
                 Duration::from_secs(5),
