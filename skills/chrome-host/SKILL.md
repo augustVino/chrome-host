@@ -22,9 +22,9 @@ chrome-host status
 
 按退出码分支：
 
-- **exit 0** → 应用可达且授权正常。**但这不等于“本机可直连 CDP”**：配置了 `CHROME_HOST_TOKEN` 的 shell（云桌面 / CI）走的是远程路径，exit 0 只证明隧道与令牌正常；实例 CDP 端口（9222 起）只绑主机回环，远程 shell 直连必然 fetch failed。同机与否用下方判别法确认。
+- **exit 0** → 应用可达且授权正常，直接开始。
 - **exit 8**（不可达）→ 应用未启动，提示用户启动 Chrome Host。API 固定在 17890，连不上就是没起——不要猜端口、不要绕道 HTTP。
-- **exit 10**（未授权）→ 本机是远程接入客户端（经 SSH 隧道连主机），`CHROME_HOST_TOKEN` 缺失/错误。隧道与应用均在线，只是凭证问题——勿按 exit 8 处置。此后走远程路径：CDP 自动化用 `cdp-session` 会话代理（见第 5 步），不要直连实例端口。
+- **exit 10**（未授权）→ 本机是远程接入客户端（经 SSH 隧道连主机），`CHROME_HOST_TOKEN` 缺失/错误。隧道与应用均在线，只是凭证问题——勿按 exit 8 处置。核对令牌后 page/instance 命令直接用（API 经隧道可达，无需额外配置）。
 - **其他**（多为 exit 1）→ 应用在跑但内部异常。错误行格式 `[CODE] message（HTTP status）`，把 CODE + message 原样转述给用户——应用自身故障 agent 修不了，不要建议"重试"掩盖问题，也不要编造数据。需要细节跑 `chrome-host doctor`。
 
 > **判断 shell 与浏览器是否同机**（token 存在时 status 的 exit 0 区分不了）：`env -u CHROME_HOST_TOKEN chrome-host status` → exit 0 = 同机；exit 10 = 远程 shell（API 经隧道同样可达，page/instance 命令直接用，无需额外配置）。
@@ -173,6 +173,7 @@ agent 的 shell 是非交互环境（非 TTY），缺 `--yes` 时这些命令直
 | 完整命令与全局 flag 速查 | references/cli.md「命令速查」 |
 | exit 0–10 全表与处置 | references/cli.md「退出码契约」 |
 | exit 5/7 时按 `[CODE]` 细分 | references/cli.md「错误码细分决策表」 |
+| page 命令族全量速查与 PAGE_* 错误码表 | references/cli.md「页面操控（page 命令族）」 |
 | 登录态自动保存 / 显式固化 / 回滚 | references/cli.md「登录态」 |
 | 远程接入原理与隧道排障 | references/cli.md「远程接入」 |
-| MCP 入口（33 个 tools）与安全边界 | references/cli.md 末尾两章 |
+| MCP 入口（44 个 tools，含 page_* 十一族）与安全边界 | references/cli.md 末尾两章 |

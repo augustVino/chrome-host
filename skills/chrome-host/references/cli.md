@@ -45,19 +45,54 @@ chrome-host instance get <id>               详情（status/pid/cdpPort/profileD
 chrome-host instance status <id>            轻量状态（轮询用）
 chrome-host instance create <envId>         创建即启动（同步阻塞；长操作无总超时）
 chrome-host instance start|stop|restart <id>   生命周期（restart 重拉 hosts）
-chrome-host instance open <id> <url>        新开标签页（http/https 本地校验）
-chrome-host instance tabs <id>              标签页列表（仅 page 类型）
+chrome-host instance open <id> <url>        新开标签页并导航（http/https 本地校验）
+chrome-host instance tabs <id>              标签页列表（仅 page 类型；id 即 page 命令的 tab 参数）
 chrome-host instance navigate <id> <tabId> <url>   导航既有标签页（丢旧页历史）
 chrome-host instance focus <id>             唤出窗口到前台
-chrome-host instance cdp <id>               CDP endpoint（--json 后 jq .port）
-chrome-host instance cdp-session <id>       发放 CDP 会话 URL（远程自动化用，30 分钟有效）
-chrome-host instance console <id> [--level error] [--limit N]   console 环（500 条，重启即清）
-chrome-host instance network <id> [--failed-only]               请求环（失败/HTTP≥400 过滤）
+chrome-host instance cdp <id>               CDP endpoint（供 Playwright/DevTools 等外部工具；page 命令族不需要它）
+chrome-host instance cdp-session <id>       发放 CDP 会话 URL（外部 CDP 客户端远程接入用，30 分钟有效）
+chrome-host instance console <id> [--level error] [--tab T] [--limit N]   console 环（500 条，重启即清；--tab 按 tab 过滤）
+chrome-host instance network <id> [--failed-only] [--tab T]               请求环（失败/HTTP≥400 过滤；--tab 按 tab 过滤）
 chrome-host instance screenshot <id> [--out F]  当前页 png（缺省 <id>.png）
 chrome-host instance har <id> [--out F]         请求环生成 HAR 1.2（缺省 <id>.har）
 chrome-host instance diagnostics <id>          页面诊断快照（错误/失败资源/LCP/FCP）
 chrome-host instance delete <id> --yes      删除（运行中自动 stop→delete）
 ```
+
+### 页面操控（page 命令族）
+
+命令结构：`chrome-host page <子命令> <insId> [tab] ...`。`tab` 是 `instance tabs` 输出的 targetId 唯一前缀；单标签实例可省略，多标签缺省报 `PAGE_TAB_AMBIGUOUS` 并列出全部 tab。本地/远程同用，无需 CDP 端口或代理凭证。
+
+```text
+page snap    <id> [tab]                     可访问性树 + @eN 引用（--json 机器可读）
+page click   <id> <sel|@eN> [--tab t]       原生输入点击：可见性检查 + hit-test 拦截遮挡 + 三段鼠标事件
+page fill    <id> <sel|@eN> <value> [--tab t]  聚焦+清空+输入+回读校验；空 value = 仅清空
+page press   <id> <key> [--target <sel|@eN>] [--tab t]  键入：命名键/单字符/组合键（Control+A、Meta+V）；可先聚焦
+page wait    <id> <sel> [--state visible|hidden|attached|detached] [--timeout 10s] [--tab t]  轮询等待（缺省 visible）
+page eval    <id> <expr> [--tab t]          执行 JS（returnByValue+awaitPromise；优先用上面的原语）
+page html    <id> [selector] [--tab t]      页面/元素 outerHTML
+page clickxy <id> <x> <y> [--tab t]         视口 CSS 像素坐标点击（无 hit-test；跨域 iframe 入口）
+page type    <id> <text> [--tab t]          当前焦点处输入（clickxy 点入跨域 iframe 后用它）
+page loadall <id> <sel> [--interval 1.5s] [--tab t]  循环点击直到元素消失
+page dialogs <id> [--tab t] [--since N]     自动接管弹窗历史（近 32 条；--since 增量拉取）
+```
+
+**操作循环**：snap → 用 @eN 操作 → 页面变化后重 snap。导航后 @eN 整表失效（PAGE_REF_STALE），重新 snap，不要对旧引用重试。
+
+**PAGE_* 错误码**（stderr 行 `[PAGE_XXX] message`，按码分支处置，不解析文案）：
+
+| 错误码 | 处置 |
+|---|---|
+| PAGE_TAB_NOT_FOUND / PAGE_TAB_AMBIGUOUS | 前者：连接刚建立时重试同一命令；后者：带 tab 列表，显式选一个 |
+| PAGE_REF_NOT_FOUND / PAGE_REF_STALE | 重新 snap 取新引用 |
+| PAGE_ELEMENT_NOT_FOUND / PAGE_ELEMENT_NOT_VISIBLE | 核对选择器；不可见先处理可见性 |
+| PAGE_ELEMENT_BLOCKED | 点击点被浮层遮挡（信息含遮挡元素）——先关浮层或改点遮挡层自身 |
+| PAGE_TARGET_NOT_FILLABLE | 目标不是可输入元素（input/textarea/contenteditable 编辑根） |
+| PAGE_FILL_VALUE_MISMATCH | 写入可能部分生效——先观察实际值再决定，勿盲目重试 |
+| PAGE_KEY_UNKNOWN | 键名不支持，见 press --help 键表 |
+| PAGE_WAIT_TIMEOUT | 超时，信息含最后观察态 |
+| PAGE_DISPATCH_FAILED | 附 effect_state：none=未发出可重试；unknown=已发出禁盲目重试，先观察 |
+| PAGE_EVAL_FAILED | 表达式抛异常（信息含异常文本） |
 
 ### 登录态
 
