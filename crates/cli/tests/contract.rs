@@ -397,6 +397,7 @@ fn fixture_router() -> Router {
             }),
         )
         // —— 常驻诊断（M6）：console/network 环 + screenshot + har ——
+        // console/network 的 tab 透传验证用 echo 路由（ins_tab，见下）
         .route(
             "/api/v1/instances/ins_x/console",
             get(|| async {
@@ -412,6 +413,37 @@ fn fixture_router() -> Router {
                 Json(json!({ "instanceId": "ins_x", "entries": [
                     { "ts": 1, "requestId": "r1", "method": "GET", "url": "https://a/404", "status": 404, "failed": false, "targetUrl": "https://a/" }
                 ] }))
+            }),
+        )
+        // tab 过滤透传验证：echo 收到的 query 为 meta（同 extension config 的 echo 先例）
+        .route(
+            "/api/v1/instances/ins_tab/console",
+            get(|Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                Json(json!({
+                    "instanceId": "ins_tab",
+                    "entries": [],
+                    "meta": {
+                        "filteredByTab": q.get("tab").cloned().unwrap_or_default(),
+                        "tabFilterUnavailable": false,
+                        "before": 2,
+                        "after": 1
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_tab/network",
+            get(|Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                Json(json!({
+                    "instanceId": "ins_tab",
+                    "entries": [],
+                    "meta": {
+                        "filteredByTab": q.get("tab").cloned().unwrap_or_default(),
+                        "tabFilterUnavailable": false,
+                        "before": 0,
+                        "after": 0
+                    }
+                }))
             }),
         )
         .route(
@@ -550,7 +582,8 @@ fn fixture_base_url() -> String {
                         .await
                         .expect("fixture 端口绑定失败");
                     let addr = listener.local_addr().expect("fixture local_addr 失败");
-                    tx.send(format!("http://{addr}")).expect("通知测试主线程失败");
+                    tx.send(format!("http://{addr}"))
+                        .expect("通知测试主线程失败");
                     axum::serve(listener, fixture_router())
                         .await
                         .expect("fixture server 运行失败");
@@ -589,13 +622,21 @@ fn env_list_decodes_cjk_summary_and_flatten() {
 fn env_crud_and_stop_all_contract() {
     let client = test_client();
     let env = client
-        .env_create("测试环境", Some("https://example.com/hosts"), None, Some("first-login"))
+        .env_create(
+            "测试环境",
+            Some("https://example.com/hosts"),
+            None,
+            Some("first-login"),
+        )
         .expect("env_create 应成功");
     // fixture 是 canned 契约（不回显 body）：断言点在 DTO 的 Some/null 双向解码，
     // 即 Option<String> 对字符串值与 null 各自正确落位
     assert_eq!(env.id, "env_1");
     assert_eq!(env.name, "测试环境");
-    assert_eq!(env.hosts_source_url.as_deref(), Some("https://example.com/hosts.txt"));
+    assert_eq!(
+        env.hosts_source_url.as_deref(),
+        Some("https://example.com/hosts.txt")
+    );
     assert_eq!(env.startup_args.as_deref(), Some("--lang=zh-CN"));
     assert!(env.icon.is_none(), "null 应解码为 None");
 
@@ -631,7 +672,9 @@ fn instance_endpoints_full_surface() {
     assert_eq!(by_env.len(), 1);
     assert_eq!(by_env[0].environment_id, "env_1");
 
-    let created = client.instance_create("env_1").expect("instance_create 应成功");
+    let created = client
+        .instance_create("env_1")
+        .expect("instance_create 应成功");
     assert_eq!(created.id, "ins_1");
 
     let got = client.instance_get("ins_1").expect("instance_get 应成功");
@@ -659,7 +702,9 @@ fn instance_endpoints_full_surface() {
     assert_eq!(endpoint.port, 9333);
     assert_eq!(endpoint.web_socket_url, None);
 
-    client.instance_delete("ins_1").expect("instance_delete 应成功");
+    client
+        .instance_delete("ins_1")
+        .expect("instance_delete 应成功");
 }
 
 /// extension 全方法面：list / get / register / set_enabled / delete；
@@ -685,10 +730,14 @@ fn extension_endpoints_and_type_rename() {
         .expect("extension_register 应成功");
     assert_eq!(registered.id, "ext_user");
 
-    let toggled = client.extension_set_enabled("ext_user", false).expect("应成功");
+    let toggled = client
+        .extension_set_enabled("ext_user", false)
+        .expect("应成功");
     assert_eq!(toggled.id, "ext_user");
 
-    client.extension_delete("ext_user").expect("extension_delete 应成功");
+    client
+        .extension_delete("ext_user")
+        .expect("extension_delete 应成功");
 }
 
 /// extension config：GET 往返（含 environmentId query 路径）、PUT 成功、
@@ -750,22 +799,45 @@ fn instance_diagnostics_passthrough_and_unavailable() {
         }
         other => panic!("应为 Api 变体: {other:?}"),
     }
-    assert_eq!(exit::from_cli_error(&err).as_u8(), 5, "409 → RUNTIME exit 5");
+    assert_eq!(
+        exit::from_cli_error(&err).as_u8(),
+        5,
+        "409 → RUNTIME exit 5"
+    );
 }
 
 /// 常驻诊断（M6）四方法面：console/network 环解包（含 query 透传）、
-/// screenshot 的 base64+PNG 魔数解码链、har 文档解包、409 → exit 5
+/// screenshot 的 base64+PNG 魔数解码链、har 文档解包、409 → exit 5、
+/// P2-D 的 tab 过滤参数透传（echo 路由验证服务端确实收到 tab）
 #[test]
 fn resident_diagnostics_endpoints() {
     let client = test_client();
 
-    let console = client.instance_console("ins_x", Some("error"), Some(10)).expect("console 应成功");
+    let console = client
+        .instance_console("ins_x", Some("error"), None, Some(10))
+        .expect("console 应成功");
     assert_eq!(console["entries"].as_array().unwrap().len(), 2);
 
-    let network = client.instance_network("ins_x", true, None).expect("network 应成功");
+    let network = client
+        .instance_network("ins_x", true, None, None)
+        .expect("network 应成功");
     assert_eq!(network["entries"][0]["status"], 404);
 
-    let shot = client.instance_screenshot("ins_x").expect("screenshot 应成功");
+    // P2-D：tab 参数由 client 原样拼入 query（echo 路由回显为 meta.filteredByTab）
+    let console = client
+        .instance_console("ins_tab", None, Some("tab-9f"), None)
+        .expect("console tab 透传应成功");
+    assert_eq!(console["meta"]["filteredByTab"], "tab-9f");
+    assert_eq!(console["meta"]["tabFilterUnavailable"], false);
+
+    let network = client
+        .instance_network("ins_tab", false, Some("tab-9f"), None)
+        .expect("network tab 透传应成功");
+    assert_eq!(network["meta"]["filteredByTab"], "tab-9f");
+
+    let shot = client
+        .instance_screenshot("ins_x")
+        .expect("screenshot 应成功");
     assert_eq!(shot["format"], "png");
     // 客户端解码链（base64 + PNG 魔数）由截图命令内部使用，此处至少验 base64 可解
     let data = shot["data"].as_str().unwrap();
@@ -775,7 +847,9 @@ fn resident_diagnostics_endpoints() {
     assert_eq!(har["log"]["version"], "1.2");
     assert_eq!(har["log"]["entries"].as_array().unwrap().len(), 1);
 
-    let err = client.instance_console("err_409_diag", None, None).unwrap_err();
+    let err = client
+        .instance_console("err_409_diag", None, None, None)
+        .unwrap_err();
     match &err {
         CliError::Api { status, code, .. } => {
             assert_eq!(*status, 409);
@@ -821,7 +895,9 @@ fn instance_status_tabs_navigate_focus_contract() {
     let client = test_client();
 
     // 精简视图：与全量 Instance 的字段分工（轻量轮询 vs 完整详情）
-    let status = client.instance_status("ins_x").expect("instance_status 应成功");
+    let status = client
+        .instance_status("ins_x")
+        .expect("instance_status 应成功");
     assert_eq!(status.id, "ins_x");
     assert_eq!(status.status, InstanceStatus::Running);
     assert_eq!(status.pid, Some(123));
@@ -846,7 +922,9 @@ fn instance_status_tabs_navigate_focus_contract() {
     assert_eq!(navigated.url, "https://example.com/");
 
     // focus：返回全量 Instance
-    let focused = client.instance_focus("ins_1").expect("instance_focus 应成功");
+    let focused = client
+        .instance_focus("ins_1")
+        .expect("instance_focus 应成功");
     assert_eq!(focused.id, "ins_1");
     assert_eq!(focused.profile_dir, "/tmp/chrome-host/env_1/ins_1");
 
@@ -859,7 +937,11 @@ fn instance_status_tabs_navigate_focus_contract() {
         }
         other => panic!("focus 409 应解包为 CliError::Api，实际 {other:?}"),
     }
-    assert_eq!(exit::from_cli_error(&err).as_u8(), 5, "409 运行时冲突 → exit 5");
+    assert_eq!(
+        exit::from_cli_error(&err).as_u8(),
+        5,
+        "409 运行时冲突 → exit 5"
+    );
 }
 
 /// env activity（含 null 可空字段一例）+ env status 计数视图
@@ -867,7 +949,9 @@ fn instance_status_tabs_navigate_focus_contract() {
 fn env_activity_and_status_contract() {
     let client = test_client();
 
-    let events = client.env_activity("env_1", 2).expect("env_activity 应成功");
+    let events = client
+        .env_activity("env_1", 2)
+        .expect("env_activity 应成功");
     assert_eq!(events.len(), 2);
     // 有值一例：可空字段落位
     assert_eq!(events[0].ts, 1_700_000_000_000);
@@ -912,7 +996,9 @@ fn session_endpoints_contract() {
     let client = test_client();
 
     // 状态：policy/generation/历史代（新 → 旧），可空 sourceInstanceId=null 兜底
-    let s = client.session_status("env_1").expect("session_status 应成功");
+    let s = client
+        .session_status("env_1")
+        .expect("session_status 应成功");
     assert_eq!(s.policy, "first-login");
     assert_eq!(s.generation, 3);
     assert_eq!(s.cookie_count, 12);
@@ -926,7 +1012,9 @@ fn session_endpoints_contract() {
     assert_eq!(restored.environment_id, "env_1");
 
     // 从实例捕获：独立响应形状（environmentId/instanceId/generation/cookieCount）
-    let cap = client.login_profile_capture_from("env_2", "ins_7").expect("capture_from 应成功");
+    let cap = client
+        .login_profile_capture_from("env_2", "ins_7")
+        .expect("capture_from 应成功");
     assert_eq!(cap.instance_id, "ins_7");
     assert_eq!(cap.generation, 4);
     assert_eq!(cap.cookie_count, 15);
@@ -937,7 +1025,9 @@ fn login_profile_endpoints_contract() {
     let client = test_client();
 
     // 列表 Row：含环境名、无 cdpPort 字段、lastCapturedAt=null（从未捕获）
-    let rows = client.login_profile_list().expect("login_profile_list 应成功");
+    let rows = client
+        .login_profile_list()
+        .expect("login_profile_list 应成功");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].environment_id, "env_2");
     assert_eq!(rows[0].environment_name, "第二环境");
@@ -954,7 +1044,9 @@ fn login_profile_endpoints_contract() {
 
     // 两个动作统一回 View（fixture 是 canned 契约，不回显请求语境）
     for view in [
-        client.login_profile_capture("env_2").expect("capture 应成功"),
+        client
+            .login_profile_capture("env_2")
+            .expect("capture 应成功"),
         client.login_profile_reset("env_2").expect("reset 应成功"),
     ] {
         assert_eq!(view.id, "env_1");
@@ -971,7 +1063,11 @@ fn login_profile_endpoints_contract() {
         }
         other => panic!("capture 409 应解包为 CliError::Api，实际 {other:?}"),
     }
-    assert_eq!(exit::from_cli_error(&err).as_u8(), 5, "409 运行时冲突 → exit 5");
+    assert_eq!(
+        exit::from_cli_error(&err).as_u8(),
+        5,
+        "409 运行时冲突 → exit 5"
+    );
 }
 
 /// LoginProfileStatus 的 snake_case 四值 + 未知值 #[serde(other)] 兑底回归
@@ -1020,17 +1116,27 @@ fn api_error_shapes_carry_status_code_and_exit() {
     // 404：{error:{code:INSTANCE_NOT_FOUND}}
     let err = client.instance_get("err_404").unwrap_err();
     match &err {
-        CliError::Api { status, code, message } => {
+        CliError::Api {
+            status,
+            code,
+            message,
+        } => {
             assert_eq!(*status, 404);
             assert_eq!(code, "INSTANCE_NOT_FOUND");
             assert_eq!(message, "x");
         }
         other => panic!("404 应解包为 CliError::Api，实际 {other:?}"),
     }
-    assert_eq!(exit::from_cli_error(&err).as_u8(), 3, "404 *_NOT_FOUND → exit 3");
+    assert_eq!(
+        exit::from_cli_error(&err).as_u8(),
+        3,
+        "404 *_NOT_FOUND → exit 3"
+    );
 
     // 403：EXTENSION_SYSTEM_LOCKED（对 system 扩展 set_enabled）
-    let err = client.extension_set_enabled("ext_system", false).unwrap_err();
+    let err = client
+        .extension_set_enabled("ext_system", false)
+        .unwrap_err();
     match &err {
         CliError::Api { status, code, .. } => {
             assert_eq!(*status, 403);
@@ -1038,7 +1144,11 @@ fn api_error_shapes_carry_status_code_and_exit() {
         }
         other => panic!("403 应解包为 CliError::Api，实际 {other:?}"),
     }
-    assert_eq!(exit::from_cli_error(&err).as_u8(), 6, "403 内置扩展锁定 → exit 6");
+    assert_eq!(
+        exit::from_cli_error(&err).as_u8(),
+        6,
+        "403 内置扩展锁定 → exit 6"
+    );
 
     // 409：INSTANCE_ALREADY_RUNNING
     let err = client.instance_start("err_409").unwrap_err();
@@ -1049,7 +1159,11 @@ fn api_error_shapes_carry_status_code_and_exit() {
         }
         other => panic!("409 应解包为 CliError::Api，实际 {other:?}"),
     }
-    assert_eq!(exit::from_cli_error(&err).as_u8(), 5, "409 运行时冲突 → exit 5");
+    assert_eq!(
+        exit::from_cli_error(&err).as_u8(),
+        5,
+        "409 运行时冲突 → exit 5"
+    );
 
     // 400：INVALID_REQUEST
     let err = client.env_patch("err_400", json!({})).unwrap_err();
@@ -1068,7 +1182,10 @@ fn api_error_shapes_carry_status_code_and_exit() {
 fn plain_text_response_is_protocol_error() {
     let client = test_client();
     let err = client.instance_get("plain").unwrap_err();
-    assert!(matches!(err, CliError::Protocol(_)), "纯文本应得 Protocol，实际 {err:?}");
+    assert!(
+        matches!(err, CliError::Protocol(_)),
+        "纯文本应得 Protocol，实际 {err:?}"
+    );
     assert_eq!(exit::from_cli_error(&err).as_u8(), 1);
 }
 
@@ -1103,6 +1220,9 @@ fn unreachable_when_no_server_listening() {
         .port();
     let client = AgentClient::new(&format!("http://127.0.0.1:{port}")).expect("构造应成功");
     let err = client.env_list().unwrap_err();
-    assert!(matches!(err, CliError::Unreachable(_)), "连接拒绝应得 Unreachable，实际 {err:?}");
+    assert!(
+        matches!(err, CliError::Unreachable(_)),
+        "连接拒绝应得 Unreachable，实际 {err:?}"
+    );
     assert_eq!(exit::from_cli_error(&err).as_u8(), 8, "不可达 → exit 8");
 }

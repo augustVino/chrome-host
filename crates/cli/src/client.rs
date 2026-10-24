@@ -25,9 +25,9 @@ use reqwest::Method;
 
 use crate::error::CliError;
 use crate::model::{
-    AppEvent, AppSettingsView, CdpEndpoint, CdpTarget, CftStatus, Environment, EnvironmentSummary,
-    EnvStatus, Extension, HealthReport, Instance, InstanceStatusView, InstanceView,
-    KernelCancelResult, KernelDownloadResult, LoginProfileRow, LoginProfileView, CdpSessionView,
+    AppEvent, AppSettingsView, CdpEndpoint, CdpSessionView, CdpTarget, CftStatus, EnvStatus,
+    Environment, EnvironmentSummary, Extension, HealthReport, Instance, InstanceStatusView,
+    InstanceView, KernelCancelResult, KernelDownloadResult, LoginProfileRow, LoginProfileView,
     SessionCaptureResult, SessionStatus,
 };
 
@@ -213,6 +213,18 @@ fn config_path(id: &str, env: Option<&str>) -> String {
     match env {
         Some(e) => format!("/api/v1/extensions/{id}/config?environmentId={e}"),
         None => format!("/api/v1/extensions/{id}/config"),
+    }
+}
+
+/// 可选 query 参数拼接：任一 Some → `?a=x&b=y`，全 None → 空串。
+/// 参数值为非敏感标识（level/tab/limit，同 activity 的直拼先例，无需 URL 编码）；
+/// verbose 请求行的 query 剥离纪律由 [`verbose_line`] 统一守护。
+fn join_query(parts: [Option<String>; 3]) -> String {
+    let joined: Vec<String> = parts.into_iter().flatten().collect();
+    if joined.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", joined.join("&"))
     }
 }
 
@@ -557,40 +569,48 @@ impl AgentClient {
     }
 
     /// GET /api/v1/instances/{id}/console —— 常驻订阅 console 环。
-    /// query：可选 level（精确匹配）与 limit；均非敏感，同 activity 的直拼先例。
+    /// query：可选 level（精确匹配）、tab（targetId 归属过滤）、limit；均为非敏感
+    /// 标识，同 activity 的直拼先例。
     pub fn instance_console(
         &self,
         id: &str,
         level: Option<&str>,
+        tab: Option<&str>,
         limit: Option<usize>,
     ) -> Result<serde_json::Value, CliError> {
-        let mut path = format!("/api/v1/instances/{id}/console");
-        if let Some(l) = level {
-            path.push_str(&format!("?level={l}"));
-        }
-        if let Some(n) = limit {
-            path.push_str(if level.is_some() { "&" } else { "?" });
-            path.push_str(&format!("limit={n}"));
-        }
-        Self::decode(self.send(Method::GET, &path, None, false))
+        let query = join_query([
+            level.map(|l| format!("level={l}")),
+            tab.map(|t| format!("tab={t}")),
+            limit.map(|n| format!("limit={n}")),
+        ]);
+        Self::decode(self.send(
+            Method::GET,
+            &format!("/api/v1/instances/{id}/console{query}"),
+            None,
+            false,
+        ))
     }
 
-    /// GET /api/v1/instances/{id}/network —— 常驻订阅请求环（failedOnly 过滤）
+    /// GET /api/v1/instances/{id}/network —— 常驻订阅请求环
+    /// （failedOnly / tab / limit 可选 query，同上非敏感）
     pub fn instance_network(
         &self,
         id: &str,
         failed_only: bool,
+        tab: Option<&str>,
         limit: Option<usize>,
     ) -> Result<serde_json::Value, CliError> {
-        let mut path = format!("/api/v1/instances/{id}/network");
-        if failed_only {
-            path.push_str("?failedOnly=true");
-        }
-        if let Some(n) = limit {
-            path.push_str(if failed_only { "&" } else { "?" });
-            path.push_str(&format!("limit={n}"));
-        }
-        Self::decode(self.send(Method::GET, &path, None, false))
+        let query = join_query([
+            (failed_only).then(|| "failedOnly=true".to_string()),
+            tab.map(|t| format!("tab={t}")),
+            limit.map(|n| format!("limit={n}")),
+        ]);
+        Self::decode(self.send(
+            Method::GET,
+            &format!("/api/v1/instances/{id}/network{query}"),
+            None,
+            false,
+        ))
     }
 
     /// GET /api/v1/instances/{id}/screenshot —— png base64（复用常驻诊断连接）
@@ -749,7 +769,11 @@ impl AgentClient {
 
     /// POST /api/v1/environments/{id}/session/restore {generation}
     /// —— 回滚 Cookie 保险库到指定历史代（仅 Cookie 层；文件快照保留当前）。
-    pub fn session_restore(&self, env_id: &str, generation: i64) -> Result<SessionStatus, CliError> {
+    pub fn session_restore(
+        &self,
+        env_id: &str,
+        generation: i64,
+    ) -> Result<SessionStatus, CliError> {
         Self::decode(self.send(
             Method::POST,
             &format!("/api/v1/environments/{env_id}/session/restore"),

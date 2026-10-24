@@ -43,8 +43,13 @@ pub async fn stop_all(
     State(state): State<ApiState>,
     Path(environment_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let stopped = state.instance_service.stop_all_for_env(&environment_id).await?;
-    Ok(Json(json!({ "environmentId": environment_id, "stopped": stopped })))
+    let stopped = state
+        .instance_service
+        .stop_all_for_env(&environment_id)
+        .await?;
+    Ok(Json(
+        json!({ "environmentId": environment_id, "stopped": stopped }),
+    ))
 }
 
 /// GET /api/v1/environments/{environmentId}/instances
@@ -144,6 +149,8 @@ pub struct ConsoleQuery {
     pub level: Option<String>,
     /// 缺省 100，上限 1000
     pub limit: Option<usize>,
+    /// 按 tab 过滤（targetId，由 GET tabs 获得）；环中存在无归属条目时降级全量
+    pub tab: Option<String>,
 }
 
 /// GET /api/v1/instances/{id}/console：常驻订阅的 console 环（500 条，进程内态）
@@ -152,7 +159,9 @@ pub async fn console(
     Path(id): Path<String>,
     Query(q): Query<ConsoleQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let view = state.diagnostics.console(&id, q.level.as_deref(), q.limit)?;
+    let view = state
+        .diagnostics
+        .console(&id, q.level.as_deref(), q.tab.as_deref(), q.limit)?;
     Ok(Json(view))
 }
 
@@ -162,6 +171,8 @@ pub struct NetworkQuery {
     #[serde(rename = "failedOnly", default)]
     pub failed_only: bool,
     pub limit: Option<usize>,
+    /// 按 tab 过滤（targetId，由 GET tabs 获得）；环中存在无归属条目时降级全量
+    pub tab: Option<String>,
 }
 
 /// GET /api/v1/instances/{id}/network：常驻订阅的请求环（1000 条，完成/失败时入环）
@@ -170,7 +181,9 @@ pub async fn network(
     Path(id): Path<String>,
     Query(q): Query<NetworkQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let view = state.diagnostics.network(&id, q.failed_only, q.limit)?;
+    let view = state
+        .diagnostics
+        .network(&id, q.failed_only, q.tab.as_deref(), q.limit)?;
     Ok(Json(view))
 }
 
