@@ -4,7 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'events';
-import { execCommand, sendCommand } from '../lib/daemon.mjs';
+import { execCommand, sendCommand, bindRefInvalidation } from '../lib/daemon.mjs';
+import { RefStore } from '../lib/ref-store.mjs';
 import { FakeCdp } from './helpers.mjs';
 
 const SID = 'SESSION-1';
@@ -53,6 +54,87 @@ test('snap (and snapshot alias) uses compact mode on the attached session', asyn
     assert.equal(res.result, '[WebArea] P\n  [button] OK');
     assert.equal(cdp.callsOf('Accessibility.getFullAXTree').at(-1).sessionId, SID);
   }
+});
+
+test('snap populates the daemon ref store (whole-table replace, §3.5)', async () => {
+  const nodes = [
+    { nodeId: '1', role: { value: 'WebArea' }, name: { value: 'P' }, childIds: ['2', '3'] },
+    { nodeId: '2', parentId: '1', role: { value: 'button' }, name: { value: 'OK' }, backendDOMNodeId: 101 },
+    { nodeId: '3', parentId: '1', role: { value: 'link' }, name: { value: 'Next' }, backendDOMNodeId: 102 },
+  ];
+  const cdp = new FakeCdp(async (method) => {
+    if (method === 'Accessibility.getFullAXTree') return { nodes };
+    return {};
+  });
+  const store = new RefStore();
+  const res = await execCommand(cdp, SID, TARGET, { cmd: 'snap', args: [] }, undefined, store);
+  assert.equal(res.ok, true);
+  assert.match(res.result, /@e1 \[button\] OK/);
+  assert.deepEqual(store.resolve('@e1'), { backendNodeId: 101, name: 'OK' });
+  assert.deepEqual(store.resolve('e2'), { backendNodeId: 102, name: 'Next' });
+
+  // A second snap replaces the whole table — old e2 dies if not re-found.
+  const nodes2 = [nodes[0], nodes[1]];
+  cdp.handler = async (method) => (method === 'Accessibility.getFullAXTree') ? { nodes: nodes2 } : {};
+  await execCommand(cdp, SID, TARGET, { cmd: 'snap', args: [] }, undefined, store);
+  assert.equal(store.resolve('e2'), null);
+  assert.deepEqual(store.resolve('e1'), { backendNodeId: 101, name: 'OK' });
+});
+
+test('click @eN goes through the store end-to-end; stale ref reports ref_stale', async () => {
+  const cdp = new FakeCdp(async (method) => {
+    if (method === 'DOM.scrollIntoViewIfNeeded') return {};
+    if (method === 'DOM.getContentQuads') return { quads: [[10, 20, 110, 20, 110, 60, 10, 60]] };
+    if (method === 'Input.dispatchMouseEvent') return {};
+    throw new Error('unexpected ' + method);
+  });
+  const store = new RefStore();
+  store.replace([{ ref: 'e1', backendNodeId: 55, name: '提交' }]);
+
+  const res = await execCommand(cdp, SID, TARGET, { cmd: 'click', args: ['@e1'] }, undefined, store);
+  assert.deepEqual(res, { ok: true, result: 'Clicked @e1 "提交" at CSS (60, 40)' });
+  assert.deepEqual(cdp.callsOf('DOM.getContentQuads')[0].params, { backendNodeId: 55 });
+
+  store.invalidate('navigation');
+  const stale = await execCommand(cdp, SID, TARGET, { cmd: 'click', args: ['@e1'] }, undefined, store);
+  assert.equal(stale.ok, false);
+  assert.match(stale.error, /^ref_stale: page changed since the last snap \(navigation\)/);
+
+  const miss = await execCommand(cdp, SID, TARGET, { cmd: 'click', args: ['@e7'] }, undefined, store);
+  assert.match(miss.error, /^ref_stale:/); // table is empty-but-stale → stale guidance
+});
+
+test('bindRefInvalidation: enables domains, invalidates on root navigation/documentUpdated only', async () => {
+  const cdp = new FakeCdp(async () => ({}));
+  const store = new RefStore();
+  store.replace([{ ref: 'e1', backendNodeId: 1 }]);
+
+  await bindRefInvalidation(cdp, SID, store);
+  // Enables sent on the tab session, best-effort (failures swallowed).
+  assert.deepEqual(cdp.callsOf('Page.enable').map(c => c.sessionId), [SID]);
+  assert.deepEqual(cdp.callsOf('DOM.enable').map(c => c.sessionId), [SID]);
+
+  // Child-frame navigation must NOT drop refs (SPEC §3.6 root-only rule).
+  cdp.emitEvent('Page.frameNavigated',
+    { frame: { id: 'child', parentId: 'root' } }, { method: 'Page.frameNavigated', params: {}, sessionId: SID });
+  assert.equal(store.size, 1);
+
+  // Events from another session are ignored (each daemon owns one tab).
+  cdp.emitEvent('DOM.documentUpdated', {}, { method: 'DOM.documentUpdated', params: {}, sessionId: 'OTHER' });
+  assert.equal(store.size, 1);
+
+  // Root navigation → invalidation.
+  cdp.emitEvent('Page.frameNavigated',
+    { frame: { id: 'root' } }, { method: 'Page.frameNavigated', params: {}, sessionId: SID });
+  assert.equal(store.size, 0);
+  assert.equal(store.stale, true);
+  assert.equal(store.lastInvalidReason, 'navigation');
+
+  // documentUpdated after a re-snap also invalidates.
+  store.replace([{ ref: 'e1', backendNodeId: 2 }]);
+  cdp.emitEvent('DOM.documentUpdated', {}, { method: 'DOM.documentUpdated', params: {}, sessionId: SID });
+  assert.equal(store.size, 0);
+  assert.equal(store.lastInvalidReason, 'document updated');
 });
 
 test('eval evaluates the first arg on the session', async () => {

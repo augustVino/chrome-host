@@ -358,7 +358,7 @@ test('clickStr --unsafe-synth keeps the synthetic el.click() legacy path', async
     }
     throw new Error('unexpected ' + method);
   });
-  assert.equal(await clickStr(cdp, 'SID', '.hook', true),
+  assert.equal(await clickStr(cdp, 'SID', '.hook', undefined, true),
     'Clicked <A> "hook" (synthetic el.click())');
   assert.ok(cdp.calls[1].params.expression.includes('el.click()'));
   assert.equal(cdp.callsOf('Input.dispatchMouseEvent').length, 0);
@@ -368,7 +368,7 @@ test('clickStr --unsafe-synth keeps the synthetic el.click() legacy path', async
     if (method === 'Runtime.evaluate') return { result: { value: JSON.stringify({ error: 'not_found' }) } };
     throw new Error('unexpected ' + method);
   });
-  await assert.rejects(clickStr(missing, 's', '.gone', true),
+  await assert.rejects(clickStr(missing, 's', '.gone', undefined, true),
     { code: 'element_not_found', message: 'Element not found: .gone' });
 });
 

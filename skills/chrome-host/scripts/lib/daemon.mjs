@@ -10,7 +10,8 @@ import {
 } from './paths.mjs';
 import { CDP, getWsUrl } from './cdp-client.mjs';
 import { getPages, formatPageList, resolvePrefix } from './pages.mjs';
-import { snapshotStr } from './tools/snapshot.mjs';
+import { collectSnapshot } from './tools/snapshot.mjs';
+import { RefStore } from './ref-store.mjs';
 import { evalStr, htmlStr, netStr } from './tools/evaluate.mjs';
 import { navStr } from './tools/navigate.mjs';
 import { clickStr, clickXyStr, typeStr, loadAllStr } from './tools/interact.mjs';
@@ -22,10 +23,12 @@ import { DialogTracker, handleDialogOpening, dialogsStr } from './dialogs.mjs';
 // dialogs is the per-tab DialogTracker; when present, every command marks the
 // dialog cursor on entry and its response gains an optional dialogs_seen
 // field if new dialogs were auto-accepted while it ran (BEHAVIOR-SPEC §1.6).
+// refStore is the daemon's @eN ref table; omitted → a throwaway store per
+// call (fine for single-shot tests, runDaemon passes a persistent one).
 // Returns { ok, result } / { ok, error } / { ok, result, stopAfter }.
-export async function execCommand(cdp, sessionId, targetId, req, dialogs) {
+export async function execCommand(cdp, sessionId, targetId, req, dialogs, refStore = new RefStore()) {
   const cursor = dialogs?.cursor();
-  const res = await dispatchCommand(cdp, sessionId, targetId, req, dialogs);
+  const res = await dispatchCommand(cdp, sessionId, targetId, req, dialogs, refStore);
   if (dialogs) {
     const seen = dialogs.since(cursor);
     if (seen.length > 0) res.dialogs_seen = seen; // omitted when empty: wire stays backward compatible
@@ -33,7 +36,7 @@ export async function execCommand(cdp, sessionId, targetId, req, dialogs) {
   return res;
 }
 
-async function dispatchCommand(cdp, sessionId, targetId, { cmd, args }, dialogs) {
+async function dispatchCommand(cdp, sessionId, targetId, { cmd, args }, dialogs, refStore) {
   try {
     let result;
     switch (cmd) {
@@ -47,7 +50,14 @@ async function dispatchCommand(cdp, sessionId, targetId, { cmd, args }, dialogs)
         result = JSON.stringify(pages);
         break;
       }
-      case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, true); break;
+      case 'snap': case 'snapshot': {
+        // Whole-table swap + generation++ (SPEC §3.5): refs describe the
+        // LAST snap only. Old refs die here even if the new snap found none.
+        const { text, refs } = await collectSnapshot(cdp, sessionId, true);
+        refStore.replace(refs);
+        result = text;
+        break;
+      }
       case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
       case 'shot': case 'screenshot': result = await shotStr(cdp, sessionId, args[0], targetId); break;
       case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
@@ -55,8 +65,8 @@ async function dispatchCommand(cdp, sessionId, targetId, { cmd, args }, dialogs)
       case 'net': case 'network': result = await netStr(cdp, sessionId); break;
       case 'click': {
         const unsafe = args.includes('--unsafe-synth');
-        const selector = args.find(a => a !== '--unsafe-synth');
-        result = await clickStr(cdp, sessionId, selector, unsafe);
+        const target = args.find(a => a !== '--unsafe-synth');
+        result = await clickStr(cdp, sessionId, target, refStore, unsafe);
         break;
       }
       case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
@@ -73,6 +83,36 @@ async function dispatchCommand(cdp, sessionId, targetId, { cmd, args }, dialogs)
     // the daemon protocol; the CLI prints them as "[CODE] message".
     return { ok: false, error: e.message, ...(e.code ? { code: e.code } : {}) };
   }
+}
+
+// Subscribe to the ref-invalidation sources for one tab (SPEC §3.6):
+//   - Page.frameNavigated, ROOT frame only (child-frame navigation keeps refs)
+//   - Page.documentOpened
+//   - DOM.documentUpdated (needs DOM.enable)
+// Page.enable is required for the Page.* events; both enables are
+// idempotent in CDP, so overlapping with T3's dialog-flow Page.enable is
+// harmless. Trade-off on DOM.enable: it starts the DOM agent's event stream
+// (setChildNodes etc.) for this tab — modest traffic overhead, no page-side
+// behavior change. Kept because same-document full replacements
+// (document.write and friends) would otherwise go undetected until a ref
+// fails to resolve (the target_moved backstop catches those anyway, but
+// the explicit invalidation tells the agent to re-snap instead of retrying).
+export async function bindRefInvalidation(cdp, sessionId, refStore) {
+  try { await cdp.send('Page.enable', {}, sessionId); } catch {}
+  try { await cdp.send('DOM.enable', {}, sessionId); } catch {}
+
+  const own = (msg) => msg?.sessionId === sessionId;
+  cdp.onEvent('Page.frameNavigated', (params, msg) => {
+    if (!own(msg)) return;
+    if (params.frame?.parentId) return; // child frame — refs stay valid
+    refStore.invalidate('navigation');
+  });
+  cdp.onEvent('Page.documentOpened', (_params, msg) => {
+    if (own(msg)) refStore.invalidate('document opened');
+  });
+  cdp.onEvent('DOM.documentUpdated', (_params, msg) => {
+    if (own(msg)) refStore.invalidate('document updated');
+  });
 }
 
 export async function runDaemon(targetId) {
@@ -134,6 +174,12 @@ export async function runDaemon(targetId) {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
+  // @eN ref table + invalidation wiring (SPEC §3.5/3.6): every snap swaps
+  // the whole table; navigation / document replacement clears it so stale
+  // refs fail loudly (ref_stale) instead of clicking stale geometry.
+  const refStore = new RefStore();
+  await bindRefInvalidation(cdp, sessionId, refStore);
+
   // Idle timer
   let idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
   function resetIdle() {
@@ -144,7 +190,7 @@ export async function runDaemon(targetId) {
   // Handle a command
   async function handleCommand(req) {
     resetIdle();
-    return execCommand(cdp, sessionId, targetId, req, dialogs);
+    return execCommand(cdp, sessionId, targetId, req, dialogs, refStore);
   }
 
   // Unix socket server — NDJSON protocol
