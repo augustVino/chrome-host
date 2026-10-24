@@ -68,6 +68,11 @@ const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// mousePressed → mouseReleased 的间隔（TS dispatchClickAtPoint 的 50ms）
 const CLICK_RELEASE_DELAY: Duration = Duration::from_millis(50);
+/// loadall 缺省轮询间隔（TS loadAllStr 的 1500ms）
+const DEFAULT_LOADALL_INTERVAL: Duration = Duration::from_millis(1500);
+/// loadall 缺省点击上限。TS 是 5min 硬顶（200 × 1500ms = 5min，量级对齐），
+/// max-clicks × interval 组合等价但更可控（任务决策，报告披露）。
+const DEFAULT_LOADALL_MAX_CLICKS: u32 = 200;
 
 /// 连接工厂：生产 = connect_page（browser 级 eventing WS），测试注入 fake。
 type Connector = Arc<
@@ -441,6 +446,115 @@ impl PageService {
         )
         .await
     }
+
+    /// eval <tab> <expr>：任意 JS 求值（Runtime.evaluate，returnByValue +
+    /// awaitPromise），结果按 TS evalStr 形态序列化成字符串（P2-G）。
+    /// **高权限原语**（可执行任意 JS，与退役前 cdp.mjs 同权限）——契约文档
+    /// 已标注「仅在需要时使用，优先 page 原语」。
+    pub async fn eval(&self, ins_id: &str, tab: &str, expression: &str) -> Result<Value, AppError> {
+        self.command(
+            TOOL_TIMEOUT,
+            "eval",
+            ins_id,
+            tab,
+            |w, _tid, sid| async move { eval_tool(&w, &sid, expression).await },
+        )
+        .await
+    }
+
+    /// html <tab> [selector]：读 outerHTML（缺省 = 整文档；selector 未命中
+    /// → 404 PAGE_ELEMENT_NOT_FOUND，见 html_tool 的行为差异说明）（P2-G）。
+    pub async fn html(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        selector: Option<&str>,
+    ) -> Result<Value, AppError> {
+        self.command(
+            TOOL_TIMEOUT,
+            "html",
+            ins_id,
+            tab,
+            |w, _tid, sid| async move { html_tool(&w, &sid, selector).await },
+        )
+        .await
+    }
+
+    /// clickxy <tab> <x> <y>：视口 CSS 像素坐标直接三段派发（无 locate /
+    /// hit-test——坐标即意图；跨域 iframe 内元素的兜底点击路径）（P2-G）。
+    pub async fn clickxy(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        x: f64,
+        y: f64,
+    ) -> Result<Value, AppError> {
+        // JSON 无法携带 NaN/Infinity，这道门拦的是 CLI/本地调用方的 inf/nan
+        // 字面量（对齐 TS clickXyStr 的 isNaN 检查）
+        if !x.is_finite() || !y.is_finite() {
+            return Err(AppError::invalid_request(
+                "x and y must be finite numbers (CSS pixels)",
+            ));
+        }
+        self.command(
+            TOOL_TIMEOUT,
+            "clickxy",
+            ins_id,
+            tab,
+            |w, _tid, sid| async move { clickxy_tool(&w, &sid, x, y).await },
+        )
+        .await
+    }
+
+    /// loadall <tab> <sel> [--interval] [--max-clicks]：循环点击直到选择器
+    /// 消失或达上限（P2-G）。预算 = interval × max-clicks + 工具兑底
+    /// （默认 200 × 1500ms = 5min + 30s，对齐 TS 的 5min 硬顶量级）。
+    pub async fn loadall(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        selector: &str,
+        interval: Option<&str>,
+        max_clicks: Option<u32>,
+    ) -> Result<Value, AppError> {
+        if selector.is_empty() {
+            return Err(AppError::invalid_request("CSS selector required"));
+        }
+        let interval = match interval {
+            Some(s) => parse_duration(s, "--interval")?,
+            None => DEFAULT_LOADALL_INTERVAL,
+        };
+        let max_clicks = max_clicks.unwrap_or(DEFAULT_LOADALL_MAX_CLICKS);
+        let budget = TOOL_TIMEOUT + interval * max_clicks;
+        self.command(
+            budget,
+            "loadall",
+            ins_id,
+            tab,
+            move |w, _tid, sid| async move {
+                loadall_tool(&w, &sid, selector, interval, max_clicks).await
+            },
+        )
+        .await
+    }
+
+    /// type <tab> <text>：对当前焦点元素直接 Input.insertText（无定位、无
+    /// 校验）——跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达
+    /// 跨域 frame，先 clickxy 点入获得焦点）（P2-G，owner 补充）。空文本 →
+    /// 400（对齐 TS typeStr）。
+    pub async fn r#type(&self, ins_id: &str, tab: &str, text: &str) -> Result<Value, AppError> {
+        if text.is_empty() {
+            return Err(AppError::invalid_request("text required"));
+        }
+        self.command(
+            TOOL_TIMEOUT,
+            "type",
+            ins_id,
+            tab,
+            |w, _tid, sid| async move { type_tool(&w, &sid, text).await },
+        )
+        .await
+    }
 }
 
 /// 工具级预算：超时即放弃整个命令（连接守卫随 future 取消而释放，tokio
@@ -769,9 +883,14 @@ fn truncate40(s: &str) -> String {
 // 4. 页内 eval 基件（TS evaluate.mjs evalStr / click-native.mjs evalJson）
 // ============================================================================
 
-/// Runtime.evaluate（TS evalStr 形态：每次先 Runtime.enable（幂等），
+/// Runtime.evaluate 的完整 result RemoteObject（eval 取值 / eval 工具序列化 /
+/// html 共用基件；TS evalStr 形态：每次先 Runtime.enable（幂等），
 /// returnByValue + awaitPromise）。页面异常 → 500 PAGE_EVAL_FAILED。
-async fn eval_raw(conn: &SharedPageConn, sid: &str, expression: &str) -> Result<Value, AppError> {
+async fn eval_remote_object(
+    conn: &SharedPageConn,
+    sid: &str,
+    expression: &str,
+) -> Result<Value, AppError> {
     let _: Value = cdp_send(conn, "Runtime.enable", json!({}), Some(sid)).await?;
     let resp = cdp_send(
         conn,
@@ -792,8 +911,15 @@ async fn eval_raw(conn: &SharedPageConn, sid: &str, expression: &str) -> Result<
             text.to_string(),
         ));
     }
-    Ok(resp
-        .pointer("/result/value")
+    Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// eval + 值提取：returnByValue 下 undefined 与 null 都坍缩为 Value::Null
+/// （需要区分二者的工具直接用 [`eval_remote_object`] 读 result.type）。
+async fn eval_raw(conn: &SharedPageConn, sid: &str, expression: &str) -> Result<Value, AppError> {
+    Ok(eval_remote_object(conn, sid, expression)
+        .await?
+        .get("value")
         .cloned()
         .unwrap_or(Value::Null))
 }
@@ -1377,6 +1503,25 @@ async fn dispatch_click(conn: &SharedPageConn, sid: &str, x: f64, y: f64) -> Res
     Ok(())
 }
 
+/// selector 路径点击链（click 与 loadall 共用，TS clickSelectorStr 原生分支）：
+/// locate → hit-test → 三段派发，返回人性化结果串。
+async fn click_selector(
+    conn: &SharedPageConn,
+    sid: &str,
+    selector: &str,
+) -> Result<String, AppError> {
+    let located = eval_json(conn, sid, &locate_expr(selector), "click").await?;
+    let (x, y, tag, text_val) = classify_locate(&located, selector)?;
+    let hit = eval_json(conn, sid, &hit_test_expr(selector, x, y), "click").await?;
+    classify_hit(&hit, selector)?;
+    dispatch_click(conn, sid, x, y).await?;
+    Ok(format!(
+        "Clicked <{tag}> \"{text_val}\" (native input @{},{})",
+        js_num(x),
+        js_num(y)
+    ))
+}
+
 async fn click_tool(
     watched: &Watched,
     tid: &str,
@@ -1401,16 +1546,7 @@ async fn click_tool(
         )
     } else {
         // selector 路径：locate → hit-test → 三段派发（TS clickSelectorStr）
-        let located = eval_json(&conn, sid, &locate_expr(target), "click").await?;
-        let (x, y, tag, text_val) = classify_locate(&located, target)?;
-        let hit = eval_json(&conn, sid, &hit_test_expr(target, x, y), "click").await?;
-        classify_hit(&hit, target)?;
-        dispatch_click(&conn, sid, x, y).await?;
-        format!(
-            "Clicked <{tag}> \"{text_val}\" (native input @{},{})",
-            js_num(x),
-            js_num(y)
-        )
+        click_selector(&conn, sid, target).await?
     };
     Ok(json!({ "result": text }))
 }
@@ -1781,6 +1917,147 @@ async fn wait_tool(
         // 绝不睡过截止线（TS 同）
         tokio::time::sleep(WAIT_POLL_INTERVAL.min(timeout.saturating_sub(elapsed))).await;
     }
+}
+
+// ============================================================================
+// 6b. 工具编排续（P2-G）：eval / html / clickxy / type / loadall
+// （cdp.mjs 退役前置——规格照抄 TS evaluate.mjs / interact.mjs，复用既有
+//  eval 基件与 click 派发链，纯增量）
+// ============================================================================
+
+/// TS evalStr 的结果序列化：对象/数组 → pretty JSON 字符串（对齐
+/// JSON.stringify(v, null, 2) 的 2 空格缩进）、字符串原样、undefined/null
+/// → "undefined"/"null"、数字/布尔 → JS String 形态。与 TS 的微差：
+/// undefined 在 TS 是空串（String(val ?? '')），任务口径取字面量
+/// "undefined"（空串与「无返回」不可区分，字面量更诚实）。
+fn eval_str_from_remote(result: &Value) -> String {
+    match result.get("value") {
+        // returnByValue 下 undefined 无 value 键、null 的 value 为 JSON null，
+        // 二者在 Value 上坍缩，用 result.type 区分
+        None | Some(Value::Null) => match result.get("type").and_then(Value::as_str) {
+            Some("object") => "null".to_string(),
+            _ => "undefined".to_string(),
+        },
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => js_num(n.as_f64().unwrap_or(0.0)),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(v) => serde_json::to_string_pretty(v).unwrap_or_else(|_| "null".into()),
+    }
+}
+
+async fn eval_tool(watched: &Watched, sid: &str, expression: &str) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    let result = eval_remote_object(&conn, sid, expression).await?;
+    Ok(json!({ "result": eval_str_from_remote(&result) }))
+}
+
+/// TS htmlStr：selector 缺省 = 整文档 outerHTML；命中元素 → outerHTML。
+/// 未命中的行为差异（任务两选一，取错误码）：TS 返回字符串哨兵
+/// 'Element not found'，此处报 404 PAGE_ELEMENT_NOT_FOUND——与 click/locate
+/// 的未命中语义一致，调用方按码分支而非解析文案。
+async fn html_tool(
+    watched: &Watched,
+    sid: &str,
+    selector: Option<&str>,
+) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    let expr = match selector {
+        None => "document.documentElement.outerHTML".to_string(),
+        Some(sel) => format!(
+            "(function() {{ const el = document.querySelector({sel}); return el ? el.outerHTML : null; }})()",
+            sel = crate::domain::page_control::json_escape(sel)
+        ),
+    };
+    let result = eval_remote_object(&conn, sid, &expr).await?;
+    match result.get("value") {
+        Some(Value::String(html)) => Ok(json!({ "html": html })),
+        // selector 路径的 null = 页内脚本显式回的未命中（区别于 eval 异常）
+        _ if selector.is_some() => {
+            Err(PageControlError::element_not_found(selector.unwrap_or("")).into())
+        }
+        // 整文档路径不会返回 null；防御空串（不装作成功也不 panic）
+        _ => Ok(json!({ "html": "" })),
+    }
+}
+
+/// TS clickXyStr：复用 click 的三段派发链，无 locate/hit-test（坐标即意图）。
+async fn clickxy_tool(watched: &Watched, sid: &str, x: f64, y: f64) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    dispatch_click(&conn, sid, x, y).await?;
+    Ok(json!({
+        "result": format!("Clicked at CSS ({}, {})", js_num(x), js_num(y))
+    }))
+}
+
+/// TS typeStr：对当前焦点元素直接 Input.insertText（无定位、无校验）。
+/// 字符计数用 Unicode 标量（fill 同口径；TS 的 .length 是 UTF-16 单元，
+/// 仅增补平面字符有差）。
+async fn type_tool(watched: &Watched, sid: &str, text: &str) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    cdp_send(
+        &conn,
+        "Input.insertText",
+        json!({ "text": text }),
+        Some(sid),
+    )
+    .await?;
+    Ok(json!({
+        "result": format!("Typed {} characters", text.chars().count())
+    }))
+}
+
+/// 存在性探针（TS loadAllStr 的 `!!document.querySelector(sel)`）：eval
+/// 失败（导航中）原样上抛，循环不吞异常（TS 同为抛错退出）。
+async fn selector_exists(
+    conn: &SharedPageConn,
+    sid: &str,
+    exists_expr: &str,
+) -> Result<bool, AppError> {
+    Ok(eval_raw(conn, sid, exists_expr).await? == Value::Bool(true))
+}
+
+/// TS loadAllStr 的循环骨架，两处任务口径偏差：
+/// - 点击用原生 selector 链（locate/hit-test/三段派发）替换 TS 的页内
+///   el.click() 合成点击——项目纪律是原生输入（synthetic 仅 --unsafe-synth
+///   场景才对，此处不引入）；
+/// - 上限从 5min 硬顶改为 max-clicks，达上限后补一次存在性复查定文案
+///   （诚实区分「消失了」与「仍在页面上」，调用方据此决定是否继续）。
+async fn loadall_tool(
+    watched: &Watched,
+    sid: &str,
+    selector: &str,
+    interval: Duration,
+    max_clicks: u32,
+) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    let exists_expr = format!(
+        "!!document.querySelector({})",
+        crate::domain::page_control::json_escape(selector)
+    );
+    let mut clicks: u32 = 0;
+    let mut disappeared = false;
+    while clicks < max_clicks {
+        if !selector_exists(&conn, sid, &exists_expr).await? {
+            disappeared = true;
+            break;
+        }
+        click_selector(&conn, sid, selector).await?;
+        clicks += 1;
+        tokio::time::sleep(interval).await;
+    }
+    if !disappeared {
+        // 达上限退出（或 max-clicks=0）：末次观察仍在页面——复查一次定文案
+        // （selector_exists 返回「存在」，disappeared 取反）
+        disappeared = !selector_exists(&conn, sid, &exists_expr).await?;
+    }
+    let result = if disappeared {
+        format!("Clicked \"{selector}\" {clicks} time(s) until it disappeared")
+    } else {
+        format!(
+            "Clicked \"{selector}\" {clicks} time(s) but it is still present (--max-clicks {max_clicks} reached)"
+        )
+    };
+    Ok(json!({ "result": result }))
 }
 
 // ============================================================================
@@ -3370,5 +3647,330 @@ mod tests {
         let (svc, _w, _calls, _script) = armed();
         let e = svc.click(INS, "NOPE", "@e1").await.unwrap_err();
         assert_eq!((e.code(), e.status()), ("PAGE_TAB_NOT_FOUND", 404));
+    }
+
+    // ---------------- 工具：eval（P2-G）---------------------------------------
+
+    /// Runtime.evaluate 原始响应形状（工具层直接拼 result RemoteObject）
+    fn rt_result(value: Value) -> Result<Value, String> {
+        Ok(json!({ "result": { "type": "stub", "value": value } }))
+    }
+
+    /// evalStr 序列化全分支：对象 pretty JSON / 字符串原样 / undefined 与
+    /// null 字面量（靠 result.type 区分）/ 数字 JS 形态 / 布尔 / 数组
+    #[tokio::test]
+    async fn eval_serializes_result_per_ts_evalstr() {
+        let (svc, _w, _calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![
+                Ok(json!({ "result": { "type": "object", "value": { "ok": true } } })),
+                rt_result(json!("plain text")),
+                Ok(json!({ "result": { "type": "undefined" } })),
+                Ok(json!({ "result": { "type": "object", "subtype": "null", "value": null } })),
+                rt_result(json!(150)),
+                rt_result(json!(2.5)),
+                rt_result(json!(false)),
+                rt_result(json!([1, 2])),
+            ],
+        );
+        let r = svc.eval(INS, "T1", "({ok:true})").await.unwrap();
+        assert_eq!(
+            r["result"],
+            json!("{\n  \"ok\": true\n}"),
+            "对象 → pretty JSON"
+        );
+        assert_eq!(r["instanceId"], json!(INS));
+        assert_eq!(r["targetId"], json!("T1"));
+        assert_eq!(
+            svc.eval(INS, "T1", "'x'").await.unwrap()["result"],
+            json!("plain text")
+        );
+        assert_eq!(
+            svc.eval(INS, "T1", "u").await.unwrap()["result"],
+            json!("undefined")
+        );
+        assert_eq!(
+            svc.eval(INS, "T1", "n").await.unwrap()["result"],
+            json!("null")
+        );
+        assert_eq!(
+            svc.eval(INS, "T1", "1").await.unwrap()["result"],
+            json!("150")
+        );
+        assert_eq!(
+            svc.eval(INS, "T1", "2").await.unwrap()["result"],
+            json!("2.5")
+        );
+        assert_eq!(
+            svc.eval(INS, "T1", "3").await.unwrap()["result"],
+            json!("false")
+        );
+        assert_eq!(
+            svc.eval(INS, "T1", "4").await.unwrap()["result"],
+            json!("[\n  1,\n  2\n]")
+        );
+    }
+
+    /// 页面抛错 → 500 PAGE_EVAL_FAILED（文案取 exceptionDetails.text）
+    #[tokio::test]
+    async fn eval_exception_maps_to_page_eval_failed() {
+        let (svc, _w, _calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![Ok(json!({
+                "result": { "type": "undefined" },
+                "exceptionDetails": { "text": "ReferenceError: x is not defined" }
+            }))],
+        );
+        let e = svc.eval(INS, "T1", "x").await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("PAGE_EVAL_FAILED", 500));
+        assert!(e.to_string().contains("ReferenceError"));
+    }
+
+    // ---------------- 工具：html（P2-G）---------------------------------------
+
+    /// 两分支：缺省 = documentElement.outerHTML；有 selector = querySelector
+    /// 命中元素的 outerHTML（表达式形状断言防退化）
+    #[tokio::test]
+    async fn html_reads_full_document_or_selector_element() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![
+                rt_result(json!("<html><body>full</body></html>")),
+                rt_result(json!("<div id=\"main\">hit</div>")),
+            ],
+        );
+        let r = svc.html(INS, "T1", None).await.unwrap();
+        assert_eq!(r["html"], json!("<html><body>full</body></html>"));
+        let exprs = calls_of(&calls, "Runtime.evaluate");
+        assert!(
+            exprs[0]
+                .param("expression")
+                .as_str()
+                .unwrap()
+                .contains("documentElement.outerHTML"),
+            "缺省走整文档表达式"
+        );
+
+        let r2 = svc.html(INS, "T1", Some("#main")).await.unwrap();
+        assert_eq!(r2["html"], json!("<div id=\"main\">hit</div>"));
+        // 重新提取：exprs 是第一次调用后的快照，不含第二次的表达式
+        let exprs = calls_of(&calls, "Runtime.evaluate");
+        let expr = exprs[1].param("expression");
+        let expr = expr.as_str().unwrap();
+        assert!(
+            expr.contains(r##"querySelector("#main")"##),
+            "selector 注入用 JSON 转义: {expr}"
+        );
+        assert!(expr.contains("outerHTML"));
+    }
+
+    /// selector 未命中 → 404 PAGE_ELEMENT_NOT_FOUND（任务两选一取错误码，
+    /// 区别于 TS 的字符串哨兵 'Element not found'）
+    #[tokio::test]
+    async fn html_selector_miss_reports_element_not_found() {
+        let (svc, _w, _calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![Ok(
+                json!({ "result": { "type": "object", "subtype": "null", "value": null } }),
+            )],
+        );
+        let e = svc.html(INS, "T1", Some("#gone")).await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
+        assert!(e.to_string().contains("#gone"));
+    }
+
+    // ---------------- 工具：clickxy（P2-G）------------------------------------
+
+    /// 坐标即意图：直接三段派发（带 session），零 eval（无 locate/hit-test）
+    #[tokio::test]
+    async fn clickxy_dispatches_three_part_sequence_without_hit_test() {
+        let (svc, _w, calls, _script) = armed();
+        let resp = svc.clickxy(INS, "T1", 150.0, 130.5).await.unwrap();
+        assert_eq!(
+            resp["result"],
+            json!("Clicked at CSS (150, 130.5)"),
+            "JS 数字形态"
+        );
+        let mouse = calls_of(&calls, "Input.dispatchMouseEvent");
+        assert_eq!(
+            mouse.iter().map(|c| c.param("type")).collect::<Vec<_>>(),
+            vec![
+                json!("mouseMoved"),
+                json!("mousePressed"),
+                json!("mouseReleased")
+            ]
+        );
+        for c in &mouse {
+            assert_eq!(c.param("x"), json!(150.0));
+            assert_eq!(c.param("y"), json!(130.5));
+            assert_eq!(c.session.as_deref(), Some("S1"));
+        }
+        assert!(
+            calls_of(&calls, "Runtime.evaluate").is_empty(),
+            "无 locate/hit-test（坐标即意图）"
+        );
+    }
+
+    /// 非有限坐标（JSON 携带不了 NaN，拦 CLI/本地调用方的 inf/nan 字面量）
+    #[tokio::test]
+    async fn clickxy_rejects_non_finite_coordinates() {
+        let (svc, _w, calls, _script) = armed();
+        let e = svc.clickxy(INS, "T1", f64::NAN, 5.0).await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
+        assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 0);
+    }
+
+    // ---------------- 工具：type（P2-G，owner 补充）---------------------------
+
+    /// 对焦点元素直接 insertText（带 session），无任何定位/校验 eval
+    #[tokio::test]
+    async fn type_inserts_text_into_focused_element() {
+        let (svc, _w, calls, _script) = armed();
+        let resp = svc.r#type(INS, "T1", "hello").await.unwrap();
+        assert_eq!(resp["result"], json!("Typed 5 characters"));
+        let insert = calls_of(&calls, "Input.insertText");
+        assert_eq!(insert.len(), 1);
+        assert_eq!(insert[0].param("text"), json!("hello"));
+        assert_eq!(insert[0].session.as_deref(), Some("S1"));
+    }
+
+    /// 空文本 → 400（对齐 TS typeStr 的 'text required'）
+    #[tokio::test]
+    async fn type_rejects_empty_text() {
+        let (svc, _w, calls, _script) = armed();
+        let e = svc.r#type(INS, "T1", "").await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
+        assert_eq!(calls_of(&calls, "Input.insertText").len(), 0);
+    }
+
+    // ---------------- 工具：loadall（P2-G）------------------------------------
+
+    fn rt_bool(b: bool) -> Result<Value, String> {
+        Ok(json!({ "result": { "type": "boolean", "value": b } }))
+    }
+
+    fn located_ok() -> Result<Value, String> {
+        eval_response(json!({ "x": 10.0, "y": 20.0, "tag": "BUTTON", "text": "More" }))
+    }
+
+    /// 分支一：存在 → 原生点击一次 → 下一轮探针消失 → 'until it disappeared'
+    ///（点击链 = locate/hit/三段派发，非 TS 的页内 el.click()）
+    #[tokio::test]
+    async fn loadall_clicks_until_selector_disappears() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![
+                rt_bool(true),
+                located_ok(),
+                eval_response(json!({ "hit": true })),
+                rt_bool(false),
+            ],
+        );
+        let resp = svc
+            .loadall(INS, "T1", ".more", Some("1ms"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp["result"],
+            json!("Clicked \".more\" 1 time(s) until it disappeared")
+        );
+        assert_eq!(
+            calls_of(&calls, "Input.dispatchMouseEvent").len(),
+            3,
+            "每次存活轮次一次原生点击"
+        );
+    }
+
+    /// 分支二：首轮探针即不存在 → 0 次点击、零派发
+    #[tokio::test]
+    async fn loadall_absent_initially_clicks_zero_times() {
+        let (svc, _w, calls, script) = armed();
+        given(&script, "Runtime.evaluate", vec![rt_bool(false)]);
+        let resp = svc
+            .loadall(INS, "T1", ".more", Some("1ms"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp["result"],
+            json!("Clicked \".more\" 0 time(s) until it disappeared")
+        );
+        assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 0);
+    }
+
+    /// 分支三：达上限后复查仍在页面 → 诚实文案 'still present'（非 disappeared）
+    #[tokio::test]
+    async fn loadall_cap_reached_reports_still_present() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![
+                rt_bool(true),
+                located_ok(),
+                eval_response(json!({ "hit": true })),
+                rt_bool(true),
+                located_ok(),
+                eval_response(json!({ "hit": true })),
+                rt_bool(true), // 达上限后的复查：仍在
+            ],
+        );
+        let resp = svc
+            .loadall(INS, "T1", ".more", Some("1ms"), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp["result"],
+            json!("Clicked \".more\" 2 time(s) but it is still present (--max-clicks 2 reached)")
+        );
+        assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 6);
+    }
+
+    /// 达上限退出但复查已消失（末次点击后页面移除）→ 仍报 disappeared
+    #[tokio::test]
+    async fn loadall_cap_exit_rechecked_and_found_gone() {
+        let (svc, _w, _calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![
+                rt_bool(true),
+                located_ok(),
+                eval_response(json!({ "hit": true })),
+                rt_bool(false), // 达上限后的复查：已消失
+            ],
+        );
+        let resp = svc
+            .loadall(INS, "T1", ".more", Some("1ms"), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp["result"],
+            json!("Clicked \".more\" 1 time(s) until it disappeared")
+        );
+    }
+
+    /// 入参门：空 selector / 非法 --interval → 400（不建连不点击）
+    #[tokio::test]
+    async fn loadall_rejects_bad_interval_and_empty_selector() {
+        let (svc, _w, calls, _script) = armed();
+        let e = svc
+            .loadall(INS, "T1", ".more", Some("abc"), None)
+            .await
+            .unwrap_err();
+        assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
+        assert!(e.to_string().contains("--interval"));
+        let e2 = svc.loadall(INS, "T1", "", None, None).await.unwrap_err();
+        assert_eq!(e2.code(), "INVALID_REQUEST");
+        assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 0);
     }
 }

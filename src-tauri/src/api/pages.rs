@@ -72,6 +72,53 @@ pub struct DialogsQuery {
     pub since: Option<u64>,
 }
 
+/// POST /api/v1/instances/{id}/page/eval —— 任意 JS 求值（P2-G）。
+/// ⚠ 高权限：可执行任意 JS（与退役前 cdp.mjs 同权限），仅在 page 原语
+/// 不够用时使用（契约文档已披露）。
+#[derive(Deserialize)]
+pub struct EvalBody {
+    pub expression: String,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/html —— 读 outerHTML（P2-G）。
+#[derive(Deserialize)]
+pub struct HtmlBody {
+    /// CSS 选择器；缺省 = 整文档 documentElement.outerHTML。未命中 → 404
+    pub selector: Option<String>,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/clickxy —— 视口坐标点击（P2-G）。
+#[derive(Deserialize)]
+pub struct ClickxyBody {
+    /// 视口 CSS 像素横/纵坐标（无 locate/hit-test，坐标即意图）
+    pub x: f64,
+    pub y: f64,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/loadall —— 循环点击直到选择器消失（P2-G）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadallBody {
+    pub selector: String,
+    /// 轮询间隔时长字符串："1500ms" / "1.5s" / 裸数字 = ms；缺省 1500ms
+    pub interval: Option<String>,
+    /// 点击上限；缺省 200（预算 = interval × maxClicks + 30s）
+    pub max_clicks: Option<u32>,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/type —— 向当前焦点元素输入文本（P2-G）。
+/// 跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达跨域 frame）。
+#[derive(Deserialize)]
+pub struct TypeBody {
+    /// 非空文本（空串 → 400）
+    pub text: String,
+    pub tab: Option<String>,
+}
+
 pub async fn snap(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -156,6 +203,76 @@ pub async fn dialogs(
     let resp = state
         .page
         .dialogs(&id, q.tab.as_deref().unwrap_or(""), q.since)
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn eval(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<EvalBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .eval(&id, body.tab.as_deref().unwrap_or(""), &body.expression)
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn html(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<HtmlBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .html(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            body.selector.as_deref(),
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn clickxy(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ClickxyBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .clickxy(&id, body.tab.as_deref().unwrap_or(""), body.x, body.y)
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn loadall(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<LoadallBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .loadall(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.selector,
+            body.interval.as_deref(),
+            body.max_clicks,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn r#type(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<TypeBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .r#type(&id, body.tab.as_deref().unwrap_or(""), &body.text)
         .await?;
     Ok(Json(resp))
 }

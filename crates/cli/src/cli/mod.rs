@@ -77,7 +77,7 @@ pub enum Commands {
     },
     /// 页面控制（snap 拿 @eN 引用 → click/fill/press 操作 → 变化后重 snap）
     Page {
-        /// page 子命令（snap/click/fill/press/wait/dialogs）
+        /// page 子命令（snap/click/fill/press/wait/dialogs/eval/html/clickxy/loadall/type）
         #[command(subcommand)]
         command: page::PageCommands,
     },

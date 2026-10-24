@@ -1,4 +1,5 @@
-//! page 命令组 —— 页面控制（P2-C）：snap / click / fill / press / wait / dialogs。
+//! page 命令组 —— 页面控制（P2-C/P2-G）：snap / click / fill / press / wait /
+//! dialogs / eval / html / clickxy / loadall / type。
 //!
 //! 行为语义全部在服务层 page_service（P2-B）：本组只做参数透传 + 渲染。
 //! 核心循环（对齐 SKILL.md 教学）：`snap` 拿 @eN 引用 → `click`/`fill`/
@@ -7,9 +8,11 @@
 //!
 //! 渲染约定：
 //! - snap：文本树（@eN 内联在行内，本身就是主产物）+ 一行元信息；
-//! - click/fill/press/wait：一行 `result`（服务端人性化结果串，如
-//!   `Clicked <BUTTON> "Save" (native input @150,130)`）；命令期间自动应答了
-//!   对话框时追加一行提示（dialogs_seen）；
+//! - click/fill/press/wait/eval/clickxy/loadall/type：一行 `result`（服务端
+//!   人性化结果串，如 `Clicked <BUTTON> "Save" (native input @150,130)`）；
+//!   命令期间自动应答了对话框时追加一行提示（dialogs_seen）；
+//! - html：主产物在 `html` 字段（可能很大），text/quiet 原样到 stdout（与
+//!   cdp.mjs 一致，不加元信息——dialogs_seen 只在 --json 里可见）；
 //! - dialogs：SEQ TYPE MESSAGE 表 + cursor 行（增量拉取的 --since 值）；
 //! - 三态：`--json` 响应原样透传（P2-F F3 修复：snap 与 result 型命令的
 //!   shell 此前缺 --json 分支，文本树直接打到 stdout，管道侧拿不到合法
@@ -115,6 +118,80 @@ pub enum PageCommands {
         #[arg(long)]
         since: Option<u64>,
     },
+
+    /// 任意 JS 求值（高权限，最后手段）
+    #[command(
+        about = "任意 JS 求值：<expr>（⚠ 高权限：优先 snap/click 等专用原语，仅在不够用时用）"
+    )]
+    Eval {
+        /// 实例 id
+        id: String,
+        /// JS 表达式（开头是 - 时需用 -- 分隔）
+        expression: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 读页面 HTML（整文档或选择器命中元素）
+    #[command(about = "读 HTML：[selector]（缺省 = 整文档 outerHTML；未命中 → 404 exit 3）")]
+    Html {
+        /// 实例 id
+        id: String,
+        /// CSS 选择器（缺省 = 整文档 documentElement.outerHTML）
+        selector: Option<String>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 视口坐标点击（无定位/遮挡校验，坐标即意图）
+    #[command(about = "坐标点击：<x> <y>（视口 CSS 像素；无校验，点错不拦）")]
+    Clickxy {
+        /// 实例 id
+        id: String,
+        /// 视口 CSS 像素横坐标
+        x: f64,
+        /// 视口 CSS 像素纵坐标
+        y: f64,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 循环点击「加载更多」类按钮直到消失
+    #[command(
+        about = "循环点击：<selector>（直到消失；--interval 缺省 1500ms，--max-clicks 缺省 200）"
+    )]
+    Loadall {
+        /// 实例 id
+        id: String,
+        /// CSS 选择器（待循环点击的按钮）
+        selector: String,
+        /// 轮询间隔：1500ms / 1.5s / 裸数字=ms（缺省 1500ms）
+        #[arg(long)]
+        interval: Option<String>,
+        /// 点击上限（缺省 200；达上限仍未消失时结果明示 still present）
+        #[arg(long)]
+        max_clicks: Option<u32>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 向当前焦点元素输入文本（跨域 iframe 唯一输入路径）
+    #[command(
+        about = "输入文本到当前焦点元素：<text>（跨域 iframe 输入唯一路径；先 clickxy 点入）"
+    )]
+    Type {
+        /// 实例 id
+        id: String,
+        /// 非空文本（空串 → 400 exit 7）
+        text: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
 }
 
 /// page 组分发入口（main.rs dispatch 的唯一调用点）。
@@ -154,6 +231,33 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
         PageCommands::Dialogs { id, tab, since } => {
             dialogs(globals, client, id, tab.as_deref(), *since)
         }
+        PageCommands::Eval {
+            id,
+            expression,
+            tab,
+        } => eval(globals, client, id, expression, tab.as_deref()),
+        PageCommands::Html { id, selector, tab } => {
+            html(globals, client, id, selector.as_deref(), tab.as_deref())
+        }
+        PageCommands::Clickxy { id, x, y, tab } => {
+            clickxy(globals, client, id, *x, *y, tab.as_deref())
+        }
+        PageCommands::Loadall {
+            id,
+            selector,
+            interval,
+            max_clicks,
+            tab,
+        } => loadall(
+            globals,
+            client,
+            id,
+            selector,
+            interval.as_deref(),
+            *max_clicks,
+            tab.as_deref(),
+        ),
+        PageCommands::Type { id, text, tab } => r#type(globals, client, id, text, tab.as_deref()),
     }
 }
 
@@ -234,6 +338,77 @@ fn wait(
     Ok(())
 }
 
+/// `page eval <ID> <expr> [--tab T]`：result 型渲染（对象结果 = pretty JSON
+/// 多行串）。高权限工具，服务端语义已由契约文档披露。
+fn eval(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    expression: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_eval(id, expression, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page html <ID> [selector] [--tab T]`：html 原样到 stdout（主产物即输出物，
+/// 与 cdp.mjs 一致）；--json 响应原样（dialogs_seen 只在该分支可见）。
+fn html(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    selector: Option<&str>,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.page_html(id, selector, tab)?;
+    print_page_out(&out, html_out(&resp, &out));
+    Ok(())
+}
+
+/// `page clickxy <ID> <x> <y> [--tab T]`
+fn clickxy(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    x: f64,
+    y: f64,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_clickxy(id, x, y, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page loadall <ID> <selector> [--interval 1500ms] [--max-clicks 200] [--tab T]`
+fn loadall(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    selector: &str,
+    interval: Option<&str>,
+    max_clicks: Option<u32>,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_loadall(id, selector, interval, max_clicks, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page type <ID> <text> [--tab T]`
+fn r#type(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    text: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_type(id, text, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
 /// `page dialogs <ID> [--tab T] [--since N]`：SEQ TYPE MESSAGE 表；
 /// 表前一行 cursor（下次 --since 增量值）。quiet 每行 `seq\ttype\tmessage`。
 fn dialogs(
@@ -306,9 +481,9 @@ fn snap_out(resp: &serde_json::Value, out: &OutputCtx) -> PageOut {
     PageOut::Text(snap_text(resp))
 }
 
-/// result 型命令（click/fill/press/wait）三态：json 原样（dialogs_seen 已在
-/// 响应体内，透传自然携带）；table = result 行 + 附注行（单字符串两行，与
-/// 逐行 println 字节等价）。
+/// result 型命令（click/fill/press/wait/eval/clickxy/loadall/type）三态：json
+/// 原样（dialogs_seen 已在响应体内，透传自然携带）；table = result 行 +
+/// 附注行（单字符串两行，与逐行 println 字节等价）。
 fn result_out(resp: &serde_json::Value, out: &OutputCtx) -> PageOut {
     if out.quiet {
         return PageOut::Quiet(result_line(resp));
@@ -322,6 +497,25 @@ fn result_out(resp: &serde_json::Value, out: &OutputCtx) -> PageOut {
         text.push_str(&note);
     }
     PageOut::Text(text)
+}
+
+/// html 三态：text/quiet = html 字段原样到 stdout（html 本身就是主产物，与
+/// cdp.mjs 一致——不加元信息行；dialogs_seen 只在 json 分支可见）；json =
+/// 响应原样。缺字段时不装作成功（空串落 stdout 便于发现契约漂移）。
+fn html_out(resp: &serde_json::Value, out: &OutputCtx) -> PageOut {
+    let html = || {
+        resp.get("html")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    if out.quiet {
+        return PageOut::Quiet(html());
+    }
+    if out.json {
+        return PageOut::Json(resp.clone());
+    }
+    PageOut::Text(html())
 }
 
 /// snap 的 table 模式输出：元信息行 + 文本树。树是主产物（@eN 引用内联），
@@ -341,7 +535,8 @@ fn snap_text(resp: &serde_json::Value) -> String {
     )
 }
 
-/// click/fill/press/wait 的主结果行（服务端 result 字段；缺字段时不装作成功）。
+/// click/fill/press/wait/eval/clickxy/loadall/type 的主结果行（服务端 result
+/// 字段；缺字段时不装作成功）。
 fn result_line(resp: &serde_json::Value) -> String {
     resp.get("result")
         .and_then(|v| v.as_str())
@@ -595,5 +790,61 @@ mod tests {
             dialogs_rows(&json!({})).is_empty(),
             "缺 entries 键防御为空表"
         );
+    }
+
+    /// html 三态：text/quiet = html 字段原样（不加元信息行——html 本身就是
+    /// 输出物，与 cdp.mjs 一致，$(...) 捕获不受污染）；json = 响应原样。
+    #[test]
+    fn html_out_routes_three_modes_pure_payload() {
+        let payload = "<!DOCTYPE html><html><body>hi</body></html>";
+        let resp = json!({
+            "instanceId": "ins_1",
+            "targetId": "TAB9F",
+            "html": payload,
+            "dialogs_seen": [ { "type": "alert", "message": "x" } ]
+        });
+        match html_out(
+            &resp,
+            &OutputCtx {
+                json: false,
+                quiet: false,
+            },
+        ) {
+            PageOut::Text(t) => assert_eq!(t, payload, "table 模式 = html 原样，无任何前缀行"),
+            other => panic!("table 模式应输出 html 原样: {other:?}"),
+        }
+        match html_out(
+            &resp,
+            &OutputCtx {
+                json: false,
+                quiet: true,
+            },
+        ) {
+            PageOut::Quiet(line) => assert_eq!(line, payload),
+            other => panic!("quiet 模式应输出 html 原样: {other:?}"),
+        }
+        match html_out(
+            &resp,
+            &OutputCtx {
+                json: true,
+                quiet: false,
+            },
+        ) {
+            PageOut::Json(v) => {
+                assert_eq!(v, resp, "json 模式 = 响应原样（dialogs_seen 在此可见）")
+            }
+            other => panic!("json 模式应原样透传: {other:?}"),
+        }
+        // 缺 html 字段防御：空串而非装作成功
+        match html_out(
+            &json!({ "instanceId": "ins_1" }),
+            &OutputCtx {
+                json: false,
+                quiet: false,
+            },
+        ) {
+            PageOut::Text(t) => assert_eq!(t, ""),
+            other => panic!("缺字段防御路径: {other:?}"),
+        }
     }
 }

@@ -311,6 +311,77 @@ struct PageDialogsArgs {
     since: Option<u64>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageEvalArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "任意 JS 表达式（Runtime.evaluate，returnByValue + awaitPromise）。⚠ 高权限：可执行任意 JS，与退役前的 cdp.mjs 同权限——仅在 page 原语（snap/click/fill/press/wait/html）不够用时使用"
+    )]
+    expression: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageHtmlArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "CSS 选择器：命中元素的 outerHTML；省略 = 整文档 documentElement.outerHTML。未命中 → 404 PAGE_ELEMENT_NOT_FOUND"
+    )]
+    selector: Option<String>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageClickxyArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = "视口 CSS 像素横坐标")]
+    x: f64,
+    #[schemars(description = "视口 CSS 像素纵坐标")]
+    y: f64,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageLoadallArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "CSS 选择器：待循环点击的「加载更多」类按钮（每次点击前带可见性/遮挡校验）"
+    )]
+    selector: String,
+    #[schemars(
+        description = "轮询间隔时长字符串：如 \"1500ms\"、\"1.5s\"，裸数字 = 毫秒；缺省 1500ms"
+    )]
+    interval: Option<String>,
+    #[schemars(description = "点击上限；缺省 200。达上限仍未消失时结果串明示 still present")]
+    max_clicks: Option<u32>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageTypeArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "非空文本（空串 → 400）：直接输入到当前焦点元素（Input.insertText，无定位无校验）"
+    )]
+    text: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
 // ---------- MCP Server ----------
 
 #[derive(Clone)]
@@ -821,6 +892,89 @@ impl ChromeHostMcp {
             self.state
                 .page
                 .dialogs(&a.instance_id, a.tab.as_deref().unwrap_or(""), a.since)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "任意 JS 求值（Runtime.evaluate，returnByValue + awaitPromise）：对象/数组 → pretty JSON 字符串，字符串原样，undefined/null → \"undefined\"/\"null\"，数字/布尔 → JS String 形态；页面抛错 → 500 PAGE_EVAL_FAILED。⚠ 高权限：可执行任意 JS（与退役前的 cdp.mjs 同权限）——仅在 page 原语（snap/click/fill/press/wait/html）不够用时使用，优先用专用原语"
+    )]
+    async fn page_eval(
+        &self,
+        Parameters(a): Parameters<PageEvalArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.eval(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.expression,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "读页面 HTML：selector 省略 = 整文档 documentElement.outerHTML；有 = querySelector 命中元素的 outerHTML（未命中 → 404 PAGE_ELEMENT_NOT_FOUND）。大页面响应会很大——优先 page_snap 定位后用 selector 缩小范围"
+    )]
+    async fn page_html(
+        &self,
+        Parameters(a): Parameters<PageHtmlArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.html(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.selector.as_deref(),
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "视口坐标点击（CSS 像素，三段原生鼠标事件）：无定位/可见性/遮挡校验——坐标即意图，点错不拦。跨域 iframe 内元素（selector/@eN 均不可达）的兜底点击路径，配合 page_type 输入"
+    )]
+    async fn page_clickxy(
+        &self,
+        Parameters(a): Parameters<PageClickxyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .clickxy(&a.instance_id, a.tab.as_deref().unwrap_or(""), a.x, a.y)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "循环点击「加载更多」类按钮：selector 存在 → 原生 click（带可见性/遮挡校验）→ 等间隔（缺省 1500ms）→ 直到消失或达 maxClicks（缺省 200）；达上限仍未消失时结果串明示 still present，由调用方决定是否继续"
+    )]
+    async fn page_loadall(
+        &self,
+        Parameters(a): Parameters<PageLoadallArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.loadall(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.selector,
+                a.interval.as_deref(),
+                a.max_clicks,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "向当前焦点元素直接输入文本（Input.insertText，无定位无校验）：跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达跨域 frame）——先用 page_clickxy 点入 iframe 获得焦点再 type；空文本 → 400"
+    )]
+    async fn page_type(
+        &self,
+        Parameters(a): Parameters<PageTypeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .r#type(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.text)
         })
         .await
     }

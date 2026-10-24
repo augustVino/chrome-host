@@ -220,12 +220,19 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 | `page press <ID> <key> [--target <sel\|@eN>] [--tab T]` | 三段键盘事件；key 支持 Enter/Tab/单字符/组合键（`Control+A`）；`--target` 先聚焦 |
 | `page wait <ID> <selector> [--state V] [--timeout 10s] [--tab T]` | 轮询等待（250ms 间隔）；state = visible（缺省）/hidden/attached/detached；超时 → 409 exit 5 |
 | `page dialogs <ID> [--tab T] [--since N]` | 已自动应答的对话框日志（SEQ/TYPE/MESSAGE 表 + cursor 行；`--since` 增量拉取） |
+| `page eval <ID> <expr> [--tab T]` | 任意 JS 求值（⚠ 高权限：优先 snap/click 等专用原语，仅在不够用时用）；对象结果 = pretty JSON |
+| `page html <ID> [selector] [--tab T]` | 读 outerHTML（缺省 = 整文档；未命中 → 404 exit 3）；html 原样到 stdout，`--json` 包 `html` 字段 |
+| `page clickxy <ID> <x> <y> [--tab T]` | 视口坐标点击（CSS 像素；无定位/遮挡校验，坐标即意图） |
+| `page loadall <ID> <selector> [--interval 1500ms] [--max-clicks 200] [--tab T]` | 循环点击「加载更多」直到消失；达上限仍未消失时结果明示 still present |
+| `page type <ID> <text> [--tab T]` | 向当前焦点元素输入文本（跨域 iframe 唯一输入路径；先 clickxy 点入）；空文本 → 400 exit 7 |
 
 `tab` 取值 = targetId 或唯一前缀（`instance tabs` 获得）；省略 = 唯一页面标签
 时自动选中，多标签 → 409 `PAGE_TAB_AMBIGUOUS` 且错误 message 列出全部
 targetId（诚实语义：不猜活跃 tab，避免取错页面；真机复测后从「最近打开」
 近似改为唯一性）。显式前缀仍是无匹配 404 / 多匹配 409（exit 5）。`--timeout`
-接受 `10s` / `250ms` / 裸数字（= 毫秒），缺省 10s。
+与 `--interval` 接受 `10s` / `250ms` / 裸数字（= 毫秒），wait 缺省 10s，
+loadall 缺省 1500ms。`page eval <ID> '--x'` 这类以 `-` 开头的表达式需 `--`
+分隔。
 
 错误看 `[PAGE_XXX]` 前缀分支处置（不解析文案）：`ref_stale`/`ref_not_found` 重
 snap；`element_blocked` 先处理遮挡；`element_not_visible`/`target_not_fillable`
@@ -241,6 +248,14 @@ chrome-host page fill ins_xxx '#search input' 'hello world'
 chrome-host page press ins_xxx Enter --target @e2
 chrome-host page wait ins_xxx '.result-item' --state visible --timeout 15s
 chrome-host page dialogs ins_xxx --since 3
+
+# 兑底五件（cdp.mjs 退役补齐）
+chrome-host page html ins_xxx '#main'          # 读命中元素 outerHTML
+chrome-host page loadall ins_xxx '.load-more' --interval 2s --max-clicks 50
+# 跨域 iframe：坐标点入获得焦点 → 直接输入（selector 不可达 frame）
+chrome-host page clickxy ins_xxx 320 240
+chrome-host page type ins_xxx 'hello iframe'
+chrome-host page eval ins_xxx 'document.title'   # 高权限，最后手段
 ```
 
 ### extension — 扩展管理

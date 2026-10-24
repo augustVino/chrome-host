@@ -897,4 +897,76 @@ impl AgentClient {
             true,
         ))
     }
+
+    /// POST /api/v1/instances/{id}/page/eval —— body `{expression, tab?}`
+    /// （高权限原语：任意 JS 求值，仅在 page 原语不够用时用）
+    pub fn page_eval(
+        &self,
+        id: &str,
+        expression: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "expression": expression, "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "eval"), Some(body), true))
+    }
+
+    /// POST /api/v1/instances/{id}/page/html —— body `{selector?, tab?}`
+    /// （selector 缺省 = 整文档 outerHTML；响应主产物在 html 字段，可能很大）
+    pub fn page_html(
+        &self,
+        id: &str,
+        selector: Option<&str>,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "selector": selector, "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "html"), Some(body), true))
+    }
+
+    /// POST /api/v1/instances/{id}/page/clickxy —— body `{x, y, tab?}`
+    pub fn page_clickxy(
+        &self,
+        id: &str,
+        x: f64,
+        y: f64,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "x": x, "y": y, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "clickxy"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/loadall —— body `{selector, interval?, maxClicks?, tab?}`
+    /// （interval 时长字符串服务端解析；maxClicks 缺省 200）
+    pub fn page_loadall(
+        &self,
+        id: &str,
+        selector: &str,
+        interval: Option<&str>,
+        max_clicks: Option<u32>,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "selector": selector, "interval": interval, "maxClicks": max_clicks, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "loadall"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/type —— body `{text, tab?}`
+    /// （对当前焦点元素输入；跨域 iframe 输入唯一路径）
+    pub fn page_type(
+        &self,
+        id: &str,
+        text: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "text": text, "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "type"), Some(body), true))
+    }
 }

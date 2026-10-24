@@ -606,6 +606,68 @@ fn fixture_router() -> Router {
                 }))
             }),
         )
+        // —— page 控制命令族（P2-G）：eval/html/clickxy/loadall/type 正常响应 ——
+        .route(
+            "/api/v1/instances/ins_x/page/eval",
+            post(|| async {
+                Json(json!({ "result": "{\n  \"ok\": true\n}", "instanceId": "ins_x", "targetId": "TAB9F" }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/html",
+            post(|| async {
+                Json(json!({ "html": "<!DOCTYPE html><html></html>", "instanceId": "ins_x", "targetId": "TAB9F" }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/clickxy",
+            post(|| async {
+                Json(json!({ "result": "Clicked at CSS (150, 130)", "instanceId": "ins_x", "targetId": "TAB9F" }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/loadall",
+            post(|| async {
+                Json(json!({ "result": "Clicked \".more\" 3 time(s) until it disappeared", "instanceId": "ins_x", "targetId": "TAB9F" }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/type",
+            post(|| async {
+                Json(json!({ "result": "Typed 5 characters", "instanceId": "ins_x", "targetId": "TAB9F" }))
+            }),
+        )
+        // 参数透传 echo：请求体原样回显（验证 client 拼的 body 形状，同 capture_from 先例）
+        .route(
+            "/api/v1/instances/ins_pg/page/eval",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_pg/page/html",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_pg/page/clickxy",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_pg/page/loadall",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_pg/page/type",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
         // 参数透传 echo：请求体原样回显（验证 client 拼的 body 形状，同 capture_from 先例）
         .route(
             "/api/v1/instances/ins_pg/page/click",
@@ -1274,6 +1336,54 @@ fn page_endpoints_contract() {
     assert_eq!(entries[1]["sequence"], 2);
     assert_eq!(dialogs["meta"]["tab"], "TAB9F");
     assert_eq!(dialogs["meta"]["since"], "1");
+
+    // P2-G 五件：eval/html/clickxy/loadall/type —— 正常响应 + 透传 body 形状
+    // （maxClicks 为首个多词 body 键，camelCase 对齐 tabId/failedOnly 先例）
+    let eval = client
+        .page_eval("ins_x", "({ok:true})", None)
+        .expect("eval 应成功");
+    assert_eq!(eval["result"], "{\n  \"ok\": true\n}");
+    let html = client.page_html("ins_x", None, None).expect("html 应成功");
+    assert_eq!(html["html"], "<!DOCTYPE html><html></html>");
+    let clickxy = client
+        .page_clickxy("ins_x", 150.0, 130.0, None)
+        .expect("clickxy 应成功");
+    assert_eq!(clickxy["result"], "Clicked at CSS (150, 130)");
+    let loadall = client
+        .page_loadall("ins_x", ".more", None, None, None)
+        .expect("loadall 应成功");
+    assert_eq!(
+        loadall["result"],
+        "Clicked \".more\" 3 time(s) until it disappeared"
+    );
+    let typed = client
+        .page_type("ins_x", "hello", None)
+        .expect("type 应成功");
+    assert_eq!(typed["result"], "Typed 5 characters");
+
+    let echo = client
+        .page_eval("ins_pg", "document.title", Some("TAB"))
+        .expect("eval echo 应成功");
+    assert_eq!(echo["echo"]["expression"], "document.title");
+    assert_eq!(echo["echo"]["tab"], "TAB");
+    let echo = client
+        .page_html("ins_pg", Some("#main"), None)
+        .expect("html echo 应成功");
+    assert_eq!(echo["echo"]["selector"], "#main");
+    let echo = client
+        .page_clickxy("ins_pg", 1.5, 2.0, None)
+        .expect("clickxy echo 应成功");
+    assert_eq!(echo["echo"]["x"], 1.5);
+    assert_eq!(echo["echo"]["y"], 2.0);
+    let echo = client
+        .page_loadall("ins_pg", ".more", Some("1500ms"), Some(50), None)
+        .expect("loadall echo 应成功");
+    assert_eq!(echo["echo"]["interval"], "1500ms");
+    assert_eq!(echo["echo"]["maxClicks"], 50);
+    let echo = client
+        .page_type("ins_pg", "hi", None)
+        .expect("type echo 应成功");
+    assert_eq!(echo["echo"]["text"], "hi");
 
     // 错误映射：404 tab 路由未命中 → exit 3
     let err = client.page_click("err_tab", "@e1", None).unwrap_err();

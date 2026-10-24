@@ -19,7 +19,7 @@ use tower_http::cors::CorsLayer;
 /// 本机任意网页（恶意 Origin）不再拿到 allow-origin 回包，浏览器端拦截成立。
 /// （此前 AGENT-API 接入注意事项第 5 条的「CORS 放行任意 Origin」风险面就此收敛）
 const ALLOWED_ORIGINS: [&str; 5] = [
-    "tauri://localhost",     // macOS GUI webview
+    "tauri://localhost",      // macOS GUI webview
     "http://tauri.localhost", // Windows GUI webview
     "http://localhost",       // Linux webview Origin（无端口形态）
     "http://localhost:1420",  // dev vite（tauri.conf devUrl）
@@ -35,8 +35,8 @@ use crate::application::health_service::HealthService;
 use crate::application::instance_service::InstanceService;
 use crate::application::page_service::PageService;
 use crate::application::profile_service::ProfileService;
-use crate::application::settings_service::SettingsService;
 use crate::application::session_service::SessionService;
+use crate::application::settings_service::SettingsService;
 use crate::application::tunnel::TunnelService;
 use crate::infrastructure::kernel::KernelManager;
 
@@ -71,7 +71,9 @@ fn cors() -> CorsLayer {
     // 鉴别面收敛在 Origin，方法/头枚举只增加无意义维护成本
     CorsLayer::new()
         .allow_origin(tower_http::cors::AllowOrigin::list(
-            ALLOWED_ORIGINS.iter().map(|o| o.parse().expect("常量 Origin 必可解析")),
+            ALLOWED_ORIGINS
+                .iter()
+                .map(|o| o.parse().expect("常量 Origin 必可解析")),
         ))
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
@@ -81,7 +83,10 @@ fn cors() -> CorsLayer {
 fn routes(state: ApiState) -> Router {
     Router::new()
         // MCP：rmcp Streamable HTTP，客户端配 http://127.0.0.1:17890/mcp 即用
-        .route_service(crate::api::mcp::MCP_PATH, crate::api::mcp::mcp_service(state.clone()))
+        .route_service(
+            crate::api::mcp::MCP_PATH,
+            crate::api::mcp::mcp_service(state.clone()),
+        )
         .route(
             "/api/v1/environments",
             get(crate::api::environments::list).post(crate::api::environments::create),
@@ -133,34 +138,104 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}",
             get(crate::api::instances::get).delete(crate::api::instances::delete),
         )
-        .route("/api/v1/instances/{id}/status", get(crate::api::instances::status))
-        .route("/api/v1/instances/{id}/start", post(crate::api::instances::start))
-        .route("/api/v1/instances/{id}/stop", post(crate::api::instances::stop))
-        .route("/api/v1/instances/{id}/restart", post(crate::api::instances::restart))
-        .route("/api/v1/instances/{id}/focus", post(crate::api::instances::focus))
-        .route("/api/v1/instances/{id}/cdp", get(crate::api::instances::cdp))
+        .route(
+            "/api/v1/instances/{id}/status",
+            get(crate::api::instances::status),
+        )
+        .route(
+            "/api/v1/instances/{id}/start",
+            post(crate::api::instances::start),
+        )
+        .route(
+            "/api/v1/instances/{id}/stop",
+            post(crate::api::instances::stop),
+        )
+        .route(
+            "/api/v1/instances/{id}/restart",
+            post(crate::api::instances::restart),
+        )
+        .route(
+            "/api/v1/instances/{id}/focus",
+            post(crate::api::instances::focus),
+        )
+        .route(
+            "/api/v1/instances/{id}/cdp",
+            get(crate::api::instances::cdp),
+        )
         .route(
             "/api/v1/instances/{id}/diagnostics",
             get(crate::api::instances::diagnostics),
         )
-        .route("/api/v1/instances/{id}/console", get(crate::api::instances::console))
-        .route("/api/v1/instances/{id}/network", get(crate::api::instances::network))
-        .route("/api/v1/instances/{id}/screenshot", get(crate::api::instances::screenshot))
-        .route("/api/v1/instances/{id}/har", get(crate::api::instances::har))
+        .route(
+            "/api/v1/instances/{id}/console",
+            get(crate::api::instances::console),
+        )
+        .route(
+            "/api/v1/instances/{id}/network",
+            get(crate::api::instances::network),
+        )
+        .route(
+            "/api/v1/instances/{id}/screenshot",
+            get(crate::api::instances::screenshot),
+        )
+        .route(
+            "/api/v1/instances/{id}/har",
+            get(crate::api::instances::har),
+        )
         .route(
             "/api/v1/instances/{id}/tabs",
             get(crate::api::instances::tabs).post(crate::api::instances::open_tab),
         )
-        .route("/api/v1/instances/{id}/navigate", post(crate::api::instances::navigate))
+        .route(
+            "/api/v1/instances/{id}/navigate",
+            post(crate::api::instances::navigate),
+        )
         // page 控制命令族（P2-C）：handler 薄透传，语义全在 page_service
-        .route("/api/v1/instances/{id}/page/snap", post(crate::api::pages::snap))
-        .route("/api/v1/instances/{id}/page/click", post(crate::api::pages::click))
-        .route("/api/v1/instances/{id}/page/fill", post(crate::api::pages::fill))
-        .route("/api/v1/instances/{id}/page/press", post(crate::api::pages::press))
-        .route("/api/v1/instances/{id}/page/wait", post(crate::api::pages::wait))
+        .route(
+            "/api/v1/instances/{id}/page/snap",
+            post(crate::api::pages::snap),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/click",
+            post(crate::api::pages::click),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/fill",
+            post(crate::api::pages::fill),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/press",
+            post(crate::api::pages::press),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/wait",
+            post(crate::api::pages::wait),
+        )
         .route(
             "/api/v1/instances/{id}/page/dialogs",
             get(crate::api::pages::dialogs),
+        )
+        // page 控制命令族（P2-G）：eval/html/clickxy/loadall/type——cdp.mjs
+        // 退役前置补齐，handler 同样薄透传
+        .route(
+            "/api/v1/instances/{id}/page/eval",
+            post(crate::api::pages::eval),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/html",
+            post(crate::api::pages::html),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/clickxy",
+            post(crate::api::pages::clickxy),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/loadall",
+            post(crate::api::pages::loadall),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/type",
+            post(crate::api::pages::r#type),
         )
         .route(
             "/api/v1/login-profiles",
@@ -189,7 +264,10 @@ fn routes(state: ApiState) -> Router {
             get(crate::api::environments::activity),
         )
         .route("/api/v1/kernel/status", get(crate::api::kernel::status))
-        .route("/api/v1/kernel/download", post(crate::api::kernel::download))
+        .route(
+            "/api/v1/kernel/download",
+            post(crate::api::kernel::download),
+        )
         .route("/api/v1/kernel/cancel", post(crate::api::kernel::cancel))
         // 远程接入：隧道状态与令牌轮换（17891 上受 token 中间件保护）
         .route(
@@ -226,8 +304,7 @@ pub fn router(state: ApiState) -> Router {
 
 /// 隧道落地监听器路由（17891，全路由 Bearer token；`/cdp/` 豁免见 auth.rs）
 pub fn remote_router(state: ApiState) -> Router {
-    let auth =
-        axum::middleware::from_fn_with_state(state.clone(), crate::api::auth::require_token);
+    let auth = axum::middleware::from_fn_with_state(state.clone(), crate::api::auth::require_token);
     routes(state).layer(auth)
 }
 
@@ -271,9 +348,7 @@ pub async fn serve_remote(state: ApiState) -> bool {
     let Some(listener) = bind_with_retry(REMOTE_API_PORT).await else {
         return false;
     };
-    tracing::info!(
-        "远程接入监听器已启动: http://127.0.0.1:{REMOTE_API_PORT}（需 Bearer token）"
-    );
+    tracing::info!("远程接入监听器已启动: http://127.0.0.1:{REMOTE_API_PORT}（需 Bearer token）");
     let _ = axum::serve(listener, remote_router(state)).await;
     true
 }

@@ -214,10 +214,11 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 
 ### 页面控制（Page Control）
 
-实例级常驻 CDP 连接上的页面操作面：`snap` 产生 @eN 引用，`click`/`fill`/`press`
-消费引用或 CSS 选择器，`wait` 轮询等待，`dialogs` 读自动应答的对话框日志。连接
-惰性建立（实例首次 page 命令时），与常驻诊断连接互不干扰；仅对运行中实例可用
-（否则 `409 PAGE_SERVICE_UNAVAILABLE`）。
+实例级常驻 CDP 连接上的页面操作面：`snap` 产生 @eN 引用，`click`/`fill`/
+`press` 消费引用或 CSS 选择器，`wait` 轮询等待，`dialogs` 读自动应答的对话框
+日志；`eval`/`html`/`clickxy`/`loadall`/`type` 为 cdp.mjs 退役补齐的兑底五件
+（行为规格同源 TS 工具）。连接惰性建立（实例首次 page 命令时），与常驻诊断
+连接互不干扰；仅对运行中实例可用（否则 `409 PAGE_SERVICE_UNAVAILABLE`）。
 
 | 端点 | 说明 |
 |---|---|
@@ -227,6 +228,11 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 | `POST /api/v1/instances/{id}/page/press` | 键盘三段序列。body `{ "key", "target?", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/wait` | 轮询等待元素状态（250ms 间隔）。body `{ "selector", "state?", "timeout?", "tab?" }` |
 | `GET /api/v1/instances/{id}/page/dialogs` | 已自动应答的对话框日志。query `tab?&since=` |
+| `POST /api/v1/instances/{id}/page/eval` | 任意 JS 求值（⚠ 高权限，见下）。body `{ "expression", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/html` | 读 outerHTML（selector 缺省 = 整文档；未命中 → 404）。body `{ "selector?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/clickxy` | 视口坐标点击（CSS 像素，无定位/遮挡校验）。body `{ "x", "y", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/loadall` | 循环点击直到选择器消失。body `{ "selector", "interval?", "maxClicks?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/type` | 向当前焦点元素输入文本（跨域 iframe 唯一输入路径）。body `{ "text", "tab?" }` |
 
 参数语义：
 
@@ -240,6 +246,19 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 - **`timeout`**：时长字符串（`"10s"` / `"250ms"`，裸数字 = 毫秒），缺省 10s；工具级
   预算 = timeout + 5s。
 - **`since`**：对话框游标，只返回 `sequence` 严格大于 N 的条目；缓冲上限 32 条。
+- **`expression`**（eval）：⚠ **高权限**——可执行任意 JS，与退役前的 cdp.mjs
+  调试脚本同权限，仅在 page 原语（snap/click/fill/press/wait/html）无法表达时
+  使用。结果序列化（对齐 TS evalStr）：对象/数组 → pretty JSON 字符串、字符串
+  原样、`undefined`/`null` → `"undefined"`/`"null"`、数字/布尔 → JS String 形态；
+  页面抛错 → `500 PAGE_EVAL_FAILED`。
+- **`x` / `y`**（clickxy）：视口 CSS 像素坐标，直接三段鼠标派发，无 locate /
+  hit-test（坐标即意图，点错不拦）；非有限数 → `400`。
+- **`interval` / `maxClicks`**（loadall）：轮询间隔时长字符串（缺省 `1500ms`）与
+  点击上限（缺省 200；预算 = interval × maxClicks + 30s）。达上限仍未消失时
+  result 明示 `still present`，由调用方决定是否继续。
+- **`text`**（type）：非空文本，直接输入到当前焦点元素（无定位、无校验）——
+  跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达跨域 frame，先用
+  clickxy 点入获得焦点）；空串 → `400`。
 
 ```json
 // POST .../page/snap 响应（蛇形键对齐 TS wire 字段）
@@ -260,6 +279,17 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 { "cursor": 2, "entries": [ { "tab_id": "ABC123", "type": "alert", "message": "m2",
     "handled": "accepted", "sequence": 2 } ],
   "instanceId": "ins_...", "targetId": "ABC123" }
+
+// POST .../page/eval 响应（对象结果 = pretty JSON 字符串形态）
+{ "result": "{\n  \"ok\": true\n}", "instanceId": "ins_...", "targetId": "ABC123" }
+
+// POST .../page/html 响应（主产物在 html 字段，可能非常大）
+{ "html": "<!DOCTYPE html><html>…</html>", "instanceId": "ins_...", "targetId": "ABC123" }
+
+// POST .../page/clickxy / loadall / type 响应（result 单行形态）
+{ "result": "Clicked at CSS (150, 130)", "instanceId": "ins_...", "targetId": "ABC123" }
+{ "result": "Clicked \".load-more\" 3 time(s) until it disappeared", ... }
+{ "result": "Typed 12 characters", ... }
 ```
 
 对话框接管：alert/confirm/prompt/beforeunload 一律自动 `accept: true`（prompt 提交

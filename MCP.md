@@ -75,7 +75,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | 实例（9） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
 | 常驻诊断（5） | `get_diagnostics` · `get_console` · `get_network` · `get_screenshot` · `get_har` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
-| 页面控制（6） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_wait` · `page_dialogs` |
+| 页面控制（11） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_wait` · `page_dialogs` · `page_eval` · `page_html` · `page_clickxy` · `page_loadall` · `page_type` |
 | 登录态（2） | `login_profile`（action: get / capture / reset） · `session_status` |
 | 扩展（7） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` · `get_extension_config` · `set_extension_config` |
 
@@ -126,9 +126,10 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | `open_tab` | `instanceId`, `url`（须含协议） | 新开标签页并导航 |
 | `navigate` | `instanceId`, `tabId`, `url` | 导航既有标签页（new+close 组合近似：丢失旧页历史） |
 
-> MCP 读页面内容优先 `page_snap`（AX 文本树 + @eN 引用）；需要自由 CDP 能力
-> （Runtime.evaluate 等）时走 `get_cdp` 拿 WebSocket URL 由客户端连接，或结合
-> `list_tabs` 的 title/url 做轻量判断。
+> MCP 读页面内容优先 `page_snap`（AX 文本树 + @eN 引用）；页内求值/读 HTML
+> 已内建为 `page_eval` / `page_html`（实例级常驻连接，无需自建 WS）；需要完全
+> 自由的 CDP 会话（Network 域等）时走 `get_cdp` 拿 WebSocket URL 由客户端连接，
+> 或结合 `list_tabs` 的 title/url 做轻量判断。
 
 ## 页面控制
 
@@ -137,6 +138,10 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 用引用操作 → 页面变化后重新 `page_snap`（导航后引用整表失效 → 409 `PAGE_REF_STALE`，
 重 snap 而非对旧引用重试）。对话框（alert/confirm/prompt/beforeunload）自动
 accept，命令期间新弹的附在成功响应 `dialogs_seen`，历史查 `page_dialogs`。
+`page_eval`/`page_html`/`page_clickxy`/`page_loadall`/`page_type` 为 cdp.mjs
+退役补齐的兑底五件：eval 是高权限原语（可执行任意 JS，与退役前 cdp.mjs 同
+权限——仅在 page 原语不够用时使用）；跨域 iframe 内元素是全部 selector 基
+工具的盲区，兜底路径 = `page_clickxy` 点入获得焦点 → `page_type` 输入。
 
 | 工具 | 输入 | 说明 |
 |---|---|---|
@@ -146,6 +151,11 @@ accept，命令期间新弹的附在成功响应 `dialogs_seen`，历史查 `pag
 | `page_press` | `instanceId`, `key`；可选 `target`, `tab` | 三段键盘事件（组合键如 Control+A）；target 先聚焦 |
 | `page_wait` | `instanceId`, `selector`；可选 `state`, `timeout`, `tab` | 轮询等待（250ms）；timeout 如 `"10s"`（裸数字 = ms），缺省 10s |
 | `page_dialogs` | `instanceId`；可选 `tab`, `since` | 已自动应答的对话框日志（cursor + entries；since 游标增量拉取，缓冲 32 条） |
+| `page_eval` | `instanceId`, `expression`；可选 `tab` | ⚠ 高权限：任意 JS 求值，仅在 page 原语不够用时用；对象结果 = pretty JSON 字符串；页面抛错 → 500 `PAGE_EVAL_FAILED` |
+| `page_html` | `instanceId`；可选 `selector`, `tab` | 读 outerHTML（selector 缺省 = 整文档；未命中 → 404）；大页面响应很大，优先 snap 定位后缩小范围 |
+| `page_clickxy` | `instanceId`, `x`, `y`；可选 `tab` | 视口坐标点击（CSS 像素；无定位/遮挡校验，坐标即意图）；跨域 iframe 元素兜底 |
+| `page_loadall` | `instanceId`, `selector`；可选 `interval`, `maxClicks`, `tab` | 循环点击直到消失（interval 缺省 `"1500ms"`，maxClicks 缺省 200）；达上限仍未消失时结果明示 still present |
+| `page_type` | `instanceId`, `text`；可选 `tab` | 向当前焦点元素直接输入（无定位无校验）；跨域 iframe 输入唯一路径（先 `page_clickxy` 点入）；空文本 → 400 |
 
 `tab` = targetId 或唯一前缀（`list_tabs` 获得）；省略 = 唯一页面标签自动选中，
 多标签 409 并在 message 列出全部 targetId。错误处置看 code 分支：`PAGE_REF_STALE`/
