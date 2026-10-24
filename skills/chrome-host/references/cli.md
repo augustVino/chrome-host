@@ -154,16 +154,15 @@ CLI 错误行格式 `[CODE] message（HTTP status）`。exit 3/6/8 已被退出�
 - exit 10 → 仅令牌问题：核对 `CHROME_HOST_TOKEN`，或请用户在主机端 Settings 页轮换后重发；这同时证明隧道与应用都在线
 - exit 0 → 一切正常
 
-**exit 0 的二义性**：token 存在时它只证明「隧道 + 授权正常」，不证明 shell 与浏览器同机（CDP 端口只绑主机回环，远程直连必 fetch failed）。同机判别：`env -u CHROME_HOST_TOKEN chrome-host status` → exit 0 = 同机（可直连）；exit 10 = 远程 shell。务实兜底：直连试探一次 `cdp.mjs list` 失败就切 `cdp-session`，勿反复重试。
+**exit 0 的二义性**：token 存在时它只证明「隧道 + 授权正常」。同机判别：`env -u CHROME_HOST_TOKEN chrome-host status` → exit 0 = 同机；exit 10 = 远程 shell。page/instance 命令远程同用（API 经隧道可达），无需区分处置。
 
 要点：
 
 1. **令牌**：远程调用需 `export CHROME_HOST_TOKEN=<令牌>`（主机端 Settings 页「远程接入」复制）。
-2. **CDP 自动化走会话代理**（远程拿不到实例真实端口，`instance cdp` 的直连端口仅主机本地有效）：
+2. **页面操控远程直用**：`chrome-host page <命令> <insId> ...` 经 API 通道，本地/远程行为一致，无需会话代理或直连端口。仅当外部工具（Playwright/DevTools）需要直接接入实例 CDP 时才用会话代理：
 
    ```bash
-   CDP_BASE=$(chrome-host instance cdp-session <insId> --quiet)   # 30 分钟有效
-   CDP_BASE=$CDP_BASE node scripts/cdp.mjs list
+   CDP_BASE=$(chrome-host instance cdp-session <insId> --quiet)   # 30 分钟有效，供外部 CDP 客户端
    ```
 
    会话过期（404 `SESSION_NOT_FOUND`）→ 重新 `cdp-session`，无需重建实例。

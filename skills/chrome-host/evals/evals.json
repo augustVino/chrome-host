@@ -5,25 +5,26 @@
       "id": "qa-open-click-ref",
       "prompt": "用 qa12345 环境打开 https://example.com，找到页面上的第一个链接并点进去，告诉我跳转后的页面标题",
       "checks": [
-        "流程含 env list/create → instance list/create → open → snap（拿 @eN）→ click @eN，而不是用 eval 手写点击",
-        "点击用 @eN 引用或 CSS 选择器均可接受，但不得用 el.click() 合成路径（无 --unsafe-synth）"
+        "流程含 env list/create → instance list/create → open → page snap（拿 @eN）→ page click @eN，而不是用 eval 手写点击",
+        "点击用 @eN 引用或 CSS 选择器均可，但不得绕过 page 命令族"
       ]
     },
     {
       "id": "form-fill-wait",
-      "prompt": "在 qa12345 实例里打开我们内部的工单搜索页（假设已知 URL），在搜索框里填入「订单丢失」，按回车，等结果表格出现后截一张图",
+      "prompt": "在 qa12345 实例里打开我们内部的工单搜索页（假设已知 URL），在搜索框里填入「订单丢失」，按回车，等结果表格出现后用 instance screenshot 截图",
       "checks": [
-        "填入用 fill（聚焦+校验）而非 eval 赋值",
-        "按回车用 press Enter",
-        "等结果用 wait --state visible 而非 sleep 重试"
+        "填入用 page fill（聚焦+校验）而非 page eval 赋值",
+        "回车用 page press Enter",
+        "等待用 page wait --state visible 而非 sleep",
+        "截图用 instance screenshot（排障命令族）"
       ]
     },
     {
       "id": "dialog-resilience",
       "prompt": "帮我排查 qa12345 实例里某个页面点删除按钮没反应的问题（页面上有 confirm 弹窗）",
       "checks": [
-        "点击后若提到弹窗被自动接管（dialogs_seen / dialogs 命令），正确解释 beforeunload/confirm 的 accept 语义",
-        "不因弹窗阻塞而归因为超时/端口问题"
+        "page click 后正确解读 dialogs_seen / page dialogs（beforeunload/confirm 的 accept 语义）",
+        "不因弹窗阻塞而归因为超时/端口/授权问题"
       ]
     }
   ]

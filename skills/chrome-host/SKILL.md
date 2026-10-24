@@ -1,11 +1,11 @@
 ---
 name: chrome-host
-description: chrome-host 桌面应用的完整 agent 技能：编排多环境隔离 Chrome 实例（查/建环境、启停实例、开标签页、登录态快照、hosts 注入、扩展与内核管理），并用内置 cdp.mjs 直接做页面自动化（截图、可访问性树 @eN 引用、eval、原生点击、表单填写 fill/press、元素等待 wait、弹窗接管）。只要用户提到"用 XX 环境打开/排查/测试"（qa、sandbox 等环境名）、需要独立 profile / hosts 注入 / 免登录的浏览器、在隔离浏览器里点按钮/填表单/提交/截图/读 DOM，或管理 chrome-host 的环境实例，就必须使用本 skill。与本机手动以 --remote-debugging-port 启动、与 chrome-host 无关的调试 Chrome 相关的纯页面操作不走本 skill。
+description: chrome-host 桌面应用的完整 agent 技能：编排多环境隔离 Chrome 实例（查/建环境、启停实例、开标签页、登录态快照、hosts 注入、扩展与内核管理），并用 chrome-host page 命令族直接做页面操控（snap @eN 引用、原生点击、表单填写 fill/press、元素等待 wait、eval、坐标点击、弹窗自动接管）。只要用户提到"用 XX 环境打开/排查/测试"（qa、sandbox 等环境名）、需要独立 profile / hosts 注入 / 免登录的浏览器、在隔离浏览器里点按钮/填表单/提交/截图/读 DOM、或管理 chrome-host 的环境实例，就必须使用本 skill。与本机手动以 --remote-debugging-port 启动、与 chrome-host 无关的调试 Chrome 相关的纯页面操作不走本 skill。
 ---
 
 # Chrome Host — 隔离 Chrome 编排 + 页面自动化
 
-本 skill 通过 **chrome-host CLI**（桌面应用的官方命令行入口）完成编排，通过内置 **`scripts/cdp.mjs`**（零依赖 CDP CLI，Node 22+）完成页面自动化。两层一条链路：CLI 把隔离实例"起好、开好页、登好录"，cdp.mjs 接管 CDP 做截图 / 交互 / 读 DOM。
+本 skill 通过 **chrome-host CLI**（桌面应用的官方命令行入口）完成全部工作：**instance 命令族**负责编排（隔离实例"起好、开好页、登好录"），**page 命令族**负责页面操控（snap 引用 → 点击/输入/等待，应用侧原生 CDP 通道）。
 
 CLI 两个契约直接影响操作方式：**危险操作有确认闸门**（见「危险操作与确认闸门」），**退出码 0–10 语义冻结**（见 references/cli.md）。
 
@@ -27,7 +27,7 @@ chrome-host status
 - **exit 10**（未授权）→ 本机是远程接入客户端（经 SSH 隧道连主机），`CHROME_HOST_TOKEN` 缺失/错误。隧道与应用均在线，只是凭证问题——勿按 exit 8 处置。此后走远程路径：CDP 自动化用 `cdp-session` 会话代理（见第 5 步），不要直连实例端口。
 - **其他**（多为 exit 1）→ 应用在跑但内部异常。错误行格式 `[CODE] message（HTTP status）`，把 CODE + message 原样转述给用户——应用自身故障 agent 修不了，不要建议"重试"掩盖问题，也不要编造数据。需要细节跑 `chrome-host doctor`。
 
-> **判断 shell 与浏览器是否同机**（token 存在时 status 的 exit 0 区分不了）：`env -u CHROME_HOST_TOKEN chrome-host status` → exit 0 = 同机，走直连路径；exit 10 = 远程 shell，走会话代理路径。务实兜底：按直连跑一次 `cdp.mjs list`，fetch failed 就立即切 `cdp-session` 代理，**不要反复重试直连**。
+> **判断 shell 与浏览器是否同机**（token 存在时 status 的 exit 0 区分不了）：`env -u CHROME_HOST_TOKEN chrome-host status` → exit 0 = 同机；exit 10 = 远程 shell（API 经隧道同样可达，page/instance 命令直接用，无需额外配置）。
 
 ## 核心模型
 
@@ -84,7 +84,7 @@ URL 必须 http:// 或 https:// 开头（本地校验，非法 exit 2 且请求�
 
 1. 明确告知用户："已在 qa12345 环境的实例中打开登录页，请在浏览器窗口完成登录后告诉我。"
 2. **等待用户回复**，不轮询猜测，不自动填表单——隔离 profile 里没有用户凭据，自动登录必然失败且可能触发风控。
-3. 用户确认后验证：`instance tabs` 看 URL 是否已离开登录页，或用 cdp.mjs `snap` 确认页面内容。
+3. 用户确认后验证：`instance tabs` 看 URL 是否已离开登录页，或用 `page snap` 确认页面内容。
 
 **登录态会自动保存（默认 first-login 策略）**：用户在实例里登录后，**关闭该实例**（或告诉用户直接关窗口），Cookie 保险库自动落盘；同环境的下一个新实例自动免登录，无需任何 capture 命令。要点：
 
@@ -95,50 +95,34 @@ URL 必须 http:// 或 https:// 开头（本地校验，非法 exit 2 且请求�
 - 免登录判定链：新实例启动时注入保险库 Cookie（失败降级为空登录态，实例照常可用）；session cookie（关浏览器即失效那类）不在注入范围——此类系统免登录 = 复用 running 实例。
 - 环境级策略可调：`env create/update --session-capture <off|first-login|always>`（默认 first-login：仅首个实例退出时保存）。
 
-### 5. 页面自动化（cdp.mjs）
+### 5. 页面操控（chrome-host page 命令族）
 
-先拿连接凭证——**每次现查，不缓存端口**（实例重启后端口可能变化；分配器从 9222 起动态分配，被占自动顺延）：
-
-```bash
-# 同机 shell（判别法 exit 0）：直连实例端口
-CDP_PORT=$(chrome-host instance cdp <insId> --json | jq .port)
-
-# 远程 shell（判别法 exit 10 / 授权失败）：会话代理，30 分钟有效
-CDP_BASE=$(chrome-host instance cdp-session <insId> --quiet)
-```
-
-实例未运行时上面两条 exit 5（`INSTANCE_NOT_RUNNING`），先 `instance start` 再查。
-
-cdp.mjs 全部命令（`<target>` 是 `list` 输出中的 targetId 唯一前缀，如 `6BE827FA`，模糊前缀会被拒绝）：
+操控命令直连应用 API——**本地与远程接入（exit 10）均直接可用，无需拿 CDP 端口或代理凭证**。`<tab>` 是 `instance tabs` 输出的 targetId 唯一前缀（如 `6BE8AB81`）；单标签实例可省略，多标签缺省会报 `PAGE_TAB_AMBIGUOUS` 并列出全部 tab 供选择。
 
 ```bash
-node scripts/cdp.mjs list                       # 列页面
-node scripts/cdp.mjs shot  <target> [file]      # 视口截图（仅视口，长页先滚动）
-node scripts/cdp.mjs snap  <target> [--compact] # 可访问性树 + @eN 引用（看结构/找元素优先用它）
-node scripts/cdp.mjs eval  <target> <expr>      # 执行 JS
-node scripts/cdp.mjs html  <target> [selector]  # 页面/元素 HTML
-node scripts/cdp.mjs nav   <target> <url>       # 导航并等加载
-node scripts/cdp.mjs click <target> <sel|@eN>   # 原生输入点击（选择器或 @eN 引用；--unsafe-synth 回退合成点击，仅 selector）
-node scripts/cdp.mjs fill  <target> <sel|@eN> <text>   # 聚焦+清空+输入+回读校验（表单填写用它，别 eval 手写）
-node scripts/cdp.mjs press <target> <key> [--target <sel|@eN>]  # 按键：Enter/Tab/Escape/箭头/F1-F12/Control+A 等组合键
-node scripts/cdp.mjs wait  <target> <sel> [--state visible|hidden|attached|detached] [--timeout 10s]  # 等元素状态（SPA 渲染等待用它，别 sleep）
-node scripts/cdp.mjs clickxy <target> <x> <y>   # 按坐标点击（CSS 像素）
-node scripts/cdp.mjs type  <target> <text>      # 焦点处输入（跨域 iframe 用它）
-node scripts/cdp.mjs loadall <target> <sel> [ms]  # 反复点"加载更多"直到消失
-node scripts/cdp.mjs evalraw <target> <method> [json]  # 原始 CDP 命令透传
-node scripts/cdp.mjs dialogs <target> [--since N]   # 查自动接管的 JS 弹窗记录（近 32 条）
-node scripts/cdp.mjs open   [url]               # 新开标签页
-node scripts/cdp.mjs stop   [target]            # 停后台 daemon
+chrome-host page snap    <id> [tab]                    # 可访问性树 + @eN 引用（操作循环起点）
+chrome-host page click   <id> <sel|@eN> [--tab t]      # 原生输入点击（非 el.click()）
+chrome-host page fill    <id> <sel|@eN> <value> [--tab t]  # 聚焦+清空+输入+回读校验（表单用它，别 eval 手写）
+chrome-host page press   <id> <key> [--target <sel|@eN>] [--tab t]  # Enter/Tab/箭头/F1-F12/Control+A 组合键
+chrome-host page wait    <id> <sel> [--state visible|hidden|attached|detached] [--timeout 10s] [--tab t]  # SPA 渲染等待用它，别 sleep
+chrome-host page eval    <id> <expr> [--tab t]         # 执行 JS（优先用上面的原语，eval 是逃生舱）
+chrome-host page html    <id> [selector] [--tab t]     # 页面/元素 HTML
+chrome-host page clickxy <id> <x> <y> [--tab t]        # 视口 CSS 像素坐标点击（跨域 iframe 用它+type）
+chrome-host page type    <id> <text> [--tab t]         # 焦点处输入（clickxy 点入跨域 iframe 后用它）
+chrome-host page loadall <id> <sel> [--interval 1.5s] [--tab t]  # 反复点"加载更多"直到消失
+chrome-host page dialogs <id> [--tab t] [--since N]    # 自动接管的弹窗历史（近 32 条）
 ```
 
-关键陷阱（断链几乎都出在这里）：
+操作循环：**`snap → 用 @eN 操作 → 页面变化后重 snap`**。
 
-- **元素定位优先 @eN 引用**：`snap` 给可交互节点（button/link/textbox/checkbox…）编号输出 `@e3 [button] 提交`，`click`/`fill`/`press --target` 直接吃引用，比 CSS 选择器稳（不受 CSS-in-JS hash、动态列表位移影响）。导航后引用整表失效（报 `ref_stale`）——这是特性：重新 `snap` 再操作，不要对旧引用重试。操作循环：`snap → 用 @eN 操作 → 页面变化后重 snap`。
-- **错误看 [CODE] 前缀分支处置**，不要解析文案：`element_blocked`（被浮层遮挡，先处理遮挡）/ `element_not_visible` / `ref_not_found`/`ref_stale`（重 snap）/ `target_not_fillable` / `fill_value_mismatch`（写入可能部分生效，先观察再重试）/ `wait_timeout` / `dispatch_failed`（附 effect_state：none=未发出可重试，unknown=已发出禁盲目重试）。
-- **坐标换算**：截图按原生分辨率保存（图像像素 = CSS 像素 × DPR），CDP 点击吃 CSS 像素。`shot` 输出会带当前页 DPR，Retina（DPR=2）除以 2 再点击。
-- **跨域 iframe 输入**：`eval` 进不去跨域 iframe，用 `click`/`clickxy` 聚焦后 `type`（Input.insertText，不受同源限制）。
-- **不存在 "Allow debugging" 授权弹窗**：实例内核是 Chrome for Testing，CDP 访问不弹任何授权框，无需用户点允许——操作失败时别往“用户未授权”归因，按端口/实例/会话逐层排查。cdp.mjs 页面命令经 per-tab 后台 daemon 保持 CDP 会话，daemon 空闲 20 分钟自动退出。页面 alert/confirm/prompt/beforeunload 会被 daemon 自动 accept（beforeunload=放行离开，prompt 提交默认文本），不再阻塞命令；期间弹窗会以 `dialogs_seen` 附在响应里（CLI 以 stderr 提示行展示），`dialogs` 命令可查历史。
-- **会话过期**（仅 CDP_BASE 模式，404 `SESSION_NOT_FOUND`）→ 重新 `cdp-session` 即可，无需重建实例。
+关键约定（断链几乎都出在这里）：
+
+- **元素定位优先 @eN 引用**：snap 给可交互节点（button/link/textbox/checkbox…）编号输出 `@e3 [button] 提交`，click/fill/press 直接吃引用，比 CSS 选择器稳（不受 CSS-in-JS hash、动态列表位移影响）。导航后引用整表失效（报 `PAGE_REF_STALE`）——这是特性：重新 snap 再操作，不要对旧引用重试。
+- **弹窗已自动接管**：页面 alert/confirm/prompt/beforeunload 由应用自动 accept（beforeunload=放行离开，prompt 提交默认文本），不阻塞命令；命令期间弹过的窗以 `dialogs_seen` 附在输出里，`page dialogs` 查历史。
+- **错误看 [PAGE_*] 前缀分支处置**，不解析文案：`PAGE_ELEMENT_BLOCKED`（被浮层遮挡，先处理遮挡）/ `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_REF_NOT_FOUND`·`PAGE_REF_STALE`（重 snap）/ `PAGE_TARGET_NOT_FILLABLE` / `PAGE_FILL_VALUE_MISMATCH`（写入可能部分生效，先观察再重试）/ `PAGE_WAIT_TIMEOUT` / `PAGE_DISPATCH_FAILED`（附 effect_state：none=未发出可重试，unknown=已发出禁盲目重试）/ `PAGE_TAB_AMBIGUOUS`（多 tab，带列表重选）。
+- **跨域 iframe**：eval/fill 的 selector 均不可达；用 `clickxy`（视口坐标，事件穿透 iframe 边界）点入目标获得焦点后 `type` 输入。
+- **首条命令偶发 PAGE_TAB_NOT_FOUND**：连接刚建立的 attach 竞态，提示语含 retry——直接重试同一命令即可。
+- **多实例调试互不干扰**：page 命令经应用持有的独立 CDP 通道，与其他工具（DevTools、Playwright 直连）并存无冲突。
 
 ### 6. 页面排障：先查历史，不要 reload 重放
 
