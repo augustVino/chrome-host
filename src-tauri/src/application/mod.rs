@@ -6,6 +6,7 @@ pub mod extension_service;
 pub mod health_service;
 pub mod instance_service;
 pub mod keep_alive;
+pub mod page_service;
 pub mod profile_service;
 pub mod reconciler;
 pub mod session_service;
