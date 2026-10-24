@@ -38,6 +38,17 @@ Usage: cdp <command> [args]
                                     Works in cross-origin iframes unlike eval-based approaches
   loadall <target> <selector> [ms]  Repeatedly click a "load more" button until it disappears
                                     Optional interval in ms between clicks (default 1500)
+  fill   <target> <sel|@eN> <text>  Fill a text-like input/textarea/contenteditable root:
+                                    focus → clear → type via Input.insertText → verify value
+                                    (errors: target_not_fillable / fill_focus_lost / fill_value_mismatch)
+  press  <target> <key> [--target <ref|sel>]
+                                    Press a key via native events: Enter, Tab, Escape, Backspace,
+                                    Delete, Home, End, PageUp/PageDown, arrows, Space, F1-F12,
+                                    single chars, combos like Control+A / Meta+V / Shift+ArrowDown
+  wait   <target> <sel> [--state visible|hidden|attached|detached]
+                                    [--timeout 10s] [--interval 250ms]
+                                    Poll until the selector reaches the state (default visible);
+                                    hidden = attached but not visible (error: wait_timeout)
   dialogs <target> [--since N]      List JS dialogs (alert/confirm/prompt/beforeunload)
                                     auto-accepted by the daemon; --since N limits to
                                     entries with sequence > N
@@ -94,7 +105,7 @@ DAEMON IPC (for advanced use / scripting)
            or {"id":<number>, "ok":false, "error":"<message>", "code":"<error_code>"?}
          (code only present for coded errors, e.g. click's element_not_found)
   Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
-  type, loadall, evalraw, dialogs, stop. Use evalraw to send arbitrary CDP methods.
+  type, fill, press, wait, loadall, evalraw, dialogs, stop. Use evalraw to send arbitrary CDP methods.
   The socket disappears after 20 min of inactivity or when the tab closes.
 
 JS DIALOG TAKEOVER
@@ -109,7 +120,7 @@ JS DIALOG TAKEOVER
 
 const NEEDS_TARGET = new Set([
   'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','loadall','evalraw','dialogs',
+  'net','network','click','clickxy','type','fill','press','wait','loadall','evalraw','dialogs',
 ]);
 
 async function main() {
@@ -190,6 +201,12 @@ async function main() {
     const text = cmdArgs.join(' ');
     if (!text) { console.error('Error: text required'); process.exit(1); }
     cmdArgs[0] = text;
+  } else if (cmd === 'fill') {
+    // args: [sel|@eN, ...text] — join text parts (allows spaces; text may be "")
+    if (cmdArgs.length < 2) { console.error('Error: selector/@eN and text required (text may be "")'); process.exit(1); }
+    const text = cmdArgs.slice(1).join(' ');
+    cmdArgs.length = 1;
+    cmdArgs.push(text);
   } else if (cmd === 'evalraw') {
     // args: [method, ...jsonParts] — join json parts in case of spaces
     if (!cmdArgs[0]) { console.error('Error: CDP method required'); process.exit(1); }

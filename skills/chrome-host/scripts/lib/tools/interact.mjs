@@ -81,7 +81,7 @@ export async function resolveRefPoint(cdp, sid, backendNodeId) {
   }
 }
 
-function refMissError(store, rawRef) {
+export function refMissError(store, rawRef) {
   const hint = 'run "snap <target>" and use the fresh @eN refs';
   if (store.stale) {
     return new Error(`ref_stale: page changed since the last snap (${store.lastInvalidReason ?? 'document changed'}) — ${hint}`);

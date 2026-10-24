@@ -15,6 +15,9 @@ import { RefStore } from './ref-store.mjs';
 import { evalStr, htmlStr, netStr } from './tools/evaluate.mjs';
 import { navStr } from './tools/navigate.mjs';
 import { clickStr, clickXyStr, typeStr, loadAllStr } from './tools/interact.mjs';
+import { fillStr } from './tools/fill.mjs';
+import { pressStr } from './tools/press.mjs';
+import { waitStr, parseDuration } from './tools/wait.mjs';
 import { shotStr } from './tools/screenshot.mjs';
 import { evalRawStr } from './tools/raw.mjs';
 import { DialogTracker, handleDialogOpening, dialogsStr } from './dialogs.mjs';
@@ -71,6 +74,37 @@ async function dispatchCommand(cdp, sessionId, targetId, { cmd, args }, dialogs,
       }
       case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
       case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
+      case 'fill': result = await fillStr(cdp, sessionId, args[0], args[1], refStore); break;
+      case 'press': {
+        // press <key> [--target <ref|sel>] — the flag may precede the key.
+        let target;
+        const positional = [];
+        for (let i = 0; i < args.length; i++) {
+          if (args[i] === '--target') {
+            if (!args[i + 1]) throw new Error('--target requires a value (<@eN ref or CSS selector>)');
+            target = args[++i];
+          } else positional.push(args[i]);
+        }
+        result = await pressStr(cdp, sessionId, positional[0], target, refStore);
+        break;
+      }
+      case 'wait': {
+        // wait <selector> [--state V] [--timeout 10s] [--interval 250ms]
+        let selector;
+        let state = 'visible';
+        let timeoutMs = 10_000;
+        let intervalMs = 250;
+        for (let i = 0; i < args.length; i++) {
+          const a = args[i];
+          if (a === '--state') state = args[++i];
+          else if (a === '--timeout') timeoutMs = parseDuration(args[++i], '--timeout');
+          else if (a === '--interval') intervalMs = parseDuration(args[++i], '--interval');
+          else if (selector === undefined) selector = a;
+          else throw new Error(`wait: unexpected argument "${a}"`);
+        }
+        result = await waitStr(cdp, sessionId, selector, { state, timeoutMs, intervalMs });
+        break;
+      }
       case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
       case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
       case 'dialogs': result = dialogsStr(dialogs, args); break;
