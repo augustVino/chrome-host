@@ -93,6 +93,7 @@ page dialogs <id> [--tab t] [--since N]     自动接管弹窗历史（近 32 �
 | PAGE_KEY_UNKNOWN | 键名不支持，见 press --help 键表 |
 | PAGE_WAIT_TIMEOUT | 超时，信息含最后观察态 |
 | PAGE_DISPATCH_FAILED | 附 effect_state：none=未发出可重试；unknown=已发出禁盲目重试，先观察 |
+| CDP_COMMAND_FAILED（大面积超时 + dialogs 无记录） | 疑似无主对话框卡死（对话框在应用断连期间弹出，CDP 通道不注册）：用 page raw 发 Page.navigate 强制导航恢复，或让用户在浏览器点掉 |
 | PAGE_EVAL_FAILED | 表达式抛异常（信息含异常文本） |
 
 ### 登录态
