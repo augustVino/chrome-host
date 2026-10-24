@@ -9,14 +9,15 @@
 //! isError + 结构化 JSON 透传 REST 语义（code/message/status），AI 可据此自行决策。
 
 use rmcp::{
-    ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    schemars,
     serde_json::json,
+    tool, tool_handler, tool_router,
     transport::streamable_http_server::{
-        StreamableHttpService, session::local::LocalSessionManager,
+        session::local::LocalSessionManager, StreamableHttpService,
     },
+    ErrorData, ServerHandler,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -91,7 +92,9 @@ struct InstanceArgs {
 struct CreateEnvironmentArgs {
     #[schemars(description = "环境名，如 qapub")]
     name: String,
-    #[schemars(description = "可选 hosts 配置源地址（返回 hosts 格式文本的 http(s) URL）；不传则不做 hosts 注入")]
+    #[schemars(
+        description = "可选 hosts 配置源地址（返回 hosts 格式文本的 http(s) URL）；不传则不做 hosts 注入"
+    )]
     hosts_source_url: Option<String>,
 }
 
@@ -134,7 +137,9 @@ struct LoginProfileArgs {
     environment_id: String,
     #[schemars(description = "get=查状态/快照版本; capture=捕获快照; reset=清空快照")]
     action: LoginProfileAction,
-    #[schemars(description = "capture 可选：从指定实例捕获登录态（实例即登录源，实例须已停止）。缺省 = 传统母本捕获")]
+    #[schemars(
+        description = "capture 可选：从指定实例捕获登录态（实例即登录源，实例须已停止）。缺省 = 传统母本捕获"
+    )]
     from_instance_id: Option<String>,
 }
 
@@ -169,6 +174,10 @@ struct ConsoleArgs {
     instance_id: String,
     #[schemars(description = "级别过滤：error/warning/info/debug/log；省略全量")]
     level: Option<String>,
+    #[schemars(
+        description = "按标签页过滤（targetId，由 tabs 获得）；环中存在无归属条目时不过滤并以 meta.tabFilterUnavailable 标注"
+    )]
+    tab: Option<String>,
     #[schemars(description = "尾部条数；缺省 100，上限 1000")]
     limit: Option<usize>,
 }
@@ -180,6 +189,10 @@ struct NetworkArgs {
     instance_id: String,
     #[schemars(description = "true = 只看失败请求或 HTTP≥400")]
     failed_only: Option<bool>,
+    #[schemars(
+        description = "按标签页过滤（targetId，由 tabs 获得）；环中存在无归属条目时不过滤并以 meta.tabFilterUnavailable 标注"
+    )]
+    tab: Option<String>,
     #[schemars(description = "尾部条数；缺省 100，上限 1000")]
     limit: Option<usize>,
 }
@@ -232,7 +245,10 @@ pub fn mcp_service(state: ApiState) -> ChromeHostMcpService {
 #[tool_router]
 impl ChromeHostMcp {
     pub fn new(state: ApiState) -> Self {
-        Self { tool_router: Self::tool_router(), state }
+        Self {
+            tool_router: Self::tool_router(),
+            state,
+        }
     }
 
     // ── 内核 ────────────────────────────────────────────────────────────
@@ -250,12 +266,19 @@ impl ChromeHostMcp {
         run(|| self.state.env_service.list_summary()).await
     }
 
-    #[tool(description = "创建环境（name + 可选 hosts 配置源）。实例起始页由 Settings 默认起始页决定，未配置则打开 about:blank")]
+    #[tool(
+        description = "创建环境（name + 可选 hosts 配置源）。实例起始页由 Settings 默认起始页决定，未配置则打开 about:blank"
+    )]
     async fn create_environment(
         &self,
         Parameters(a): Parameters<CreateEnvironmentArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let input = CreateEnvironmentInput { name: a.name, hosts_source_url: a.hosts_source_url, icon: None, session_capture: None };
+        let input = CreateEnvironmentInput {
+            name: a.name,
+            hosts_source_url: a.hosts_source_url,
+            icon: None,
+            session_capture: None,
+        };
         run_sync(|| self.state.env_service.create(input))
     }
 
@@ -288,7 +311,12 @@ impl ChromeHostMcp {
         &self,
         Parameters(a): Parameters<EnvironmentArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        run(|| self.state.instance_service.stop_all_for_env(&a.environment_id)).await
+        run(|| {
+            self.state
+                .instance_service
+                .stop_all_for_env(&a.environment_id)
+        })
+        .await
     }
 
     #[tool(description = "查询环境最近事件流（创建/启动/停止/hosts 解析/快照等审计记录）")]
@@ -296,12 +324,18 @@ impl ChromeHostMcp {
         &self,
         Parameters(a): Parameters<ActivityArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        run_sync(|| self.state.activity.list_by_env(&a.environment_id, a.limit.unwrap_or(50)))
+        run_sync(|| {
+            self.state
+                .activity
+                .list_by_env(&a.environment_id, a.limit.unwrap_or(50))
+        })
     }
 
     // ── 实例 ────────────────────────────────────────────────────────────
 
-    #[tool(description = "为环境创建并启动完全隔离的 Chrome 实例（独立 profile + hosts 注入 + 登录态克隆）。首次运行可能阻塞于内核下载。错误时先查 kernel_status")]
+    #[tool(
+        description = "为环境创建并启动完全隔离的 Chrome 实例（独立 profile + hosts 注入 + 登录态克隆）。首次运行可能阻塞于内核下载。错误时先查 kernel_status"
+    )]
     async fn create_instance(
         &self,
         Parameters(a): Parameters<EnvironmentArgs>,
@@ -357,7 +391,9 @@ impl ChromeHostMcp {
         run(|| self.state.instance_service.delete(&a.instance_id)).await
     }
 
-    #[tool(description = "获取实例 CDP endpoint（含 WebSocket URL，可直接连 Chrome DevTools Protocol 做页面自动化）")]
+    #[tool(
+        description = "获取实例 CDP endpoint（含 WebSocket URL，可直接连 Chrome DevTools Protocol 做页面自动化）"
+    )]
     async fn get_cdp(
         &self,
         Parameters(a): Parameters<InstanceArgs>,
@@ -365,13 +401,18 @@ impl ChromeHostMcp {
         run(|| self.state.instance_service.get_cdp(&a.instance_id)).await
     }
 
-    #[tool(description = "发放实例的 CDP 会话（远程/代理访问用，30 分钟有效）：返回 sessionId 与 baseUrl。远程客户端以 baseUrl 代理访问 CDP（GET /json/version 与 /devtools/* WebSocket，webSocketDebuggerUrl 已改写指向代理）；本地直连场景优先 get_cdp。实例须运行中（否则 409）")]
+    #[tool(
+        description = "发放实例的 CDP 会话（远程/代理访问用，30 分钟有效）：返回 sessionId 与 baseUrl。远程客户端以 baseUrl 代理访问 CDP（GET /json/version 与 /devtools/* WebSocket，webSocketDebuggerUrl 已改写指向代理）；本地直连场景优先 get_cdp。实例须运行中（否则 409）"
+    )]
     async fn create_cdp_session(
         &self,
         Parameters(a): Parameters<InstanceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run(|| async {
-            self.state.instance_service.require_cdp_port(&a.instance_id).await?;
+            self.state
+                .instance_service
+                .require_cdp_port(&a.instance_id)
+                .await?;
             Ok(self.state.sessions.create(&a.instance_id))
         })
         .await
@@ -400,12 +441,19 @@ impl ChromeHostMcp {
         &self,
         Parameters(a): Parameters<NavigateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        run(|| self.state.instance_service.navigate(&a.instance_id, &a.tab_id, &a.url)).await
+        run(|| {
+            self.state
+                .instance_service
+                .navigate(&a.instance_id, &a.tab_id, &a.url)
+        })
+        .await
     }
 
     // ── 页面诊断 ──────────────────────────────────────────────────
 
-    #[tool(description = "读取实例当前页面诊断快照：JS 错误（error/unhandledrejection）与失败资源（status≥400 或 transferSize==0）各环形 100 条 + LCP/FCP。对第一个 http(s) 页面目标短连接求值 page-diagnostics 扩展挂载的 window.__chromeHostDiagnostics；实例未运行或无 http 页面 → 409 DIAGNOSTICS_UNAVAILABLE；diagnostics: null = 页面未注入（实例启动早于扩展加载或目标页不运行 content script）")]
+    #[tool(
+        description = "读取实例当前页面诊断快照：JS 错误（error/unhandledrejection）与失败资源（status≥400 或 transferSize==0）各环形 100 条 + LCP/FCP。对第一个 http(s) 页面目标短连接求值 page-diagnostics 扩展挂载的 window.__chromeHostDiagnostics；实例未运行或无 http 页面 → 409 DIAGNOSTICS_UNAVAILABLE；diagnostics: null = 页面未注入（实例启动早于扩展加载或目标页不运行 content script）"
+    )]
     async fn get_diagnostics(
         &self,
         Parameters(a): Parameters<InstanceArgs>,
@@ -413,31 +461,43 @@ impl ChromeHostMcp {
         run(|| self.state.instance_service.diagnostics(&a.instance_id)).await
     }
 
-    #[tool(description = "常驻订阅的 console 环形缓冲（500 条，进程内态重启即清）：console API 输出 + 页面日志（含资源加载失败）。可选 level（error/warning/info/debug/log）与 limit（缺省 100）")]
+    #[tool(
+        description = "常驻订阅的 console 环形缓冲（500 条，进程内态重启即清）：console API 输出 + 页面日志（含资源加载失败）。可选 level（error/warning/info/debug/log）、tab（targetId 按标签页过滤，由 tabs 获得）与 limit（缺省 100）"
+    )]
     async fn get_console(
         &self,
         Parameters(a): Parameters<ConsoleArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run_sync(|| {
-            self.state
-                .diagnostics
-                .console(&a.instance_id, a.level.as_deref(), a.limit)
+            self.state.diagnostics.console(
+                &a.instance_id,
+                a.level.as_deref(),
+                a.tab.as_deref(),
+                a.limit,
+            )
         })
     }
 
-    #[tool(description = "常驻订阅的请求环（1000 条，进程内态重启即清；请求完成/失败时入环）。可选 failedOnly（失败或 HTTP≥400）与 limit；完整时序与耗时用 get_har")]
+    #[tool(
+        description = "常驻订阅的请求环（1000 条，进程内态重启即清；请求完成/失败时入环）。可选 failedOnly（失败或 HTTP≥400）、tab（targetId 按标签页过滤，由 tabs 获得）与 limit；完整时序与耗时用 get_har"
+    )]
     async fn get_network(
         &self,
         Parameters(a): Parameters<NetworkArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run_sync(|| {
-            self.state
-                .diagnostics
-                .network(&a.instance_id, a.failed_only.unwrap_or(false), a.limit)
+            self.state.diagnostics.network(
+                &a.instance_id,
+                a.failed_only.unwrap_or(false),
+                a.tab.as_deref(),
+                a.limit,
+            )
         })
     }
 
-    #[tool(description = "当前页面 png 截图（base64，复用常驻诊断连接的第一个 http(s) 页面 session）。实例未运行/连接未就绪/无 http 页 → 409 DIAGNOSTICS_UNAVAILABLE")]
+    #[tool(
+        description = "当前页面 png 截图（base64，复用常驻诊断连接的第一个 http(s) 页面 session）。实例未运行/连接未就绪/无 http 页 → 409 DIAGNOSTICS_UNAVAILABLE"
+    )]
     async fn get_screenshot(
         &self,
         Parameters(a): Parameters<InstanceArgs>,
@@ -445,7 +505,9 @@ impl ChromeHostMcp {
         run(|| self.state.diagnostics.screenshot(&a.instance_id)).await
     }
 
-    #[tool(description = "从请求环生成 HAR 1.2 文档（har-recorder 落地点，可直接存档/回放分析）；未采集字段按规范以 -1/空集占位，_targetUrl 标注条目归属页面")]
+    #[tool(
+        description = "从请求环生成 HAR 1.2 文档（har-recorder 落地点，可直接存档/回放分析）；未采集字段按规范以 -1/空集占位，_targetUrl 标注条目归属页面"
+    )]
     async fn get_har(
         &self,
         Parameters(a): Parameters<InstanceArgs>,
@@ -455,24 +517,33 @@ impl ChromeHostMcp {
 
     // ── 登录态 ──────────────────────────────────────────────────────────
 
-    #[tool(description = "环境登录态管理（查询/捕获/重置）。登录主路径 = 实例里登录后关闭实例自动保存（SessionService）；capture 用于显式固化（可选 fromInstanceId 从已停止实例捕获）")]
+    #[tool(
+        description = "环境登录态管理（查询/捕获/重置）。登录主路径 = 实例里登录后关闭实例自动保存（SessionService）；capture 用于显式固化（可选 fromInstanceId 从已停止实例捕获）"
+    )]
     async fn login_profile(
         &self,
         Parameters(a): Parameters<LoginProfileArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         match a.action {
-            LoginProfileAction::Get => run(|| self.state.profile_service.view(&a.environment_id)).await,
+            LoginProfileAction::Get => {
+                run(|| self.state.profile_service.view(&a.environment_id)).await
+            }
             LoginProfileAction::Capture => match a.from_instance_id {
                 Some(ins) => {
                     let env = a.environment_id.clone();
                     run(move || async move {
-                        self.state.session_service.capture_from_instance(&env, &ins).await
+                        self.state
+                            .session_service
+                            .capture_from_instance(&env, &ins)
+                            .await
                     })
                     .await
                 }
                 None => run(|| self.state.profile_service.capture(&a.environment_id)).await,
             },
-            LoginProfileAction::Reset => run(|| self.state.session_service.reset(&a.environment_id)).await,
+            LoginProfileAction::Reset => {
+                run(|| self.state.session_service.reset(&a.environment_id)).await
+            }
         }
     }
 
@@ -486,7 +557,9 @@ impl ChromeHostMcp {
 
     // ── 扩展 ────────────────────────────────────────────────────────────
 
-    #[tool(description = "列出已注册扩展（含状态 ready/missing/invalid；system=内置锁定，user=用户注册）")]
+    #[tool(
+        description = "列出已注册扩展（含状态 ready/missing/invalid；system=内置锁定，user=用户注册）"
+    )]
     async fn list_extensions(&self) -> Result<CallToolResult, ErrorData> {
         run_sync(|| self.state.extension_service.list())
     }
@@ -499,7 +572,9 @@ impl ChromeHostMcp {
         run_sync(|| self.state.extension_service.get(&a.extension_id))
     }
 
-    #[tool(description = "注册用户扩展（服务端读 manifest 提取元数据；注册后对新启动实例生效）。安全边界：只接受显式注册，无按任意路径加载")]
+    #[tool(
+        description = "注册用户扩展（服务端读 manifest 提取元数据；注册后对新启动实例生效）。安全边界：只接受显式注册，无按任意路径加载"
+    )]
     async fn register_extension(
         &self,
         Parameters(a): Parameters<RegisterExtensionArgs>,
@@ -507,12 +582,18 @@ impl ChromeHostMcp {
         run_sync(|| self.state.extension_service.register(&a.path))
     }
 
-    #[tool(description = "启用/禁用扩展（system 内置 → 403 EXTENSION_SYSTEM_LOCKED；配置变化只影响之后启动的实例）")]
+    #[tool(
+        description = "启用/禁用扩展（system 内置 → 403 EXTENSION_SYSTEM_LOCKED；配置变化只影响之后启动的实例）"
+    )]
     async fn set_extension_enabled(
         &self,
         Parameters(a): Parameters<SetExtensionEnabledArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        run_sync(|| self.state.extension_service.set_enabled(&a.extension_id, a.enabled))
+        run_sync(|| {
+            self.state
+                .extension_service
+                .set_enabled(&a.extension_id, a.enabled)
+        })
     }
 
     #[tool(description = "移除扩展注册项（不删源文件；system 内置 → 403）")]
@@ -523,7 +604,9 @@ impl ChromeHostMcp {
         run_sync(|| self.state.extension_service.delete(&a.extension_id))
     }
 
-    #[tool(description = "读取扩展运行时配置（可选 environmentId，省略 = 全局默认；未配置 → config: null）。仅声明 configFile 的 system 扩展可配置（list_extensions 的 configurable 字段）")]
+    #[tool(
+        description = "读取扩展运行时配置（可选 environmentId，省略 = 全局默认；未配置 → config: null）。仅声明 configFile 的 system 扩展可配置（list_extensions 的 configurable 字段）"
+    )]
     async fn get_extension_config(
         &self,
         Parameters(a): Parameters<ExtensionConfigArgs>,
@@ -535,16 +618,20 @@ impl ChromeHostMcp {
         })
     }
 
-    #[tool(description = "写入扩展运行时配置（整体覆盖；可选 environmentId 省略 = 全局默认；对新启动实例生效）。net-rules 形状：{\"block\":[\"*.google-analytics.com\"],\"redirect\":[{\"from\":\"https://api.foo.com/*\",\"to\":\"http://localhost:3000/$1\"}],\"headers\":[{\"url\":\"https://app.foo.com/*\",\"set\":{\"X-Debug-Uid\":\"42\"}}]}（block/headers 域锚定可带路径通配；redirect 的 * 依序为 $1 $2…）；；语法参考（DNR）：https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest 与匹配模式 https://developer.chrome.com/docs/extensions/develop/concepts/match-patterns（extension get 的 configDocsUrl 同源）；非法 → 400 EXTENSION_CONFIG_INVALID")]
+    #[tool(
+        description = "写入扩展运行时配置（整体覆盖；可选 environmentId 省略 = 全局默认；对新启动实例生效）。net-rules 形状：{\"block\":[\"*.google-analytics.com\"],\"redirect\":[{\"from\":\"https://api.foo.com/*\",\"to\":\"http://localhost:3000/$1\"}],\"headers\":[{\"url\":\"https://app.foo.com/*\",\"set\":{\"X-Debug-Uid\":\"42\"}}]}（block/headers 域锚定可带路径通配；redirect 的 * 依序为 $1 $2…）；；语法参考（DNR）：https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest 与匹配模式 https://developer.chrome.com/docs/extensions/develop/concepts/match-patterns（extension get 的 configDocsUrl 同源）；非法 → 400 EXTENSION_CONFIG_INVALID"
+    )]
     async fn set_extension_config(
         &self,
         Parameters(a): Parameters<SetExtensionConfigArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run_sync(|| {
             let body = a.config.to_string();
-            self.state
-                .extension_service
-                .set_config(&a.extension_id, a.environment_id.as_deref(), &body)
+            self.state.extension_service.set_config(
+                &a.extension_id,
+                a.environment_id.as_deref(),
+                &body,
+            )
         })
     }
 }

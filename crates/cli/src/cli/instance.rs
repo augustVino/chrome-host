@@ -16,7 +16,10 @@ use super::output::{OutputCtx, TableRow};
 use super::GlobalArgs;
 use crate::client::AgentClient;
 use crate::error::CliError;
-use crate::model::{CdpEndpoint, CdpSessionView, CdpTarget, Instance, InstanceStatus, InstanceStatusView, InstanceView};
+use crate::model::{
+    CdpEndpoint, CdpSessionView, CdpTarget, Instance, InstanceStatus, InstanceStatusView,
+    InstanceView,
+};
 
 /// instance 子命令树。
 #[derive(Debug, Subcommand)]
@@ -44,33 +47,45 @@ pub enum InstanceCommands {
     },
 
     /// 页面诊断快照（JS 错误/失败资源/LCP/FCP；仅运行中实例）
-    #[command(about = "页面诊断快照：JS 错误/失败资源/LCP/FCP（仅运行中实例，409 = 未运行或无 http 页面）")]
+    #[command(
+        about = "页面诊断快照：JS 错误/失败资源/LCP/FCP（仅运行中实例，409 = 未运行或无 http 页面）"
+    )]
     Diagnostics {
         /// 实例 id
         id: String,
     },
 
     /// 常驻订阅的 console 环（进程内态重启即清）
-    #[command(about = "console 环形缓冲（500 条）：--level 过滤、--limit 尾部 N 条")]
+    #[command(
+        about = "console 环形缓冲（500 条）：--level 过滤、--tab 按标签页过滤、--limit 尾部 N 条"
+    )]
     Console {
         /// 实例 id
         id: String,
         /// 级别过滤：error/warning/info/debug/log
         #[arg(long)]
         level: Option<String>,
+        /// 按标签页过滤（tab id，由 tabs 命令获得）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
         /// 尾部条数（缺省 100）
         #[arg(long)]
         limit: Option<usize>,
     },
 
     /// 常驻订阅的请求环（进程内态重启即清）
-    #[command(about = "请求环形缓冲（1000 条）：--failed-only 只看失败/HTTP≥400")]
+    #[command(
+        about = "请求环形缓冲（1000 条）：--failed-only 只看失败/HTTP≥400、--tab 按标签页过滤"
+    )]
     Network {
         /// 实例 id
         id: String,
         /// 只看失败请求或 HTTP ≥400
         #[arg(long = "failed-only")]
         failed_only: bool,
+        /// 按标签页过滤（tab id，由 tabs 命令获得）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
         /// 尾部条数（缺省 100）
         #[arg(long)]
         limit: Option<usize>,
@@ -194,12 +209,25 @@ pub fn run(
         InstanceCommands::Get { id } => get(globals, client, id),
         InstanceCommands::Status { id } => status(globals, client, id),
         InstanceCommands::Diagnostics { id } => diagnostics(globals, client, id),
-        InstanceCommands::Console { id, level, limit } => {
-            console(globals, client, id, level.as_deref(), *limit)
-        }
-        InstanceCommands::Network { id, failed_only, limit } => {
-            network(globals, client, id, *failed_only, *limit)
-        }
+        InstanceCommands::Console {
+            id,
+            level,
+            tab,
+            limit,
+        } => console(
+            globals,
+            client,
+            id,
+            level.as_deref(),
+            tab.as_deref(),
+            *limit,
+        ),
+        InstanceCommands::Network {
+            id,
+            failed_only,
+            tab,
+            limit,
+        } => network(globals, client, id, *failed_only, tab.as_deref(), *limit),
         InstanceCommands::Screenshot { id, out } => screenshot(globals, client, id, out.as_deref()),
         InstanceCommands::Har { id, out } => har(globals, client, id, out.as_deref()),
         InstanceCommands::Create { env_id } => create(globals, client, env_id),
@@ -335,18 +363,19 @@ fn status(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), Cl
     Ok(())
 }
 
-/// `chrome-host instance console <ID> [--level] [--limit]`：console 环渲染。
+/// `chrome-host instance console <ID> [--level] [--tab] [--limit]`：console 环渲染。
 /// table：LEVEL SOURCE TEXT 列表（TEXT 截断到 80 列，json 模式完整保留）；
-/// quiet：每行一条 `level\ttext`。
+/// quiet：每行一条 `level\ttext`；tab 过滤条件在列表前标注（仅 table 模式）。
 fn console(
     globals: &GlobalArgs,
     client: &AgentClient,
     id: &str,
     level: Option<&str>,
+    tab: Option<&str>,
     limit: Option<usize>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.instance_console(id, level, limit)?;
+    let resp = client.instance_console(id, level, tab, limit)?;
     let entries = resp
         .get("entries")
         .and_then(|v| v.as_array())
@@ -371,31 +400,36 @@ fn console(
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
             cells: vec![
-                e.get("level").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                e.get("source").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
-                truncate(
-                    e.get("text").and_then(|v| v.as_str()).unwrap_or(""),
-                    80,
-                ),
+                e.get("level")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                e.get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                truncate(e.get("text").and_then(|v| v.as_str()).unwrap_or(""), 80),
             ],
             json: e.clone(),
         })
         .collect();
+    print_tab_filter_note(&out, &resp);
     out.render_list(&["LEVEL", "SOURCE", "TEXT"], &rows);
     Ok(())
 }
 
-/// `chrome-host instance network <ID> [--failed-only] [--limit]`：请求环渲染。
-/// table：METHOD STATUS URL 列表；quiet：每行 `status\turl`。
+/// `chrome-host instance network <ID> [--failed-only] [--tab] [--limit]`：请求环渲染。
+/// table：METHOD STATUS URL 列表；quiet：每行 `status\turl`；tab 过滤条件同 console。
 fn network(
     globals: &GlobalArgs,
     client: &AgentClient,
     id: &str,
     failed_only: bool,
+    tab: Option<&str>,
     limit: Option<usize>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.instance_network(id, failed_only, limit)?;
+    let resp = client.instance_network(id, failed_only, tab, limit)?;
     let entries = resp
         .get("entries")
         .and_then(|v| v.as_array())
@@ -405,7 +439,10 @@ fn network(
         for e in &entries {
             out.print_id(&format!(
                 "{}\t{}",
-                e.get("status").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "FAIL".into()),
+                e.get("status")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "FAIL".into()),
                 e.get("url").and_then(|v| v.as_str()).unwrap_or("")
             ));
         }
@@ -420,18 +457,50 @@ fn network(
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
             cells: vec![
-                e.get("method").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                e.get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
                 e.get("status")
                     .and_then(|v| v.as_i64())
                     .map(|v| v.to_string())
-                    .unwrap_or_else(|| e.get("error").and_then(|v| v.as_str()).unwrap_or("FAIL").to_string()),
+                    .unwrap_or_else(|| {
+                        e.get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("FAIL")
+                            .to_string()
+                    }),
                 truncate(e.get("url").and_then(|v| v.as_str()).unwrap_or(""), 70),
             ],
             json: e.clone(),
         })
         .collect();
+    print_tab_filter_note(&out, &resp);
     out.render_list(&["METHOD", "STATUS", "URL"], &rows);
     Ok(())
+}
+
+/// tab 过滤条件标注（仅 table 模式；json 模式响应原样含 meta，quiet 保持纯行输出）。
+/// 服务端过滤降级（存在无归属条目）时明确告知，避免「过滤了但没完全过滤」的误读。
+fn print_tab_filter_note(out: &OutputCtx, resp: &serde_json::Value) {
+    let Some(m) = resp.get("meta") else { return };
+    if out.quiet || out.json {
+        return;
+    }
+    let tab = m
+        .get("filteredByTab")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    if m.get("tabFilterUnavailable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        out.render_text(format!("tab 过滤 {tab} 不可用（存在无归属条目），返回全量"));
+    } else {
+        let before = m.get("before").and_then(|v| v.as_u64()).unwrap_or(0);
+        let after = m.get("after").and_then(|v| v.as_u64()).unwrap_or(0);
+        out.render_text(format!("tab 过滤 {tab}：{before} → {after} 条"));
+    }
 }
 
 /// `chrome-host instance screenshot <ID> [--out]`：解码 base64 写 png。
@@ -447,15 +516,19 @@ fn screenshot(
     let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
     let bytes = decode_base64_png(data)?;
     if !out.json {
-        let path = out_path.map(str::to_string).unwrap_or_else(|| format!("{id}.png"));
-        std::fs::write(&path, &bytes).map_err(|e| {
-            CliError::Local(format!("写截图文件失败 {path}: {e}"))
-        })?;
+        let path = out_path
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{id}.png"));
+        std::fs::write(&path, &bytes)
+            .map_err(|e| CliError::Local(format!("写截图文件失败 {path}: {e}")))?;
         if out.quiet {
             out.print_id(&path);
         } else {
             out.render_kv(
-                &[("file".into(), path.clone()), ("bytes".into(), bytes.len().to_string())],
+                &[
+                    ("file".into(), path.clone()),
+                    ("bytes".into(), bytes.len().to_string()),
+                ],
                 serde_json::json!({ "file": path, "bytes": bytes.len(), "format": "png" }),
             );
         }
@@ -479,7 +552,9 @@ fn har(
         out.render_kv(&[], resp);
         return Ok(());
     }
-    let path = out_path.map(str::to_string).unwrap_or_else(|| format!("{id}.har"));
+    let path = out_path
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{id}.har"));
     let pretty = serde_json::to_string_pretty(&resp)
         .map_err(|e| CliError::Local(format!("HAR 序列化失败: {e}")))?;
     std::fs::write(&path, pretty)
@@ -493,7 +568,10 @@ fn har(
         out.print_id(&path);
     } else {
         out.render_kv(
-            &[("file".into(), path.clone()), ("entries".into(), entries.to_string())],
+            &[
+                ("file".into(), path.clone()),
+                ("entries".into(), entries.to_string()),
+            ],
             serde_json::json!({ "file": path, "entries": entries }),
         );
     }
@@ -507,7 +585,9 @@ fn decode_base64_png(data: &str) -> Result<Vec<u8>, CliError> {
         .decode(data)
         .map_err(|e| CliError::Local(format!("截图 base64 解码失败: {e}")))?;
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Err(CliError::Protocol("截图数据不是 PNG（魔数校验失败）".into()));
+        return Err(CliError::Protocol(
+            "截图数据不是 PNG（魔数校验失败）".into(),
+        ));
     }
     Ok(bytes)
 }
@@ -529,9 +609,7 @@ fn diagnostics(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(
     let out = OutputCtx::from(globals);
     let resp = client.instance_diagnostics(id)?;
     if out.quiet {
-        out.print_id(
-            resp.get("targetUrl").and_then(|v| v.as_str()).unwrap_or(""),
-        );
+        out.print_id(resp.get("targetUrl").and_then(|v| v.as_str()).unwrap_or(""));
         return Ok(());
     }
     out.render_kv(&diagnostics_kv_pairs(&resp), resp);
@@ -543,12 +621,19 @@ fn diagnostics(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(
 fn diagnostics_kv_pairs(resp: &serde_json::Value) -> Vec<(String, String)> {
     let mut pairs = vec![(
         "targetUrl".into(),
-        resp.get("targetUrl").and_then(|v| v.as_str()).unwrap_or("-").to_string(),
+        resp.get("targetUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string(),
     )];
     match resp.get("diagnostics") {
         Some(d) if d.is_object() => {
             let count = |key: &str| {
-                d.get(key).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0).to_string()
+                d.get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0)
+                    .to_string()
             };
             let ms = |key: &str| {
                 d.get(key)
@@ -561,7 +646,10 @@ fn diagnostics_kv_pairs(resp: &serde_json::Value) -> Vec<(String, String)> {
             pairs.push(("lcp".into(), ms("lcp")));
             pairs.push(("fcp".into(), ms("fcp")));
         }
-        _ => pairs.push(("diagnostics".into(), "null（页面未注入：实例早于扩展启动，或目标页不运行 content script）".into())),
+        _ => pairs.push((
+            "diagnostics".into(),
+            "null（页面未注入：实例早于扩展启动，或目标页不运行 content script）".into(),
+        )),
     }
     pairs
 }
@@ -588,16 +676,33 @@ mod tests {
             }
         });
         let pairs = diagnostics_kv_pairs(&resp);
-        assert_eq!(pairs[0], ("targetUrl".into(), "https://app.example.com/home".into()));
-        assert!(pairs.iter().any(|(k, v)| k == "errors" && v == "2"), "{pairs:?}");
-        assert!(pairs.iter().any(|(k, v)| k == "badResources" && v == "1"), "{pairs:?}");
-        assert!(pairs.iter().any(|(k, v)| k == "lcp" && v == "731ms"), "{pairs:?}");
-        assert!(pairs.iter().any(|(k, v)| k == "fcp" && v == "120ms"), "{pairs:?}");
+        assert_eq!(
+            pairs[0],
+            ("targetUrl".into(), "https://app.example.com/home".into())
+        );
+        assert!(
+            pairs.iter().any(|(k, v)| k == "errors" && v == "2"),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.iter().any(|(k, v)| k == "badResources" && v == "1"),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.iter().any(|(k, v)| k == "lcp" && v == "731ms"),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.iter().any(|(k, v)| k == "fcp" && v == "120ms"),
+            "{pairs:?}"
+        );
 
         let null_resp = json!({ "targetUrl": "https://a.com", "diagnostics": null });
         let pairs = diagnostics_kv_pairs(&null_resp);
         assert!(
-            pairs.iter().any(|(k, v)| k == "diagnostics" && v.contains("未注入")),
+            pairs
+                .iter()
+                .any(|(k, v)| k == "diagnostics" && v.contains("未注入")),
             "null 明示原因: {pairs:?}"
         );
     }
@@ -843,9 +948,9 @@ fn delete(
         Ok(()) => {}
         // 原 409 错误在此臂不透传：确认流取消 → exit 2「已取消」，否则 stop 后重试
         // DELETE（失败原样上抛），都携带比原始 409 更明确的终态信息
-        Err(CliError::Api { status: 409, code, .. })
-            if code == "INSTANCE_ALREADY_RUNNING" =>
-        {
+        Err(CliError::Api {
+            status: 409, code, ..
+        }) if code == "INSTANCE_ALREADY_RUNNING" => {
             if yes {
                 // 已显式授权级联操作（stop → delete）
             } else if std::io::stdin().is_terminal() {

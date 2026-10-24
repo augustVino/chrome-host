@@ -14,9 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::{json, Value};
 
-use crate::domain::diagnostics::{ApplyOutcome, DiagBuffer};
+use crate::domain::diagnostics::{ApplyOutcome, DiagBuffer, QueryResult};
 use crate::domain::instance::InstanceStatus;
 use crate::error::AppError;
 use crate::infrastructure::cdp::ws::CdpConnection;
@@ -58,7 +59,11 @@ pub struct DiagnosticsService {
 
 impl DiagnosticsService {
     pub fn new(repo: Arc<InstanceRepository>, version: String) -> Self {
-        DiagnosticsService { registry: Arc::new(Mutex::new(HashMap::new())), repo, version }
+        DiagnosticsService {
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            repo,
+            version,
+        }
     }
 
     /// 实例置 running 后由 InstanceService 调用。同步部分只有登记 + spawn，
@@ -100,24 +105,43 @@ impl DiagnosticsService {
         Ok(self.registry.lock().unwrap().get(ins_id).cloned())
     }
 
-    /// GET console?level=&limit=：level 精确匹配（error/warning/info/debug/log）
-    pub fn console(&self, ins_id: &str, level: Option<&str>, limit: Option<usize>) -> Result<Value, AppError> {
+    /// GET console?level=&limit=&tab=：level 精确匹配（error/warning/info/debug/log）；
+    /// tab 按 targetId 归属过滤（环中存在无归属条目时降级全量，meta 标注）
+    pub fn console(
+        &self,
+        ins_id: &str,
+        level: Option<&str>,
+        tab: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Value, AppError> {
         let watched = self.require(ins_id)?;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-        let entries = watched
-            .map(|w| w.buffer.lock().unwrap().console_entries(level, limit))
-            .unwrap_or_default();
-        Ok(json!({ "instanceId": ins_id, "entries": entries }))
+        let result = watched
+            .map(|w| w.buffer.lock().unwrap().console_entries(level, tab, limit))
+            .unwrap_or_else(empty_result);
+        Ok(query_response(ins_id, result))
     }
 
-    /// GET network?failedOnly=：failedOnly = 失败请求或 HTTP ≥400
-    pub fn network(&self, ins_id: &str, failed_only: bool, limit: Option<usize>) -> Result<Value, AppError> {
+    /// GET network?failedOnly=&limit=&tab=：failedOnly = 失败请求或 HTTP ≥400；
+    /// tab 按 targetId 归属过滤（同上）
+    pub fn network(
+        &self,
+        ins_id: &str,
+        failed_only: bool,
+        tab: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Value, AppError> {
         let watched = self.require(ins_id)?;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-        let entries = watched
-            .map(|w| w.buffer.lock().unwrap().network_entries(failed_only, limit))
-            .unwrap_or_default();
-        Ok(json!({ "instanceId": ins_id, "entries": entries }))
+        let result = watched
+            .map(|w| {
+                w.buffer
+                    .lock()
+                    .unwrap()
+                    .network_entries(failed_only, tab, limit)
+            })
+            .unwrap_or_else(empty_result);
+        Ok(query_response(ins_id, result))
     }
 
     /// GET har：network 环生成 HAR 1.2 文档原样返回（har-recorder 落地点）
@@ -125,21 +149,22 @@ impl DiagnosticsService {
         let watched = self.require(ins_id)?;
         let har = watched
             .map(|w| w.buffer.lock().unwrap().to_har(&self.version))
-            .unwrap_or_else(|| {
-                DiagBuffer::default().to_har(&self.version)
-            });
+            .unwrap_or_else(|| DiagBuffer::default().to_har(&self.version));
         Ok(har)
     }
 
     /// GET screenshot：复用常驻连接对第一个 http(s) 页面 session 截图（png base64）。
     /// 连接未就绪/无页面 → 409 DIAGNOSTICS_UNAVAILABLE（与 M5 同码同语义）。
     pub async fn screenshot(&self, ins_id: &str) -> Result<Value, AppError> {
-        let watched = self.require(ins_id)?.ok_or_else(|| {
-            unavailable("常驻诊断连接未就绪（实例刚启动，稍后重试）")
-        })?;
-        let shared = watched.conn.lock().unwrap().clone().ok_or_else(|| {
-            unavailable("常驻诊断连接断开重连中，稍后重试")
-        })?;
+        let watched = self
+            .require(ins_id)?
+            .ok_or_else(|| unavailable("常驻诊断连接未就绪（实例刚启动，稍后重试）"))?;
+        let shared = watched
+            .conn
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| unavailable("常驻诊断连接断开重连中，稍后重试"))?;
         let session_id = watched
             .buffer
             .lock()
@@ -148,7 +173,11 @@ impl DiagnosticsService {
             .ok_or_else(|| unavailable("无可截图的 http(s) 页面目标"))?;
         let mut conn = shared.lock().await;
         let resp: Value = conn
-            .send("Page.captureScreenshot", json!({ "format": "png" }), Some(&session_id))
+            .send(
+                "Page.captureScreenshot",
+                json!({ "format": "png" }),
+                Some(&session_id),
+            )
             .await?;
         let data = resp
             .get("data")
@@ -161,6 +190,24 @@ impl DiagnosticsService {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// watcher 未就绪时的空投影（空环过滤任意 tab 结果仍为空，无需降级标注）
+fn empty_result<T>() -> QueryResult<T> {
+    QueryResult {
+        entries: Vec::new(),
+        meta: None,
+    }
+}
+
+/// 查询响应组装：meta 仅在请求了 tab 过滤时出现（未过滤查询形状不变）
+fn query_response<T: Serialize>(ins_id: &str, result: QueryResult<T>) -> Value {
+    let QueryResult { entries, meta } = result;
+    let mut resp = json!({ "instanceId": ins_id, "entries": entries });
+    if let Some(m) = meta {
+        resp["meta"] = json!(m);
+    }
+    resp
 }
 
 /// watcher 主循环：连接 → 泵事件 → 死亡后退避重连；退出条件（代际失效或实例
@@ -206,7 +253,10 @@ async fn watch_loop(
         backoff = std::cmp::min(backoff * 2, BACKOFF_MAX);
     }
     let mut map = registry.lock().unwrap();
-    if map.get(&ins_id).is_some_and(|cur| Arc::ptr_eq(cur, &watched)) {
+    if map
+        .get(&ins_id)
+        .is_some_and(|cur| Arc::ptr_eq(cur, &watched))
+    {
         map.remove(&ins_id);
     }
 }
@@ -218,7 +268,10 @@ fn alive(repo: &InstanceRepository, ins_id: &str) -> bool {
 }
 
 /// 建立常驻连接并挂 autoAttach；事件通道由 reader 侧持有（连接死 → 通道 drop）
-async fn start_session(port: u16, watched: &Watched) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>, AppError> {
+async fn start_session(
+    port: u16,
+    watched: &Watched,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>, AppError> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let conn = CdpConnection::connect_eventing(port, tx).await?;
     let shared = Arc::new(tokio::sync::Mutex::new(conn));
@@ -239,7 +292,9 @@ async fn start_session(port: u16, watched: &Watched) -> Result<tokio::sync::mpsc
 /// per-session 域启用（console/network/log 三源）。best-effort：失败仅该 session
 /// 缺数据，重连后自愈；不因单个 attach 失败拖垮 watcher
 async fn enable_session(watched: &Watched, session_id: &str) {
-    let Some(shared) = watched.conn.lock().unwrap().clone() else { return };
+    let Some(shared) = watched.conn.lock().unwrap().clone() else {
+        return;
+    };
     let mut g = shared.lock().await;
     for method in ["Runtime.enable", "Network.enable", "Log.enable"] {
         if let Err(e) = g.send::<Value>(method, (), Some(session_id)).await {
@@ -295,8 +350,12 @@ mod tests {
         let (repo, ins) = setup();
         let svc = DiagnosticsService::new(repo.clone(), "0.2.3".into());
 
-        let console = svc.console(&ins.id, None, None).unwrap();
-        assert_eq!(console["entries"].as_array().unwrap().len(), 0, "无 watcher = 空数据");
+        let console = svc.console(&ins.id, None, None, None).unwrap();
+        assert_eq!(
+            console["entries"].as_array().unwrap().len(),
+            0,
+            "无 watcher = 空数据"
+        );
         let har = svc.har(&ins.id).unwrap();
         assert_eq!(har["log"]["entries"].as_array().unwrap().len(), 0);
 
@@ -308,7 +367,7 @@ mod tests {
             },
         )
         .unwrap();
-        let err = svc.console(&ins.id, None, None).unwrap_err();
+        let err = svc.console(&ins.id, None, None, None).unwrap_err();
         assert_eq!(err.status(), 409);
         assert_eq!(err.code(), "DIAGNOSTICS_UNAVAILABLE");
     }
@@ -329,5 +388,57 @@ mod tests {
         assert!(second.current.load(Ordering::Relaxed));
         // 实例停止后 watcher 自行退出并清理登记（这里直接驱动其退出路径）
         second.current.store(false, Ordering::Relaxed);
+    }
+
+    /// tab 过滤透传：直接登记 Watched 并喂事件（绕过 spawn 的网络路径），
+    /// 验证 service 层的 tab 参数透传与 meta 组装（filteredByTab/tabFilterUnavailable）
+    #[test]
+    fn console_network_tab_filter_meta_surfaced() {
+        let (repo, ins) = setup();
+        let svc = DiagnosticsService::new(repo, "0.2.3".into());
+        let watched = Arc::new(Watched::new());
+        svc.registry
+            .lock()
+            .unwrap()
+            .insert(ins.id.clone(), Arc::clone(&watched));
+
+        let mut buffer = watched.buffer.lock().unwrap();
+        buffer.apply(
+            &json!({ "method": "Target.attachedToTarget",
+                "params": { "sessionId": "s1", "targetInfo": { "targetId": "tab-1", "type": "page", "url": "https://a/" } } }),
+            1,
+        );
+        buffer.apply(
+            &json!({ "method": "Runtime.consoleAPICalled", "sessionId": "s1",
+                "params": { "type": "error", "args": [{ "type": "string", "value": "boom" }] } }),
+            2,
+        );
+        // 归属缺失样本：未登记 session 的迟到 console 帧
+        buffer.apply(
+            &json!({ "method": "Runtime.consoleAPICalled", "sessionId": "ghost",
+                "params": { "type": "error", "args": [{ "type": "string", "value": "late" }] } }),
+            3,
+        );
+        drop(buffer);
+
+        // 带 tab 查询：降级全量 + meta 标注（domain 语义在 service 响应中如实透出）
+        let resp = svc
+            .console(&ins.id, Some("error"), Some("tab-1"), None)
+            .unwrap();
+        assert_eq!(resp["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(resp["meta"]["filteredByTab"], "tab-1");
+        assert_eq!(resp["meta"]["tabFilterUnavailable"], true);
+        assert_eq!(resp["meta"]["before"], 2);
+        assert_eq!(resp["meta"]["after"], 2);
+
+        // network 透传：空环 + tab 过滤 → 空 entries，meta 正常（不降级）
+        let resp = svc.network(&ins.id, false, Some("tab-1"), None).unwrap();
+        assert_eq!(resp["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(resp["meta"]["tabFilterUnavailable"], false);
+
+        // 未请求 tab：响应形状与 M6 一致（无 meta 键）
+        let resp = svc.console(&ins.id, None, None, None).unwrap();
+        assert_eq!(resp["entries"].as_array().unwrap().len(), 2);
+        assert!(resp.get("meta").is_none());
     }
 }
