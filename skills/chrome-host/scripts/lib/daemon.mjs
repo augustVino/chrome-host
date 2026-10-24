@@ -16,10 +16,24 @@ import { navStr } from './tools/navigate.mjs';
 import { clickStr, clickXyStr, typeStr, loadAllStr } from './tools/interact.mjs';
 import { shotStr } from './tools/screenshot.mjs';
 import { evalRawStr } from './tools/raw.mjs';
+import { DialogTracker, handleDialogOpening, dialogsStr } from './dialogs.mjs';
 
 // Dispatch one daemon command. cdp is injected so tests can pass a fake.
+// dialogs is the per-tab DialogTracker; when present, every command marks the
+// dialog cursor on entry and its response gains an optional dialogs_seen
+// field if new dialogs were auto-accepted while it ran (BEHAVIOR-SPEC §1.6).
 // Returns { ok, result } / { ok, error } / { ok, result, stopAfter }.
-export async function execCommand(cdp, sessionId, targetId, { cmd, args }) {
+export async function execCommand(cdp, sessionId, targetId, req, dialogs) {
+  const cursor = dialogs?.cursor();
+  const res = await dispatchCommand(cdp, sessionId, targetId, req, dialogs);
+  if (dialogs) {
+    const seen = dialogs.since(cursor);
+    if (seen.length > 0) res.dialogs_seen = seen; // omitted when empty: wire stays backward compatible
+  }
+  return res;
+}
+
+async function dispatchCommand(cdp, sessionId, targetId, { cmd, args }, dialogs) {
   try {
     let result;
     switch (cmd) {
@@ -44,6 +58,7 @@ export async function execCommand(cdp, sessionId, targetId, { cmd, args }) {
       case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
       case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
       case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
+      case 'dialogs': result = dialogsStr(dialogs, args); break;
       case 'stop': return { ok: true, result: '', stopAfter: true };
       default: return { ok: false, error: `Unknown command: ${cmd}` };
     }
@@ -70,6 +85,22 @@ export async function runDaemon(targetId) {
     sessionId = res.sessionId;
   } catch (e) {
     process.stderr.write(`Daemon: attach failed: ${e.message}\n`);
+    cdp.close();
+    process.exit(1);
+  }
+
+  // P-1: take over JS dialogs (alert/confirm/prompt/beforeunload). While one
+  // is open, every CDP command on this tab blocks. Subscribe BEFORE
+  // Page.enable — dialog events only start flowing after the enable, so no
+  // opening event can slip past the handler.
+  const dialogs = new DialogTracker(targetId);
+  cdp.onEvent('Page.javascriptDialogOpening', (params) => {
+    void handleDialogOpening(cdp, sessionId, dialogs, params);
+  });
+  try {
+    await cdp.send('Page.enable', {}, sessionId);
+  } catch (e) {
+    process.stderr.write(`Daemon: Page.enable failed: ${e.message}\n`);
     cdp.close();
     process.exit(1);
   }
@@ -106,7 +137,7 @@ export async function runDaemon(targetId) {
   // Handle a command
   async function handleCommand(req) {
     resetIdle();
-    return execCommand(cdp, sessionId, targetId, req);
+    return execCommand(cdp, sessionId, targetId, req, dialogs);
   }
 
   // Unix socket server — NDJSON protocol

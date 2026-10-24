@@ -123,6 +123,7 @@ node scripts/cdp.mjs clickxy <target> <x> <y>   # 按坐标点击（CSS 像素�
 node scripts/cdp.mjs type  <target> <text>      # 输入文本（当前焦点处）
 node scripts/cdp.mjs loadall <target> <sel> [ms]  # 反复点"加载更多"直到消失
 node scripts/cdp.mjs evalraw <target> <method> [json]  # 原始 CDP 命令透传
+node scripts/cdp.mjs dialogs <target> [--since N]   # 查自动接管的 JS 弹窗记录（近 32 条）
 node scripts/cdp.mjs open   [url]               # 新开标签页
 node scripts/cdp.mjs stop   [target]            # 停后台 daemon
 ```
@@ -132,7 +133,7 @@ node scripts/cdp.mjs stop   [target]            # 停后台 daemon
 - **坐标换算**：截图按原生分辨率保存（图像像素 = CSS 像素 × DPR），CDP 点击吃 CSS 像素。`shot` 输出会带当前页 DPR，Retina（DPR=2）除以 2 再点击。
 - **eval 索引漂移**：多次 `eval` 之间 DOM 会变（如点掉一个卡片后全体系号位移），跨调用别用 `querySelectorAll(...)[i]`——一次 eval 收齐数据，或用稳定选择器。
 - **跨域 iframe 输入**：`eval` 进不去跨域 iframe，用 `click`/`clickxy` 聚焦后 `type`（Input.insertText，不受同源限制）。
-- **不存在 "Allow debugging" 授权弹窗**：实例内核是 Chrome for Testing，CDP 访问不弹任何授权框，无需用户点允许——操作失败时别往“用户未授权”归因，按端口/实例/会话逐层排查。cdp.mjs 页面命令经 per-tab 后台 daemon 保持 CDP 会话，daemon 空闲 20 分钟自动退出。
+- **不存在 "Allow debugging" 授权弹窗**：实例内核是 Chrome for Testing，CDP 访问不弹任何授权框，无需用户点允许——操作失败时别往“用户未授权”归因，按端口/实例/会话逐层排查。cdp.mjs 页面命令经 per-tab 后台 daemon 保持 CDP 会话，daemon 空闲 20 分钟自动退出。页面 alert/confirm/prompt/beforeunload 会被 daemon 自动 accept（beforeunload=放行离开，prompt 提交默认文本），不再阻塞命令；期间弹窗会以 `dialogs_seen` 附在响应里（CLI 以 stderr 提示行展示），`dialogs` 命令可查历史。
 - **会话过期**（仅 CDP_BASE 模式，404 `SESSION_NOT_FOUND`）→ 重新 `cdp-session` 即可，无需重建实例。
 
 ### 6. 页面排障：先查历史，不要 reload 重放

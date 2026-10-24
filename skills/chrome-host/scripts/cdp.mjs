@@ -36,6 +36,9 @@ Usage: cdp <command> [args]
                                     Works in cross-origin iframes unlike eval-based approaches
   loadall <target> <selector> [ms]  Repeatedly click a "load more" button until it disappears
                                     Optional interval in ms between clicks (default 1500)
+  dialogs <target> [--since N]      List JS dialogs (alert/confirm/prompt/beforeunload)
+                                    auto-accepted by the daemon; --since N limits to
+                                    entries with sequence > N
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   open  [url]                       Open a new tab (default: about:blank)
@@ -68,13 +71,22 @@ DAEMON IPC (for advanced use / scripting)
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
-  type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
+  type, loadall, evalraw, dialogs, stop. Use evalraw to send arbitrary CDP methods.
   The socket disappears after 20 min of inactivity or when the tab closes.
+
+JS DIALOG TAKEOVER
+  Native JS dialogs (alert/confirm/prompt/beforeunload) block all CDP commands
+  on their tab. The daemon auto-accepts them (beforeunload accept = allow
+  leaving; prompt submits its default text) and keeps the last 32 per tab.
+  If a dialog was accepted while a command ran, its response gains an extra
+  optional field "dialogs_seen": [{"sequence":1,"type":"alert","message":"...",...}] —
+  absent when none appeared (old clients can ignore it). The CLI prints such
+  dialogs on stderr; 'cdp dialogs <target> [--since N]' reads the buffer.
 `;
 
 const NEEDS_TARGET = new Set([
   'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','loadall','evalraw',
+  'net','network','click','clickxy','type','loadall','evalraw','dialogs',
 ]);
 
 async function main() {
@@ -167,6 +179,12 @@ async function main() {
   }
 
   const response = await sendCommand(conn, { cmd, args: cmdArgs });
+
+  // P-1: surface dialogs auto-accepted while the command ran (stderr keeps
+  // stdout parseable for scripts).
+  for (const d of response.dialogs_seen || []) {
+    console.error(`JS dialog auto-accepted: [${d.type}] ${d.message}`);
+  }
 
   if (response.ok) {
     if (response.result) console.log(response.result);
