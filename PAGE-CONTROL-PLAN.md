@@ -203,32 +203,43 @@ chrome-host page raw   <ins> <tabId> <method> [json] # CDP 透传（逃生舱，
 
 ## 5. 实施路线
 
-### Phase 1 — 止血 + 行为验证（cdp.mjs / TS，1–2 天级）
+### Phase 1 — 止血 + 行为验证（cdp.mjs / TS）✅ 已完成（feature/page-control-phase1）
 
-改仓库内 `skills/chrome-host/scripts/cdp.mjs`（安装版随之同步）：
+T1 拆分（cdp.mjs → lib/ 模块 + 183 单测）/ T2 行为规范（BEHAVIOR-SPEC）/ T3 对话框接管 / T4 原生点击 + hit-test / T5 @eN ref / T6 fill/press/wait / T7 SKILL.md v4 + evals。全部合入 feature/page-control-phase1，未 push。验收：183/183 测试全绿；USAGE 兼容；[CODE] 错误码与 chrome-host CLI 错误行风格对齐。
 
-1. 拆文件：`cdp.mjs` → `session.mjs`（L1：daemon/连接/事件）+ `tools/*.mjs`（L2：命令）；
-2. 对话框接管（P-1）；3. click(selector) 改原生事件链（P-2）；
-4. snap 加 @eN + click/fill 支持 ref（P-3）；
-5. 补 fill/press/wait-for-element（P-4）。
+### Phase 2 — 能力落应用（Rust）✅ 已完成（feature/page-control-phase1，待应用发版生效）
 
-**验收**：qa 页面弹 alert 不再假死；点击被浮层遮挡可被发现；skill 陷阱段删一半。
-**产物**：一份"行为规范"（含边界用例）= Phase 2 的 Rust 实现规格。
-
-### Phase 2 — 能力落应用（Rust）
-
-1. `CdpSupervisor`（4.1）：会话表 + 对话框 + 事件缓冲，扩展 `ws.rs` 常驻形态；
-2. L2 工具层（4.2）按 Phase 1 行为规范实现；
-3. REST API → CLI `page` 命令族（4.3）→ MCP `page_*`（4.4）；
-4. 契约文档三份同步（AGENT-API / CLI / MCP）。
+> **范围基于附录 B《主仓能力清单》逐项去重后确定**。P2-A domain 纯逻辑层（1878 行/47 测）→ P2-D 诊断 tab 过滤 → P2-B 服务编排（3171 行/31 测）→ P2-C 三暴露 + 契约（1363 行/62 测）。交付：REST 6 端点（api/pages.rs）、CLI `page` 六命令族（cli/page.rs，PAGE_* 错误码入既有退出码契约）、MCP page_* 六工具、AGENT-API/CLI/MCP 三份文档同步。终验收：cargo 289 测全绿 + TS 183 测全绿 + 新文件 fmt/clippy 干净（基线存量问题未动）。
+>
+> **遗留**：① 真机端到端待应用发版后验证（运行中应用为旧版无 /page 端点；新 CLI 对旧应用已验证优雅降级）；② Q6 对话框应答与 in-flight 命令互斥（ws.rs &mut self）最坏 15s 延迟；③ P2-B 备案 4 个补齐错误码已随 P2-C 披露。
 
 **验收**：`chrome-host page snap/click/fill/console/network` 全链路可用（本地 + 远程两种模式）；退出码契约覆盖新命令。
 
-### Phase 3 — 切换与退役
+### 真机端到端冒烟记录（P3-1，dev 构建）
 
-1. skill 瘦身（4.5），cdp.mjs 退役；
-2. iframe 有限读（按需）；
-3. vendor `@browser-skill/vom` 评估语义树升级（snap → observe）。
+**已验证**：snap（AX 树+@eN+环境标签）、click（原生事件/坐标精确/isTrusted=true/触发页面行为）、fill（聚焦+输入+回读校验）、对话框事件订阅链、snap --json。
+**发现并修复**：F2 对话框 handle 阻塞（第一版旁路连接方案因 sessionId 连接级作用域失败；终版：ws.rs send &self 化根治 Q6，命令并发 in-flight）；F1 空 target 语义（唯一 tab 自动选/多 tab 列表报错）；F3 snap --json。
+**遗留边角**：首条命令 attach 竞态（提示 retry shortly，agent 可自意重试）——修复中（握手窗口，feature/pc-l23）。
+**main 既有问题**：instance open/navigate 导航不生效——根因已定位：CfT 131 忽略 HTTP /json/new 的 url 参数（/json/close 同失效）；修复中（改走 WS createTarget/closeTarget，feature/pc-l1）。
+**重连对话框失明**（CDP 无事件重播）——修复中（重连盲探测，feature/pc-l23）。
+**测试环境保护教训**：调试用 cdp.mjs daemon 与 PageService 是双 CDP 客户端，对话框接管会互相竞争——验证对话框行为时必须停掉 cdp.mjs daemon。
+
+### Phase 3 — 切换与退役 ✅ 已完成（随应用发版一次性生效）
+
+P3-1 真机冒烟（两轮）：snap/click（含遮挡负例）/fill/press/wait/dialogs/eval/html/clickxy/type/loadall 全链路 dev 构建验证通过；冒烟期间发现并修复 P2-F（对话框连接锁、空 target 语义、snap --json）与 P2-G 补齐（eval/html/clickxy/type/loadall，消除 cdp.mjs 退役缺口）。
+P3-2 skill v5：教学全量切 chrome-host page 命令族（11 命令），凭证/端口/daemon 段落全部删除，远程模式教学简化（page 命令远程直用）；evals 更新至 3 例。
+P3-3 cdp.mjs 退役：scripts/ 目录已删除（行为规格已固化进 domain/application 测试）；TS 测试 183 个随目录退役（历史在 git）。
+
+## 发版清单（用户决定时机；遗留 L1–L3 修复合入后执行）
+
+> L4（vom vendor 语义树升级）经用户决策转入 backlog，不阻塞发版。
+
+1. push + tag（触发 GitHub Action 构建）——分支：feature/page-control-phase1（17 个提交）
+2. 发版后用户环境：升级应用（CLI 随应用内置更新）
+3. skill 安装位同步：仓库 skills/chrome-host/ → ~/.pi/agent/skills/chrome-host/（rsync，排除 tests）
+4. 验收：chrome-host page snap <ins> 在新应用上直接可用
+
+⚠️ 发版前建议单独处理：main 既有 instance open/navigate 导航不生效问题（冒烟记录见上，非本分支引入）
 
 **验收**：skill 目录无脚本；新 agent 零 Node 依赖接入。
 
@@ -238,13 +249,31 @@ chrome-host page raw   <ins> <tabId> <method> [json] # CDP 透传（逃生舱，
 
 | # | 问题 | 状态 |
 |---|---|---|
-| Q1 | 实例改 `--remote-debugging-pipe`（fd 管道替代 HTTP 端口）能否同时消除 "Allow debugging" 弹窗与端口分配器？ | 待实验验证（Puppeteer 默认方案；若可行，L1 再简化） |
+| Q1 | 实例改 `--remote-debugging-pipe`（fd 管道替代 HTTP 端口）能否同时消除 "Allow debugging" 弹窗与端口分配器？ | 已失效：实例内核为 Chrome for Testing，无授权弹窗（SKILL.md v3 已订正） |
 | Q2 | Rust 侧 `Network.getResponseBody` 的 body 上限与编码（base64）处理 | Phase 2 设计时定 |
 | Q3 | 多 agent 并发操控同一实例：沿用"编排类命令无锁、page 类命令 per-tab 串行"是否足够 | Phase 2 压测后定（BrowserSkill 是 per-session 串行队列） |
 | Q4 | vendor vom 包后的上游跟随策略（锁版本 + 手动升级） | Phase 3 定 |
-| Q5 | 事件缓冲内存预算（每 tab 条数/字节上限，超限丢弃策略） | Phase 2 定 |
+| Q6 | ws.rs `CdpConnection::send` 为 `&mut self` 串行：对话框应答与 in-flight 命令互斥，最坏延迟 = 命令超时（15s）。根治需 ws.rs 支持 `&self` 并发 send（P2-B 报告备案） | 待专项 |
+| ~~Q5~~ | ~~事件缓冲内存预算~~ | 已关闭：M6 已定（console 500/network 1000，pending 表 500 上限） |
 
 ---
+
+## 附录 B：主仓能力清单（Phase 2 规划的事实底座，2026-10 盘点）
+
+> **Owner 工作规程**：任何阶段的规划与子任务下发前，先对照本清单逐项打勾（已有→复用 / 部分有→适配 / 没有→新建）；读到的注释、文档提及的能力必须追到提交或 CLI/MCP 契约确认后才可用。本清单随主仓演进同步维护。
+
+| 域 | 已交付能力 | 交付位置 |
+|---|---|---|
+| CDP 基础 | 按需短连接 WS 客户端（Cookie 导出/注入、evaluate） | M1 `infrastructure/cdp/ws.rs` |
+| CDP 事件 | 常驻事件订阅：autoAttach flatten + EventSink 通道（waitForDebuggerOnStart:false） | M6 同上 |
+| 诊断采集 | console 环 500 / network 环 1000 / HAR 1.2 / instance screenshot / diagnostics（LCP/FCP/errors） | M5/M6 `application/diagnostics_service.rs` + `domain/diagnostics.rs` |
+| 网络改写 | net-rules 扩展：block / redirect（$N 引用）/ headers 注入，全局默认 + 环境覆盖 | M4 内置 system 扩展 |
+| 登录态 | 实例即登录源：Cookie 导出 + 三档策略 + 保险库；capture/reset（launch 子系统已于 M7-C④移除） | M2/M3 `session_vault.rs` + `profile_service.rs` |
+| 业务事件 | SSE 流 `GET /api/v1/events`（instance-deleted 等） | M7-B `api/events.rs` |
+| 远程接入 | SSH 隧道 + token + cdp-session 下级凭证（30min）+ HTTP/WS 帧级代理 | `tunnel.rs` + `cdp_session.rs` + `cdp/proxy.rs` |
+| CLI | env/instance/extension/login-profile/settings/runtime/status/doctor 全命令族 + 退出码 0–10 冻结契约 | `crates/cli` + CLI.md |
+| MCP | 33 tools（编排 28 + 常驻诊断 5），与 REST/CLI 同服务层 | `api/mcp.rs` + MCP.md |
+| tab 级 | tabs / open / navigate（实现为新开页+关旧页，无交互原语、无 ref、无输入注入） | instance 命令族 |
 
 ## 附录 A：BrowserSkill 源码锚点速查（Phase 1/2 实现时对照）
 

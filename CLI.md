@@ -221,6 +221,7 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 | `page wait <ID> <selector> [--state V] [--timeout 10s] [--tab T]` | 轮询等待（250ms 间隔）；state = visible（缺省）/hidden/attached/detached；超时 → 409 exit 5 |
 | `page dialogs <ID> [--tab T] [--since N]` | 已自动应答的对话框日志（SEQ/TYPE/MESSAGE 表 + cursor 行；`--since` 增量拉取） |
 | `page eval <ID> <expr> [--tab T]` | 任意 JS 求值（⚠ 高权限：优先 snap/click 等专用原语，仅在不够用时用）；对象结果 = pretty JSON |
+| `page raw <ID> <method> [json] [--tab T] [--browser]` | 任意 CDP 命令透传（⚠ 最高权限逃生舱，对齐退役前 cdp.mjs evalraw）；--browser 发 browser 级（Target 域等），缺省发 tab 的 page session；params 非法 JSON 本地 exit 2 |
 | `page html <ID> [selector] [--tab T]` | 读 outerHTML（缺省 = 整文档；未命中 → 404 exit 3）；html 原样到 stdout，`--json` 包 `html` 字段 |
 | `page clickxy <ID> <x> <y> [--tab T]` | 视口坐标点击（CSS 像素；无定位/遮挡校验，坐标即意图） |
 | `page loadall <ID> <selector> [--interval 1500ms] [--max-clicks 200] [--tab T]` | 循环点击「加载更多」直到消失；达上限仍未消失时结果明示 still present |

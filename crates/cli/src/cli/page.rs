@@ -133,6 +133,25 @@ pub enum PageCommands {
         tab: Option<String>,
     },
 
+    /// 任意 CDP 命令透传（最高权限逃生舱）
+    #[command(
+        about = "CDP 命令透传：<method> [json params]（⚠ 最高权限逃生舱：仅在 page 原语不够用时用；--browser 发 browser 级）"
+    )]
+    Raw {
+        /// 实例 id
+        id: String,
+        /// CDP 方法名（如 "Emulation.setDeviceMetricsOverride"）
+        method: String,
+        /// 命令参数 JSON（缺省 = {}；开头是 - 时需用 -- 分隔）
+        params: Option<String>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+        /// 发 browser 级（Target.getTargets 等）；缺省发到 tab 的 page session
+        #[arg(long)]
+        browser: bool,
+    },
+
     /// 读页面 HTML（整文档或选择器命中元素）
     #[command(about = "读 HTML：[selector]（缺省 = 整文档 outerHTML；未命中 → 404 exit 3）")]
     Html {
@@ -236,6 +255,21 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             expression,
             tab,
         } => eval(globals, client, id, expression, tab.as_deref()),
+        PageCommands::Raw {
+            id,
+            method,
+            params,
+            tab,
+            browser,
+        } => raw(
+            globals,
+            client,
+            id,
+            method,
+            params.as_deref(),
+            tab.as_deref(),
+            *browser,
+        ),
         PageCommands::Html { id, selector, tab } => {
             html(globals, client, id, selector.as_deref(), tab.as_deref())
         }
@@ -348,6 +382,27 @@ fn eval(
     tab: Option<&str>,
 ) -> Result<(), CliError> {
     let resp = client.page_eval(id, expression, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page raw <ID> <method> [json] [--tab T] [--browser]`：CDP 透传，result
+/// 原样 pretty JSON。params 非法 JSON 在本地报参数错（对齐 cdp.mjs evalraw）。
+fn raw(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    method: &str,
+    params: Option<&str>,
+    tab: Option<&str>,
+    browser: bool,
+) -> Result<(), CliError> {
+    let params: serde_json::Value = match params {
+        None => serde_json::json!({}),
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|e| CliError::Local(format!("params 不是合法 JSON: {e}")))?,
+    };
+    let resp = client.page_raw(id, method, params, tab, browser)?;
     render_result(&OutputCtx::from(globals), &resp);
     Ok(())
 }

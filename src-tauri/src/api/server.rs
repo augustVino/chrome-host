@@ -222,6 +222,10 @@ fn routes(state: ApiState) -> Router {
             post(crate::api::pages::eval),
         )
         .route(
+            "/api/v1/instances/{id}/page/raw",
+            post(crate::api::pages::raw),
+        )
+        .route(
             "/api/v1/instances/{id}/page/html",
             post(crate::api::pages::html),
         )

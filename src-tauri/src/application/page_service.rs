@@ -490,6 +490,26 @@ impl PageService {
         .await
     }
 
+    /// raw <tab> <method> [params]：任意 CDP 命令透传（D5 逃生舱，对齐退役前
+    /// cdp.mjs evalraw）。browser=true 发 browser 级（sid 置 None）。
+    pub async fn raw(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        method: &str,
+        params: Value,
+        browser: bool,
+    ) -> Result<Value, AppError> {
+        self.command(
+            TOOL_TIMEOUT,
+            "raw",
+            ins_id,
+            tab,
+            |w, _tid, sid| async move { raw_tool(&w, &sid, method, params, browser).await },
+        )
+        .await
+    }
+
     /// html <tab> [selector]：读 outerHTML（缺省 = 整文档；selector 未命中
     /// → 404 PAGE_ELEMENT_NOT_FOUND，见 html_tool 的行为差异说明）（P2-G）。
     pub async fn html(
@@ -2036,6 +2056,24 @@ async fn eval_tool(watched: &Watched, sid: &str, expression: &str) -> Result<Val
     let conn = require_conn(watched)?;
     let result = eval_remote_object(&conn, sid, expression).await?;
     Ok(json!({ "result": eval_str_from_remote(&result) }))
+}
+
+/// raw <method> [json]：任意 CDP 命令透传（PLAN D5 逃生舱；与退役前 cdp.mjs
+/// evalraw 同权限）。browser=true 发 browser 级（Target.getTargets 等），
+/// 否则发到 tab 的 page session（Runtime/DOM/Input/Emulation 全域可达）。
+/// 响应 = CDP 原始 result 对象，原样透传不裁剪。
+async fn raw_tool(
+    watched: &Watched,
+    sid: &str,
+    method: &str,
+    params: Value,
+    browser: bool,
+) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    let result: Value = cdp_send(&conn, method, params, if browser { None } else { Some(sid) })
+        .await
+        .map_err(|e| AppError::from(PageControlError::dispatch_failed(&e.to_string(), false)))?;
+    Ok(json!({ "result": result }))
 }
 
 /// TS htmlStr：selector 缺省 = 整文档 outerHTML；命中元素 → outerHTML。

@@ -8,7 +8,7 @@
 
 - [连接配置](#连接配置)
 - [通用行为约定](#通用行为约定)
-- [工具总览（39 个）](#工具总览39-个)
+- [工具总览（40 个）](#工具总览39-个)
 - [内核](#内核)
 - [环境](#环境)
 - [实例](#实例)
@@ -66,7 +66,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 4. **内核未装时 `create_instance` 会阻塞于首次下载**（约 150MB）——复杂任务先调 `kernel_status` 预判。
 5. 扩展启停只影响**之后启动的实例**；实例创建非幂等（每次新增一个）。
 
-## 工具总览（39 个）
+## 工具总览（40 个）
 
 | 分组 | 工具 |
 |---|---|
@@ -75,7 +75,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | 实例（9） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
 | 常驻诊断（5） | `get_diagnostics` · `get_console` · `get_network` · `get_screenshot` · `get_har` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
-| 页面控制（11） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_wait` · `page_dialogs` · `page_eval` · `page_html` · `page_clickxy` · `page_loadall` · `page_type` |
+| 页面控制（12） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_wait` · `page_dialogs` · `page_eval` · `page_raw` · `page_html` · `page_clickxy` · `page_loadall` · `page_type` |
 | 登录态（2） | `login_profile`（action: get / capture / reset） · `session_status` |
 | 扩展（7） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` · `get_extension_config` · `set_extension_config` |
 
@@ -152,6 +152,7 @@ accept，命令期间新弹的附在成功响应 `dialogs_seen`，历史查 `pag
 | `page_wait` | `instanceId`, `selector`；可选 `state`, `timeout`, `tab` | 轮询等待（250ms）；timeout 如 `"10s"`（裸数字 = ms），缺省 10s |
 | `page_dialogs` | `instanceId`；可选 `tab`, `since` | 已自动应答的对话框日志（cursor + entries；since 游标增量拉取，缓冲 32 条） |
 | `page_eval` | `instanceId`, `expression`；可选 `tab` | ⚠ 高权限：任意 JS 求值，仅在 page 原语不够用时用；对象结果 = pretty JSON 字符串；页面抛错 → 500 `PAGE_EVAL_FAILED` |
+| `page_raw` | `instanceId`, `method`；可选 `params`（对象，缺省 {}）、`tab`、`browser`（bool，true = browser 级） | 任意 CDP 命令透传（⚠ 最高权限逃生舱）：返回 CDP 原始 result。仅 page 原语不够用时使用 |
 | `page_html` | `instanceId`；可选 `selector`, `tab` | 读 outerHTML（selector 缺省 = 整文档；未命中 → 404）；大页面响应很大，优先 snap 定位后缩小范围 |
 | `page_clickxy` | `instanceId`, `x`, `y`；可选 `tab` | 视口坐标点击（CSS 像素；无定位/遮挡校验，坐标即意图）；跨域 iframe 元素兜底 |
 | `page_loadall` | `instanceId`, `selector`；可选 `interval`, `maxClicks`, `tab` | 循环点击直到消失（interval 缺省 `"1500ms"`，maxClicks 缺省 200）；达上限仍未消失时结果明示 still present |

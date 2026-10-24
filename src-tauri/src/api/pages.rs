@@ -219,6 +219,39 @@ pub async fn eval(
     Ok(Json(resp))
 }
 
+/// POST /api/v1/instances/{id}/page/raw —— 任意 CDP 命令透传（D5 逃生舱）。
+/// ⚠ 最高权限：可发任意 CDP 命令（含 Input/Emulation 等域），仅排查未覆盖
+/// 场景时使用；与退役前 cdp.mjs evalraw 同权限。
+#[derive(Deserialize)]
+pub struct RawBody {
+    /// CDP 方法名（如 "Emulation.setDeviceMetricsOverride"）
+    pub method: String,
+    /// 命令参数；缺省 = 空对象
+    pub params: Option<Value>,
+    pub tab: Option<String>,
+    /// true = 发 browser 级（Target.getTargets 等）；缺省 false = tab 的 page session
+    #[serde(default)]
+    pub browser: bool,
+}
+
+pub async fn raw(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<RawBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .raw(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.method,
+            body.params.unwrap_or(serde_json::json!({})),
+            body.browser,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
 pub async fn html(
     State(state): State<ApiState>,
     Path(id): Path<String>,

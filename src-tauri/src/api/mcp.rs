@@ -326,6 +326,23 @@ struct PageEvalArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct PageRawArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "CDP 方法名（如 \"Emulation.setDeviceMetricsOverride\"、\"Target.getTargets\"）。⚠ 最高权限逃生舱：仅在 page 原语不够用时使用"
+    )]
+    method: String,
+    #[schemars(description = "命令参数对象；缺省 = {}")]
+    params: Option<serde_json::Value>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+    #[schemars(description = "true = 发 browser 级（Target 域等）；缺省 false = 发到 tab 的 page session（Runtime/DOM/Input/Emulation）")]
+    browser: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct PageHtmlArgs {
     #[schemars(description = "实例 id（ins_ 前缀）")]
     instance_id: String,
@@ -908,6 +925,25 @@ impl ChromeHostMcp {
                 &a.instance_id,
                 a.tab.as_deref().unwrap_or(""),
                 &a.expression,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "任意 CDP 命令透传（D5 逃生舱）：method + params 原样发送，返回 CDP 原始 result。browser=true 发 browser 级（Target.getTargets 等），缺省发到 tab 的 page session（Runtime/DOM/Input/Emulation 全域可达）。⚠ 最高权限：仅在 page 原语不够用时使用"
+    )]
+    async fn page_raw(
+        &self,
+        Parameters(a): Parameters<PageRawArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.raw(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.method,
+                a.params.clone().unwrap_or(serde_json::json!({})),
+                a.browser.unwrap_or(false),
             )
         })
         .await

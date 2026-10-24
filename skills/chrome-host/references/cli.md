@@ -70,6 +70,7 @@ page fill    <id> <sel|@eN> <value> [--tab t]  聚焦+清空+输入+回读校验
 page press   <id> <key> [--target <sel|@eN>] [--tab t]  键入：命名键/单字符/组合键（Control+A、Meta+V）；可先聚焦
 page wait    <id> <sel> [--state visible|hidden|attached|detached] [--timeout 10s] [--tab t]  轮询等待（缺省 visible）
 page eval    <id> <expr> [--tab t]          执行 JS（returnByValue+awaitPromise；优先用上面的原语）
+page raw     <id> <method> [json] [--tab t] [--browser]  任意 CDP 命令透传（⚠ 最高权限逃生舱；--browser 发 browser 级）
 page html    <id> [selector] [--tab t]      页面/元素 outerHTML
 page clickxy <id> <x> <y> [--tab t]         视口 CSS 像素坐标点击（无 hit-test；跨域 iframe 入口）
 page type    <id> <text> [--tab t]          当前焦点处输入（clickxy 点入跨域 iframe 后用它）

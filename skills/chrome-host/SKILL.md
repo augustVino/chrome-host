@@ -106,6 +106,7 @@ chrome-host page fill    <id> <sel|@eN> <value> [--tab t]  # 聚焦+清空+输�
 chrome-host page press   <id> <key> [--target <sel|@eN>] [--tab t]  # Enter/Tab/箭头/F1-F12/Control+A 组合键
 chrome-host page wait    <id> <sel> [--state visible|hidden|attached|detached] [--timeout 10s] [--tab t]  # SPA 渲染等待用它，别 sleep
 chrome-host page eval    <id> <expr> [--tab t]         # 执行 JS（优先用上面的原语，eval 是逃生舱）
+chrome-host page raw     <id> <method> [json] [--tab t] [--browser]  # 任意 CDP 命令透传（最高权限逃生舱，未覆盖场景用）
 chrome-host page html    <id> [selector] [--tab t]     # 页面/元素 HTML
 chrome-host page clickxy <id> <x> <y> [--tab t]        # 视口 CSS 像素坐标点击（跨域 iframe 用它+type）
 chrome-host page type    <id> <text> [--tab t]         # 焦点处输入（clickxy 点入跨域 iframe 后用它）

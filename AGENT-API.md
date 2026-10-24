@@ -229,6 +229,7 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 | `POST /api/v1/instances/{id}/page/wait` | 轮询等待元素状态（250ms 间隔）。body `{ "selector", "state?", "timeout?", "tab?" }` |
 | `GET /api/v1/instances/{id}/page/dialogs` | 已自动应答的对话框日志。query `tab?&since=` |
 | `POST /api/v1/instances/{id}/page/eval` | 任意 JS 求值（⚠ 高权限，见下）。body `{ "expression", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/raw` | 任意 CDP 命令透传（⚠ 最高权限逃生舱）。body `{ "method", "params?", "tab?", "browser?" }`；browser=true 发 browser 级，缺省发 tab 的 page session；响应 = CDP 原始 result 原样透传 |
 | `POST /api/v1/instances/{id}/page/html` | 读 outerHTML（selector 缺省 = 整文档；未命中 → 404）。body `{ "selector?", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/clickxy` | 视口坐标点击（CSS 像素，无定位/遮挡校验）。body `{ "x", "y", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/loadall` | 循环点击直到选择器消失。body `{ "selector", "interval?", "maxClicks?", "tab?" }` |

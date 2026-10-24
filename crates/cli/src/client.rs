@@ -910,6 +910,19 @@ impl AgentClient {
         Self::decode(self.send(Method::POST, &Self::page_path(id, "eval"), Some(body), true))
     }
 
+    /// POST /api/v1/instances/{id}/page/raw —— body `{method, params?, tab?, browser?}`
+    pub fn page_raw(
+        &self,
+        id: &str,
+        method: &str,
+        params: serde_json::Value,
+        tab: Option<&str>,
+        browser: bool,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "method": method, "params": params, "tab": tab, "browser": browser });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "raw"), Some(body), true))
+    }
+
     /// POST /api/v1/instances/{id}/page/html —— body `{selector?, tab?}`
     /// （selector 缺省 = 整文档 outerHTML；响应主产物在 html 字段，可能很大）
     pub fn page_html(
