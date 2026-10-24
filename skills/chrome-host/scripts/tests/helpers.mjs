@@ -2,12 +2,26 @@
 // node --test only collects files matching its test-name patterns.
 
 // Scriptable stand-in for the CDP class: send() delegates to a handler
-// function, every call is recorded in .calls for assertions.
+// function, every call is recorded in .calls for assertions. Also carries a
+// minimal event bus mirroring CDP.onEvent so tests can drive subscriptions
+// via emitEvent(method, params, msg).
 export class FakeCdp {
   constructor(handler = () => { throw new Error('FakeCdp: unexpected send()'); }) {
     this.handler = handler;
     this.calls = [];
     this.eventWaiters = [];
+    this.eventHandlers = new Map();
+  }
+
+  onEvent(method, handler) {
+    if (!this.eventHandlers.has(method)) this.eventHandlers.set(method, new Set());
+    const handlers = this.eventHandlers.get(method);
+    handlers.add(handler);
+    return () => handlers.delete(handler);
+  }
+
+  emitEvent(method, params = {}, msg = { method, params }) {
+    for (const handler of [...(this.eventHandlers.get(method) || [])]) handler(params, msg);
   }
 
   async send(method, params = {}, sessionId) {

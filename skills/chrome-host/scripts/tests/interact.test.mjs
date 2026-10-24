@@ -3,7 +3,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { clickStr, clickXyStr, typeStr, loadAllStr } from '../lib/tools/interact.mjs';
+import {
+  clickStr, clickXyStr, typeStr, loadAllStr, isRefTarget, clickRefStr, resolveRefPoint,
+} from '../lib/tools/interact.mjs';
+import { RefStore } from '../lib/ref-store.mjs';
 import { FakeCdp } from './helpers.mjs';
 
 function cdpEvalValue(value) {
@@ -29,6 +32,125 @@ test('clickStr clicks and reports the tag/text reported by the page', async () =
 test('clickStr surfaces "Element not found" from the page', async () => {
   const cdp = cdpEvalValue(JSON.stringify({ ok: false, error: 'Element not found: .gone' }));
   await assert.rejects(clickStr(cdp, 's', '.gone'), { message: 'Element not found: .gone' });
+});
+
+// ---------------------------------------------------------------------------
+// @eN ref routing + resolution chain (T5)
+// ---------------------------------------------------------------------------
+
+test('isRefTarget: @-prefixed or bare eN tokens, nothing else', () => {
+  assert.equal(isRefTarget('@e3'), true);
+  assert.equal(isRefTarget('e3'), true);
+  assert.equal(isRefTarget('@E3'), true); // routed to ref path to fail case-sensitively
+  assert.equal(isRefTarget('E3'), false);
+  assert.equal(isRefTarget('button.primary'), false);
+  assert.equal(isRefTarget('#main .btn'), false);
+  assert.equal(isRefTarget(undefined), false);
+  assert.equal(isRefTarget(''), false);
+});
+
+// FakeCdp answering the ref geometry chain: scroll → quads → native click.
+function refChainCdp(quad = [0, 0, 10, 0, 10, 10, 0, 10]) {
+  return new FakeCdp(async (method) => {
+    if (method === 'DOM.scrollIntoViewIfNeeded') return {};
+    if (method === 'DOM.getContentQuads') return { quads: [quad] };
+    if (method === 'Input.dispatchMouseEvent') return {};
+    throw new Error('unexpected ' + method);
+  });
+}
+
+function stockedStore() {
+  const store = new RefStore();
+  store.replace([{ ref: 'e1', backendNodeId: 101, name: 'OK' }]);
+  return store;
+}
+
+test('clickStr routes @eN through the ref chain and clicks the quad centroid', async () => {
+  const cdp = refChainCdp();
+  const store = stockedStore();
+
+  assert.equal(await clickStr(cdp, 'SID', '@e1', store), 'Clicked @e1 "OK" at CSS (5, 5)');
+
+  // Geometry asked for the mapped backendNodeId, not a DOM query.
+  assert.deepEqual(cdp.callsOf('DOM.getContentQuads')[0].params, { backendNodeId: 101 });
+  assert.equal(cdp.callsOf('DOM.getContentQuads')[0].sessionId, 'SID');
+  // Native click sequence dispatched at the resolved point.
+  const events = cdp.callsOf('Input.dispatchMouseEvent');
+  assert.deepEqual(events.map(e => e.params.type), ['mouseMoved', 'mousePressed', 'mouseReleased']);
+  for (const e of events) assert.equal(e.params.x, 5);
+});
+
+test('bare e3 and @e3 both resolve; selector-looking strings never enter the ref path', async () => {
+  const store = stockedStore();
+  store.replace([{ ref: 'e3', backendNodeId: 31 }]);
+
+  const refCdp = refChainCdp();
+  await clickStr(refCdp, 'SID', 'e3', store); // bare form
+  assert.equal(refCdp.callsOf('Input.dispatchMouseEvent').length, 3);
+
+  const selCdp = cdpEvalValue(JSON.stringify({ ok: true, tag: 'A', text: 'x' }));
+  await clickStr(selCdp, 'SID', 'a.link', store); // CSS path untouched by the store
+  assert.ok(selCdp.calls[1].params.expression.includes('document.querySelector'));
+});
+
+test('ref click picks the LARGEST quad (occlusion/transform leftovers discarded)', async () => {
+  const cdp = new FakeCdp(async (method) => {
+    if (method === 'DOM.scrollIntoViewIfNeeded') return {};
+    if (method === 'DOM.getContentQuads') {
+      return { quads: [[0, 0, 1, 0, 1, 1, 0, 1], [100, 100, 200, 100, 200, 160, 100, 160]] };
+    }
+    return {};
+  });
+  // Largest quad = 100x60 at (100,100) → centroid (150,130); the 1x1 junk
+  // quad (zero-visibility leftovers) must lose.
+  assert.deepEqual(await resolveRefPoint(cdp, 'SID', 1), { x: 150, y: 130 });
+});
+test('resolveRefPoint falls back to getBoundingClientRect when quads fail', async () => {
+  const cdp = new FakeCdp(async (method) => {
+    if (method === 'DOM.scrollIntoViewIfNeeded') return {};
+    if (method === 'DOM.getContentQuads') return { quads: [] }; // empty → fallback
+    if (method === 'DOM.resolveNode') return { object: { objectId: 'OBJ-1' } };
+    if (method === 'Runtime.callFunctionOn') {
+      return { result: { value: { x: 0, y: 0, w: 20, h: 10 } } };
+    }
+    throw new Error('unexpected ' + method);
+  });
+  assert.deepEqual(await resolveRefPoint(cdp, 'SID', 101), { x: 10, y: 5 });
+  assert.equal(cdp.callsOf('Runtime.callFunctionOn')[0].params.objectId, 'OBJ-1');
+});
+
+test('ref resolution failure → target_moved with a re-snap hint', async () => {
+  const cdp = new FakeCdp(async (method) => {
+    if (method === 'DOM.scrollIntoViewIfNeeded') return {};
+    if (method === 'DOM.getContentQuads') throw new Error('No node with given id');
+    if (method === 'DOM.resolveNode') return {}; // no objectId either
+    throw new Error('unexpected ' + method);
+  });
+  await assert.rejects(resolveRefPoint(cdp, 'SID', 101),
+    /target_moved: .*run "snap <target>" again/);
+});
+
+test('unknown ref → ref_not_found; stale table → ref_stale; both suggest re-snap', async () => {
+  const store = stockedStore();
+
+  await assert.rejects(clickRefStr(refChainCdp(), 'SID', '@e9', store),
+    /ref_not_found: @e9 .*run "snap <target>"/);
+
+  store.invalidate('navigation');
+  await assert.rejects(clickRefStr(refChainCdp(), 'SID', '@e1', store),
+    /ref_stale: page changed since the last snap \(navigation\) — run "snap <target>"/);
+});
+
+test('@E3 is case-sensitive: routes to the ref path, then misses the table', async () => {
+  const store = stockedStore();
+  const cdp = refChainCdp();
+  await assert.rejects(clickStr(cdp, 'SID', '@E3', store), /ref_not_found/);
+  assert.equal(cdp.callsOf('Input.dispatchMouseEvent').length, 0); // never clicked
+});
+
+test('ref click without a store fails with ref_not_found, not a TypeError', async () => {
+  await assert.rejects(clickStr(refChainCdp(), 'SID', '@e1', undefined),
+    { message: 'ref_not_found: no ref table — run "snap <target>" first' });
 });
 
 test('clickXyStr rejects non-numeric coordinates', async () => {

@@ -10,7 +10,8 @@ import {
 } from './paths.mjs';
 import { CDP, getWsUrl } from './cdp-client.mjs';
 import { getPages, formatPageList, resolvePrefix } from './pages.mjs';
-import { snapshotStr } from './tools/snapshot.mjs';
+import { collectSnapshot } from './tools/snapshot.mjs';
+import { RefStore } from './ref-store.mjs';
 import { evalStr, htmlStr, netStr } from './tools/evaluate.mjs';
 import { navStr } from './tools/navigate.mjs';
 import { clickStr, clickXyStr, typeStr, loadAllStr } from './tools/interact.mjs';
@@ -18,8 +19,10 @@ import { shotStr } from './tools/screenshot.mjs';
 import { evalRawStr } from './tools/raw.mjs';
 
 // Dispatch one daemon command. cdp is injected so tests can pass a fake.
+// refStore is the daemon's @eN ref table; omitted → a throwaway store per
+// call (fine for single-shot tests, runDaemon passes a persistent one).
 // Returns { ok, result } / { ok, error } / { ok, result, stopAfter }.
-export async function execCommand(cdp, sessionId, targetId, { cmd, args }) {
+export async function execCommand(cdp, sessionId, targetId, { cmd, args }, refStore = new RefStore()) {
   try {
     let result;
     switch (cmd) {
@@ -33,13 +36,20 @@ export async function execCommand(cdp, sessionId, targetId, { cmd, args }) {
         result = JSON.stringify(pages);
         break;
       }
-      case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, true); break;
+      case 'snap': case 'snapshot': {
+        // Whole-table swap + generation++ (SPEC §3.5): refs describe the
+        // LAST snap only. Old refs die here even if the new snap found none.
+        const { text, refs } = await collectSnapshot(cdp, sessionId, true);
+        refStore.replace(refs);
+        result = text;
+        break;
+      }
       case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
       case 'shot': case 'screenshot': result = await shotStr(cdp, sessionId, args[0], targetId); break;
       case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
       case 'nav': case 'navigate': result = await navStr(cdp, sessionId, args[0]); break;
       case 'net': case 'network': result = await netStr(cdp, sessionId); break;
-      case 'click': result = await clickStr(cdp, sessionId, args[0]); break;
+      case 'click': result = await clickStr(cdp, sessionId, args[0], refStore); break;
       case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
       case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
       case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
@@ -51,6 +61,36 @@ export async function execCommand(cdp, sessionId, targetId, { cmd, args }) {
   } catch (e) {
     return { ok: false, error: e.message };
   }
+}
+
+// Subscribe to the ref-invalidation sources for one tab (SPEC §3.6):
+//   - Page.frameNavigated, ROOT frame only (child-frame navigation keeps refs)
+//   - Page.documentOpened
+//   - DOM.documentUpdated (needs DOM.enable)
+// Page.enable is required for the Page.* events; both enables are
+// idempotent in CDP, so overlapping with T3's dialog-flow Page.enable is
+// harmless. Trade-off on DOM.enable: it starts the DOM agent's event stream
+// (setChildNodes etc.) for this tab — modest traffic overhead, no page-side
+// behavior change. Kept because same-document full replacements
+// (document.write and friends) would otherwise go undetected until a ref
+// fails to resolve (the target_moved backstop catches those anyway, but
+// the explicit invalidation tells the agent to re-snap instead of retrying).
+export async function bindRefInvalidation(cdp, sessionId, refStore) {
+  try { await cdp.send('Page.enable', {}, sessionId); } catch {}
+  try { await cdp.send('DOM.enable', {}, sessionId); } catch {}
+
+  const own = (msg) => msg?.sessionId === sessionId;
+  cdp.onEvent('Page.frameNavigated', (params, msg) => {
+    if (!own(msg)) return;
+    if (params.frame?.parentId) return; // child frame — refs stay valid
+    refStore.invalidate('navigation');
+  });
+  cdp.onEvent('Page.documentOpened', (_params, msg) => {
+    if (own(msg)) refStore.invalidate('document opened');
+  });
+  cdp.onEvent('DOM.documentUpdated', (_params, msg) => {
+    if (own(msg)) refStore.invalidate('document updated');
+  });
 }
 
 export async function runDaemon(targetId) {
@@ -96,6 +136,12 @@ export async function runDaemon(targetId) {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
+  // @eN ref table + invalidation wiring (SPEC §3.5/3.6): every snap swaps
+  // the whole table; navigation / document replacement clears it so stale
+  // refs fail loudly (ref_stale) instead of clicking stale geometry.
+  const refStore = new RefStore();
+  await bindRefInvalidation(cdp, sessionId, refStore);
+
   // Idle timer
   let idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
   function resetIdle() {
@@ -106,7 +152,7 @@ export async function runDaemon(targetId) {
   // Handle a command
   async function handleCommand(req) {
     resetIdle();
-    return execCommand(cdp, sessionId, targetId, req);
+    return execCommand(cdp, sessionId, targetId, req, refStore);
   }
 
   // Unix socket server — NDJSON protocol

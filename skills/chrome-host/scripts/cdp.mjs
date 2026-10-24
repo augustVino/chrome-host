@@ -24,13 +24,13 @@ const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 Usage: cdp <command> [args]
 
   list                              List open pages (shows unique target prefixes)
-  snap  <target>                    Accessibility tree snapshot
+  snap  <target>                    Accessibility tree snapshot (interactive nodes get @eN refs)
   eval  <target> <expr>             Evaluate JS expression
   shot  <target> [file]             Screenshot (default: screenshot-<target>.png in runtime dir); prints coordinate mapping
   html  <target> [selector]         Get HTML (full page or CSS selector)
   nav   <target> <url>              Navigate to URL and wait for load completion
   net   <target>                    Network performance entries
-  click   <target> <selector>       Click an element by CSS selector
+  click   <target> <selector|@eN>   Click an element by CSS selector or @eN ref (see @eN REFS below)
   clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
   type    <target> <text>           Type text at current focus via Input.insertText
                                     Works in cross-origin iframes unlike eval-based approaches
@@ -54,6 +54,19 @@ COORDINATE SYSTEM
   shot prints the DPR and an example conversion for the current page.
   Typical Retina (DPR=2): CSS px ≈ screenshot px × 0.5
   If your viewer rescales the image further, account for that scaling too.
+
+@eN ELEMENT REFS
+  snap assigns refs to interactive nodes (button/link/textbox/checkbox/…):
+    @e1 [button] 提交
+  Click by ref instead of a fragile CSS selector — refs survive markup
+  changes within the same document:
+    cdp click <target> @e3
+  Refs describe the LAST snap of that tab:
+  - Navigation or document replacement invalidates ALL refs; using an old
+    ref then returns "ref_stale: …" — snap again and use fresh refs.
+  - Unknown or mistyped ref → "ref_not_found" (case-sensitive: @e3, not @E3).
+  - Node removed since the snap → "target_moved" (snap again).
+  - Refs are per-tab: a ref from another tab is simply ref_not_found.
 
 EVAL SAFETY NOTE
   Avoid index-based DOM selection (querySelectorAll(...)[i]) across multiple
