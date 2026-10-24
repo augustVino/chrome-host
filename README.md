@@ -7,6 +7,7 @@
 ## 核心能力
 
 - **环境与实例**：环境 = 一份配置（可选 hosts 配置源 + keepAlive）；实例 = 该环境的一次隔离运行（独立 user-data-dir + CDP 端口）
+- **页面操控（page 命令族）**：内置 `chrome-host page` 命令族——snap @eN 引用、原生输入点击（含遮挡拦截）、表单填写、按键、元素等待、弹窗自动接管、任意 CDP 透传；本地/远程同用，无需脚本或端口凭证
 - **登录态自动保存（实例即登录源）**：在实例里登录 → 关闭实例 → 登录态（文件快照 + 含 session cookie 的保险库）自动保存为环境身份；之后创建的实例自动注入。环境可配回写策略（first-login 默认 / always / off），保险库保留最近 5 代可回滚
 - **hosts 注入**：实例启动时从 hosts 配置源现拉最新配置，经 `--host-resolver-rules` 进程级注入，不改系统 hosts
 - **多入口共享服务层**：GUI / Agent API（REST）/ MCP / CLI 四个入口，同一套业务契约，专为 AI Agent 与自动化设计

@@ -63,17 +63,16 @@ chrome-host status                                    # 探活（见下方三态
 ENV_ID=$(chrome-host env list --json | jq -r '.[] | select(.name=="staging") | .id')
 INS_ID=$(chrome-host instance create "$ENV_ID" --quiet)
 
-# CDP 走会话代理：cdp-session --quiet 直接输出完整代理 URL（供 CDP_BASE 直接捕获）
-CDP_BASE=$(chrome-host instance cdp-session "$INS_ID" --quiet)
-CDP_BASE="$CDP_BASE" node skills/chrome-host/scripts/cdp.mjs list
-CDP_BASE="$CDP_BASE" node skills/chrome-host/scripts/cdp.mjs shot <target>
+# 页面操控：page 命令族远程直用（API 经隧道，与编排命令同路，无需凭证准备）
+chrome-host page snap "$INS_ID"                       # 可访问性树 + @eN 引用
+chrome-host page click "$INS_ID" @e1                 # 原生输入点击
 
 chrome-host instance delete "$INS_ID" --yes           # 收尾
 ```
 
-令牌注入：环境变量 `CHROME_HOST_TOKEN`，或隐藏 flag `--token`（优先级更高，同 `--api-url` 模式）；本地直连两者都不需要。MCP 客户端同样可用 `create_cdp_session` 工具取会话。
+令牌注入：环境变量 `CHROME_HOST_TOKEN`，或隐藏 flag `--token`（优先级更高，同 `--api-url` 模式）；本地直连两者都不需要。MCP 客户端同样可用 `page_*` 工具族直接操控。
 
-会话 30 分钟过期后重新 `cdp-session` 取新会话即可（cdp.mjs 本就逐命令建连，无长连接损失）。用户在远程全程零参与；仅当环境首次登录时需要**在主机本地点击**。
+外部 CDP 客户端（Playwright / DevTools）仍经会话代理接入：`chrome-host instance cdp-session "$INS_ID" --quiet` 输出代理 URL（30 分钟有效，过期重取）；page 命令族不需要它。用户在远程全程零参与；仅当环境首次登录时需要**在主机本地点击**。
 
 ## 诊断三态（协议语义，非启发式）
 

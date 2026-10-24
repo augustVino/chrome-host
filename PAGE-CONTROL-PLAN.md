@@ -221,7 +221,12 @@ T1 拆分（cdp.mjs → lib/ 模块 + 183 单测）/ T2 行为规范（BEHAVIOR-
 **发现并修复**：F2 对话框 handle 阻塞（第一版旁路连接方案因 sessionId 连接级作用域失败；终版：ws.rs send &self 化根治 Q6，命令并发 in-flight）；F1 空 target 语义（唯一 tab 自动选/多 tab 列表报错）；F3 snap --json。
 **遗留边角**：首条命令 attach 竞态（提示 retry shortly，agent 可自意重试）——修复中（握手窗口，feature/pc-l23）。
 **main 既有问题**：instance open/navigate 导航不生效——根因已定位：CfT 131 忽略 HTTP /json/new 的 url 参数（/json/close 同失效）；修复中（改走 WS createTarget/closeTarget，feature/pc-l1）。
-**重连对话框失明**（CDP 无事件重播）——修复中（重连盲探测，feature/pc-l23）。
+**重连对话框失明**（CDP 无事件重播）——已修复并两轮真机验证，最终行为模型（2026-10-25 实验定谳）：
+  ① 对话框弹出时有已连接客户端 → handleJavaScriptDialog 可用，probe/事件驱动均覆盖 ✅；
+  ② 无主对话框（弹出时无任何 debugger，如应用断连期间的 setTimeout alert）→ handle 报 No dialog、Input 不可达、dialogs 无记录，但 renderer 被卡（命令大面积超时）——**唯一自动化出口 = Page.navigate 强制导航丢弃对话框**（实验验证 ✅）；
+  ③ 应对：probe 保留（覆盖 ①），②的恢复手段已写入 skill 错误码处置表（page raw Page.navigate），不自动执行（无条件导航会刷新正常页面）。
+探测顺序已修正为先于 enable（①场景下 handle 是唯一非阻塞命令）。
+**page raw 逃生舱**（D5 决策补齐）：任意 CDP 命令透传（session/browser 双模式），cdp.mjs evalraw 等价，真机验证 ✅。
 **测试环境保护教训**：调试用 cdp.mjs daemon 与 PageService 是双 CDP 客户端，对话框接管会互相竞争——验证对话框行为时必须停掉 cdp.mjs daemon。
 
 ### Phase 3 — 切换与退役 ✅ 已完成（随应用发版一次性生效）

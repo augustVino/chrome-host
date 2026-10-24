@@ -1,6 +1,6 @@
 [package]
 name = "chrome-host"
-version = "0.4.2"
+version = "0.5.0"
 description = "Browser Runtime Manager for Humans and AI Agents"
 edition = "2021"
 license = "MIT"

@@ -46,37 +46,36 @@ INS_ID=$(chrome-host instance create "$ENV_ID" --quiet)    # 创建即启动
 
 > GUI 等价：环境详情 → 新建实例。
 
-## 4. 打开页面与取 CDP 端点
+## 4. 打开页面
 
 ```bash
 chrome-host instance open "$INS_ID" https://staging.example.com
-chrome-host instance cdp "$INS_ID" --json | jq '{port, httpUrl, webSocketUrl}'
+chrome-host instance tabs "$INS_ID" --json    # 查看已开页面（id 即 page 命令的 tab 参数）
 ```
-
-> 端口每次现查：实例重启后 CDP 端口可能变化，不要缓存。
 
 ## 5. 自动化（三种方式任选）
 
-**方式 A：任意 CDP 客户端直连**（Playwright / Puppeteer / 自研客户端）：
+**方式 A：内置 page 命令族**（推荐，无需任何依赖，本地/远程同用）：
+
+```bash
+chrome-host page snap "$INS_ID"                          # 可访问性树 + @eN 引用
+chrome-host page click "$INS_ID" @e1                     # 原生输入点击
+chrome-host page fill "$INS_ID" "#kw" "搜索词"          # 表单填写（回读校验）
+chrome-host instance screenshot "$INS_ID" --out now.png # 当前页截图
+```
+
+完整命令与 PAGE_* 错误码见 [CLI 手册 · 页面操控](/reference/cli#页面操控page-命令族)；操作循环经验见 [AI Agent Skills](./skills)。
+
+**方式 B：外部 CDP 客户端直连**（Playwright / Puppeteer / DevTools）：
 
 ```bash
 WS=$(chrome-host instance cdp "$INS_ID" --json | jq -r .webSocketUrl)
 playwright --browser "cdp://$WS" ...
 ```
 
-**方式 B：仓库自带的轻量 CDP 工具**（无需任何依赖，Node 22+ 即可）：
+> 端口每次现查：实例重启后 CDP 端口可能变化，不要缓存。远程机器经会话代理接入（`instance cdp-session`）。
 
-```bash
-PORT=$(chrome-host instance cdp "$INS_ID" --json | jq -r .port)
-node skills/chrome-host/scripts/cdp.mjs list                    # 列出页面，取 targetId 前缀
-CDP_PORT=$PORT node skills/chrome-host/scripts/cdp.mjs shot 6BE827FA   # 截图
-CDP_PORT=$PORT node skills/chrome-host/scripts/cdp.mjs snap 6BE827FA   # 可访问性树
-CDP_PORT=$PORT node skills/chrome-host/scripts/cdp.mjs eval 6BE827FA 'document.title'
-```
-
-完整命令见 [AI Agent Skills](./skills)。
-
-**方式 C：交给 AI Agent**：通过 MCP 或加载仓库 skills 接入，见 [AI Agent Skills](./skills)。
+**方式 C：交给 AI Agent**：通过 MCP（含 `page_*` 工具族）或加载仓库 skills 接入，见 [AI Agent Skills](./skills)。
 
 ## 6. 收尾清理
 

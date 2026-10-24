@@ -132,6 +132,84 @@ export const API_CATALOG: CatalogGroup[] = [
     ],
   },
   {
+    group: 'Page Control（页面操控）',
+    items: [
+      {
+        method: 'POST',
+        path: '/instances/:id/page/snap',
+        desc: '可访问性树 + @eN 引用（操作循环起点）；响应含 text/refs_count/generation',
+        body: '{ "tab": "<targetId 前缀，单标签可省>" }',
+        note: '导航后 @eN 整表失效（PAGE_REF_STALE），重新 snap',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/click',
+        desc: '原生输入点击：<sel|@eN>（可见性检查 + 遮挡拦截 + 三段鼠标事件）',
+        body: '{ "target": "@e1", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/fill',
+        desc: '表单填写：聚焦+清空+输入+回读校验；空 value = 仅清空',
+        body: '{ "target": "@e2", "value": "文本", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/press',
+        desc: '按键：命名键/单字符/组合键（Control+A）；target 先聚焦',
+        body: '{ "key": "Enter", "target": "@e1", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/wait',
+        desc: '轮询等待元素状态：visible|hidden|attached|detached',
+        body: '{ "selector": ".result", "state": "visible", "timeoutMs": 10000, "tab": null }',
+      },
+      {
+        method: 'GET',
+        path: '/instances/:id/page/dialogs',
+        desc: '自动接管的弹窗历史（近 32 条；?tab=&since= 增量）',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/eval',
+        desc: '任意 JS 求值（⚠ 高权限：优先 page 原语）',
+        body: '{ "expression": "document.title", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/raw',
+        desc: '任意 CDP 命令透传（⚠ 最高权限逃生舱）',
+        body: '{ "method": "Target.getTargets", "params": {}, "tab": null, "browser": true }',
+        note: 'browser=true 发 browser 级；缺省发 tab 的 page session',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/html',
+        desc: '页面/元素 outerHTML（selector 缺省 = 整文档）',
+        body: '{ "selector": "#main", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/clickxy',
+        desc: '视口 CSS 像素坐标点击（无 hit-test；跨域 iframe 入口）',
+        body: '{ "x": 100, "y": 200, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/type',
+        desc: '当前焦点处输入（clickxy 点入跨域 iframe 后用它）',
+        body: '{ "text": "输入内容", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/loadall',
+        desc: '循环点击"加载更多"直到元素消失',
+        body: '{ "selector": ".more", "intervalMs": 1500, "tab": null }',
+      },
+    ],
+  },
+  {
     group: 'Settings',
     items: [
       { method: 'GET', path: '/settings', desc: '应用设置' },
