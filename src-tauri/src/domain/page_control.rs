@@ -746,6 +746,22 @@ fn is_plain_number(num: &str) -> bool {
 }
 
 // ============================================================================
+// 5b. 导航 URL 白名单（page/navigate 与 instance 级 tabs/navigate 共用）
+// ============================================================================
+
+/// http/https 白名单校验（原 instance_service 私有逻辑上移共享：page/navigate
+/// 与实例级 open_tab/navigate 必须同源校验，防两处白名单漂移）。
+/// 错误形态（码/文案）与上移前逐字一致——实例级端点的对外契约不变。
+pub fn validate_http_url(url: &str) -> Result<(), AppError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|_| AppError::invalid_request(format!("URL 不合法: {url}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::invalid_request("URL 必须 http/https 开头"));
+    }
+    Ok(())
+}
+
+// ============================================================================
 // 6. eval 表达式生成器（TS 内嵌 JS → Rust 字符串生成，语义逐字移植）
 // ============================================================================
 
@@ -1019,6 +1035,45 @@ pub fn dialog_accept_params(info: &DialogInfo) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---------------- validate_http_url（导航 URL 白名单）----------------------
+
+    /// http/https 白名单与拒绝面：实例级 open_tab/navigate 与 page/navigate
+    /// 共用同一校验，这里钉住“哪些 scheme 被拒”——特别是 javascript:/file:/data:
+    /// （可执行/本地文件面），防未来某处单独放宽。
+    #[test]
+    fn validate_http_url_whitelists_schemes() {
+        for ok in [
+            "http://example.com",
+            "https://example.com/path?q=1",
+            "http://127.0.0.1:8080/",
+        ] {
+            assert!(validate_http_url(ok).is_ok(), "应放行: {ok}");
+        }
+        for bad in [
+            "",
+            "not a url",
+            "ftp://example.com",
+            "file:///etc/hosts",
+            "javascript:alert(1)",
+            "data:text/html,<script>",
+            "chrome://settings",
+            "about:blank",
+            "example.com/no-scheme",
+        ] {
+            let e = validate_http_url(bad).unwrap_err();
+            assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400), "应拒绝: {bad}");
+        }
+        // 拒绝面双方文案：非法解析 vs scheme 白名单（对外契约逐字保持）
+        assert!(validate_http_url("javascript:x")
+            .unwrap_err()
+            .to_string()
+            .contains("必须 http/https"));
+        assert!(validate_http_url(":::")
+            .unwrap_err()
+            .to_string()
+            .contains("URL 不合法"));
+    }
 
     // ---------------- RefStore / normalize_ref（tests/ref-store.test.mjs）------
 

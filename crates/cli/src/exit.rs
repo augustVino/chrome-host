@@ -51,10 +51,12 @@ const RUNTIME_ERROR_CODES: &[&str] = &[
     "CDP_CONNECTION_FAILED",
     "HOSTS_FETCH_FAILED",
     // page 控制族（P2-B/P2-C）：Input 派发失败 / 工具预算超时 / 页内 eval 失败 /
-    // CDP 发送失败——均为已知运行时故障，不落入 GENERAL 兑底
+    // CDP 发送失败——均为已知运行时故障，不落入 GENERAL 兜底；导航失败
+    //（Page.navigate errorText，net::ERR_*）同为运行时故障
     "PAGE_DISPATCH_FAILED",
     "PAGE_TOOL_TIMEOUT",
     "PAGE_EVAL_FAILED",
+    "PAGE_NAV_FAILED",
     "CDP_COMMAND_FAILED",
 ];
 
@@ -276,6 +278,11 @@ mod tests {
                 ExitCode::RUNTIME,
             ),
             (
+                "409 PAGE_NAV_NO_HISTORY（back/forward 已在历史边界）",
+                api(409, "PAGE_NAV_NO_HISTORY"),
+                ExitCode::RUNTIME,
+            ),
+            (
                 "409 PAGE_SERVICE_UNAVAILABLE（实例未运行/无 CDP 端口）",
                 api(409, "PAGE_SERVICE_UNAVAILABLE"),
                 ExitCode::RUNTIME,
@@ -299,6 +306,11 @@ mod tests {
             (
                 "500 PAGE_DISPATCH_FAILED（Input 派发失败，附 effect_state）",
                 api(500, "PAGE_DISPATCH_FAILED"),
+                ExitCode::RUNTIME,
+            ),
+            (
+                "500 PAGE_NAV_FAILED（Page.navigate errorText，net::ERR_*）",
+                api(500, "PAGE_NAV_FAILED"),
                 ExitCode::RUNTIME,
             ),
             (

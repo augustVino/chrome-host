@@ -1,5 +1,6 @@
-//! page 命令组 —— 页面控制（P2-C/P2-G）：snap / click / fill / press / wait /
-//! dialogs / eval / html / clickxy / loadall / type。
+//! page 命令组 —— 页面控制（P2-C/P2-G + 导航族）：snap / click / fill /
+//! press / wait / dialogs / eval / html / clickxy / loadall / type /
+//! navigate / back / forward / reload。
 //!
 //! 行为语义全部在服务层 page_service（P2-B）：本组只做参数透传 + 渲染。
 //! 核心循环（对齐 SKILL.md 教学）：`snap` 拿 @eN 引用 → `click`/`fill`/
@@ -211,6 +212,53 @@ pub enum PageCommands {
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
+
+    /// 页内导航（保留历史；与 instance navigate 的区别见 CLI.md）
+    #[command(
+        about = "页内导航：<url>（同一标签内 Page.navigate，保留历史；等 load 至多 25s，未证实 → loaded:false）"
+    )]
+    Navigate {
+        /// 实例 id
+        id: String,
+        /// 目标 URL（http/https，与 instance navigate 同白名单；非法 → 400 exit 7）
+        url: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 历史后退（无更早条目 → 409 exit 5）
+    #[command(about = "历史后退一步（无更早条目 → 409 PAGE_NAV_NO_HISTORY）")]
+    Back {
+        /// 实例 id
+        id: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 历史前进（无更晚条目 → 409 exit 5）
+    #[command(about = "历史前进一步（无更晚条目 → 409 PAGE_NAV_NO_HISTORY）")]
+    Forward {
+        /// 实例 id
+        id: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 重载当前页（--ignore-cache 跳过缓存）
+    #[command(about = "重载当前页（--ignore-cache 跳过缓存；等 load 至多 25s，未证实 → loaded:false）")]
+    Reload {
+        /// 实例 id
+        id: String,
+        /// 跳过缓存（Page.reload ignoreCache）
+        #[arg(long)]
+        ignore_cache: bool,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
 }
 
 /// page 组分发入口（main.rs dispatch 的唯一调用点）。
@@ -292,6 +340,16 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             tab.as_deref(),
         ),
         PageCommands::Type { id, text, tab } => r#type(globals, client, id, text, tab.as_deref()),
+        PageCommands::Navigate { id, url, tab } => {
+            navigate(globals, client, id, url, tab.as_deref())
+        }
+        PageCommands::Back { id, tab } => back(globals, client, id, tab.as_deref()),
+        PageCommands::Forward { id, tab } => forward(globals, client, id, tab.as_deref()),
+        PageCommands::Reload {
+            id,
+            ignore_cache,
+            tab,
+        } => reload(globals, client, id, *ignore_cache, tab.as_deref()),
     }
 }
 
@@ -460,6 +518,57 @@ fn r#type(
     tab: Option<&str>,
 ) -> Result<(), CliError> {
     let resp = client.page_type(id, text, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page navigate <ID> <url> [--tab T]`：result 型渲染（result 行内含加载
+/// 证据：load complete / not confirmed / same-document navigation）。
+fn navigate(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    url: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_navigate(id, url, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page back <ID> [--tab T]`
+fn back(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_back(id, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page forward <ID> [--tab T]`
+fn forward(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_forward(id, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page reload <ID> [--ignore-cache] [--tab T]`
+fn reload(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    ignore_cache: bool,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_reload(id, ignore_cache, tab)?;
     render_result(&OutputCtx::from(globals), &resp);
     Ok(())
 }

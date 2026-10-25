@@ -399,6 +399,37 @@ struct PageTypeArgs {
     tab: Option<String>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageNavigateArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = "目标 URL（http/https 白名单，非法 → 400）")]
+    url: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageNavHistoryArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageReloadArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = "true = 跳过缓存；缺省 false")]
+    ignore_cache: Option<bool>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
 // ---------- MCP Server ----------
 
 #[derive(Clone)]
@@ -1011,6 +1042,62 @@ impl ChromeHostMcp {
             self.state
                 .page
                 .r#type(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.text)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "页内导航（同一 tab 的 page session 上 Page.navigate，保留历史——区别于实例级 navigate 的 new+close 组合近似）：等待 load 事件至多 25s，窗口内未见 → loaded:false（导航已开始而非失败，用 page_snap/wait 观察）；同文档导航（#fragment）不触发 load，立即 loaded:true；导航失败（net::ERR_*）→ 500 PAGE_NAV_FAILED；URL 非法 → 400"
+    )]
+    async fn page_navigate(
+        &self,
+        Parameters(a): Parameters<PageNavigateArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.navigate(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.url,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "导航历史后退一步（Page.getNavigationHistory 偏移 + navigateToHistoryEntry）：已在最早条目 → 409 PAGE_NAV_NO_HISTORY。新文档条目等 load 事件；同文档（SPA pushState）条目以历史索引提交 + readyState 为完成信号"
+    )]
+    async fn page_back(
+        &self,
+        Parameters(a): Parameters<PageNavHistoryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| self.state.page.back(&a.instance_id, a.tab.as_deref().unwrap_or("")))
+            .await
+    }
+
+    #[tool(
+        description = "导航历史前进一步：已在最新条目 → 409 PAGE_NAV_NO_HISTORY。完成信号双轨同 page_back"
+    )]
+    async fn page_forward(
+        &self,
+        Parameters(a): Parameters<PageNavHistoryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| self.state.page.forward(&a.instance_id, a.tab.as_deref().unwrap_or("")))
+            .await
+    }
+
+    #[tool(
+        description = "重载当前页（Page.reload）：ignoreCache=true 跳过缓存；等待 load 事件至多 25s，窗口内未见 → loaded:false（重载已开始而非失败，用 page_snap/wait 观察）"
+    )]
+    async fn page_reload(
+        &self,
+        Parameters(a): Parameters<PageReloadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.reload(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.ignore_cache.unwrap_or(false),
+            )
         })
         .await
     }

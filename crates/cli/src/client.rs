@@ -982,4 +982,66 @@ impl AgentClient {
         let body = serde_json::json!({ "text": text, "tab": tab });
         Self::decode(self.send(Method::POST, &Self::page_path(id, "type"), Some(body), true))
     }
+
+    /// POST /api/v1/instances/{id}/page/navigate —— body `{url, tab?}`
+    /// （page session 内导航，保留历史；响应含 loaded：false = 窗口内未证实
+    /// 加载完成，非失败）
+    pub fn page_navigate(
+        &self,
+        id: &str,
+        url: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "url": url, "tab": tab });
+        Self::decode(
+            self.send(
+                Method::POST,
+                &Self::page_path(id, "navigate"),
+                Some(body),
+                true,
+            ),
+        )
+    }
+
+    /// POST /api/v1/instances/{id}/page/back —— body `{tab?}`
+    /// （历史后退；无更早条目 → 409 PAGE_NAV_NO_HISTORY）
+    pub fn page_back(&self, id: &str, tab: Option<&str>) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "tab": tab });
+        Self::decode(
+            self.send(Method::POST, &Self::page_path(id, "back"), Some(body), true),
+        )
+    }
+
+    /// POST /api/v1/instances/{id}/page/forward —— body `{tab?}`
+    /// （历史前进；无更晚条目 → 409 PAGE_NAV_NO_HISTORY）
+    pub fn page_forward(&self, id: &str, tab: Option<&str>) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "tab": tab });
+        Self::decode(
+            self.send(
+                Method::POST,
+                &Self::page_path(id, "forward"),
+                Some(body),
+                true,
+            ),
+        )
+    }
+
+    /// POST /api/v1/instances/{id}/page/reload —— body `{ignoreCache?, tab?}`
+    /// （重载；响应含 loaded，语义同 navigate）
+    pub fn page_reload(
+        &self,
+        id: &str,
+        ignore_cache: bool,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "ignoreCache": ignore_cache, "tab": tab });
+        Self::decode(
+            self.send(
+                Method::POST,
+                &Self::page_path(id, "reload"),
+                Some(body),
+                true,
+            ),
+        )
+    }
 }
