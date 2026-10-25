@@ -694,7 +694,39 @@ fn fixture_router() -> Router {
                 Json(json!({ "result": "Typed 5 characters", "instanceId": "ins_x", "targetId": "TAB9F" }))
             }),
         )
+        .route(
+            "/api/v1/instances/ins_x/page/extract",
+            post(|| async {
+                Json(json!({
+                    "columns": [
+                        { "name": "订单号", "source": "header", "path": ["订单号"] },
+                        { "name": "金额", "source": "header", "path": ["金额"] },
+                    ],
+                    "rows": [["A1", "12.5"], [null, "8"]],
+                    "coverage": {
+                        "datasetComplete": "incomplete", "hiddenRowsOmitted": 1,
+                        "truncated": false,
+                        "reasons": ["aria-rowcount 100 > 可见行 2（虚拟化未加载完？）"],
+                    },
+                    "meta": {
+                        "format": "html", "caption": null, "headerRows": 1,
+                        "rowCount": 2, "columnCount": 2, "cellCount": 4,
+                        "spans": [{ "row": 1, "col": 0, "rowspan": 1, "colspan": 1 }],
+                        "aria": { "rowCount": 100, "colCount": null },
+                        "target": "(auto-discovered)",
+                    },
+                    "instanceId": "ins_x",
+                    "targetId": "TAB9F",
+                }))
+            }),
+        )
         // 参数透传 echo：请求体原样回显（验证 client 拼的 body 形状，同 capture_from 先例）
+        .route(
+            "/api/v1/instances/ins_pg/page/extract",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
         .route(
             "/api/v1/instances/ins_pg/page/eval",
             post(|body: Option<Json<serde_json::Value>>| async move {
@@ -1518,6 +1550,27 @@ fn page_endpoints_contract() {
         .page_type("ins_x", "hello", None)
         .expect("type 应成功");
     assert_eq!(typed["result"], "Typed 5 characters");
+
+    // extract：{ columns, rows, coverage, meta } 原样透传（null 单元格保留）
+    let extract = client
+        .page_extract("ins_x", None, None)
+        .expect("extract 应成功");
+    assert_eq!(extract["targetId"], "TAB9F");
+    assert_eq!(extract["columns"][0]["name"], "订单号");
+    assert_eq!(extract["rows"][1][0], serde_json::json!(null), "null 保留（被合并覆盖）");
+    assert_eq!(extract["coverage"]["datasetComplete"], "incomplete");
+    assert_eq!(extract["meta"]["spans"][0]["row"], 1);
+    let echo = client
+        .page_extract("ins_pg", Some("@e3"), Some("TAB"))
+        .expect("extract echo 应成功");
+    assert_eq!(echo["echo"]["target"], "@e3");
+    assert_eq!(echo["echo"]["tab"], "TAB");
+    let echo = client.page_extract("ins_pg", None, None).expect("echo2 应成功");
+    assert_eq!(
+        echo["echo"]["target"],
+        serde_json::json!(null),
+        "缺省 target 序列化为 null 而非省略"
+    );
 
     let echo = client
         .page_eval("ins_pg", "document.title", Some("TAB"))

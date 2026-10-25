@@ -318,6 +318,11 @@ mod tests {
                 api(422, "PAGE_EMULATE_UNKNOWN_PRESET"),
                 ExitCode::VALIDATION,
             ),
+            (
+                "422 PAGE_EXTRACT_NOT_A_TABLE（extract 目标非表格）",
+                api(422, "PAGE_EXTRACT_NOT_A_TABLE"),
+                ExitCode::VALIDATION,
+            ),
             // —— page 控制族：5xx 运行时码表（非 GENERAL 兑底）——
             (
                 "500 PAGE_DISPATCH_FAILED（Input 派发失败，附 effect_state）",

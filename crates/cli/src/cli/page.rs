@@ -313,6 +313,24 @@ pub enum PageCommands {
         out: Option<String>,
     },
 
+    /// 表格结构化提取（W-ext：表格/网格 → JSON；CSV 未做）
+    #[command(
+        about = "表格提取：[sel|@eN] 缺省 = 主文档最大表格；输出 { columns, rows, coverage, meta }；--out 写 JSON 文件"
+    )]
+    Extract {
+        /// 实例 id
+        id: String,
+        /// 表格目标：@eN 引用（上次 snap 产生）或 CSS 选择器（仅 table/[role=table|grid|treegrid]）；
+        /// 缺省 = 主文档内最大表格自动发现
+        target: Option<String>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+        /// 输出 JSON 文件路径（全量 payload pretty 写入；缺省仅打印；quiet 时输出路径）
+        #[arg(long = "out")]
+        out: Option<String>,
+    },
+
     /// 设备仿真（W-cap）
     #[command(
         about = "设备仿真：--preset 预设（iphone-14 等）| --viewport WxH [--user-agent UA] [--mobile] [--touch] | --off 恢复；仅作用该 tab"
@@ -467,6 +485,19 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             !*no_print_background,
             *paper_width,
             *paper_height,
+            tab.as_deref(),
+            out.as_deref(),
+        ),
+        PageCommands::Extract {
+            id,
+            target,
+            tab,
+            out,
+        } => extract(
+            globals,
+            client,
+            id,
+            target.as_deref(),
             tab.as_deref(),
             out.as_deref(),
         ),
@@ -850,6 +881,30 @@ fn reload(
     Ok(())
 }
 
+/// `page extract <ID> [sel|@eN] [--tab T] [--out F]`：表格 → 结构化 JSON。
+/// --out 两模式都写全量 payload（与 screenshot 的「json 模式忽略 --out」不同：
+/// 这里文件内容 = stdout payload，无歧义）；缺省模式打摘要 + 数据表
+///（单元格列 60 字符截断，全量走 --out/--json）；quiet = 行数（--out 时路径）。
+fn extract(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: Option<&str>,
+    tab: Option<&str>,
+    out_path: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.page_extract(id, target, tab)?;
+    if let Some(p) = out_path {
+        let pretty = serde_json::to_string_pretty(&resp)
+            .map_err(|e| CliError::Local(format!("序列化 JSON 失败: {e}")))?;
+        std::fs::write(p, pretty)
+            .map_err(|e| CliError::Local(format!("写 JSON 文件失败 {p}: {e}")))?;
+    }
+    print_page_out(&out, extract_out(&resp, &out, out_path));
+    Ok(())
+}
+
 /// "390x844"（x/X 均可）→ (390, 844)；格式/正整数校验本地拦（exit 2）。
 fn parse_viewport(s: &str) -> Result<(i64, i64), CliError> {
     let bad = || CliError::Local(format!("--viewport 格式为 WxH（如 390x844），got \"{s}\""));
@@ -1044,6 +1099,104 @@ fn dialogs_seen_note(resp: &serde_json::Value) -> Option<String> {
     ))
 }
 
+/// extract 三态：quiet = 行数（--out 时路径，供 $(...) 捕获）；json = 响应
+/// 原样（--out 已另落文件）；table = 摘要行 + 数据表。
+fn extract_out(
+    resp: &serde_json::Value,
+    out: &OutputCtx,
+    out_path: Option<&str>,
+) -> PageOut {
+    if out.quiet {
+        return PageOut::Quiet(match out_path {
+            Some(p) => p.to_string(),
+            None => resp
+                .pointer("/meta/rowCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    if out.json {
+        return PageOut::Json(resp.clone());
+    }
+    PageOut::Text(extract_text(resp, out_path))
+}
+
+/// extract 的 table 模式输出：摘要行（脚本可 grep）+ comfy-table 数据表。
+/// null 单元格渲染为 ∅（与空串区分）；单元格 60 字符截断（全量走 --out）。
+fn extract_text(resp: &serde_json::Value, out_path: Option<&str>) -> String {
+    let num = |p: &str| {
+        resp.pointer(p)
+            .and_then(|v| v.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into())
+    };
+    let mut summary = format!(
+        "rows: {} · cols: {} · datasetComplete: {} · hiddenRowsOmitted: {} · truncated: {}",
+        num("/meta/rowCount"),
+        num("/meta/columnCount"),
+        resp.pointer("/coverage/datasetComplete")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?"),
+        num("/coverage/hiddenRowsOmitted"),
+        resp.pointer("/coverage/truncated")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
+    );
+    if let Some(p) = out_path {
+        summary.push_str(&format!("\nfile: {p}"));
+    }
+    let headers: Vec<String> = resp
+        .get("columns")
+        .and_then(|v| v.as_array())
+        .map(|cols| {
+            cols.iter()
+                .map(|c| {
+                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let src = c.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                    if src == "generated" {
+                        format!("{name}*")
+                    } else {
+                        name.to_string()
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let rows: Vec<TableRow> = resp
+        .get("rows")
+        .and_then(|v| v.as_array())
+        .map(|rs| {
+            rs.iter()
+                .enumerate()
+                .map(|(i, r)| TableRow {
+                    id: i.to_string(),
+                    cells: r
+                        .as_array()
+                        .map(|cs| {
+                            cs.iter()
+                                .map(|c| match c {
+                                    serde_json::Value::String(s) => truncate(s, 60),
+                                    _ => "∅".to_string(), // null = 被合并覆盖/空位
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    json: r.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return summary;
+    }
+    format!(
+        "{summary}\n{}",
+        crate::cli::output::list_table_string(&headers, &rows)
+    )
+}
+
 /// dialogs 表行：SEQ TYPE MESSAGE（与 JSON 字段同源；message 截断 80 列，
 /// json 模式完整保留——同 console 的 TEXT 列约定）。
 fn dialogs_rows(resp: &serde_json::Value) -> Vec<TableRow> {
@@ -1215,6 +1368,68 @@ mod tests {
             result_line(&json!({ "instanceId": "ins_1" })),
             "(响应缺少 result 字段)"
         );
+    }
+
+    /// extract 三态：quiet = 行数（--out 时路径）；json = 原样；
+    /// table = 摘要行（含 coverage 四元组）+ 数据表（∅ 表 null、* 表生成列名）。
+    #[test]
+    fn extract_out_routes_three_modes_and_renders_null_distinctly() {
+        let resp = json!({
+            "columns": [
+                { "name": "姓名", "source": "header" },
+                { "name": "col_2", "source": "generated" },
+            ],
+            "rows": [
+                [ "张三", null ],
+                [ "", "备注" ],
+            ],
+            "coverage": {
+                "datasetComplete": "incomplete",
+                "hiddenRowsOmitted": 2,
+                "truncated": false,
+            },
+            "meta": { "rowCount": 2, "columnCount": 2 },
+        });
+        match extract_out(
+            &resp,
+            &OutputCtx { json: false, quiet: true },
+            None,
+        ) {
+            PageOut::Quiet(n) => assert_eq!(n, "2", "quiet = 行数"),
+            other => panic!("quiet 应输出行数: {other:?}"),
+        }
+        match extract_out(
+            &resp,
+            &OutputCtx { json: false, quiet: true },
+            Some("t.json"),
+        ) {
+            PageOut::Quiet(p) => assert_eq!(p, "t.json", "--out + quiet = 路径"),
+            other => panic!("quiet 应输出路径: {other:?}"),
+        }
+        match extract_out(
+            &resp,
+            &OutputCtx { json: true, quiet: false },
+            None,
+        ) {
+            PageOut::Json(v) => assert_eq!(v, resp),
+            other => panic!("json 模式 = 响应原样: {other:?}"),
+        }
+        match extract_out(
+            &resp,
+            &OutputCtx { json: false, quiet: false },
+            None,
+        ) {
+            PageOut::Text(t) => {
+                assert!(
+                    t.starts_with("rows: 2 · cols: 2 · datasetComplete: incomplete · hiddenRowsOmitted: 2 · truncated: false"),
+                    "{t}"
+                );
+                assert!(t.contains("∅"), "null 单元格渲染为 ∅: {t}");
+                assert!(t.contains("col_2*"), "生成列名带 * 标记: {t}");
+                assert!(t.contains("张三"), "{t}");
+            }
+            other => panic!("table 模式应输出摘要+表: {other:?}"),
+        }
     }
 
     /// dialogs_seen：条目拼装 + 截断；无字段 / 空数组 → None（table 模式不输出）。

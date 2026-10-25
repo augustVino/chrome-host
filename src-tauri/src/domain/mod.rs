@@ -8,4 +8,5 @@ pub mod instance;
 pub mod login_profile;
 pub mod net_rules;
 pub mod page_control;
+pub mod table_extract;
 pub mod redact;

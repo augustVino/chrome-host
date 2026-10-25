@@ -310,6 +310,13 @@ export const API_CATALOG: CatalogGroup[] = [
         body: '{ "preset": "iphone-14", "tab": null }',
         note: '仅作用该 tab 的 page session；重复 emulate = 覆盖；未知预设 → 422 PAGE_EMULATE_UNKNOWN_PRESET',
       },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/extract',
+        desc: '表格结构化提取：target = @eN 或 CSS 选择器（仅 table/[role=table|grid|treegrid]），缺省 = 主文档最大表格自动发现；返回 { columns, rows, coverage, meta }',
+        body: '{ "target": "@e1", "tab": null }',
+        note: 'null 单元格 = 被合并覆盖/空位、"" = 真实空单元格；coverage.datasetComplete 只有 unknown/incomplete（永不装作取全）；非表格目标 → 422 PAGE_EXTRACT_NOT_A_TABLE；单元格预算 10000 超限整行截断',
+      },
     ],
   },
   {

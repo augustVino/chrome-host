@@ -520,6 +520,27 @@ pub async fn reload(
     Ok(Json(resp))
 }
 
+/// POST /api/v1/instances/{id}/page/extract —— 表格结构化提取（W-ext）。
+#[derive(Deserialize)]
+pub struct ExtractBody {
+    /// 表格目标：@eN 引用或 CSS 选择器；缺省 = 主文档内最大表格自动发现。
+    ///命中但非 table/[role=table|grid|treegrid] → 422 PAGE_EXTRACT_NOT_A_TABLE
+    pub target: Option<String>,
+    pub tab: Option<String>,
+}
+
+pub async fn extract(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ExtractBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .extract(&id, body.tab.as_deref().unwrap_or(""), body.target.as_deref())
+        .await?;
+    Ok(Json(resp))
+}
+
 pub async fn emulate(
     State(state): State<ApiState>,
     Path(id): Path<String>,

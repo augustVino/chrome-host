@@ -518,6 +518,19 @@ struct PageEmulateArgs {
     tab: Option<String>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageExtractArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "表格目标：@eN 引用（上次 page_snap 产生）或 CSS 选择器；省略 = 主文档内最大表格自动发现"
+    )]
+    target: Option<String>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
 // ---------- MCP Server ----------
 
 #[derive(Clone)]
@@ -1268,6 +1281,23 @@ impl ChromeHostMcp {
             off: a.off.unwrap_or(false),
         };
         run(|| self.state.page.emulate(&a.instance_id, a.tab.as_deref().unwrap_or(""), req)).await
+    }
+
+    #[tool(
+        description = "表格结构化提取（QA 常用：订单列表/查询结果 → JSON）：target 省略 = 主文档内最大表格自动发现，也支持 @eN 引用与 CSS 选择器（仅 table/[role=table|grid|treegrid]，非表格 → 422 PAGE_EXTRACT_NOT_A_TABLE）。响应 { columns, rows, coverage, meta }：rows 单元格 null = 被合并覆盖/空位、\"\" = 真实空单元格；coverage.datasetComplete 只有 unknown/incomplete（永不装作取全——aria-rowcount 超出可见行/预算 10000 截断/空 tbody 均标 incomplete 并给 reasons）；合并单元格锚点在 meta.spans"
+    )]
+    async fn page_extract(
+        &self,
+        Parameters(a): Parameters<PageExtractArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.extract(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.target.as_deref(),
+            )
+        })
+        .await
     }
 }
 

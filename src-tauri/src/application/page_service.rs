@@ -660,6 +660,25 @@ impl PageService {
         .await
     }
 
+    /// extract <tab> [target]：表格 → 结构化 JSON（W-ext 两段式：收集器
+    /// 只读采 DOM 事实 → domain/table_extract 归一化）。target 缺省 = 主文档
+    /// 最大表格自动发现；支持 @eN（含跨帧 ref）与 CSS 选择器。
+    pub async fn extract(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        target: Option<&str>,
+    ) -> Result<Value, AppError> {
+        self.command(
+            TOOL_TIMEOUT,
+            "extract",
+            ins_id,
+            tab,
+            |w, tid, sid| async move { extract_tool(&w, &tid, &sid, target).await },
+        )
+        .await
+    }
+
     /// clickxy <tab> <x> <y>：视口 CSS 像素坐标直接三段派发（无 locate /
     /// hit-test——坐标即意图；跨域 iframe 内元素的兜底点击路径）（P2-G）。
     pub async fn clickxy(
@@ -3883,6 +3902,125 @@ async fn html_tool(
     }
 }
 
+// ============================================================================
+// 6a-2. 表格结构化提取（W-ext：收集编排 + 归一化接线）
+// ============================================================================
+
+/// extract 工具：目标三路解析（自动发现 / @eN ref（含跨帧）/ CSS 选择器）
+/// → 页内收集器（EXTRACT_COLLECT_FN，纯只读事实）→ domain 归一化。
+/// 错误映射：目标未命中 404 PAGE_ELEMENT_NOT_FOUND（自动发现无表格同码，
+/// message 区分）；命中但非表格 422 PAGE_EXTRACT_NOT_A_TABLE；收集脚本
+/// 抛错 500 PAGE_EVAL_FAILED（与 eval 同语义）。
+async fn extract_tool(
+    watched: &Watched,
+    tid: &str,
+    sid: &str,
+    target: Option<&str>,
+) -> Result<Value, AppError> {
+    use crate::domain::page_control::{
+        extract_call_on_fn, extract_discovery_expr, extract_selector_expr,
+    };
+    use crate::domain::table_extract::{self, TableFacts};
+
+    let conn = require_conn(watched)?;
+    let (facts_value, target_desc): (Value, String) = match target {
+        None => {
+            let v = eval_json(&conn, sid, &extract_discovery_expr(), "extract").await?;
+            (v, "(auto-discovered)".to_string())
+        }
+        Some(t) if is_ref_target(t) => {
+            let entry = resolve_ref_entry(watched, tid, t)?;
+            // 帧内 ref（W-oopif）：收集在 frame session 上做（press --target 同链）
+            let esid = match &entry.frame_target_id {
+                None => sid.to_string(),
+                Some(fid) => {
+                    live_frame_session(watched, tid, fid, entry.frame_session_id.as_deref())
+                        .ok_or_else(|| {
+                            PageControlError::target_moved(
+                                "owning iframe session is gone (frame detached?) — re-snap",
+                            )
+                        })?
+                }
+            };
+            let resp = cdp_send(
+                &conn,
+                "DOM.resolveNode",
+                json!({ "backendNodeId": entry.backend_node_id }),
+                Some(&esid),
+            )
+            .await
+            .map_err(|e| PageControlError::target_moved(&e.to_string()))?;
+            let object_id = resp
+                .pointer("/object/objectId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| PageControlError::target_moved("no objectId"))?;
+            let resp = cdp_send(
+                &conn,
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": extract_call_on_fn(),
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+                Some(&esid),
+            )
+            .await
+            .map_err(|e| PageControlError::target_moved(&e.to_string()))?;
+            if let Some(d) = resp.get("exceptionDetails") {
+                let text = d
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| d.pointer("/exception/description").and_then(Value::as_str))
+                    .unwrap_or("unknown error");
+                return Err(AppError::business(500, "PAGE_EVAL_FAILED", text.to_string()));
+            }
+            let s = resp
+                .pointer("/result/value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppError::internal("extract: 收集器返回缺失（value 非 JSON 字符串）")
+                })?;
+            let v: Value = serde_json::from_str(s)
+                .map_err(|e| AppError::internal(format!("extract: 收集器输出非 JSON: {e}")))?;
+            (v, t.to_string())
+        }
+        Some(sel) => {
+            let v = eval_json(&conn, sid, &extract_selector_expr(sel), "extract").await?;
+            (v, sel.to_string())
+        }
+    };
+
+    let facts: TableFacts = serde_json::from_value(facts_value)
+        .map_err(|e| AppError::internal(format!("extract: 事实反序列化失败: {e}")))?;
+    match facts.reason.as_deref() {
+        // 自动发现无表格 / 选择器未命中（选择器路径的 miss 在页内拦）
+        Some("no-table") => {
+            return Err(PageControlError::element_not_found(target.unwrap_or(
+                "no <table> in main document",
+            ))
+            .into())
+        }
+        Some("not-a-table") => {
+            return Err(PageControlError::extract_not_a_table(
+                facts.tag.as_deref().unwrap_or("?"),
+                facts.role.as_deref(),
+            )
+            .into())
+        }
+        _ => {}
+    }
+    if !facts.found {
+        // 收集器契约：found=false 必带 reason；此处防御（不装作空表）
+        return Err(AppError::internal(
+            "extract: 收集器返回 found=false 但未说明原因",
+        ));
+    }
+    let mut out = table_extract::normalize(&facts);
+    out["meta"]["target"] = json!(target_desc);
+    Ok(out)
+}
+
 /// TS clickXyStr：复用 click 的三段派发链，无 locate/hit-test（坐标即意图）。
 async fn clickxy_tool(watched: &Watched, sid: &str, x: f64, y: f64) -> Result<Value, AppError> {
     let conn = require_conn(watched)?;
@@ -6847,6 +6985,142 @@ mod tests {
         let e = svc.html(INS, "T1", Some("#gone")).await.unwrap_err();
         assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
         assert!(e.to_string().contains("#gone"));
+    }
+
+    // ---------------- 工具：extract（W-ext）---------------------------------
+
+    /// 收集器事实（同构 wire 样本）：thead 2 列 + tbody 1 行 + aria-rowcount
+    /// 超出可见行 → 归一化后 columns/rows/coverage/meta 齐备
+    fn facts_wire() -> Value {
+        json!({
+            "found": true, "format": "html", "caption": "订单",
+            "aria": { "rowCount": 100, "colCount": null },
+            "hiddenRows": 1, "totalRows": 2, "totalCells": 4, "partial": false,
+            "sections": [
+                { "kind": "thead", "rows": [ { "cells": [
+                    { "text": "姓名", "header": true, "rowSpan": 1, "colSpan": 1 },
+                    { "text": "年龄", "header": true, "rowSpan": 1, "colSpan": 1 },
+                ] } ] },
+                { "kind": "tbody", "rows": [ { "cells": [
+                    { "text": "张三", "rowSpan": 1, "colSpan": 1 },
+                    { "text": "", "rowSpan": 1, "colSpan": 1 },
+                ] } ] },
+            ]
+        })
+    }
+
+    /// 自动发现路径：Runtime.evaluate 收集 → 归一化输出 + 命令骨架字段
+    #[tokio::test]
+    async fn extract_auto_discovers_and_normalizes() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![rt_result(json!(facts_wire().to_string()))],
+        );
+        let r = svc.extract(INS, "T1", None).await.unwrap();
+        assert_eq!(
+            r["columns"],
+            json!([
+                { "name": "姓名", "source": "header", "path": ["姓名"] },
+                { "name": "年龄", "source": "header", "path": ["年龄"] },
+            ])
+        );
+        // 空串保留（真实空单元格）
+        assert_eq!(r["rows"], json!([["张三", ""]]));
+        assert_eq!(r["coverage"]["datasetComplete"], "incomplete");
+        assert_eq!(r["coverage"]["hiddenRowsOmitted"], 1);
+        assert_eq!(r["meta"]["target"], "(auto-discovered)");
+        assert_eq!(r["meta"]["caption"], "订单");
+        // 命令骨架：instanceId/targetId 注入；evaluate 发到 tab session
+        assert_eq!(r["instanceId"], INS);
+        assert_eq!(r["targetId"], "T1");
+        let evals = calls_of(&calls, "Runtime.evaluate");
+        assert!(evals[0].param("expression").as_str().unwrap().contains("BUDGET = 10000"));
+        assert_eq!(evals[0].session.as_deref(), Some("S1"));
+    }
+
+    /// 选择器未命中（页内拦 null → found:false/no-table）→ 404；
+    /// 表达式里 querySelector 注入 JSON 转义
+    #[tokio::test]
+    async fn extract_selector_miss_is_element_not_found() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![rt_result(json!(
+                json!({ "found": false, "reason": "no-table" }).to_string()
+            ))],
+        );
+        let e = svc.extract(INS, "T1", Some("#gone")).await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
+        let expr = calls_of(&calls, "Runtime.evaluate")[0]
+            .param("expression")
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            expr.contains(r##"querySelector("#gone")"##),
+            "selector 注入用 JSON 转义: {expr}"
+        );
+    }
+
+    /// 目标命中但非表格 → 422 PAGE_EXTRACT_NOT_A_TABLE
+    #[tokio::test]
+    async fn extract_non_table_target_is_422() {
+        let (svc, _w, _calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![rt_result(json!(
+                json!({ "found": false, "reason": "not-a-table", "tag": "DIV", "role": null }).to_string()
+            ))],
+        );
+        let e = svc.extract(INS, "T1", Some(".list")).await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("PAGE_EXTRACT_NOT_A_TABLE", 422));
+        assert!(e.to_string().contains("DIV"));
+    }
+
+    /// @eN 路径：resolveNode → callFunctionOn（returnByValue）→ 归一化；
+    /// 未 snap 的 ref → 404 PAGE_REF_NOT_FOUND
+    #[tokio::test]
+    async fn extract_ref_path_resolves_and_calls_on_element() {
+        let (svc, watched, calls, script) = armed();
+        watched
+            .refs
+            .lock()
+            .unwrap()
+            .entry("T1".into())
+            .or_default()
+            .replace(&json!([{ "ref": "e1", "backendNodeId": 7 }]));
+        given(
+            &script,
+            "DOM.resolveNode",
+            vec![Ok(json!({ "object": { "objectId": "OID-1" } }))],
+        );
+        given(
+            &script,
+            "Runtime.callFunctionOn",
+            vec![Ok(json!({ "result": { "type": "string", "value": facts_wire().to_string() } }))],
+        );
+        let r = svc.extract(INS, "T1", Some("@e1")).await.unwrap();
+        assert_eq!(r["rows"], json!([["张三", ""]]));
+        assert_eq!(r["meta"]["target"], "@e1");
+        let rn = calls_of(&calls, "DOM.resolveNode");
+        assert_eq!(rn[0].param("backendNodeId"), json!(7));
+        assert_eq!(rn[0].session.as_deref(), Some("S1"));
+        let cfo = calls_of(&calls, "Runtime.callFunctionOn");
+        assert_eq!(cfo[0].param("objectId"), json!("OID-1"));
+        assert_eq!(cfo[0].param("returnByValue"), json!(true));
+        assert!(cfo[0]
+            .param("functionDeclaration")
+            .as_str()
+            .unwrap()
+            .contains("BUDGET = 10000"));
+
+        // 未 snap 的 ref：refs 表空（另一个 tab 无表）→ 404
+        let e = svc.extract(INS, "TAB2", Some("@e9")).await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("PAGE_REF_NOT_FOUND", 404));
     }
 
     // ---------------- 工具：clickxy（P2-G）------------------------------------
