@@ -341,6 +341,47 @@ pub enum PageCommands {
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
+
+    /// 等待下一次下载完成（W-file；命令式等待：先调它再 click 触发）
+    #[command(
+        about = "等待下载完成：[--timeout-ms 30000]（命令式：先调本命令，再另行 click 触发下载；落盘在实例 profile 的 downloads/ 目录）"
+    )]
+    DownloadWait {
+        /// 实例 id
+        id: String,
+        /// 等待窗口毫秒数（缺省 30000）
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 下载终态记录环查询（W-file；最近 20 条，含已消费）
+    #[command(about = "下载记录：最近 20 条终态（完成/取消/中断，含已消费——matched 列区分）")]
+    Downloads {
+        /// 实例 id
+        id: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 上传：主机文件设入 file input（W-file）
+    #[command(
+        about = "上传：<sel|@eN> <主机绝对路径>（设入 input[type=file]；路径拒符号链接；≤100MB）"
+    )]
+    Upload {
+        /// 实例 id
+        id: String,
+        /// file input 目标：@eN 引用或 CSS 选择器
+        target: String,
+        /// 主机本地绝对路径（拒符号链接；不存在 → 404 exit 3；超 100MB → 422 exit 7）
+        file_path: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
 }
 
 /// page 组分发入口（main.rs dispatch 的唯一调用点）。
@@ -478,6 +519,16 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             *off,
             tab.as_deref(),
         ),
+        PageCommands::DownloadWait { id, timeout_ms, tab } => {
+            download_wait(globals, client, id, *timeout_ms, tab.as_deref())
+        }
+        PageCommands::Downloads { id, tab } => downloads(globals, client, id, tab.as_deref()),
+        PageCommands::Upload {
+            id,
+            target,
+            file_path,
+            tab,
+        } => upload(globals, client, id, target, file_path, tab.as_deref()),
     }
 }
 
@@ -809,6 +860,68 @@ fn emulate(
     Ok(())
 }
 
+/// `page download-wait <ID> [--timeout-ms N] [--tab T]`（W-file）：命令式等待
+/// 下一次下载完成。quiet = filePath；table = 文件行 + 落盘路径（未核证时
+/// 标注）；json 原样。
+fn download_wait(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    timeout_ms: Option<u64>,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.page_download_wait(id, timeout_ms, tab)?;
+    if out.quiet {
+        out.print_id(
+            resp.get("filePath")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        );
+        return Ok(());
+    }
+    if out.json {
+        out.render_kv(&[], resp);
+        return Ok(());
+    }
+    out.render_text(download_wait_text(&resp));
+    Ok(())
+}
+
+/// `page downloads <ID> [--tab T]`（W-file）：终态记录环。
+fn downloads(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.page_downloads(id, tab)?;
+    let rows = downloads_rows(&resp);
+    if out.quiet {
+        for row in &rows {
+            out.print_id(&row.cells.join("\t"));
+        }
+        return Ok(());
+    }
+    out.render_list(&["STATE", "FILE", "BYTES", "MATCHED"], &rows);
+    Ok(())
+}
+
+/// `page upload <ID> <sel|@eN> <绝对路径> [--tab T]`（W-file）：result 型渲染。
+fn upload(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: &str,
+    file_path: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_upload(id, target, file_path, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
 /// `page reload <ID> [--ignore-cache] [--tab T]`
 fn reload(
     globals: &GlobalArgs,
@@ -1040,6 +1153,55 @@ fn dialogs_rows(resp: &serde_json::Value) -> Vec<TableRow> {
                             .unwrap_or("?")
                             .to_string(),
                         truncate(e.get("message").and_then(|v| v.as_str()).unwrap_or(""), 80),
+                    ],
+                    json: e.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// download-wait 文本渲染：`文件名 (bytes) → 路径`；verified=false 时
+/// 标注（bytes 来自事件而非实测，路径为预期值）。
+fn download_wait_text(resp: &serde_json::Value) -> String {
+    let name = resp.get("fileName").and_then(|v| v.as_str()).unwrap_or("?");
+    let bytes = resp.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let path = resp
+        .get("filePath")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mut line = format!("Downloaded \"{name}\" ({bytes} bytes) → {path}");
+    if !resp
+        .get("verified")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        line.push_str("  [unverified: bytes 来自事件，路径未实测]");
+    }
+    line
+}
+
+/// downloads 记录环行：STATE/FILE/BYTES/MATCHED（防御式缺省，同 dialogs_rows）。
+fn downloads_rows(resp: &serde_json::Value) -> Vec<TableRow> {
+    resp.get("downloads")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .map(|e| TableRow {
+                    id: e
+                        .get("guid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    cells: vec![
+                        e.get("state").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                        truncate(e.get("fileName").and_then(|v| v.as_str()).unwrap_or(""), 40),
+                        e.get("bytes").and_then(|v| v.as_u64()).unwrap_or_default().to_string(),
+                        e.get("matched")
+                            .and_then(|v| v.as_bool())
+                            .map(|b| if b { "yes" } else { "no" })
+                            .unwrap_or("?")
+                            .to_string(),
                     ],
                     json: e.clone(),
                 })

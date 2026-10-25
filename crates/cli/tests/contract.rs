@@ -750,6 +750,50 @@ fn fixture_router() -> Router {
                 Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
             }),
         )
+        // W-file：下载等待/记录环/上传——echo + 正常样本
+        .route(
+            "/api/v1/instances/ins_pg/page/download-wait",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_pg/page/upload",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/download-wait",
+            post(|| async {
+                Json(json!({
+                    "guid": "g-1", "state": "completed", "fileName": "hello.txt",
+                    "filePath": "/tmp/p/downloads/hello.txt", "bytes": 1024, "mimeType": null,
+                    "verified": true, "matched": true,
+                    "instanceId": "ins_x", "targetId": "TAB9F"
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/downloads",
+            get(|| async {
+                Json(json!({
+                    "downloads": [
+                        { "guid": "g-1", "state": "completed", "fileName": "hello.txt", "bytes": 1024, "matched": true },
+                        { "guid": "g-2", "state": "interrupted", "fileName": "big.zip", "bytes": 512, "matched": false }
+                    ],
+                    "capacity": 20,
+                    "instanceId": "ins_x", "targetId": "TAB9F"
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/page/upload",
+            post(|| async {
+                Json(json!({ "result": "Set file \"a.png\" (3 bytes) on #f", "fileName": "a.png", "bytes": 3,
+                    "instanceId": "ins_x", "targetId": "TAB9F" }))
+            }),
+        )
         // 错误样本：page 族四类代表映射（404→3 / 409→5 / 422→7 / 504→5 运行时码表）
         .route(
             "/api/v1/instances/err_tab/page/click",
@@ -1535,6 +1579,44 @@ fn page_endpoints_contract() {
         .page_type("ins_pg", "hi", None)
         .expect("type echo 应成功");
     assert_eq!(echo["echo"]["text"], "hi");
+
+    // W-file 三件：download-wait / downloads / upload —— 正常样本 + body 透传
+    let dl = client
+        .page_download_wait("ins_x", None, None)
+        .expect("download-wait 应成功");
+    assert_eq!(dl["fileName"], "hello.txt");
+    assert_eq!(dl["bytes"], 1024);
+    assert_eq!(dl["filePath"], "/tmp/p/downloads/hello.txt");
+    let echo = client
+        .page_download_wait("ins_pg", Some(5000), Some("TAB"))
+        .expect("download-wait echo 应成功");
+    assert_eq!(echo["echo"]["timeoutMs"], 5000);
+    assert_eq!(echo["echo"]["tab"], "TAB");
+    let echo = client
+        .page_download_wait("ins_pg", None, None)
+        .expect("download-wait 缺省 echo 应成功");
+    assert_eq!(
+        echo["echo"]["timeoutMs"],
+        serde_json::json!(null),
+        "timeoutMs 缺省序列化为 null"
+    );
+    let ring = client
+        .page_downloads("ins_x", None)
+        .expect("downloads 应成功");
+    assert_eq!(ring["capacity"], 20);
+    assert_eq!(ring["downloads"].as_array().unwrap().len(), 2);
+    assert_eq!(ring["downloads"][1]["state"], "interrupted");
+    let up = client
+        .page_upload("ins_x", "#f", "/tmp/a.png", None)
+        .expect("upload 应成功");
+    assert_eq!(up["result"], "Set file \"a.png\" (3 bytes) on #f");
+    assert_eq!(up["bytes"], 3);
+    let echo = client
+        .page_upload("ins_pg", "@e2", "/abs/x.bin", Some("TAB"))
+        .expect("upload echo 应成功");
+    assert_eq!(echo["echo"]["target"], "@e2");
+    assert_eq!(echo["echo"]["filePath"], "/abs/x.bin");
+    assert_eq!(echo["echo"]["tab"], "TAB");
 
     // 错误映射：404 tab 路由未命中 → exit 3
     let err = client.page_click("err_tab", "@e1", None).unwrap_err();

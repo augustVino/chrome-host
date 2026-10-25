@@ -1119,4 +1119,57 @@ impl AgentClient {
     ) -> Result<serde_json::Value, CliError> {
         Self::decode(self.send(Method::POST, &Self::page_path(id, "emulate"), Some(body), true))
     }
+
+    /// POST /api/v1/instances/{id}/page/download-wait —— body `{timeoutMs?, tab?}`
+    ///（命令式等待：先调本命令再 click 触发下载；服务端等待期间不占实例
+    /// 串行锁，click 可并发执行）。long = true 同 page 族——等待窗口可远超
+    /// 客户端 30s 总超时
+    pub fn page_download_wait(
+        &self,
+        id: &str,
+        timeout_ms: Option<u64>,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "timeoutMs": timeout_ms, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "download-wait"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// GET /api/v1/instances/{id}/page/downloads?tab= —— 下载终态记录环（最近 20 条）
+    pub fn page_downloads(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let query = join_query([tab.map(|t| format!("tab={t}")), None, None]);
+        Self::decode(self.send(
+            Method::GET,
+            &format!("{}{query}", Self::page_path(id, "downloads")),
+            None,
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/upload —— body `{target, filePath, tab?}`
+    ///（filePath 主机绝对路径；拒符号链接/超 100MB 由服务端校验，CLI 不做
+    /// 本地预检——服务端是唯一校验源）
+    pub fn page_upload(
+        &self,
+        id: &str,
+        target: &str,
+        file_path: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "filePath": file_path, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "upload"),
+            Some(body),
+            true,
+        ))
+    }
 }

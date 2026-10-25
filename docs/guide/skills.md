@@ -37,6 +37,8 @@ chrome-host page dialogs <insId>              # 查自动接管的弹窗历史
 chrome-host page screenshot <insId> [@eN]     # 元素/视口 png 截图（--out 写文件）
 chrome-host page pdf       <insId>            # 整页 PDF（缺省 <insId>.pdf）
 chrome-host page emulate   <insId> --preset iphone-14  # 设备仿真（--off 恢复）
+chrome-host page download-wait <insId>        # 等下一次下载完成（命令式：先调它再 click 触发）
+chrome-host page upload <insId> <sel|@eN> /private/tmp/f.png  # 文件设入 input[type=file]
 ```
 
 本地与远程接入（SSH 隧道 + 令牌）用法完全一致；外部 CDP 客户端（Playwright / DevTools）接入走 `instance cdp` / `cdp-session`（见[单环境闭环演练](./walkthrough)与[远程接入](./remote-access)）。

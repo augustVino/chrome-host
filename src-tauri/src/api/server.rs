@@ -283,6 +283,20 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/emulate",
             post(crate::api::pages::emulate),
         )
+        // 文件传输（W-file）：下载等待（命令式，browser 级事件）+ 终态环查询
+        // + 主机文件设入 file input
+        .route(
+            "/api/v1/instances/{id}/page/download-wait",
+            post(crate::api::pages::download_wait),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/downloads",
+            get(crate::api::pages::downloads),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/upload",
+            post(crate::api::pages::upload),
+        )
         .route(
             "/api/v1/login-profiles",
             get(crate::api::login_profiles::list),

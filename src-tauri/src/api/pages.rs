@@ -197,6 +197,33 @@ pub struct EmulateBody {
     pub tab: Option<String>,
 }
 
+/// POST /api/v1/instances/{id}/page/download-wait —— 等待下一次下载完成
+///（W-file）。命令式等待：先调本端点再触发点击。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadWaitBody {
+    /// 等待窗口（毫秒）；缺省 30s
+    pub timeout_ms: Option<u64>,
+    pub tab: Option<String>,
+}
+
+/// GET /api/v1/instances/{id}/page/downloads —— 下载终态记录环查询（W-file）。
+#[derive(Deserialize)]
+pub struct DownloadsQuery {
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/upload —— 主机文件设入 file input（W-file）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadBody {
+    /// file input 目标：@eN ref 或 CSS 选择器（非 file input → 422）
+    pub target: String,
+    /// 主机本地绝对路径（拒符号链接；≤100MB；不存在 → 404）
+    pub file_path: String,
+    pub tab: Option<String>,
+}
+
 pub async fn snap(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -530,6 +557,54 @@ pub async fn emulate(
     let resp = state
         .page
         .emulate(&id, body.tab.as_deref().unwrap_or(""), req)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/download-wait —— 等待下一次下载完成。
+/// 语义：命令式等待（从调用时刻起算，先调 wait 再触发点击）；返回
+/// { filePath, fileName, bytes, mimeType, ... }；失败/取消 → 500
+/// PAGE_DOWNLOAD_FAILED，超时（无终态）→ 409 PAGE_DOWNLOAD_TIMEOUT。
+pub async fn download_wait(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DownloadWaitBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .download_wait(&id, body.tab.as_deref().unwrap_or(""), body.timeout_ms)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// GET /api/v1/instances/{id}/page/downloads —— 下载终态记录环（最近 20 条）。
+pub async fn downloads(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<DownloadsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .downloads_list(&id, q.tab.as_deref().unwrap_or(""))
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/upload —— 主机文件设入 file input。
+/// DOM.setFileInputFiles（chooser 模式），不拷贝文件（CDP 直接引用主机路径）。
+pub async fn upload(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<UploadBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .upload(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.target,
+            &body.file_path,
+        )
         .await?;
     Ok(Json(resp))
 }

@@ -65,6 +65,8 @@ chrome-host instance screenshot "$INS_ID" --out now.png # 当前页截图
 chrome-host page screenshot "$INS_ID" @e1 --out btn.png # 元素级截图（先 snap 拿引用）
 chrome-host page pdf "$INS_ID"                            # 整页 PDF（缺省 <id>.pdf）
 chrome-host page emulate "$INS_ID" --preset iphone-14   # 设备仿真（--off 恢复）
+chrome-host page download-wait "$INS_ID"               # 挂住等下一次下载（先调它，再另行 click 下载链接）
+chrome-host page upload "$INS_ID" 'input[type=file]' /private/tmp/a.png  # 文件设入上传框（物理绝对路径）
 ```
 
 完整命令与 PAGE_* 错误码见 [CLI 手册 · 页面操控](/reference/cli#页面操控page-命令族)；操作循环经验见 [AI Agent Skills](./skills)。
