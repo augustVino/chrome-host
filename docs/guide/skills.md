@@ -21,7 +21,7 @@
 - **Claude Code**：按其 skills 机制注册仓库内 skill；
 - 其他 agent：`SKILL.md` 本身就是完整的操作手册（含触发条件、流程、命令速查、错误决策表），直接作为上下文喂给 agent 亦可。
 
-若 agent 环境支持 MCP，更简单的路径是直接接 MCP 服务（见 [MCP 手册](/reference/mcp)），56 个工具覆盖编排与操控（含 `page_*` 命令族）；skills 的价值在于更细的排障决策知识与工作流经验。
+若 agent 环境支持 MCP，更简单的路径是直接接 MCP 服务（见 [MCP 手册](/reference/mcp)），57 个工具覆盖编排与操控（含 `page_*` 命令族）；skills 的价值在于更细的排障决策知识与工作流经验。
 
 ## page 命令族：人类也能直接用
 
