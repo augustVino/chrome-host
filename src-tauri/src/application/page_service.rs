@@ -2229,6 +2229,7 @@ mod tests {
         let repo = Arc::new(InstanceRepository::new(pool));
         repo.insert(&Instance {
             id: INS.into(),
+            name: None,
             environment_id: "env_x".into(),
             login_profile_id: None,
             profile_dir: "/tmp/x".into(),

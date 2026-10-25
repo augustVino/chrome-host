@@ -75,6 +75,7 @@ fn canned_env_summary() -> serde_json::Value {
 fn canned_instance() -> serde_json::Value {
     json!({
         "id": "ins_1",
+        "name": "e2e-42",
         "environmentId": "env_1",
         "loginProfileId": null,
         "profileDir": "/tmp/chrome-host/env_1/ins_1",
@@ -295,6 +296,30 @@ fn fixture_router() -> Router {
             "/api/v1/environments/env_1/instances",
             get(|| async { Json(json!([canned_instance()])) })
                 .post(|| async { (StatusCode::CREATED, Json(canned_instance())) }),
+        )
+        // create body 形状锁：name 键存在且携带入参值 → 回 canned；
+        // 否则（含 None 序列化的 null）→ 400 ECHO_NAME_MISMATCH，
+        // 验证 client 恒发 {"name": ...} 且值原样透传
+        .route(
+            "/api/v1/environments/env_pg/instances",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                match body
+                    .as_ref()
+                    .and_then(|Json(v)| v.get("name"))
+                    .and_then(|n| n.as_str())
+                {
+                    Some("e2e-42") => {
+                        axum::response::IntoResponse::into_response((
+                            StatusCode::CREATED,
+                            Json(canned_instance()),
+                        ))
+                    }
+                    _ => axum::response::IntoResponse::into_response((
+                        StatusCode::BAD_REQUEST,
+                        Json(error_body("ECHO_NAME_MISMATCH")),
+                    )),
+                }
+            }),
         )
         // —— instance ——
         .route(
@@ -812,7 +837,8 @@ fn env_crud_and_stop_all_contract() {
 }
 
 /// instance 全方法面：list / list_by_env / get / create / start / stop / restart /
-/// open(tabs) / cdp / delete
+/// open(tabs) / cdp / delete；name 字段双向解码（Some / null）与 create body 形状、
+/// name 引用解析（唯一命中 / 零命中 → 404）
 #[test]
 fn instance_endpoints_full_surface() {
     let client = test_client();
@@ -821,6 +847,7 @@ fn instance_endpoints_full_surface() {
     assert_eq!(views.len(), 1);
     assert_eq!(views[0].environment_name, "测试环境");
     assert_eq!(views[0].instance.id, "ins_1");
+    assert_eq!(views[0].instance.name.as_deref(), Some("e2e-42"), "name 字段解码");
     assert_eq!(views[0].instance.status, InstanceStatus::Running);
     assert_eq!(views[0].instance.cdp_port, Some(9333));
     assert_eq!(views[0].instance.pid, Some(4321));
@@ -828,11 +855,26 @@ fn instance_endpoints_full_surface() {
     let by_env = client.instance_list_by_env("env_1").expect("应成功");
     assert_eq!(by_env.len(), 1);
     assert_eq!(by_env[0].environment_id, "env_1");
+    assert_eq!(by_env[0].name.as_deref(), Some("e2e-42"));
 
     let created = client
-        .instance_create("env_1")
+        .instance_create("env_1", None)
         .expect("instance_create 应成功");
     assert_eq!(created.id, "ins_1");
+
+    // create body 形状：name 键携带入参值（fixture 分支锁形）；
+    // None 序列化为 null（服务端 #[serde(default)] 兼容），不是缺键
+    let echoed = client
+        .instance_create("env_pg", Some("e2e-42"))
+        .expect("create body 应携带 name=e2e-42");
+    assert_eq!(echoed.name.as_deref(), Some("e2e-42"));
+    let err = client.instance_create("env_pg", None).unwrap_err();
+    match &err {
+        CliError::Api { status, code, .. } => {
+            assert_eq!((*status, code.as_str()), (400, "ECHO_NAME_MISMATCH"));
+        }
+        other => panic!("应为 Api 变体: {other:?}"),
+    }
 
     let got = client.instance_get("ins_1").expect("instance_get 应成功");
     assert_eq!(got.profile_dir, "/tmp/chrome-host/env_1/ins_1");
@@ -862,6 +904,30 @@ fn instance_endpoints_full_surface() {
     client
         .instance_delete("ins_1")
         .expect("instance_delete 应成功");
+}
+
+/// name 引用解析（CLI 层）：唯一命中 → id；零命中 → 404 INSTANCE_NOT_FOUND；
+/// ins_ 前缀零额外请求直达。fixture 全量列表仅 1 个实例（name=e2e-42），
+/// 多命中消歧路径由 cli/instance.rs 的 match_by_name 纯函数单测覆盖。
+#[test]
+fn instance_ref_resolution_by_name() {
+    let client = test_client();
+
+    // name 唯一命中 → 解析为 ins_1（内部走 GET /api/v1/instances）
+    let resolved = cli::instance::resolve_instance_ref(&client, "e2e-42")
+        .expect("name 唯一命中应解析成功");
+    assert_eq!(resolved, "ins_1");
+
+    // 零命中 → 404 INSTANCE_NOT_FOUND（exit 3，与服务端 id 语义同构）
+    let err = cli::instance::resolve_instance_ref(&client, "不存在的名字").unwrap_err();
+    match &err {
+        CliError::Api { status, code, .. } => {
+            assert_eq!(*status, 404);
+            assert_eq!(code, "INSTANCE_NOT_FOUND");
+        }
+        other => panic!("零命中应为 Api 404，实际 {other:?}"),
+    }
+    assert_eq!(exit::from_cli_error(&err).as_u8(), 3);
 }
 
 /// extension 全方法面：list / get / register / set_enabled / delete；

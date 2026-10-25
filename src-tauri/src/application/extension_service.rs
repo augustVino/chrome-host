@@ -525,6 +525,7 @@ mod tests {
     fn sample_ins(env_id: &str) -> Instance {
         Instance {
             id: "ins_test".into(),
+            name: None,
             environment_id: env_id.into(),
             login_profile_id: None,
             profile_dir: "/tmp/x".into(),

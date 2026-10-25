@@ -64,6 +64,9 @@ pub enum InstanceStatus {
 #[serde(rename_all = "camelCase")]
 pub struct Instance {
     pub id: String,
+    /// 可选实例名（同环境唯一）；旧服务端无此字段 → None
+    #[serde(default)]
+    pub name: Option<String>,
     pub environment_id: String,
     pub login_profile_id: Option<String>,
     pub profile_dir: String,

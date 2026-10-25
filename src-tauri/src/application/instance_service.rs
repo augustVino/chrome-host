@@ -7,7 +7,7 @@ use tauri::AppHandle;
 use uuid::Uuid;
 
 use crate::domain::environment::Environment;
-use crate::domain::instance::{Instance, InstanceStatus, RuntimeUpdate};
+use crate::domain::instance::{self as instance_domain, Instance, InstanceStatus, RuntimeUpdate};
 use crate::error::AppError;
 use crate::infrastructure::cdp;
 use crate::infrastructure::cdp::ws::CdpConnection;
@@ -113,8 +113,19 @@ impl InstanceService {
     }
 
     /// 创建并启动 Instance。创建非幂等：每调用一次新增一个 Instance。
-    pub async fn create(&self, env_id: &str) -> Result<Instance, AppError> {
+    /// name 可选（校验见 domain::normalize_name）；同环境内唯一，
+    /// 先查后插预检 + DB 唯一索引兑底双路径。
+    pub async fn create(&self, env_id: &str, name: Option<&str>) -> Result<Instance, AppError> {
         let env = self.envs.get(env_id)?;
+        let name = instance_domain::normalize_name(name)?;
+        if let Some(n) = &name {
+            if self.instances.name_exists(env_id, n)? {
+                return Err(AppError::conflict(
+                    "INSTANCE_NAME_CONFLICT",
+                    format!("实例名 {n} 在环境 {} 内已存在", env.name),
+                ));
+            }
+        }
 
         // 1. 分配 ID 与 CDP 端口
         let id = format!("ins_{}", Uuid::new_v4());
@@ -131,6 +142,7 @@ impl InstanceService {
         let now = chrono::Utc::now().timestamp_millis();
         let draft = Instance {
             id: id.clone(),
+            name,
             environment_id: env.id.clone(),
             login_profile_id,
             profile_dir: profile_dir.to_string_lossy().to_string(),
@@ -144,7 +156,12 @@ impl InstanceService {
             created_at: now,
             updated_at: now,
         };
-        self.instances.insert(&draft)?;
+        if let Err(e) = self.instances.insert(&draft) {
+            // 兑底：并发创建同名实例漏过预检窗口时由 DB 唯一索引拦下，
+            // 统一映射 409（实例表仅 PK 与 env+name 两个唯一约束，PK 为 uuid
+            // 生成不可能碰撞，可安全归类）
+            return Err(map_insert_unique_violation(e, &draft.name));
+        }
         self.emit("instance-created", &id);
 
         // 4. 公共启动流程（内核 → hosts → spawn → CDP）
@@ -846,6 +863,23 @@ impl InstanceService {
     }
 }
 
+/// insert 唯一约束错误 → 409 INSTANCE_NAME_CONFLICT（冻结契约码）。
+/// 独立成色函数供单测：并发竞态兑底语义不依赖完整服务装配即可验证。
+fn map_insert_unique_violation(e: AppError, name: &Option<String>) -> AppError {
+    match &e {
+        AppError::Db(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            let which = name.as_deref().unwrap_or("");
+            AppError::conflict(
+                "INSTANCE_NAME_CONFLICT",
+                format!("实例名 {which} 在该环境内已存在"),
+            )
+        }
+        _ => e,
+    }
+}
+
 /// 诊断目标选择：第一个 http(s) page。过滤 chrome-extension:// 内部页（dev 环境
 /// 代理扩展常驻 options 页，会抢占「第一个 page」）与 about:blank（content script
 /// 不注入，读到的只有 undefined）——单页操作场景下首个 http 页即 agent 所在页面。
@@ -887,6 +921,7 @@ mod tests {
     fn sample_ins(id: &str, env_id: &str, created_at: i64) -> Instance {
         Instance {
             id: id.into(),
+            name: None,
             environment_id: env_id.into(),
             login_profile_id: None,
             profile_dir: "/tmp/x".into(),
@@ -973,6 +1008,28 @@ mod tests {
             "Instance 字段平铺且 camelCase"
         );
         assert!(json.get("instance").is_none(), "不得出现嵌套 instance 键");
+        assert_eq!(json["name"], serde_json::Value::Null, "未命名实例 name 序列化为 null");
+    }
+
+    /// 兑底映射：唯一约束错误 → 409 INSTANCE_NAME_CONFLICT；
+    /// 非约束的 DB 错误原样透传（不吞错、不误归类）。
+    #[test]
+    fn insert_unique_violation_maps_to_409_conflict() {
+        let constraint = AppError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: 19,
+            },
+            Some("UNIQUE constraint failed: instances.environment_id, instances.name".into()),
+        ));
+        let mapped = map_insert_unique_violation(constraint, &Some("task-1".into()));
+        assert_eq!(mapped.status(), 409);
+        assert_eq!(mapped.code(), "INSTANCE_NAME_CONFLICT");
+        assert!(mapped.to_string().contains("task-1"), "message 携带冲突名");
+
+        let other = AppError::Db(rusqlite::Error::InvalidColumnName("x".into()));
+        let passed = map_insert_unique_violation(other, &Some("task-1".into()));
+        assert_eq!(passed.status(), 500, "非约束错误原样透传（Db 默认 500）");
     }
 
     /// 诊断目标选择：扩展内部页与空白页让位，首个 http(s) 页胜出；

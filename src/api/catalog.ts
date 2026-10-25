@@ -39,7 +39,13 @@ export const API_CATALOG: CatalogGroup[] = [
       { method: 'DELETE', path: '/environments/:id', desc: '删除环境（运行中 → 409）' },
       { method: 'GET', path: '/environments/:id/status', desc: '运行时摘要' },
       { method: 'GET', path: '/environments/:id/activity', desc: 'Activity 流（?limit=50）' },
-      { method: 'POST', path: '/environments/:id/instances', desc: '创建并启动 Instance' },
+      {
+        method: 'POST',
+        path: '/environments/:id/instances',
+        desc: '创建并启动 Instance（可选 name，同环境唯一）',
+        body: '{ "name": "checkout-e2e" }',
+        note: 'body 可选：无 body / name=null = 不命名；name 1-64 字符、非纯空白，同环境内唯一，重名 → 409 INSTANCE_NAME_CONFLICT',
+      },
       { method: 'POST', path: '/environments/:id/stop-all', desc: '停止该环境全部实例' },
       {
         method: 'GET',

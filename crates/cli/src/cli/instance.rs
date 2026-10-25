@@ -35,14 +35,14 @@ pub enum InstanceCommands {
     /// 查看实例详情
     #[command(about = "查看实例详情")]
     Get {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
     },
 
     /// 查看实例状态（轻量轮询视图；全量详情含 profileDir 用 get）
     #[command(about = "查看实例状态（轻量轮询视图；全量详情含 profileDir 用 get）")]
     Status {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
     },
 
@@ -51,7 +51,7 @@ pub enum InstanceCommands {
         about = "页面诊断快照：JS 错误/失败资源/LCP/FCP（仅运行中实例，409 = 未运行或无 http 页面）"
     )]
     Diagnostics {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
     },
 
@@ -60,7 +60,7 @@ pub enum InstanceCommands {
         about = "console 环形缓冲（500 条）：--level 过滤、--tab 按标签页过滤、--limit 尾部 N 条"
     )]
     Console {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
         /// 级别过滤：error/warning/info/debug/log
         #[arg(long)]
@@ -78,7 +78,7 @@ pub enum InstanceCommands {
         about = "请求环形缓冲（1000 条）：--failed-only 只看失败/HTTP≥400、--tab 按标签页过滤"
     )]
     Network {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
         /// 只看失败请求或 HTTP ≥400
         #[arg(long = "failed-only")]
@@ -94,7 +94,7 @@ pub enum InstanceCommands {
     /// 当前页面 png 截图（复用常驻诊断连接）
     #[command(about = "当前页面 png 截图：--out 写文件（缺省 <实例id>.png），quiet 输出路径")]
     Screenshot {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
         /// 输出文件路径
         #[arg(long = "out")]
@@ -104,7 +104,7 @@ pub enum InstanceCommands {
     /// 请求环生成 HAR 1.2 文档
     #[command(about = "生成 HAR 1.2：--out 写文件（缺省 <实例id>.har），quiet 输出路径")]
     Har {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
         /// 输出文件路径
         #[arg(long = "out")]
@@ -116,33 +116,36 @@ pub enum InstanceCommands {
     Create {
         /// 环境 id
         env_id: String,
+        /// 可选实例名（1-64 字符；同环境唯一，重名 → 409 exit 5）
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
     },
 
     /// 启动实例
     #[command(about = "启动实例")]
     Start {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
     },
 
     /// 停止实例
     #[command(about = "停止实例")]
     Stop {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
     },
 
     /// 重启实例
     #[command(about = "重启实例")]
     Restart {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
     },
 
     /// 在实例中打开 URL（仅支持 http/https）
     #[command(about = "在实例中打开 URL（仅支持 http/https）")]
     Open {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
         /// 目标 URL（必须以 http:// 或 https:// 开头）
         url: String,
@@ -151,14 +154,14 @@ pub enum InstanceCommands {
     /// 列出实例当前标签页
     #[command(about = "列出实例当前标签页")]
     Tabs {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
     },
 
     /// 将指定标签页导航到新 URL（仅支持 http/https）
     #[command(about = "将指定标签页导航到新 URL（仅支持 http/https）")]
     Navigate {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
         /// 目标标签页 id（由 tabs 获得）
         tab_id: String,
@@ -169,28 +172,28 @@ pub enum InstanceCommands {
     /// 聚焦实例窗口
     #[command(about = "聚焦实例窗口")]
     Focus {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
     },
 
     /// 查看实例 CDP 端点
     #[command(about = "查看实例 CDP 端点")]
     Cdp {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
     },
 
     /// 发放 CDP 会话（远程/代理访问用，30 分钟有效）；--quiet 输出完整代理 URL
     #[command(about = "发放 CDP 会话（远程/代理访问用，30 分钟有效）；--quiet 输出完整代理 URL")]
     CdpSession {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
     },
 
     /// 删除实例（同时删除其 profile 数据；运行中实例会先停止）
     #[command(about = "删除实例（同时删除其 profile 数据；运行中实例会先停止）")]
     Delete {
-        /// 实例 id
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
         id: String,
         /// 跳过确认（非交互环境必需）
         #[arg(long)]
@@ -230,7 +233,7 @@ pub fn run(
         } => network(globals, client, id, *failed_only, tab.as_deref(), *limit),
         InstanceCommands::Screenshot { id, out } => screenshot(globals, client, id, out.as_deref()),
         InstanceCommands::Har { id, out } => har(globals, client, id, out.as_deref()),
-        InstanceCommands::Create { env_id } => create(globals, client, env_id),
+        InstanceCommands::Create { env_id, name } => create(globals, client, env_id, name.as_deref()),
         InstanceCommands::Start { id } => start(globals, client, id),
         InstanceCommands::Stop { id } => stop(globals, client, id),
         InstanceCommands::Restart { id } => restart(globals, client, id),
@@ -246,8 +249,51 @@ pub fn run(
     }
 }
 
-/// `chrome-host instance list [--env <env_id>]`。table 列集冻结：
-/// ID ENVIRONMENT STATUS PID CDP。
+/// 实例引用解析：ID 直达 / name 匹配（CLI 层解析，API 路径参数恒为 id）。
+/// - `ins_` 前缀 → 视为 id 原样使用（零额外请求；实例 id 恒为 ins_ 前缀，
+///   name 撞前缀时 id 优先）；
+/// - 其余 → GET /api/v1/instances 全量列表按 name 精确匹配（服务端唯一性
+///   是环境级的，全局匹配唯一即可安全解析）：唯一命中 → 该实例 id；
+///   零命中 → 404 INSTANCE_NOT_FOUND（exit 3，与服务端语义同构）；
+///   多命中（同名实例存在于多个环境）→ Local 错误列出候选（exit 2，改用 id 消歧）。
+pub(crate) fn resolve_instance_ref(client: &AgentClient, id_or_name: &str) -> Result<String, CliError> {
+    if id_or_name.starts_with("ins_") {
+        return Ok(id_or_name.to_string());
+    }
+    let views = client.instance_list()?;
+    let matched = match_by_name(&views, id_or_name);
+    match matched.len() {
+        0 => Err(CliError::Api {
+            status: 404,
+            code: "INSTANCE_NOT_FOUND".into(),
+            message: format!(
+                "没有名为「{id_or_name}」的实例（name 引用需实例已命名；也可使用 ins_ 前缀的 id）"
+            ),
+        }),
+        1 => Ok(matched[0].instance.id.clone()),
+        _ => Err(CliError::Local(format!(
+            "实例名「{id_or_name}」不唯一（存在 {} 个环境的同名实例），请改用 id：{}",
+            matched.len(),
+            matched
+                .iter()
+                .map(|v| format!("{}（{}）", v.instance.id, v.environment_name))
+                .collect::<Vec<_>>()
+                .join("、")
+        ))),
+    }
+}
+
+/// name 精确匹配（纯函数，供单测）；未命名实例（None）不参与匹配。
+fn match_by_name<'a>(views: &'a [InstanceView], name: &str) -> Vec<&'a InstanceView> {
+    views
+        .iter()
+        .filter(|v| v.instance.name.as_deref() == Some(name))
+        .collect()
+}
+
+/// `chrome-host instance list [--env <env_id>]`。table 列集：
+/// ID NAME ENVIRONMENT STATUS PID CDP（NAME 列随实例命名能力 v0.6+ 加入，
+/// 可空显示 `-`；此前为五列冻结集的显式扩展，json 模式不变）。
 ///
 /// 两种数据源形状不同（服务端契约）：
 /// - 缺省走全量端点 GET /api/v1/instances → `InstanceView`（含 environmentName，
@@ -282,16 +328,18 @@ fn list(globals: &GlobalArgs, client: &AgentClient, env: Option<&str>) -> Result
                 .collect()
         }
     };
-    out.render_list(&["ID", "ENVIRONMENT", "STATUS", "PID", "CDP"], &rows);
+    out.render_list(&["ID", "NAME", "ENVIRONMENT", "STATUS", "PID", "CDP"], &rows);
     Ok(())
 }
 
-/// table 五列单元格（ID ENVIRONMENT STATUS PID CDP）。ENVIRONMENT 列取值由调用方注入
-/// （理由见 [`list`]）；PID/CDP 空值显示 `-` —— 仅 table 占位，json 原样保留 null
+/// table 六列单元格（ID NAME ENVIRONMENT STATUS PID CDP）。ENVIRONMENT 列取值由调用方注入
+/// （理由见 [`list`]）；name 可空显示 `-`（同 PID/CDP 占位约定，json 原样保留 null）；
+/// PID/CDP 空值显示 `-` —— 仅 table 占位，json 原样保留 null
 /// （两模式无信息差，PRD §39）。
 fn instance_cells(instance: &Instance, environment: &str) -> Vec<String> {
     vec![
         instance.id.clone(),
+        instance.name.clone().unwrap_or_else(|| "-".into()),
         environment.to_string(),
         status_label(&instance.status),
         option_cell(instance.pid),
@@ -314,11 +362,12 @@ fn option_cell<T: ToString>(value: Option<T>) -> String {
     value.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
 }
 
-/// `chrome-host instance get <id>`：单对象渲染 —— json 原样；table 模式 key: value。
+/// `chrome-host instance get <id|name>`：单对象渲染 —— json 原样；table 模式 key: value。
 /// quiet 对单对象无冻结语义（同 env get），按缺省 kv 输出。
 fn get(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let instance = client.instance_get(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let instance = client.instance_get(&id)?;
     out.render_kv(
         &instance_kv_pairs(&instance),
         serde_json::to_value(&instance).expect("纯数据 DTO 的序列化不会失败"),
@@ -327,13 +376,18 @@ fn get(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliEr
 }
 
 /// instance get/create/start/stop/restart 共用的单对象 key: value 对，键名与
-/// JSON 字段一致（PRD §39 两模式无信息差）。冻结字段集：
-/// id/status/pid/cdpPort/browserVersion/profileDir/createdAt/updatedAt。
+/// JSON 字段一致（PRD §39 两模式无信息差）。字段集：
+/// id/name/status/pid/cdpPort/browserVersion/profileDir/createdAt/updatedAt
+/// （name 随实例命名能力 v0.6+ 加入，与 json 字段同步——不进 kv 会造成两模式信息差）。
 /// 时间戳输出原始 epoch 毫秒（同 env_kv_pairs：不为本地格式化加 chrono 依赖）；
 /// Option 字段 table 模式空值显示 `-`，json 原样保留 null。
 fn instance_kv_pairs(instance: &Instance) -> Vec<(String, String)> {
     vec![
         ("id".into(), instance.id.clone()),
+        (
+            "name".into(),
+            instance.name.clone().unwrap_or_else(|| "-".into()),
+        ),
         ("status".into(), status_label(&instance.status)),
         ("pid".into(), option_cell(instance.pid)),
         ("cdpPort".into(), option_cell(instance.cdp_port)),
@@ -355,7 +409,8 @@ fn instance_kv_pairs(instance: &Instance) -> Vec<(String, String)> {
 /// 适合脚本高频轮询；get 是全量详情）。
 fn status(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let view = client.instance_status(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let view = client.instance_status(&id)?;
     out.render_kv(
         &status_kv_pairs(&view),
         serde_json::to_value(&view).expect("纯数据 DTO 的序列化不会失败"),
@@ -375,7 +430,8 @@ fn console(
     limit: Option<usize>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.instance_console(id, level, tab, limit)?;
+    let id = resolve_instance_ref(client, id)?;
+    let resp = client.instance_console(&id, level, tab, limit)?;
     let entries = resp
         .get("entries")
         .and_then(|v| v.as_array())
@@ -429,7 +485,8 @@ fn network(
     limit: Option<usize>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.instance_network(id, failed_only, tab, limit)?;
+    let id = resolve_instance_ref(client, id)?;
+    let resp = client.instance_network(&id, failed_only, tab, limit)?;
     let entries = resp
         .get("entries")
         .and_then(|v| v.as_array())
@@ -512,7 +569,8 @@ fn screenshot(
     out_path: Option<&str>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.instance_screenshot(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let resp = client.instance_screenshot(&id)?;
     let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
     let bytes = decode_base64_png(data)?;
     if !out.json {
@@ -547,7 +605,8 @@ fn har(
     out_path: Option<&str>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.instance_har(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let resp = client.instance_har(&id)?;
     if out.json {
         out.render_kv(&[], resp);
         return Ok(());
@@ -607,7 +666,8 @@ fn truncate(s: &str, max: usize) -> String {
 /// quiet：输出 targetUrl（供脚本捕获定位被诊断页面）。
 fn diagnostics(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.instance_diagnostics(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let resp = client.instance_diagnostics(&id)?;
     if out.quiet {
         out.print_id(resp.get("targetUrl").and_then(|v| v.as_str()).unwrap_or(""));
         return Ok(());
@@ -658,6 +718,47 @@ fn diagnostics_kv_pairs(resp: &serde_json::Value) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 构造测试用 InstanceView（仅 name / id / 环境名参与匹配与提示）
+    fn view(id: &str, env: &str, name: Option<&str>) -> InstanceView {
+        InstanceView {
+            instance: Instance {
+                id: id.into(),
+                name: name.map(str::to_string),
+                environment_id: env.into(),
+                login_profile_id: None,
+                profile_dir: String::new(),
+                pid: None,
+                cdp_port: None,
+                status: crate::model::InstanceStatus::Stopped,
+                host_rules: None,
+                browser_version: None,
+                started_at: None,
+                stopped_at: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+            environment_name: env.to_string(),
+        }
+    }
+
+    /// name 解析的匹配语义：精确匹配、未命名不参与、同名多命中保留全部候选。
+    /// 解析消费方（resolve_instance_ref）据此保证「唯一命中才解析」的安全前提。
+    #[test]
+    fn match_by_name_exact_and_excludes_unnamed() {
+        let views = vec![
+            view("ins_1", "env_a", Some("task-1")),
+            view("ins_2", "env_a", None),
+            view("ins_3", "env_b", Some("task-1")),
+            view("ins_4", "env_b", Some("task-1x")),
+        ];
+        assert_eq!(match_by_name(&views, "task-1").len(), 2, "同名路多环境 → 多命中待消歧");
+        let unique = match_by_name(&views, "task-1x");
+        assert_eq!(unique.len(), 1);
+        assert_eq!(unique[0].instance.id, "ins_4");
+        assert!(match_by_name(&views, "task-2").is_empty(), "零命中");
+        assert!(match_by_name(&views, "").is_empty(), "空串不匹配任何（含未命名）");
+    }
 
     /// 摘要提取：对象快照 → 计数/指标；null/缺失 → 明示未注入而非伪 0
     #[test]
@@ -724,31 +825,39 @@ fn status_kv_pairs(view: &InstanceStatusView) -> Vec<(String, String)> {
     ]
 }
 
-/// `chrome-host instance create <env_id>`：创建即启动 —— 服务端内部走完
+/// `chrome-host instance create <env_id> [--name <name>]`：创建即启动 —— 服务端内部走完
 /// 内核就绪 → hosts → spawn → CDP 等待全链路后才返回；首次运行可能阻塞于
 /// Chrome for Testing 内核下载（~150MB，本调用在 client.rs 走无总超时客户端，
 /// Ctrl-C 安全：下载槽服务端幂等）。quiet 输出新实例 id，table 模式
-/// 输出创建后快照 kv。
-fn create(globals: &GlobalArgs, client: &AgentClient, env_id: &str) -> Result<(), CliError> {
-    let instance = client.instance_create(env_id)?;
+/// 输出创建后快照 kv。name 可选：同环境唯一，重名 → 409 exit 5。
+fn create(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    env_id: &str,
+    name: Option<&str>,
+) -> Result<(), CliError> {
+    let instance = client.instance_create(env_id, name)?;
     render_mutated(globals, instance)
 }
 
-/// `chrome-host instance start <id>`：启动含内核/CDP 等待，长操作。
+/// `chrome-host instance start <id|name>`：启动含内核/CDP 等待，长操作。
 fn start(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
-    let instance = client.instance_start(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let instance = client.instance_start(&id)?;
     render_mutated(globals, instance)
 }
 
-/// `chrome-host instance stop <id>`：优雅退出，常规超时内完成。
+/// `chrome-host instance stop <id|name>`：优雅退出，常规超时内完成。
 fn stop(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
-    let instance = client.instance_stop(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let instance = client.instance_stop(&id)?;
     render_mutated(globals, instance)
 }
 
-/// `chrome-host instance restart <id>`：stop + start 复合，长操作。
+/// `chrome-host instance restart <id|name>`：stop + start 复合，长操作。
 fn restart(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
-    let instance = client.instance_restart(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let instance = client.instance_restart(&id)?;
     render_mutated(globals, instance)
 }
 
@@ -786,8 +895,9 @@ fn validate_url(url: &str) -> Result<(), CliError> {
 /// 省一次注定失败的网络往返，错误即时反馈），规则见 [`validate_url`]。
 fn open(globals: &GlobalArgs, client: &AgentClient, id: &str, url: &str) -> Result<(), CliError> {
     validate_url(url)?;
+    let id = resolve_instance_ref(client, id)?;
     let out = OutputCtx::from(globals);
-    let target = client.instance_open(id, url)?;
+    let target = client.instance_open(&id, url)?;
     out.render_kv(
         &target_kv_pairs(&target),
         serde_json::to_value(&target).expect("纯数据 DTO 的序列化不会失败"),
@@ -801,7 +911,8 @@ fn open(globals: &GlobalArgs, client: &AgentClient, id: &str, url: &str) -> Resu
 /// json 原样 Vec&lt;CdpTarget&gt;；quiet 每行 tab id（供 navigate `$(...)` 取用）。
 fn tabs(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let targets = client.instance_tabs(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let targets = client.instance_tabs(&id)?;
     let rows: Vec<TableRow> = targets
         .iter()
         .map(|t| TableRow {
@@ -825,8 +936,9 @@ fn navigate(
     url: &str,
 ) -> Result<(), CliError> {
     validate_url(url)?;
+    let id = resolve_instance_ref(client, id)?;
     let out = OutputCtx::from(globals);
-    let target = client.instance_navigate(id, tab_id, url)?;
+    let target = client.instance_navigate(&id, tab_id, url)?;
     out.render_kv(
         &target_kv_pairs(&target),
         serde_json::to_value(&target).expect("纯数据 DTO 的序列化不会失败"),
@@ -839,7 +951,8 @@ fn navigate(
 /// （exit 5，无翻译义务——该码语义单一），CLI 不做二次包装。成功走
 /// [`render_mutated`]：服务端返回操作后实例快照，与 start/stop 同为变更类渲染。
 fn focus(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
-    let instance = client.instance_focus(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let instance = client.instance_focus(&id)?;
     render_mutated(globals, instance)
 }
 
@@ -857,7 +970,8 @@ fn target_kv_pairs(target: &CdpTarget) -> Vec<(String, String)> {
 /// webSocketUrl 可空显示 `-`（json 原样保留 null）。
 fn cdp(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let endpoint = client.instance_cdp(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let endpoint = client.instance_cdp(&id)?;
     out.render_kv(
         &cdp_kv_pairs(&endpoint),
         serde_json::to_value(&endpoint).expect("纯数据 DTO 的序列化不会失败"),
@@ -871,7 +985,8 @@ fn cdp(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliEr
 /// json 模式在服务端 DTO 基础上补 fullUrl 字段，与 kv 无信息差。
 fn cdp_session(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let view = client.instance_cdp_session(id)?;
+    let id = resolve_instance_ref(client, id)?;
+    let view = client.instance_cdp_session(&id)?;
     let full_url = format!("{}{}", client.base_url(), view.base_url);
     if out.quiet {
         out.print_id(&full_url);
@@ -943,8 +1058,9 @@ fn delete(
     if !yes {
         confirm_or_yes(globals, "删除实例将同时删除其 profile 数据，继续?")?;
     }
+    let id = resolve_instance_ref(client, id)?;
 
-    match client.instance_delete(id) {
+    match client.instance_delete(&id) {
         Ok(()) => {}
         // 原 409 错误在此臂不透传：确认流取消 → exit 2「已取消」，否则 stop 后重试
         // DELETE（失败原样上抛），都携带比原始 409 更明确的终态信息
@@ -962,14 +1078,14 @@ fn delete(
                     "实例运行中，非交互环境需要 --yes 才能停止并删除".into(),
                 ));
             }
-            client.instance_stop(id)?;
-            client.instance_delete(id)?;
+            client.instance_stop(&id)?;
+            client.instance_delete(&id)?;
         }
         Err(err) => return Err(err),
     }
 
     if out.quiet {
-        out.print_id(id);
+        out.print_id(&id);
     }
     Ok(())
 }

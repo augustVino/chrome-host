@@ -23,8 +23,8 @@ impl InstanceRepository {
     pub fn insert(&self, ins: &Instance) -> Result<(), AppError> {
         let conn = self.pool.get()?;
         conn.execute(
-            "INSERT INTO instances (id, environment_id, login_profile_id, profile_dir, pid, cdp_port, status, host_rules, browser_version, started_at, stopped_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO instances (id, environment_id, login_profile_id, profile_dir, pid, cdp_port, status, host_rules, browser_version, started_at, stopped_at, created_at, updated_at, name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 ins.id,
                 ins.environment_id,
@@ -39,6 +39,7 @@ impl InstanceRepository {
                 ins.stopped_at,
                 ins.created_at,
                 ins.created_at,
+                ins.name,
             ],
         )?;
         Ok(())
@@ -186,7 +187,7 @@ impl InstanceRepository {
     }
 
     const SELECT: &'static str =
-        "SELECT id, environment_id, login_profile_id, profile_dir, pid, cdp_port, status, host_rules, browser_version, started_at, stopped_at, created_at, updated_at
+        "SELECT id, environment_id, login_profile_id, profile_dir, pid, cdp_port, status, host_rules, browser_version, started_at, stopped_at, created_at, updated_at, name
          FROM instances";
 
     fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
@@ -194,6 +195,7 @@ impl InstanceRepository {
         let cdp_port: Option<i64> = row.get(5)?;
         Ok(Instance {
             id: row.get(0)?,
+            name: row.get(13)?,
             environment_id: row.get(1)?,
             login_profile_id: row.get(2)?,
             profile_dir: row.get(3)?,
@@ -207,6 +209,17 @@ impl InstanceRepository {
             created_at: row.get(11)?,
             updated_at: row.get(12)?,
         })
+    }
+
+    /// 同环境内 name 是否已被占用（创建前冲突预检；并发窗口由 DB 唯一索引兜底）
+    pub fn name_exists(&self, env_id: &str, name: &str) -> Result<bool, AppError> {
+        let conn = self.pool.get()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM instances WHERE environment_id = ?1 AND name = ?2",
+            params![env_id, name],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
     }
 }
 
@@ -231,6 +244,7 @@ mod tests {
     fn sample_instance(env_id: &str, id: &str, port: u16) -> Instance {
         Instance {
             id: id.to_string(),
+            name: None,
             environment_id: env_id.to_string(),
             login_profile_id: None,
             profile_dir: format!("/tmp/instances/{id}"),
@@ -311,5 +325,60 @@ mod tests {
             .update_runtime("ins_1", RuntimeUpdate { status: Some(InstanceStatus::Running), ..Default::default() })
             .unwrap();
         assert_eq!(instances.count_running_by_env("env_a").unwrap(), 1);
+    }
+
+    /// name 唯一约束的仓储层验证：先查后插的预检（name_exists）与
+    /// DB 唯一索引兑底（同环境同名 insert 报错）双路径部到位。
+    #[test]
+    fn name_roundtrip_uniqueness_and_precheck() {
+        let (_pool, envs, instances) = setup();
+        envs.insert(&Environment {
+            id: "env_a".into(),
+            name: "A".into(),
+            hosts_source_url: None,
+            icon: None,
+            startup_args: None,
+            keep_alive: false,
+            session_capture: Default::default(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+        envs.insert(&Environment {
+            id: "env_b".into(),
+            name: "B".into(),
+            hosts_source_url: None,
+            icon: None,
+            startup_args: None,
+            keep_alive: false,
+            session_capture: Default::default(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+
+        // 写入与回读：Some/None 均往返
+        let mut named = sample_instance("env_a", "ins_1", 9222);
+        named.name = Some("task-1".into());
+        instances.insert(&named).unwrap();
+        instances.insert(&sample_instance("env_a", "ins_2", 9223)).unwrap();
+        assert_eq!(instances.get("ins_1").unwrap().name.as_deref(), Some("task-1"));
+        assert_eq!(instances.get("ins_2").unwrap().name, None);
+
+        // 预检：同环境已占用 / 未占用；跨环境同名不占用（唯一性是环境级的）
+        assert!(instances.name_exists("env_a", "task-1").unwrap());
+        assert!(!instances.name_exists("env_a", "task-2").unwrap());
+        assert!(!instances.name_exists("env_b", "task-1").unwrap());
+
+        // 兑底：同环境同名 insert 被唯一索引拒绝（以 Sqlite 唯一约束错误形态上抛，
+        // 409 语义映射在 service 层）；两个 NULL name 共存合法已由 ins_2 覆盖
+        let mut dup = sample_instance("env_a", "ins_3", 9224);
+        dup.name = Some("task-1".into());
+        let err = instances.insert(&dup).unwrap_err();
+        assert!(
+            matches!(&err, AppError::Db(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation),
+            "唯一约束错误原样上抛供 service 映射 409: {err:?}"
+        );
     }
 }
