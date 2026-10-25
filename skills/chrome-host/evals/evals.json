@@ -60,6 +60,15 @@
         "snap 后能发现 [frame] 段与帧内 @eN 引用，直接 fill/click 帧内 @eN（而不是立刻退到 clickxy+type 坐标兜底）",
         "帧内 ref 失效（PAGE_REF_STALE）时重新 snap 而非重试旧引用"
       ]
+    },
+    {
+      "id": "table-extract-coverage",
+      "prompt": "在 qa12345 实例里打开订单查询页，把查询结果表格导出成结构化数据给我（表格有合并表头）",
+      "checks": [
+        "用 page extract（而非 page html 后手写解析或 eval 拼 DOM 遍历）",
+        "正确解读 coverage（datasetComplete=incomplete 时告知用户数据可能不完整，不装作全量）",
+        "null 与空字符串单元格语义不被混淆"
+      ]
     }
   ]
 }

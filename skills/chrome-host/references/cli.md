@@ -74,7 +74,8 @@ page navigate <id> <url> [--tab t]         页内导航（Page.navigate，保留
 page back    <id> [--tab t]                历史后退一步（边界 → 409 PAGE_NAV_NO_HISTORY）
 page forward <id> [--tab t]               历史前进一步（边界 → 409 PAGE_NAV_NO_HISTORY）
 page reload  <id> [--ignore-cache] [--tab t]  重载当前页（等待语义同 navigate）
-page screenshot <id> [sel|@eN] [--out f] [--tab t]  png 截图：目标缺省=当前视口；元素路径先滚入视口再截包围盒（跨行取并集）
+page screenshot <id> [sel|@eN] [--full] [--out f] [--tab t]  png 截图：目标缺省=当前视口；元素路径先滚入视口再截包围盒（跨行取并集）；--full=全页长截图（上限 16384 设备像素 ÷ DPR，Retina=8192 CSS；缺省文件 <id>-full.png；与目标互斥）
+page extract <id> [sel|@eN] [--tab t] [--out f.json]  表格 → 结构化 JSON（columns/rows/coverage/meta；缺省目标 = 主文档最大表格自动发现；null=被合并覆盖、""=真实空单元格；coverage.datasetComplete 只有 unknown/incomplete——aria-rowcount 超出/截断/空 tbody 均 incomplete 并给 reasons，永不装作取全；非表格 → 422 PAGE_EXTRACT_NOT_A_TABLE）
 page pdf     <id> [--out f] [--landscape] [--no-print-background] [--paper-width 8.5] [--paper-height 11] [--tab t]  整页 PDF（缺省 Letter 纵向带背景）
 page emulate <id> --preset NAME | --viewport WxH [--user-agent UA] [--mobile] [--touch] | --off [--tab t]  设备仿真（预设：iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p；仅作用该 tab，重复=覆盖，--off 恢复）
 page eval    <id> <expr> [--tab t]          执行 JS（returnByValue+awaitPromise；优先用上面的原语）

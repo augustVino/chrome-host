@@ -111,7 +111,7 @@ chrome-host page navigate <id> <url> [--tab t]         # 页内导航（保留�
 chrome-host page back    <id> [--tab t]                # 历史后退（边界 → 409 PAGE_NAV_NO_HISTORY）
 chrome-host page forward <id> [--tab t]               # 历史前进
 chrome-host page reload  <id> [--ignore-cache] [--tab t]  # 重载当前页
-chrome-host page screenshot <id> [sel|@eN] [--out f] [--tab t]  # 视口/元素截图（png 写文件）
+chrome-host page screenshot <id> [sel|@eN] [--full] [--out f] [--tab t]  # 视口/元素/全页截图（--full 截发起时刻整文档，懒加载未加载内容不在图）
 chrome-host page pdf     <id> [--out f] [--landscape] [--paper-width 8.5] [--paper-height 11] [--tab t]  # 整页 PDF
 chrome-host page emulate <id> --preset iphone-14|... | --viewport WxH [--user-agent UA] | --off [--tab t]  # 设备仿真（仅作用该 tab）
 chrome-host page eval    <id> <expr> [--tab t]         # 执行 JS（优先用上面的原语，eval 是逃生舱）
@@ -198,7 +198,7 @@ agent 的 shell 是非交互环境（非 TTY），缺 `--yes` 时这些命令直
 | page 命令族全量速查与 PAGE_* 错误码表 | references/cli.md「页面操控（page 命令族）」 |
 | 登录态自动保存 / 显式固化 / 回滚 | references/cli.md「登录态」 |
 | 远程接入原理与隧道排障 | references/cli.md「远程接入」 |
-| MCP 入口（53 个 tools，含 page_* 十八族）与安全边界 | references/cli.md 末尾两章 |
+| MCP 入口（57 个 tools，含 page_* 二十三族）与安全边界 | references/cli.md 末尾两章 |
 
 ## 评估与回归（evals/）
 
