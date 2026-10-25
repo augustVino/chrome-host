@@ -40,6 +40,23 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, 
 /// 常驻连接的事件出口：无 id 帧（CDP 事件）透传给消费者
 pub type EventSink = mpsc::UnboundedSender<serde_json::Value>;
 
+/// pending 表项的取消安全守卫：send future 在任意 await 点被外层 drop
+/// （如 diagnostics body 拉取的 2.5s 预算超时）时，由 Drop 即时移除表项。
+/// 此前只有内层超时（15s）或响应到达才清理——被 drop 的悬挂请求会滞留
+/// pending 表直到 Chrome 迟来响应被 reader 路由丢弃或连接关闭统一 drain。
+/// 正常出口（响应/拒绝/内层超时/写失败）Drop 同样执行 remove，幂等无害：
+/// id 单调不复用，reader 抢先移除时 remove 落空即 no-op。
+struct PendingGuard {
+    pending: Pending,
+    id: u64,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
 /// 一次性 CDP 命令连接（可共享：`Arc<CdpConnection>` 直接发命令，无锁包裹）。
 pub struct CdpConnection {
     /// 写半部短锁：只覆盖「写一帧」，不等响应——若把等响应也留在锁内，
@@ -115,7 +132,9 @@ impl CdpConnection {
     /// - `params` 传 `()` 表示无参数命令（序列化为 null，Chrome 接受）；
     /// - `session_id` 供 flatten 模式的 per-target 命令；browser 级命令传 None；
     /// - Chrome 侧返回 error、命令超时、连接中断统一归为
-    ///   `CDP_COMMAND_FAILED`（调用方按可降级路径处理，区分码无消费方）。
+    ///   `CDP_COMMAND_FAILED`（调用方按可降级路径处理，区分码无消费方）；
+    /// - 取消安全（W-fix2）：future 在任意 await 点被 drop 时 pending 表项由
+    ///   [`PendingGuard`] 即时移除——外层包 timeout 取消不再依赖内层超时兜底。
     pub async fn send<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -135,6 +154,12 @@ impl CdpConnection {
 
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        // 插入即布防：本函数所有出口（写帧失败/响应/拒绝/内层超时/被外层
+        // drop）统一经 Drop 清理 pending——取代原先散落的手动 remove
+        let _guard = PendingGuard {
+            pending: Arc::clone(&self.pending),
+            id,
+        };
 
         {
             // 写帧短锁：发送完成即释放，等响应不持锁（并发 in-flight 的前提）
@@ -145,22 +170,18 @@ impl CdpConnection {
                 ))
                 .await
                 .map_err(|e| {
-                    self.pending.lock().unwrap().remove(&id);
                     AppError::business(500, "CDP_COMMAND_FAILED", format!("CDP 命令发送失败: {e}"))
                 })?;
         }
 
         let outcome = tokio::time::timeout(self.timeout, rx).await;
         match outcome {
-            // 超时：清掉 pending 表项防泄漏（reader 只在收到响应时移除）
-            Err(_elapsed) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(AppError::business(
-                    500,
-                    "CDP_COMMAND_FAILED",
-                    format!("CDP 命令 {method} 超时（{}ms）", self.timeout.as_millis()),
-                ))
-            }
+            // 超时：表项由 _guard Drop 移除（reader 只在收到响应时移除）
+            Err(_elapsed) => Err(AppError::business(
+                500,
+                "CDP_COMMAND_FAILED",
+                format!("CDP 命令 {method} 超时（{}ms）", self.timeout.as_millis()),
+            )),
             // reader 在连接关闭时会把所有 pending 置为 Err
             Ok(Err(_closed)) => Err(AppError::business(
                 500,
@@ -329,6 +350,31 @@ mod tests {
         let err = conn.send::<Value>("Echo.hang", (), None).await.unwrap_err();
         assert_eq!(err.code(), "CDP_COMMAND_FAILED");
         assert!(err.to_string().contains("超时"));
+    }
+
+    /// 取消安全回归（W-fix2）：外层 timeout drop 掉 send future 时，pending
+    /// 表项必须被 Drop guard 即时移除——此前只有内层超时或响应到达才清理，
+    /// 悬挂请求会滞留 pending 表直到连接关闭
+    #[tokio::test]
+    async fn dropped_send_removes_pending_entry() {
+        let url = spawn_mock().await;
+        // 内层超时 10s：若 drop 不清理，表项将滞留至 10s 内层超时——直接断言 0
+        let conn = CdpConnection::connect_ws(&url, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            conn.send::<Value>("Echo.hang", (), None),
+        )
+        .await; // Elapsed：send future 在此被 drop
+        assert_eq!(
+            conn.pending.lock().unwrap().len(),
+            0,
+            "drop 后 pending 表项必须即时清理"
+        );
+        // 后续命令不受残留表项影响（id 递增不冲突）
+        let out: Value = conn.send("Echo.ok", json!({ "n": 1 }), None).await.unwrap();
+        assert_eq!(out["n"], 1);
     }
 
     #[tokio::test]

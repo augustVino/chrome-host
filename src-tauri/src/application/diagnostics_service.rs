@@ -18,8 +18,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::domain::diagnostics::{
-    ApplyOutcome, BodyPayload, BodyState, DiagBuffer, NetworkBodyView, QueryResult, RingStats,
-    NETWORK_SCOPE_COMPLETED, REASON_NO_DATA, REASON_TIMEOUT,
+    build_har, settle_body, ApplyOutcome, BodyPayload, BodyState, DiagBuffer, NetworkBodyView,
+    QueryResult, RingStats, SettledBody, NETWORK_SCOPE_COMPLETED, REASON_NO_DATA, REASON_TIMEOUT,
 };
 use crate::domain::instance::InstanceStatus;
 use crate::error::AppError;
@@ -206,21 +206,27 @@ impl DiagnosticsService {
     /// 不用 {har, meta} 包裹——会破坏「API 返回 HAR 文档原样」的既有消费方）
     pub fn har(&self, ins_id: &str) -> Result<Value, AppError> {
         let watched = self.require(ins_id)?;
-        let (mut har, stats, since, live) = match watched {
+        // 锁内只取快照（条目克隆 + 统计，同一锁内获得 = 一致的点时视图）；
+        // HAR 组装（含最高 ~8MiB body 的 base64 编码）在锁外——与 body 结算
+        // 同纪律：重活不进 DiagBuffer Mutex，事件泵与查询不被 HAR 生成阻塞
+        let (snapshot, stats, since, live) = match watched {
             Some(w) => {
                 let buf = w.buffer.lock().unwrap();
                 (
-                    buf.to_har(&self.version),
+                    buf.har_snapshot(),
                     buf.network_stats(),
                     Some(w.since_ms),
                     true,
                 )
             }
-            None => {
-                let buf = DiagBuffer::default();
-                (buf.to_har(&self.version), buf.network_stats(), None, false)
-            }
+            None => (
+                Vec::new(),
+                DiagBuffer::default().network_stats(),
+                None,
+                false,
+            ),
         };
+        let mut har = build_har(&snapshot, &self.version);
         har["_meta"] = json!({
             "since": since,
             "live": live,
@@ -251,7 +257,9 @@ impl DiagnosticsService {
         limit: Option<usize>,
     ) -> Result<Value, AppError> {
         let offset = offset.unwrap_or(0);
-        let limit = limit.unwrap_or(BODY_READ_DEFAULT_LIMIT).min(BODY_READ_MAX_LIMIT);
+        let limit = limit
+            .unwrap_or(BODY_READ_DEFAULT_LIMIT)
+            .min(BODY_READ_MAX_LIMIT);
         let Some(watched) = self.require(ins_id)? else {
             return Err(AppError::not_found(
                 "NETWORK_BODY_NOT_FOUND",
@@ -360,7 +368,7 @@ fn dispatch_body_fetch(watched: &Arc<Watched>, session_id: String, request_id: S
     if watched.body_backlog.load(Ordering::Relaxed) >= BODY_BACKLOG_CAP {
         watched.buffer.lock().unwrap().store_body(
             &request_id,
-            BodyPayload::Unavailable {
+            SettledBody::Unavailable {
                 reason: REASON_NO_DATA,
             },
         );
@@ -376,18 +384,33 @@ fn dispatch_body_fetch(watched: &Arc<Watched>, session_id: String, request_id: S
         // 排队等待 permit（≤4 并发）；拿到 permit 即退出排队计数
         let _permit = gate.acquire().await;
         backlog.fetch_sub(1, Ordering::Relaxed);
+        // 两段式结算（W-fix2 锁外化）：① 锁内 mime 快照（短锁）——目标条目
+        // 已被并发结算/环溢出挤出则诚实丢弃，网络拉取与解码脱敏全部跳过
+        let Some(mime) = buffer.lock().unwrap().pending_body_mime(&request_id) else {
+            return;
+        };
         let payload = match conn {
-            Some(conn) => fetch_response_body(&conn, &session_id, &request_id, BODY_FETCH_TIMEOUT).await,
+            Some(conn) => {
+                fetch_response_body(&conn, &session_id, &request_id, BODY_FETCH_TIMEOUT).await
+            }
             None => BodyPayload::Unavailable {
                 reason: REASON_NO_DATA,
             },
         };
-        buffer.lock().unwrap().store_body(&request_id, payload);
+        // ② 锁外重活：base64 解码 → UTF-8 校验 → 脱敏 → 单条截断。此前全部
+        // 发生在 DiagBuffer Mutex 内——大 body 会串行卡死事件泵 apply() 与
+        // console/network/har 全部查询，与「常驻事件流不被拉取堵死」相悖
+        let settled = settle_body(mime.as_deref(), payload);
+        // ③ 锁内轻活：终态入账 + 预算驱逐（最旧先驱；快照-计算-回锁提交
+        // 期间账本可能被并发结算推进，驱逐基于锁内最新 body_bytes 重验）
+        buffer.lock().unwrap().store_body(&request_id, settled);
     });
 }
 
 /// 单条拉取：getResponseBody（per-session）+ 2.5s 超时预算 → 归因映射。
-/// timeout 参数化仅为单测提速（生产恒为 [`BODY_FETCH_TIMEOUT`]）。
+/// 外层 timeout drop 掉 send future 是取消安全的：ws.rs send 以 Drop guard
+/// 即时清理 pending 表项（W-fix2），悬挂请求不再滞留至内层 15s 超时或连接
+/// 关闭。timeout 参数化仅为单测提速（生产恒为 [`BODY_FETCH_TIMEOUT`]）。
 async fn fetch_response_body(
     conn: &CdpConnection,
     session_id: &str,
@@ -488,9 +511,10 @@ async fn watch_loop(
                     let outcome = watched.buffer.lock().unwrap().apply(&event, now_ms());
                     match outcome {
                         ApplyOutcome::Attach(sid) => enable_session(&watched, &sid).await,
-                        ApplyOutcome::BodyFetch { session_id, request_id } => {
-                            dispatch_body_fetch(&watched, session_id, request_id)
-                        }
+                        ApplyOutcome::BodyFetch {
+                            session_id,
+                            request_id,
+                        } => dispatch_body_fetch(&watched, session_id, request_id),
                         ApplyOutcome::Detach(_) | ApplyOutcome::None => {}
                     }
                 }
@@ -610,8 +634,15 @@ mod tests {
             0,
             "无 watcher = 空数据"
         );
-        assert_eq!(console["meta"]["since"], Value::Null, "无 watcher 无窗口起点");
-        assert_eq!(console["meta"]["live"], false, "无 watcher 必须声明非活采集");
+        assert_eq!(
+            console["meta"]["since"],
+            Value::Null,
+            "无 watcher 无窗口起点"
+        );
+        assert_eq!(
+            console["meta"]["live"], false,
+            "无 watcher 必须声明非活采集"
+        );
         assert_eq!(console["meta"]["dropped"], 0);
         assert_eq!(console["meta"]["capacity"], 500);
         let network = svc.network(&ins.id, false, None, None).unwrap();
@@ -698,7 +729,10 @@ mod tests {
         // 证据边界与 tab 过滤字段同层：tab 过滤信息不得挤掉窗口/溢出声明
         assert_eq!(resp["meta"]["dropped"], 0);
         assert_eq!(resp["meta"]["capacity"], 500);
-        assert!(resp["meta"]["since"].as_i64().is_some(), "watcher 在 = 有窗口起点");
+        assert!(
+            resp["meta"]["since"].as_i64().is_some(),
+            "watcher 在 = 有窗口起点"
+        );
         assert_eq!(resp["meta"]["live"], true);
         assert!(resp["meta"].get("scope").is_none(), "console 无 scope 语义");
 
@@ -773,19 +807,35 @@ mod tests {
             finish_request(&mut buf, "r1", "application/json");
             finish_request(&mut buf, "r2", "image/png");
             finish_request(&mut buf, "r3", "application/json");
+            // 两段式结算（生产同构）：mime 快照 → 锁外结算 → 锁内提交
+            let mime = buf.pending_body_mime("r1").unwrap();
             buf.store_body(
                 "r1",
-                BodyPayload::Raw { body: "{\"token\":\"x\",\"data\":[1,2,3]}".into(), base64_encoded: false },
+                settle_body(
+                    mime.as_deref(),
+                    BodyPayload::Raw {
+                        body: "{\"token\":\"x\",\"data\":[1,2,3]}".into(),
+                        base64_encoded: false,
+                    },
+                ),
             );
-            // r3 超时终态
-            buf.store_body("r3", BodyPayload::Unavailable { reason: crate::domain::diagnostics::REASON_TIMEOUT });
+            // r3 超时终态（直接提交，无重活）
+            buf.store_body(
+                "r3",
+                SettledBody::Unavailable {
+                    reason: crate::domain::diagnostics::REASON_TIMEOUT,
+                },
+            );
         }
 
         // 列表契约：条目携带 bodyState/bodyReason；meta 结构不变（无新增键语义）
         let list = svc.network(&ins.id, false, None, None).unwrap();
         let e0 = &list["entries"][0];
         assert_eq!(e0["bodyState"], "available");
-        assert!(e0.get("bodyReason").is_none(), "非 unavailable 无 bodyReason");
+        assert!(
+            e0.get("bodyReason").is_none(),
+            "非 unavailable 无 bodyReason"
+        );
         assert_eq!(list["entries"][1]["bodyState"], "unavailable");
         assert_eq!(list["entries"][1]["bodyReason"], "mime");
         assert_eq!(list["meta"]["scope"], "completed");
@@ -809,7 +859,10 @@ mod tests {
 
         // 不可读（mime）→ 409 NETWORK_BODY_UNAVAILABLE，message 携带归因
         let err = svc.network_body(&ins.id, "r2", None, None).unwrap_err();
-        assert_eq!((err.status(), err.code()), (409, "NETWORK_BODY_UNAVAILABLE"));
+        assert_eq!(
+            (err.status(), err.code()),
+            (409, "NETWORK_BODY_UNAVAILABLE")
+        );
         assert!(err.to_string().contains("mime"));
         let err = svc.network_body(&ins.id, "r3", None, None).unwrap_err();
         assert!(err.to_string().contains("timeout"));
@@ -859,7 +912,10 @@ mod tests {
             .entries[0];
         assert_eq!(
             (e.body_state, e.body_reason),
-            (BodyState::Unavailable, Some(crate::domain::diagnostics::REASON_NO_DATA))
+            (
+                BodyState::Unavailable,
+                Some(crate::domain::diagnostics::REASON_NO_DATA)
+            )
         );
     }
 
@@ -877,7 +933,9 @@ mod tests {
             while let Some(Ok(msg)) = socket.recv().await {
                 let Message::Text(text) = msg else { continue };
                 let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-                let Some(id) = v.get("id").and_then(|x| x.as_u64()) else { continue };
+                let Some(id) = v.get("id").and_then(|x| x.as_u64()) else {
+                    continue;
+                };
                 let reply = match v["params"]["requestId"].as_str() {
                     Some("r-ok") => serde_json::json!({
                         "id": id,
@@ -898,9 +956,7 @@ mod tests {
                     Some("r-hang") => continue, // 不应答：超时路径
                     _ => continue,
                 };
-                let _ = socket
-                    .send(Message::Text(reply.to_string().into()))
-                    .await;
+                let _ = socket.send(Message::Text(reply.to_string().into())).await;
             }
         }
         let app = Router::new().route(
@@ -919,15 +975,21 @@ mod tests {
 
         // 正常：文本（脱敏在域层，此处只验取回）
         match fetch_response_body(&conn, "sess", "r-ok", Duration::from_secs(2)).await {
-            BodyPayload::Raw { body, base64_encoded } => {
+            BodyPayload::Raw {
+                body,
+                base64_encoded,
+            } => {
                 assert_eq!(body, "Bearer sec.ret");
                 assert!(!base64_encoded);
             }
             other => panic!("应为 Raw: {other:?}"),
         }
-        // base64 形态透传（解码在域层 store_body）
+        // base64 形态透传（解码在域层 settle_body）
         match fetch_response_body(&conn, "sess", "r-b64", Duration::from_secs(2)).await {
-            BodyPayload::Raw { body: _, base64_encoded } => assert!(base64_encoded),
+            BodyPayload::Raw {
+                body: _,
+                base64_encoded,
+            } => assert!(base64_encoded),
             other => panic!("应为 Raw: {other:?}"),
         }
         // CDP 拒绝 → no-data
@@ -945,6 +1007,9 @@ mod tests {
             }
             other => panic!("应为 Unavailable: {other:?}"),
         }
-        assert!(start.elapsed() < Duration::from_secs(2), "超时预算生效，非命令通道 15s");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "超时预算生效，非命令通道 15s"
+        );
     }
 }
