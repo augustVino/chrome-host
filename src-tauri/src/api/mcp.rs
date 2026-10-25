@@ -948,7 +948,7 @@ impl ChromeHostMcp {
     // ── 页面控制（P2-C）───────────────────────────────────────
 
     #[tool(
-        description = "可访问性树快照：返回精简文本树（可交互节点带 @e1..@eN 引用，内联 role/name/value）+ refs_count + generation。操作循环的起点：snap → 用 @eN 引用 click/fill/press → 页面变化后重新 snap（导航会使全部引用失效 → 409 PAGE_REF_STALE，需重 snap 而非重试）"
+        description = "可访问性树快照：返回精简文本树（可交互节点带 @e1..@eN 引用，内联 role/name/value）+ refs_count + generation。跨域 iframe 内容以 [frame] 段内嵌，@eN 跨 frame 连续编号（click 走坐标投影、fill/press 走帧会话；CSS 选择器仍只查主 frame）。操作循环的起点：snap → 用 @eN 引用 click/fill/press → 页面变化后重新 snap（导航会使全部引用失效 → 409 PAGE_REF_STALE；单帧导航只失效该帧内引用，需重 snap 而非重试）"
     )]
     async fn page_snap(
         &self,

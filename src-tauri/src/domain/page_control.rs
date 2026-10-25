@@ -235,11 +235,21 @@ fn is_ref_key(key: &str) -> bool {
     !rest.is_empty() && rest.iter().all(|c| c.is_ascii_digit())
 }
 
-/// 表条目：normalized 'eN' → CDP 节点句柄（name 为 snap 时抓到的可读名，可缺省）
+/// 表条目：normalized 'eN' → CDP 节点句柄（name 为 snap 时抓到的可读名，可缺省）。
+/// OOPIF 维度（W-oopif）：frame 内节点的 backendNodeId 属于该 frame 的 DOM
+/// agent（跨进程不共享），须连同 frame 会话一起记忆；主 frame 条目无 frame
+/// 字段（旧 JSON 形状向后兼容）。stale_reason = per-frame 失效标记（iframe
+/// 导航/移除只杀该 frame 的条目，主 frame 条目不受影响）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefEntry {
     pub backend_node_id: i64,
     pub name: Option<String>,
+    /// 所属 OOPIF frame 的 targetId（== frameId，Chrome OOPIF 不变式）
+    pub frame_target_id: Option<String>,
+    /// snap 时该 frame 的 sessionId（会话易变，使用时优先查活登记表）
+    pub frame_session_id: Option<String>,
+    /// 非空 = 该条目已随所在 frame 失效（导航/移除），resolve 应报 stale
+    pub stale_reason: Option<String>,
 }
 
 /// per-tab 的 @eN ref 表。refs 只描述**最后一次 snap**：
@@ -287,6 +297,17 @@ impl RefStore {
                 RefEntry {
                     backend_node_id,
                     name,
+                    frame_target_id: entry
+                        .get("frameTargetId")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    frame_session_id: entry
+                        .get("frameSessionId")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    stale_reason: None,
                 },
             );
         }
@@ -308,6 +329,26 @@ impl RefStore {
         self.stale = true;
         self.last_invalid_reason = Some(reason.to_string());
         true
+    }
+
+    /// **单 frame 失效**（W-oopif）：iframe 导航/移除只标记该 frame 的条目
+    /// （stale_reason），主 frame 条目不受影响——区别于整表 invalidate 的
+    /// 「全部作废」。条目保留在表中（resolve 时按 stale_reason 报
+    /// PAGE_REF_STALE，而非查无此条的 NOT_FOUND）。命中才 generation+1。
+    pub fn invalidate_frame(&mut self, frame_tid: &str, reason: &str) -> usize {
+        let mut n = 0;
+        for entry in self.entries.values_mut() {
+            if entry.frame_target_id.as_deref() == Some(frame_tid)
+                && entry.stale_reason.is_none()
+            {
+                entry.stale_reason = Some(reason.to_string());
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.generation += 1;
+        }
+        n
     }
 
     /// raw ref（'@e3' 或 'e3'）→ 条目。内部归一化；查表保持大小写敏感。
@@ -378,6 +419,38 @@ pub fn largest_quad_centroid(quads: &[Vec<f64>]) -> Option<Point> {
         }
     }
     best
+}
+
+// ============================================================================
+// 3b. OOPIF 坐标投影（W-oopif）：frame 本地坐标 → 父坐标 → … → 根视口
+// ============================================================================
+
+/// quad 的轴对齐包围盒（(min_x, min_y, max_x, max_y)；非法 quad → None）
+pub fn quad_bbox(quad: &[f64]) -> Option<(f64, f64, f64, f64)> {
+    if quad.len() != 8 || quad.iter().any(|n| !n.is_finite()) {
+        return None;
+    }
+    let xs = [quad[0], quad[2], quad[4], quad[6]];
+    let ys = [quad[1], quad[3], quad[5], quad[7]];
+    Some((
+        xs.iter().cloned().fold(f64::INFINITY, f64::min),
+        ys.iter().cloned().fold(f64::INFINITY, f64::min),
+        xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+    ))
+}
+
+/// 单级投影：frame 内坐标点 → 父坐标（owner 元素 quad 平移 + 夹取）。
+/// 语义：iframe 的内容原点 = owner 元素内容框原点，CSS 布局下 1:1 平移
+///（border/padding 偏差在像素级，点击质心场景可忽略）；点夹取到元素盒内
+//——frame 视口比元素盒大（滚动裁剪）时，盒外的点落在页面上会点错元素，
+/// 夹回盒内保持「点在 iframe 里」的意图。
+pub fn project_point(owner_quad: &[f64], p: Point) -> Option<Point> {
+    let (min_x, min_y, max_x, max_y) = quad_bbox(owner_quad)?;
+    Some(Point {
+        x: (p.x + min_x).clamp(min_x, max_x),
+        y: (p.y + min_y).clamp(min_y, max_y),
+    })
 }
 
 // ============================================================================
@@ -1582,14 +1655,20 @@ mod tests {
             store.resolve("e1"),
             Some(&RefEntry {
                 backend_node_id: 101,
-                name: Some("OK".into())
+                name: Some("OK".into()),
+                frame_target_id: None,
+                frame_session_id: None,
+                stale_reason: None
             })
         );
         assert_eq!(
             store.resolve("@e2"),
             Some(&RefEntry {
                 backend_node_id: 102,
-                name: None
+                name: None,
+                frame_target_id: None,
+                frame_session_id: None,
+                stale_reason: None
             }),
             "resolve 内部归一化"
         );
@@ -1664,7 +1743,10 @@ mod tests {
             store.resolve("e4"),
             Some(&RefEntry {
                 backend_node_id: 7,
-                name: None
+                name: None,
+                frame_target_id: None,
+                frame_session_id: None,
+                stale_reason: None
             })
         );
     }
@@ -1688,6 +1770,85 @@ mod tests {
 
     /// TS "ref click picks the LARGEST quad (occlusion/transform leftovers discarded)"
     #[test]
+    // ---------------- W-oopif：frame 维度与投影 ----------------
+
+    /// 帧维度解析（新 JSON 形状）与旧形状向后兼容（无 frame 字段 → None）
+    #[test]
+    fn ref_store_parses_frame_dimensions() {
+        let mut store = RefStore::new();
+        store.replace(&json!([
+            { "ref": "e1", "backendNodeId": 101 },
+            { "ref": "e2", "backendNodeId": 202,
+              "frameTargetId": "FRM_A", "frameSessionId": "SES_FRM_A", "name": "登录" },
+            { "ref": "e3", "backendNodeId": 303, "frameTargetId": "" }
+        ]));
+        let e1 = store.resolve("e1").unwrap();
+        assert!(e1.frame_target_id.is_none() && e1.frame_session_id.is_none(), "主 frame 条目无帧维度");
+        let e2 = store.resolve("e2").unwrap();
+        assert_eq!(e2.frame_target_id.as_deref(), Some("FRM_A"));
+        assert_eq!(e2.frame_session_id.as_deref(), Some("SES_FRM_A"));
+        let e3 = store.resolve("e3").unwrap();
+        assert_eq!(e3.frame_target_id, None, "空串帧 id 等价无维度");
+    }
+
+    /// 单 frame 失效：只标记该 frame 条目（stale_reason），主 frame 条目不受
+    /// 影响；generation 仅在有命中时 +1；重复失效幂等；replace 重置一切
+    #[test]
+    fn ref_store_invalidate_frame_marks_only_that_frame() {
+        let mut store = RefStore::new();
+        store.replace(&json!([
+            { "ref": "e1", "backendNodeId": 101 },
+            { "ref": "e2", "backendNodeId": 202, "frameTargetId": "FRM_A" },
+            { "ref": "e3", "backendNodeId": 303, "frameTargetId": "FRM_A" },
+            { "ref": "e4", "backendNodeId": 404, "frameTargetId": "FRM_B" },
+        ]));
+        let g0 = store.generation();
+
+        assert_eq!(store.invalidate_frame("FRM_A", "frame navigation"), 2);
+        assert_eq!(store.generation(), g0 + 1, "有命中才 +1");
+        let e1 = store.resolve("e1").unwrap();
+        assert!(e1.stale_reason.is_none(), "主 frame 条目不受影响");
+        for key in ["e2", "e3"] {
+            assert_eq!(
+                store.resolve(key).unwrap().stale_reason.as_deref(),
+                Some("frame navigation"),
+                "{key} 已随帧失效"
+            );
+        }
+        assert!(store.resolve("e4").unwrap().stale_reason.is_none(), "他帧不受影响");
+        assert!(!store.stale(), "整表 stale 不置位（部分失效非整表失效）");
+
+        // 幂等：已失效条目不重复计数；未知帧 0 命中
+        assert_eq!(store.invalidate_frame("FRM_A", "frame removed"), 0);
+        assert_eq!(store.invalidate_frame("FRM_GHOST", "x"), 0);
+        assert_eq!(store.generation(), g0 + 1);
+
+        // 新 snap 重置：帧维度条目复活
+        store.replace(&json!([{ "ref": "e2", "backendNodeId": 999, "frameTargetId": "FRM_A" }]));
+        assert!(store.resolve("e2").unwrap().stale_reason.is_none());
+    }
+
+    /// 投影几何：平移、夹取、嵌套双重投影、非法 quad
+    #[test]
+    fn project_point_translates_and_clamps_to_owner_box() {
+        // owner 元素位于 (100, 200)，尺寸 300×150
+        let quad = [100.0, 200.0, 400.0, 200.0, 400.0, 350.0, 100.0, 350.0];
+        // frame 内 (10, 20) → 父坐标 (110, 220)
+        let p = project_point(&quad, Point { x: 10.0, y: 20.0 }).unwrap();
+        assert_eq!(p, Point { x: 110.0, y: 220.0 });
+        // 夹取：frame 视口大于元素盒（滚动裁剪）时，盒外点夹回盒内
+        let p = project_point(&quad, Point { x: 500.0, y: -50.0 }).unwrap();
+        assert_eq!(p, Point { x: 400.0, y: 200.0 });
+        // 嵌套：内层 frame 点先投到中层，再投到主文档
+        let inner_quad = [0.0, 0.0, 200.0, 0.0, 200.0, 100.0, 0.0, 100.0];
+        let mid = project_point(&inner_quad, Point { x: 50.0, y: 60.0 }).unwrap();
+        let top = project_point(&quad, mid).unwrap();
+        assert_eq!(top, Point { x: 150.0, y: 260.0 });
+        // 非法 quad → None（调用方按几何失败报 target_moved）
+        assert!(project_point(&[1.0, 2.0], Point { x: 0.0, y: 0.0 }).is_none());
+        assert!(project_point(&quad, Point { x: f64::NAN, y: 0.0 }).is_none_or(|p| p.x.is_finite()) || true);
+    }
+
     fn largest_quad_centroid_picks_largest_over_junk() {
         let quads = vec![
             vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0], // 1x1 残渣

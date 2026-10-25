@@ -182,7 +182,7 @@ export const API_CATALOG: CatalogGroup[] = [
         path: '/instances/:id/page/snap',
         desc: '可访问性树 + @eN 引用（操作循环起点）；响应含 text/refs_count/generation/hoverScan',
         body: '{ "tab": "<targetId 前缀，单标签可省>" }',
-        note: '导航后 @eN 整表失效（PAGE_REF_STALE），重新 snap；hover 感知：行内 [hover] = hover 它会有效果，[hover-reveal] = hover 后才变化；hoverScan = ok|truncated|skipped|error（预算 32 表/2MiB/256 规则）',
+        note: '导航后 @eN 整表失效（PAGE_REF_STALE），重新 snap；跨域 iframe（OOPIF）内容以 [frame] 段内嵌（v0.7+，@eN 跨 frame 连续编号，click 走坐标投影 / fill/press 走帧会话；CSS 选择器仍只查主 frame，单帧导航只失效该帧引用）；hover 感知：行内 [hover] = hover 它会有效果，[hover-reveal] = hover 后才变化；hoverScan = ok|truncated|skipped|error（预算 32 表/2MiB/256 规则，帧内不扫）',
       },
       {
         method: 'POST',
