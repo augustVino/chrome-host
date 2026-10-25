@@ -292,9 +292,9 @@ export const API_CATALOG: CatalogGroup[] = [
       {
         method: 'POST',
         path: '/instances/:id/page/screenshot',
-        desc: '元素/视口 png 截图：target = @eN 或 CSS 选择器（缺省 = 当前视口）；返回 base64 png',
-        body: '{ "target": "@e1", "tab": null }',
-        note: '元素路径与 click 同定位链，clip 取元素包围盒；未命中 → 404 PAGE_ELEMENT_NOT_FOUND',
+        desc: '元素/视口/全页 png 截图：target = @eN 或 CSS 选择器（缺省 = 当前视口）；full = true 截发起时刻整文档（与 target 互斥）；返回 base64 png',
+        body: '{ "target": "@e1", "full": false, "tab": null }',
+        note: '元素路径与 click 同定位链，clip 取元素包围盒；未命中 → 404 PAGE_ELEMENT_NOT_FOUND。full：clip 全文档 + captureBeyondViewport（不滚动页面，fixed 元素只出现一次，懒加载未加载内容不在图）；单边超限截断标 truncated（上限 = 16384 设备像素 ÷ DPR，Retina = 8192 CSS px）；响应带 width/height（截取 CSS px）与 documentWidth/documentHeight（发起时刻原始读数）',
       },
       {
         method: 'POST',

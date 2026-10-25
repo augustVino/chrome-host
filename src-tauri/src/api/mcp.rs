@@ -441,6 +441,10 @@ struct PageScreenshotArgs {
         description = "截图目标：@eN 引用（上次 page_snap 产生）或 CSS 选择器；省略 = 当前视口整幅。元素路径先滚动入视口再截其包围盒（跨行元素取并集）"
     )]
     target: Option<String>,
+    #[schemars(
+        description = "true = 全页截图：截发起时刻的整文档（不滚动页面、fixed 元素只出现一次）；与 target 互斥。响应带 width/height（实际截取 CSS 像素）、documentWidth/documentHeight（发起时刻文档原始尺寸）、truncated（单边超限截断时 true；上限 = 16384 设备像素 ÷ DPR，Retina = 8192 CSS px）"
+    )]
+    full: Option<bool>,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
 }
@@ -1167,7 +1171,7 @@ impl ChromeHostMcp {
     }
 
     #[tool(
-        description = "png 截图：target 省略 = 当前视口整幅；target 为 @eN 引用或 CSS 选择器时截该元素（与 page_click 同定位链，先滚动入视口，clip 取元素包围盒）。响应 data 为 base64 png；未命中 → 404 PAGE_ELEMENT_NOT_FOUND，几何退化 → 409 PAGE_TARGET_MOVED"
+        description = "png 截图：target 省略 = 当前视口整幅；target 为 @eN 引用或 CSS 选择器时截该元素（与 page_click 同定位链，先滚动入视口，clip 取元素包围盒）；full=true 截发起时刻的整文档（captureBeyondViewport，不滚动页面，懒加载/虚拟列表未加载内容不在图中——响应 documentHeight 供判断；单边超限截断标 truncated，上限 = 16384 设备像素 ÷ DPR，Retina = 8192 CSS px）。响应 data 为 base64 png；未命中 → 404 PAGE_ELEMENT_NOT_FOUND，几何退化 → 409 PAGE_TARGET_MOVED，full 与 target 同给 → 400"
     )]
     async fn page_screenshot(
         &self,
@@ -1178,6 +1182,7 @@ impl ChromeHostMcp {
                 &a.instance_id,
                 a.tab.as_deref().unwrap_or(""),
                 a.target.as_deref(),
+                a.full.unwrap_or(false),
             )
         })
         .await

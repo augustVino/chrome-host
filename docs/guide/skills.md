@@ -34,7 +34,7 @@ chrome-host page fill    <insId> @e1 "文本"   # 聚焦+输入+回读校验
 chrome-host page press   <insId> Enter        # 按键（支持 Control+A 组合）
 chrome-host page wait    <insId> ".result"    # 等元素出现（SPA 场景）
 chrome-host page dialogs <insId>              # 查自动接管的弹窗历史
-chrome-host page screenshot <insId> [@eN]     # 元素/视口 png 截图（--out 写文件）
+chrome-host page screenshot <insId> [@eN|--full]  # 元素/视口/全页 png 截图（--out 写文件；--full = 整文档长截图）
 chrome-host page pdf       <insId>            # 整页 PDF（缺省 <insId>.pdf）
 chrome-host page emulate   <insId> --preset iphone-14  # 设备仿真（--off 恢复）
 ```

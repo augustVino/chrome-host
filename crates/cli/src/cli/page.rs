@@ -18,8 +18,9 @@
 //! - html：主产物在 `html` 字段（可能很大），text/quiet 原样到 stdout（与
 //!   cdp.mjs 一致，不加元信息——dialogs_seen 只在 --json 里可见）；
 //! - dialogs：SEQ TYPE MESSAGE 表 + cursor 行（增量拉取的 --since 值）；
-//! - screenshot/pdf：解码 base64 落盘（--out，缺省 <实例id>.png/.pdf），quiet
-//!   输出路径（与 instance screenshot/har 同先例）；emulate：一行 result。
+//! - screenshot/pdf：解码 base64 落盘（--out，缺省 <实例id>.png/.pdf；
+//!   screenshot --full 缺省 <实例id>-full.png，文本输出附 size 与截断标注），
+//!   quiet 输出路径（与 instance screenshot/har 同先例）；emulate：一行 result。
 //! - 三态：`--json` 响应原样透传（P2-F F3 修复：snap 与 result 型命令的
 //!   shell 此前缺 --json 分支，文本树直接打到 stdout，管道侧拿不到合法
 //!   JSON；分流收敛在 [`snap_out`]/[`result_out`] 纯函数）；`--quiet` 输出
@@ -274,10 +275,13 @@ pub enum PageCommands {
         id: String,
         /// 截图目标：@eN 引用（上次 snap 产生）或 CSS 选择器；缺省 = 当前视口整幅
         target: Option<String>,
+        /// 全页截图：截发起时刻的整文档（懒加载未加载内容不在图中；与 target 互斥）
+        #[arg(long, conflicts_with = "target")]
+        full: bool,
         /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
-        /// 输出文件路径
+        /// 输出文件路径（--full 缺省 <实例id>-full.png，普通缺省 <实例id>.png）
         #[arg(long = "out")]
         out: Option<String>,
     },
@@ -435,9 +439,18 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
         PageCommands::Screenshot {
             id,
             target,
+            full,
             tab,
             out,
-        } => screenshot(globals, client, id, target.as_deref(), tab.as_deref(), out.as_deref()),
+        } => screenshot(
+            globals,
+            client,
+            id,
+            target.as_deref(),
+            *full,
+            tab.as_deref(),
+            out.as_deref(),
+        ),
         PageCommands::Pdf {
             id,
             landscape,
@@ -688,37 +701,52 @@ fn forward(
     Ok(())
 }
 
-/// `page screenshot <ID> [sel|@eN] [--tab T] [--out F]`：解码 base64 写 png
-/// （与 instance screenshot 同模式：缺省 <实例id>.png，quiet 输出路径，json
-/// 模式响应原样不落盘）。魔数校验失败显式报错，不写坏文件。
+/// `page screenshot <ID> [sel|@eN] [--full] [--tab T] [--out F]`：解码 base64
+/// 写 png（与 instance screenshot 同模式：缺省 <实例id>.png，--full 缺省
+/// <实例id>-full.png，quiet 输出路径，json 模式响应原样不落盘）。魔数校验
+/// 失败显式报错，不写坏文件。--full 时文本输出附 size（实际截取 CSS 像素）
+/// 与截断标注（超 16384px 诚实提示，不静默丢尾巴）。
 fn screenshot(
     globals: &GlobalArgs,
     client: &AgentClient,
     id: &str,
     target: Option<&str>,
+    full: bool,
     tab: Option<&str>,
     out_path: Option<&str>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.page_screenshot(id, target, tab)?;
+    let resp = client.page_screenshot(id, target, full, tab)?;
     let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
     let bytes = decode_base64(data, PNG_MAGIC, "截图")?;
     if !out.json {
         let path = out_path
             .map(str::to_string)
-            .unwrap_or_else(|| format!("{id}.png"));
+            .unwrap_or_else(|| format!("{id}{}.png", if full { "-full" } else { "" }));
         std::fs::write(&path, &bytes)
             .map_err(|e| CliError::Local(format!("写截图文件失败 {path}: {e}")))?;
         if out.quiet {
             out.print_id(&path);
         } else {
-            out.render_kv(
-                &[
-                    ("file".into(), path.clone()),
-                    ("bytes".into(), bytes.len().to_string()),
-                ],
-                serde_json::json!({ "file": path, "bytes": bytes.len(), "format": "png" }),
-            );
+            let mut rows = vec![
+                ("file".into(), path.clone()),
+                ("bytes".into(), bytes.len().to_string()),
+            ];
+            let mut payload = serde_json::json!({ "file": path, "bytes": bytes.len(), "format": "png" });
+            if full {
+                let size = format!(
+                    "{}x{}",
+                    resp.get("width").and_then(|v| v.as_i64()).unwrap_or(0),
+                    resp.get("height").and_then(|v| v.as_i64()).unwrap_or(0)
+                );
+                rows.push(("size".into(), size.clone()));
+                payload["size"] = serde_json::json!(size);
+                if resp.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    rows.push(("truncated".into(), "true".into()));
+                    payload["truncated"] = serde_json::json!(true);
+                }
+            }
+            out.render_kv(&rows, payload);
         }
     } else {
         out.render_kv(&[], resp);

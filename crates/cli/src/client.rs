@@ -1071,15 +1071,16 @@ impl AgentClient {
         )
     }
 
-    /// POST /api/v1/instances/{id}/page/screenshot —— body `{target?, tab?}`
-    /// （target 缺省 = 当前视口；响应 data 为 base64 png）
+    /// POST /api/v1/instances/{id}/page/screenshot —— body `{target?, full?, tab?}`
+    /// （target 缺省 = 当前视口；full=true 截整文档；响应 data 为 base64 png）
     pub fn page_screenshot(
         &self,
         id: &str,
         target: Option<&str>,
+        full: bool,
         tab: Option<&str>,
     ) -> Result<serde_json::Value, CliError> {
-        let body = serde_json::json!({ "target": target, "tab": tab });
+        let body = serde_json::json!({ "target": target, "full": full, "tab": tab });
         Self::decode(self.send(
             Method::POST,
             &Self::page_path(id, "screenshot"),

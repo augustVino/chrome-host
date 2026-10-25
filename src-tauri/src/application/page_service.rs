@@ -121,6 +121,14 @@ const ATTACH_HANDSHAKE_WINDOW: Duration = Duration::from_millis(300);
 /// 握手窗口的轮询间隔：10ms 在「attach 到表即响应」与「空转次数」间折中
 ///（300ms 窗口至多 30 次查询，tabs 表是个位数行的 Vec 线性判空）。
 const ATTACH_HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// 全页截图单边上限（**设备像素**，W-shot 真机 spike 定准）：Chrome 光栅面
+/// 单边硬顶 16384 device px——真机实测（CfT 131 / Retina DPR=2）clip
+/// 8192 CSS px（=16384 device）成功、8193 CSS px（=16386 device）即被
+/// CDP 拒绝（-32000 Unable to capture screenshot）。故 CSS 上限按
+/// devicePixelRatio 动态换算：cap_css = 16384 / DPR（DPR=1 → 16384，
+/// DPR=2 → 8192）。超限显式截断并标 truncated（诚实证据，不产出可疑图，
+/// 也不让调用方拿到裸 500）。png 实际尺寸 = 响应 width/height × DPR。
+const FULL_SHOT_MAX_DEVICE_SIDE: f64 = 16384.0;
 
 /// 连接工厂：生产 = connect_page（browser 级 eventing WS），测试注入 fake。
 type Connector = Arc<
@@ -761,20 +769,29 @@ impl PageService {
         .await
     }
 
-    /// screenshot <tab> [--target]：元素级（@eN / CSS 选择器，复用定位链）或
-    /// 整视口 png 截图（W-cap）。target 缺省 = 当前视口；元素路径：
-    /// scrollIntoView best-effort → quads 联合 bbox → 回退 getBoundingClientRect
-    /// → Page.captureScreenshot { clip }（与 click 的几何链同源，clip 是区域
-    /// 取并集，点击是点取最大 quad）。
+    /// screenshot <tab> [--target] [--full]：元素级（@eN / CSS 选择器，复用定位链）、
+    /// 整视口、或全页 png 截图（W-cap；--full 形态 W-shot）。target 缺省 = 当前
+    /// 视口；元素路径：scrollIntoView best-effort → quads 联合 bbox → 回退
+    /// getBoundingClientRect → Page.captureScreenshot { clip }（与 click 的几何
+    /// 链同源，clip 是区域取并集，点击是点取最大 quad）。full = 发起时刻的
+    /// 整文档尺寸（Runtime.evaluate 读 scrollWidth/scrollHeight → clip 全文档
+    /// + captureBeyondViewport），与 target 互斥（两个语义拼在一起只会掩盖
+    /// 调用方 bug，显式 400 不静默取舍）。
     pub async fn screenshot(
         &self,
         ins_id: &str,
         tab: &str,
         target: Option<&str>,
+        full: bool,
     ) -> Result<Value, AppError> {
         if target == Some("") {
             return Err(AppError::invalid_request(
                 "target must be an @eN ref or CSS selector (omit it to capture the viewport)",
+            ));
+        }
+        if full && target.is_some() {
+            return Err(AppError::invalid_request(
+                "full and target are mutually exclusive: full captures the whole document, target captures one element",
             ));
         }
         self.command(
@@ -782,7 +799,7 @@ impl PageService {
             "screenshot",
             ins_id,
             tab,
-            |w, tid, sid| async move { screenshot_tool(&w, &tid, &sid, target).await },
+            |w, tid, sid| async move { screenshot_tool(&w, &tid, &sid, target, full).await },
         )
         .await
     }
@@ -3986,18 +4003,93 @@ async fn resolve_clip_rect(
 }
 
 /// screenshot 工具：无 target = 整视口；有 target = ref / selector 定位链 →
-/// clip（整数化、scale 1）→ Page.captureScreenshot。响应与诊断面 screenshot
-/// 同形状（format/data），command() 补 instanceId/targetId。
+/// clip（整数化、scale 1）；full = 全文档（W-shot）。响应与诊断面 screenshot
+/// 同形状（format/data），full 另带尺寸证据字段。
 async fn screenshot_tool(
     watched: &Watched,
     tid: &str,
     sid: &str,
     target: Option<&str>,
+    full: bool,
 ) -> Result<Value, AppError> {
     let conn = require_conn(watched)?;
-    let params = match target {
-        None => json!({ "format": "png" }),
-        Some(t) => {
+    let params = match (full, target) {
+        // 全页：先读发起时刻的文档尺寸与设备像素比，再 clip 全文档 +
+        // captureBeyondViewport。设计决策（真机 spike 验证，详见任务报告）：
+        // - clip 用 CSS 像素整数 + scale 显式 1：DPR≠1（Retina）下换算由 CDP 内部
+        //   完成，亚像素 clip 在缩放链路会产生边缘半截像素（同元素路径 rounded_clip
+        //   的结论）；png 实际尺寸 = clip × DPR。
+        // - 截断上限按设备像素 16384 换算 CSS（DPR=2 → 8192 CSS px）：真机实测
+        //   clip 超过 16384 device px 的边直接被 CDP 拒绝（-32000），不是静默
+        //   截断——上限必须在设备像素层定，否则 Retina 长页拿到裸 500。
+        // - captureBeyondViewport 不滚动页面（截图后原滚动位置不变，真机验证）；
+        //   fixed 元素只出现一次，位置随当前滚动偏移（scroll=0 → 图顶部，
+        //   scroll=800 → 图中 800..840 处；真机验证，文档如实描述）。
+        // - 诚实边界：截的是发起时刻的 scrollHeight，虚拟列表/懒加载在截图后才
+        //   加载的内容不在图中；不做自动滚动加载（那是 loadall 的职责）。响应带
+        //   documentWidth/documentHeight 原始读数，调用方可比对判断。
+        (true, None) => {
+            let dims = eval_raw(
+                &conn,
+                sid,
+                "(() => { const de = document.documentElement; return [de.scrollWidth, de.scrollHeight, window.devicePixelRatio]; })()",
+            )
+            .await?;
+            let nums: Vec<f64> = dims
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_f64).collect())
+                .unwrap_or_default();
+            let (doc_w, doc_h, dpr) = match nums.as_slice() {
+                [w, h, d] if w.is_finite() && h.is_finite() && *d > 0.0 && d.is_finite() => {
+                    (*w, *h, *d)
+                }
+                _ => {
+                    return Err(AppError::internal(
+                        "full 截图读取文档尺寸失败（scrollWidth/scrollHeight/devicePixelRatio 非有限数）",
+                    ))
+                }
+            };
+            // CSS 单边上限 = 16384 device px / DPR（向下取整，不越设备硬顶）。
+            // DPR 异常小时理论上限反而变大，但设备硬顶仍在——按换算值走。
+            let max_side = (FULL_SHOT_MAX_DEVICE_SIDE / dpr).floor();
+            // 截断保护：任一边超限 → 取上限，响应标 truncated + 原始读数（诚实证据）。
+            // 最小 1×1：空文档（about:blank）scrollWidth/Height 为 0，空 clip 会报错。
+            let (w, h) = (
+                (doc_w.min(max_side).floor().max(1.0)) as i64,
+                (doc_h.min(max_side).floor().max(1.0)) as i64,
+            );
+            let truncated = doc_w > max_side || doc_h > max_side;
+            let resp = cdp_send(
+                &conn,
+                "Page.captureScreenshot",
+                json!({
+                    "format": "png",
+                    "captureBeyondViewport": true,
+                    "clip": { "x": 0, "y": 0, "width": w, "height": h, "scale": 1 }
+                }),
+                Some(sid),
+            )
+            .await?;
+            let data = capture_data(&resp)?;
+            return Ok(json!({
+                "format": "png",
+                "data": data,
+                "full": true,
+                // 实际截取尺寸（截断后，CSS 像素）
+                "width": w,
+                "height": h,
+                // 发起时刻的文档原始尺寸（未截断读数，供调用方判断增长/截断）
+                "documentWidth": doc_w.floor() as i64,
+                "documentHeight": doc_h.floor() as i64,
+                "truncated": truncated,
+            }));
+        }
+        // 互斥校验在 service 入口（screenshot），工具层不重复；真到达这里 = 内部 bug
+        (true, Some(_)) => {
+            return Err(AppError::internal("full 与 target 互斥校验未在入口拦截"));
+        }
+        (false, None) => json!({ "format": "png" }),
+        (false, Some(t)) => {
             let handle = if is_ref_target(t) {
                 let entry = resolve_ref_entry(watched, tid, t)?;
                 NodeHandle::BackendNode(entry.backend_node_id)
@@ -4031,12 +4123,17 @@ async fn screenshot_tool(
         }
     };
     let resp = cdp_send(&conn, "Page.captureScreenshot", params, Some(sid)).await?;
-    let data = resp
-        .get("data")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AppError::internal("截图响应缺少 data 字段"))?
-        .to_string();
+    let data = capture_data(&resp)?;
     Ok(json!({ "format": "png", "data": data }))
+}
+
+/// captureScreenshot 响应的 data 提取：缺 data = 显式报错，不静默降级
+/// （viewport/元素/全页三路径共用）。
+fn capture_data(resp: &Value) -> Result<String, AppError> {
+    resp.get("data")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| AppError::internal("截图响应缺少 data 字段"))
 }
 
 /// pdf 工具：参数透传（默认值已在 service 入口归一）。缺 data = 显式报错，
@@ -7215,7 +7312,7 @@ mod tests {
             "Page.captureScreenshot",
             vec![Ok(json!({ "data": "aGVsbG8=" }))],
         );
-        let resp = svc.screenshot(INS, "T1", None).await.unwrap();
+        let resp = svc.screenshot(INS, "T1", None, false).await.unwrap();
         assert_eq!(resp["format"], json!("png"));
         assert_eq!(resp["data"], json!("aGVsbG8="));
         assert_eq!(resp["instanceId"], json!(INS));
@@ -7253,7 +7350,7 @@ mod tests {
             "Page.captureScreenshot",
             vec![Ok(json!({ "data": "aGVsbG8=" }))],
         );
-        let resp = svc.screenshot(INS, "T1", Some("@e1")).await.unwrap();
+        let resp = svc.screenshot(INS, "T1", Some("@e1"), false).await.unwrap();
         assert_eq!(resp["data"], json!("aGVsbG8="));
         let scroll = calls_of(&calls, "DOM.scrollIntoViewIfNeeded");
         assert_eq!(scroll[0].param("backendNodeId"), json!(101));
@@ -7291,7 +7388,7 @@ mod tests {
             "Page.captureScreenshot",
             vec![Ok(json!({ "data": "aGVsbG8=" }))],
         );
-        svc.screenshot(INS, "T1", Some("#hero")).await.unwrap();
+        svc.screenshot(INS, "T1", Some("#hero"), false).await.unwrap();
         let q = calls_of(&calls, "DOM.querySelector");
         assert_eq!(q[0].param("selector"), json!("#hero"));
         assert_eq!(q[0].param("nodeId"), json!(3));
@@ -7307,7 +7404,7 @@ mod tests {
         let (svc2, _w2, _c2, script2) = armed();
         given(&script2, "DOM.getDocument", vec![Ok(json!({ "root": { "nodeId": 3 } }))]);
         given(&script2, "DOM.querySelector", vec![Ok(json!({ "nodeId": 0 }))]);
-        let e = svc2.screenshot(INS, "T1", Some(".missing")).await.unwrap_err();
+        let e = svc2.screenshot(INS, "T1", Some(".missing"), false).await.unwrap_err();
         assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
     }
 
@@ -7341,7 +7438,7 @@ mod tests {
             "Page.captureScreenshot",
             vec![Ok(json!({ "data": "aGVsbG8=" }))],
         );
-        svc.screenshot(INS, "T1", Some("e1")).await.unwrap();
+        svc.screenshot(INS, "T1", Some("e1"), false).await.unwrap();
         let cap = calls_of(&calls, "Page.captureScreenshot");
         // 外扩取整：floor(5.1)=5 / ceil(105.5)=106 → 101；floor(6.2)=6 / ceil(47.1)=48 → 42
         assert_eq!(
@@ -7369,7 +7466,7 @@ mod tests {
             "Runtime.callFunctionOn",
             vec![Ok(json!({ "result": { "value": { "x": 5.0, "y": 6.0, "w": 100.0, "h": 0.0 } } }))],
         );
-        let e = svc2.screenshot(INS, "T1", Some("e1")).await.unwrap_err();
+        let e = svc2.screenshot(INS, "T1", Some("e1"), false).await.unwrap_err();
         assert_eq!((e.code(), e.status()), ("PAGE_TARGET_MOVED", 409));
     }
 
@@ -7378,7 +7475,7 @@ mod tests {
     async fn screenshot_missing_data_is_explicit_internal_error() {
         let (svc, _w, _calls, script) = armed();
         given(&script, "Page.captureScreenshot", vec![Ok(json!({}))]);
-        let e = svc.screenshot(INS, "T1", None).await.unwrap_err();
+        let e = svc.screenshot(INS, "T1", None, false).await.unwrap_err();
         assert_eq!((e.code(), e.status()), ("INTERNAL_ERROR", 500));
         assert!(e.to_string().contains("data"));
     }
@@ -7387,9 +7484,123 @@ mod tests {
     #[tokio::test]
     async fn screenshot_empty_target_is_rejected() {
         let (svc, _w, calls, _script) = armed();
-        let e = svc.screenshot(INS, "T1", Some("")).await.unwrap_err();
+        let e = svc.screenshot(INS, "T1", Some(""), false).await.unwrap_err();
         assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
         assert_eq!(calls_of(&calls, "Page.captureScreenshot").len(), 0);
+    }
+
+    // ---------------- 工具：screenshot --full（W-shot）--------------------
+
+    /// full：先 Runtime.evaluate 读文档尺寸+DPR，再 clip 全文档 +
+    /// captureBeyondViewport=true + scale 1（DPR 换算留给 CDP 内部）；
+    /// 响应带尺寸证据字段（full/width/height/documentWidth/documentHeight/
+    /// truncated）——调用方靠它们核对 png 尺寸与截断，不靠猜。
+    #[tokio::test]
+    async fn screenshot_full_clips_whole_document_with_evidence_fields() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![rt_result(json!([1280, 2592, 2]))],
+        );
+        given(
+            &script,
+            "Page.captureScreenshot",
+            vec![Ok(json!({ "data": "aGVsbG8=" }))],
+        );
+        let resp = svc.screenshot(INS, "T1", None, true).await.unwrap();
+        assert_eq!(resp["data"], json!("aGVsbG8="));
+        assert_eq!(
+            (
+                resp["full"].as_bool().unwrap(),
+                resp["width"].as_i64().unwrap(),
+                resp["height"].as_i64().unwrap(),
+                resp["documentWidth"].as_i64().unwrap(),
+                resp["documentHeight"].as_i64().unwrap(),
+                resp["truncated"].as_bool().unwrap(),
+            ),
+            (true, 1280, 2592, 1280, 2592, false)
+        );
+        let cap = calls_of(&calls, "Page.captureScreenshot");
+        assert_eq!(cap.len(), 1);
+        assert_eq!(cap[0].param("captureBeyondViewport"), json!(true));
+        assert_eq!(
+            cap[0].params.get("clip"),
+            Some(&json!({ "x": 0, "y": 0, "width": 1280, "height": 2592, "scale": 1 }))
+        );
+        assert_eq!(cap[0].param("format"), json!("png"));
+        // 尺寸读数经 tab 的 page session（不是 browser 级）
+        assert_eq!(cap[0].session.as_deref(), Some("S1"));
+    }
+
+    /// 超限截断（DPR 感知）：上限按设备像素 16384 换算 CSS（真机 spike：
+    /// 16384 device px 是 CDP 硬顶，超过即 -32000 拒绝）。DPR=2 → 上限 8192
+    /// CSS px：20000×9000.8 文档 → 双边截到 8192、truncated=true；
+    /// documentWidth/Height 保留原始读数（诚实证据：调用方能算出被截了多少）。
+    /// DPR=1 → 上限 16384：20000 宽截、9000 高不截，truncated 仍 true（任一边）。
+    #[tokio::test]
+    async fn screenshot_full_caps_each_side_by_dpr_and_marks_truncated() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![rt_result(json!([20000, 9000.8, 2]))],
+        );
+        given(
+            &script,
+            "Page.captureScreenshot",
+            vec![Ok(json!({ "data": "aGVsbG8=" })), Ok(json!({ "data": "aGVsbG8=" }))],
+        );
+        let resp = svc.screenshot(INS, "T1", None, true).await.unwrap();
+        assert_eq!(
+            (
+                resp["width"].as_i64().unwrap(),
+                resp["height"].as_i64().unwrap(),
+                resp["documentWidth"].as_i64().unwrap(),
+                resp["documentHeight"].as_i64().unwrap(),
+                resp["truncated"].as_bool().unwrap(),
+            ),
+            (8192, 8192, 20000, 9000, true)
+        );
+        let cap = calls_of(&calls, "Page.captureScreenshot");
+        assert_eq!(
+            cap[0].params.get("clip"),
+            Some(&json!({ "x": 0, "y": 0, "width": 8192, "height": 8192, "scale": 1 }))
+        );
+
+        // DPR=1：上限 16384；高 9000 未超限不截，宽 20000 截断
+        let (svc2, _w2, _c2, script2) = armed();
+        given(
+            &script2,
+            "Runtime.evaluate",
+            vec![rt_result(json!([20000, 9000, 1]))],
+        );
+        given(
+            &script2,
+            "Page.captureScreenshot",
+            vec![Ok(json!({ "data": "aGVsbG8=" }))],
+        );
+        let resp2 = svc2.screenshot(INS, "T1", None, true).await.unwrap();
+        assert_eq!(
+            (
+                resp2["width"].as_i64().unwrap(),
+                resp2["height"].as_i64().unwrap(),
+                resp2["truncated"].as_bool().unwrap(),
+            ),
+            (16384, 9000, true)
+        );
+    }
+
+    /// full + target 互斥：两个语义拼在一起只会掩盖调用方 bug，显式 400，
+    /// 且不发出任何 CDP 命令（校验在 service 入口，早于建连/尺寸读数）。
+    #[tokio::test]
+    async fn screenshot_full_and_target_are_mutually_exclusive() {
+        let (svc, _w, calls, _script) = armed();
+        let e = svc.screenshot(INS, "T1", Some("#hero"), true).await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
+        assert!(e.to_string().contains("mutually exclusive"));
+        assert_eq!(calls_of(&calls, "Page.captureScreenshot").len(), 0);
+        assert_eq!(calls_of(&calls, "Runtime.evaluate").len(), 0);
     }
 
     // ---------------- 工具：pdf（W-cap）------------------------------------

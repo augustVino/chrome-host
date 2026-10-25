@@ -750,6 +750,13 @@ fn fixture_router() -> Router {
                 Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
             }),
         )
+        // W-shot：screenshot 透传 echo（full 进 body；与 target 互斥由服务层校验）
+        .route(
+            "/api/v1/instances/ins_pg/page/screenshot",
+            post(|body: Option<Json<serde_json::Value>>| async move {
+                Json(json!({ "echo": body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null) }))
+            }),
+        )
         // 错误样本：page 族四类代表映射（404→3 / 409→5 / 422→7 / 504→5 运行时码表）
         .route(
             "/api/v1/instances/err_tab/page/click",
@@ -1535,6 +1542,20 @@ fn page_endpoints_contract() {
         .page_type("ins_pg", "hi", None)
         .expect("type echo 应成功");
     assert_eq!(echo["echo"]["text"], "hi");
+
+    // W-shot：screenshot 的 full 进 body（false 亦显式序列化，与服务端
+    // Option<bool> 缺省对齐——调用方拼 body 不靠字段缺省）
+    let echo = client
+        .page_screenshot("ins_pg", None, false, None)
+        .expect("screenshot echo 应成功");
+    assert_eq!(echo["echo"]["target"], serde_json::json!(null));
+    assert_eq!(echo["echo"]["full"], false);
+    assert_eq!(echo["echo"]["tab"], serde_json::json!(null));
+    let echo = client
+        .page_screenshot("ins_pg", None, true, Some("TAB"))
+        .expect("screenshot full echo 应成功");
+    assert_eq!(echo["echo"]["full"], true);
+    assert_eq!(echo["echo"]["tab"], "TAB");
 
     // 错误映射：404 tab 路由未命中 → exit 3
     let err = client.page_click("err_tab", "@e1", None).unwrap_err();

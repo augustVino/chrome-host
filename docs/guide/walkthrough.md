@@ -63,6 +63,7 @@ chrome-host page click "$INS_ID" @e1                     # 原生输入点击
 chrome-host page fill "$INS_ID" "#kw" "搜索词"          # 表单填写（回读校验）
 chrome-host instance screenshot "$INS_ID" --out now.png # 当前页截图
 chrome-host page screenshot "$INS_ID" @e1 --out btn.png # 元素级截图（先 snap 拿引用）
+chrome-host page screenshot "$INS_ID" --full            # 全页长截图（截发起时刻整文档，缺省 <id>-full.png）
 chrome-host page pdf "$INS_ID"                            # 整页 PDF（缺省 <id>.pdf）
 chrome-host page emulate "$INS_ID" --preset iphone-14   # 设备仿真（--off 恢复）
 ```

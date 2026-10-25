@@ -144,12 +144,18 @@ pub struct ReloadBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/screenshot —— 元素/视口 png 截图（W-cap）。
+/// POST /api/v1/instances/{id}/page/screenshot —— 元素/视口/全页 png 截图
+/// （W-cap；full 形态 W-shot）。
 #[derive(Deserialize)]
 pub struct ScreenshotBody {
     /// 截图目标：@eN ref（上次 snap 产生）或 CSS 选择器；缺省 = 当前视口整幅。
     /// 元素路径与 click 同定位链（scrollIntoView + quads），clip 取联合包围盒
     pub target: Option<String>,
+    /// true = 全页截图：截发起时刻的整文档（clip 全文档 + captureBeyondViewport，
+    /// 不滚动页面）；与 target 互斥（同给 → 400）。单边超限截断并标 truncated
+    /// （上限 = 16384 设备像素 ÷ DPR，Retina DPR2 = 8192 CSS px）；响应带
+    /// width/height/documentWidth/documentHeight。
+    pub full: Option<bool>,
     pub tab: Option<String>,
 }
 
@@ -440,7 +446,12 @@ pub async fn screenshot(
 ) -> Result<Json<Value>, AppError> {
     let resp = state
         .page
-        .screenshot(&id, body.tab.as_deref().unwrap_or(""), body.target.as_deref())
+        .screenshot(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            body.target.as_deref(),
+            body.full.unwrap_or(false),
+        )
         .await?;
     Ok(Json(resp))
 }
