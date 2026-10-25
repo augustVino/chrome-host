@@ -137,6 +137,21 @@ impl PageControlError {
         )
     }
 
+    /// 422：extract 目标不是表格（table / [role=table|grid|treegrid]）
+    pub fn extract_not_a_table(tag: &str, role: Option<&str>) -> Self {
+        let what = match role {
+            Some(r) => format!("<{tag} role=\"{r}\">"),
+            None => format!("<{tag}>"),
+        };
+        Self::business(
+            422,
+            "PAGE_EXTRACT_NOT_A_TABLE",
+            format!(
+                "{what} is not a table — extract targets must be <table> or [role=table|grid|treegrid]"
+            ),
+        )
+    }
+
     /// 422：fill 目标不可编辑（TS requireFillable）
     pub fn target_not_fillable(target_desc: &str, why: &str) -> Self {
         Self::business(
@@ -1331,6 +1346,178 @@ pub fn wait_observe_expr(selector: &str) -> String {
   return JSON.stringify({ observed: visible ? 'visible' : 'hidden' });
 })()"#;
     TEMPLATE.replace("__SEL__", &json_escape(selector))
+}
+
+// ============================================================================
+// 6b. 表格结构化提取——DOM 事实收集脚本（W-ext 两段式的收集段）
+// ============================================================================
+
+/// 收集器主体：`function(t)`，t = 表格元素或 null（null = 主文档最大表格
+/// 自动发现）。只读采集 DOM 事实（分区/th-td 文本/rowspan-colspan/aria
+/// 行列声明/隐藏行计数），**不解析、不解释**——归一化在
+/// domain/table_extract.rs 纯函数层。返回 JSON 字符串（camelCase 键对齐
+/// TableFacts serde）。BUDGET 与 table_extract::CELL_BUDGET 必须一致
+///（超限停止采集，置 partial，行数/格数照常计数——截断判定归 domain）。
+pub const EXTRACT_COLLECT_FN: &str = r#"function(t) {
+  var BUDGET = 10000;
+  function isTableEl(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var role = (el.getAttribute('role') || '').toLowerCase();
+    return el.tagName === 'TABLE' || role === 'table' || role === 'grid' || role === 'treegrid';
+  }
+  var el;
+  if (t === null || t === undefined) {
+    // 主文档最大表格自动发现（按单元格数；外层表格的计数包含嵌套表格，
+    // 因此候选天然落在外层——不单独剔嵌套）
+    var best = null, bestN = -1;
+    var cands = document.querySelectorAll('table, [role=table], [role=grid], [role=treegrid]');
+    for (var i = 0; i < cands.length; i++) {
+      var c = cands[i];
+      var n = c.querySelectorAll('th, td, [role=cell], [role=columnheader], [role=rowheader], [role=gridcell]').length;
+      if (n > bestN) { bestN = n; best = c; }
+    }
+    el = best;
+  } else {
+    el = t;
+  }
+  if (!el) return JSON.stringify({ found: false, reason: 'no-table' });
+  if (!isTableEl(el)) {
+    return JSON.stringify({ found: false, reason: 'not-a-table', tag: el.tagName, role: el.getAttribute('role') });
+  }
+  var format = el.tagName === 'TABLE' ? 'html' : 'aria';
+  function posInt(s) { var n = parseInt(s, 10); return isFinite(n) && n >= 1 ? n : null; }
+  var rc = el.getAttribute('aria-rowcount'), cc = el.getAttribute('aria-colcount');
+  var aria = (rc !== null || cc !== null)
+    ? { rowCount: rc !== null ? posInt(rc) : null, colCount: cc !== null ? posInt(cc) : null }
+    : null;
+  var caption = null;
+  if (format === 'html') {
+    var cap = el.querySelector(':scope > caption');
+    if (cap) caption = (cap.textContent || '').trim() || null;
+  } else {
+    caption = (el.getAttribute('aria-label') || '').trim() || null;
+  }
+  // 本表的行（排除嵌套表格内的行）
+  function ownRows(sel) {
+    var out = [];
+    var all = el.querySelectorAll(sel);
+    for (var i = 0; i < all.length; i++) {
+      var n = all[i], p = n.parentElement, ok = true;
+      while (p && p !== el) {
+        if (isTableEl(p)) { ok = false; break; }
+        p = p.parentElement;
+      }
+      if (ok) out.push(n);
+    }
+    return out;
+  }
+  var rawRows = format === 'html' ? ownRows('tr') : ownRows('[role=row]');
+  function sectionKind(r) {
+    var p = r.parentElement;
+    while (p && p !== el) {
+      var tn = p.tagName;
+      if (tn === 'THEAD' || tn === 'TBODY' || tn === 'TFOOT') return p;
+      p = p.parentElement;
+    }
+    return null;
+  }
+  function cellRole(c) { return (c.getAttribute('role') || '').toLowerCase(); }
+  function isHeaderCell(c) {
+    if (c.tagName === 'TH') return true;
+    var r = cellRole(c);
+    return r === 'columnheader' || r === 'rowheader';
+  }
+  function rowCells(r) {
+    if (r.tagName === 'TR' && r.cells) {
+      var out = [];
+      for (var i = 0; i < r.cells.length; i++) out.push(r.cells[i]);
+      return out;
+    }
+    var out2 = [];
+    for (var i = 0; i < r.children.length; i++) {
+      var c = r.children[i];
+      var cr = cellRole(c);
+      if (cr === 'cell' || cr === 'gridcell' || cr === 'columnheader' || cr === 'rowheader'
+          || c.tagName === 'TH' || c.tagName === 'TD') out2.push(c);
+    }
+    return out2;
+  }
+  var sections = [];
+  var totalRows = 0, totalCells = 0, hiddenRows = 0, collectedCells = 0, partial = false;
+  for (var i = 0; i < rawRows.length; i++) {
+    var r = rawRows[i];
+    var sec = sectionKind(r);
+    var kind = sec ? sec.tagName.toLowerCase() : 'flat';
+    var cs = rowCells(r);
+    var hidden = getComputedStyle(r).display === 'none'
+      || (sec && getComputedStyle(sec).display === 'none');
+    totalRows++;
+    if (hidden) { hiddenRows++; continue; }
+    totalCells += cs.length;
+    if (partial) continue; // 已超预算：只计数不采集
+    if (collectedCells + cs.length > BUDGET) { partial = true; continue; }
+    var cells = [];
+    for (var j = 0; j < cs.length; j++) {
+      var c = cs[j];
+      var rs, cps;
+      if (c.rowSpan !== undefined && c.rowSpan !== null && isFinite(c.rowSpan)) rs = c.rowSpan;
+      else rs = posInt(c.getAttribute('rowspan')) || 1;
+      if (c.colSpan !== undefined && c.colSpan !== null && isFinite(c.colSpan)) cps = c.colSpan;
+      else cps = posInt(c.getAttribute('colspan')) || 1;
+      var hs = c.getAttribute('headers');
+      cells.push({
+        text: (c.textContent || '').trim(),
+        header: isHeaderCell(c),
+        rowSpan: rs,
+        colSpan: cps,
+        ariaRowIndex: posInt(c.getAttribute('aria-rowindex')),
+        ariaColIndex: posInt(c.getAttribute('aria-colindex')),
+        headers: hs ? hs.trim().split(/\s+/).filter(Boolean) : [],
+      });
+    }
+    collectedCells += cs.length;
+    var rowFact = { cells: cells };
+    var ri = posInt(r.getAttribute('aria-rowindex'));
+    if (ri !== null) rowFact.ariaRowIndex = ri;
+    var last = sections[sections.length - 1];
+    if (last && last.kind === kind) last.rows.push(rowFact);
+    else sections.push({ kind: kind, rows: [rowFact] });
+  }
+  return JSON.stringify({
+    found: true,
+    format: format,
+    caption: caption,
+    aria: aria,
+    hiddenRows: hiddenRows,
+    totalRows: totalRows,
+    totalCells: totalCells,
+    partial: partial,
+    sections: sections,
+  });
+}"#;
+
+/// 自动发现路径的求值表达式（主文档最大表格）。
+pub fn extract_discovery_expr() -> String {
+    format!("({EXTRACT_COLLECT_FN})(null)")
+}
+
+/// CSS 选择器路径的求值表达式。**未命中在本层拦**（null 进入收集器会被
+/// 误读为自动发现），回 found:false/no-table → 404 PAGE_ELEMENT_NOT_FOUND。
+pub fn extract_selector_expr(selector: &str) -> String {
+    format!(
+        r#"(function() {{
+  var el = document.querySelector({sel});
+  if (!el) return JSON.stringify({{ found: false, reason: 'no-table' }});
+  return ({fn_})(el);
+}})()"#,
+        sel = json_escape(selector),
+        fn_ = EXTRACT_COLLECT_FN
+    )
+}
+
+/// @eN 引用路径的 callFunctionOn 声明（this = 目标元素）。
+pub fn extract_call_on_fn() -> String {
+    format!("function() {{ return ({EXTRACT_COLLECT_FN})(this); }}")
 }
 
 // ============================================================================

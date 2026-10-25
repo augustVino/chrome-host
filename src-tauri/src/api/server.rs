@@ -284,6 +284,10 @@ fn routes(state: ApiState) -> Router {
             post(crate::api::pages::emulate),
         )
         .route(
+            "/api/v1/instances/{id}/page/extract",
+            post(crate::api::pages::extract),
+        )
+        .route(
             "/api/v1/login-profiles",
             get(crate::api::login_profiles::list),
         )

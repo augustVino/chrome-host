@@ -1088,6 +1088,18 @@ impl AgentClient {
         ))
     }
 
+    /// POST /api/v1/instances/{id}/page/extract —— body `{target?, tab?}`
+    /// （target 缺省 = 主文档内最大表格自动发现；响应 {columns, rows, coverage, meta}）
+    pub fn page_extract(
+        &self,
+        id: &str,
+        target: Option<&str>,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "extract"), Some(body), true))
+    }
+
     /// POST /api/v1/instances/{id}/page/pdf —— body `{tab?, landscape?, printBackground?,
     /// paperWidth?, paperHeight?}`（纸张单位英寸；缺省 Letter 纵向带背景）
     pub fn page_pdf(

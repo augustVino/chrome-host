@@ -21,7 +21,7 @@
 - **Claude Code**：按其 skills 机制注册仓库内 skill；
 - 其他 agent：`SKILL.md` 本身就是完整的操作手册（含触发条件、流程、命令速查、错误决策表），直接作为上下文喂给 agent 亦可。
 
-若 agent 环境支持 MCP，更简单的路径是直接接 MCP 服务（见 [MCP 手册](/reference/mcp)），48 个工具覆盖编排与操控（含 `page_*` 十五族）；skills 的价值在于更细的排障决策知识与工作流经验。
+若 agent 环境支持 MCP，更简单的路径是直接接 MCP 服务（见 [MCP 手册](/reference/mcp)），54 个工具覆盖编排与操控（含 `page_*` 二十族）；skills 的价值在于更细的排障决策知识与工作流经验。
 
 ## page 命令族：人类也能直接用
 
@@ -37,6 +37,7 @@ chrome-host page dialogs <insId>              # 查自动接管的弹窗历史
 chrome-host page screenshot <insId> [@eN]     # 元素/视口 png 截图（--out 写文件）
 chrome-host page pdf       <insId>            # 整页 PDF（缺省 <insId>.pdf）
 chrome-host page emulate   <insId> --preset iphone-14  # 设备仿真（--off 恢复）
+chrome-host page extract   <insId> [sel|@eN]  # 表格 → 结构化 JSON（缺省 = 最大表格自动发现）
 ```
 
 本地与远程接入（SSH 隧道 + 令牌）用法完全一致；外部 CDP 客户端（Playwright / DevTools）接入走 `instance cdp` / `cdp-session`（见[单环境闭环演练](./walkthrough)与[远程接入](./remote-access)）。
@@ -46,4 +47,5 @@ chrome-host page emulate   <insId> --preset iphone-14  # 设备仿真（--off �
 - `<tab>` 用 `instance tabs` 输出的 **targetId 唯一前缀**，单标签实例可省略；
 - **元素定位优先 @eN 引用**（snap 产出），比 CSS 选择器稳；导航后引用整表失效，重新 snap；
 - **错误看 `[PAGE_*]` 前缀**分支处置（完整表见 `references/cli.md`），不解析文案；
-- **跨域 iframe** 用 `clickxy`（视口坐标）点入后 `type` 输入。
+- **跨域 iframe** 用 `clickxy`（视口坐标）点入后 `type` 输入；
+- **表格/查询结果导出**用 `page extract`（不要 eval 手拼 innerText）：合并单元格被覆盖位是 `null`（空串才是真实空单元格）；`coverage.datasetComplete` 只有 unknown/incomplete——看到 incomplete 与 reasons 先处理归因（虚拟化未加载完就先 `page wait` 行出现），绝不当作取全。
