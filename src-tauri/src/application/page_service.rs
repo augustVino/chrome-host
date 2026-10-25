@@ -3321,10 +3321,11 @@ async fn hover_scan(
 }
 
 /// 单选择器求值：命中 nodeId 集合（上限 MAX_HOVER_QUERY_HITS，超出截断）。
-/// 选择器非法（Chrome 报 "... is not a valid selector"——启发式提取产物
-/// 可能的形态，如预处理器的 /deep/ 组合子）→ 跳过该选择器（该规则无
-/// 标记，不装作预算截断：truncated 语义 = 预算内不完整，狼来了效应会
-/// 让真截断失去信号）；其他错误（会话/超时）→ 截断标记。
+/// 选择器非法（真机报文：CfT 131 为 "DOM Error while querying"，旧变体
+/// "... is not a valid selector"——启发式提取产物仍可能的形态，如预处理器的
+/// /deep/、>>> 组合子）→ 跳过该选择器（该规则无标记，不装作预算截断：
+/// truncated 语义 = 预算内不完整，狼来了效应会让真截断失去信号）；其他
+/// 错误（会话/超时/节点失放）→ 截断标记。
 async fn hover_query_hits(
     conn: &SharedPageConn,
     sid: &str,
@@ -3357,9 +3358,9 @@ async fn hover_query_hits(
             }
         }
         Err(e) => {
-            if e.to_string()
-                .to_lowercase()
-                .contains("is not a valid selector")
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("dom error while querying")
+                || msg.contains("is not a valid selector")
             {
                 tracing::debug!("[page] hover 选择器非法，跳过: {sel}（{e}）");
                 return;
@@ -6572,10 +6573,11 @@ mod tests {
         assert_eq!(push[0].param("backendNodeIds"), json!([101, 102]));
     }
 
-    /// querySelectorAll 报「非法选择器」（Chrome 的 "... is not a valid
-    /// selector."——启发式提取产物仍可能的形态，如预处理器 /deep/ 组合子）
-    /// → 跳过该选择器而非 truncated：truncated 语义 = 预算内不完整，语法
-    /// 失败只丢该条规则，不能让含非法形态的页面恒报狼来了。
+    /// querySelectorAll 报选择器非法（真机 CfT 131 报文 "DOM Error while
+    /// querying"；旧变体 "... is not a valid selector"——启发式提取产物仍
+    /// 可能的形态，如预处理器 /deep/ 组合子）→ 跳过该选择器而非 truncated：
+    /// truncated 语义 = 预算内不完整，语法失败只丢该条规则，不能让含非法
+    /// 形态的页面恒报狼来了。
     #[tokio::test]
     async fn snap_hover_scan_skips_invalid_selectors_instead_of_truncating() {
         let (svc, watched, _calls, script) = armed();
@@ -6595,7 +6597,7 @@ mod tests {
             "DOM.querySelectorAll",
             vec![
                 Ok(json!({ "nodeIds": [3] })),
-                Err("-32000 '.legacy /deep/ .tip' is not a valid selector.".to_string()),
+                Err("-32000 DOM Error while querying".to_string()),
             ],
         );
         given(
