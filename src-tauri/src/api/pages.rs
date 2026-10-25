@@ -119,6 +119,30 @@ pub struct TypeBody {
     pub tab: Option<String>,
 }
 
+/// POST /api/v1/instances/{id}/page/navigate —— 页内导航（保留历史）。
+/// 与实例级 navigate（new+close 组合，丢历史）的差异见 AGENT-API。
+#[derive(Deserialize)]
+pub struct NavigateBody {
+    /// 目标 URL（http/https 白名单，与实例级 tabs/navigate 同源；非法 → 400）
+    pub url: String,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/back|forward —— 导航历史回退/前进。
+#[derive(Deserialize)]
+pub struct NavHistoryBody {
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/reload —— 重载当前页。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReloadBody {
+    /// true = 跳过缓存（Page.reload ignoreCache）；缺省 false
+    pub ignore_cache: Option<bool>,
+    pub tab: Option<String>,
+}
+
 pub async fn snap(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -306,6 +330,65 @@ pub async fn r#type(
     let resp = state
         .page
         .r#type(&id, body.tab.as_deref().unwrap_or(""), &body.text)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/navigate —— 页内导航（page session 上
+/// Page.navigate，保留历史；等待 load 事件，窗口内未见 → loaded:false）。
+pub async fn navigate(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<NavigateBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .navigate(&id, body.tab.as_deref().unwrap_or(""), &body.url)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/back —— 历史后退（无更早条目 → 409
+/// PAGE_NAV_NO_HISTORY）。
+pub async fn back(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<NavHistoryBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .back(&id, body.tab.as_deref().unwrap_or(""))
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/forward —— 历史前进（无更晚条目 → 409
+/// PAGE_NAV_NO_HISTORY）。
+pub async fn forward(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<NavHistoryBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .forward(&id, body.tab.as_deref().unwrap_or(""))
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/reload —— 重载（等待语义同 navigate）。
+pub async fn reload(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ReloadBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .reload(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            body.ignore_cache.unwrap_or(false),
+        )
         .await?;
     Ok(Json(resp))
 }

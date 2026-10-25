@@ -18,6 +18,12 @@
 //!   page 命令（含建连），正确性优先；并发需求出现后可演进为 per-tab 锁。
 //! - **per-tab RefStore / DialogBuffer**（决策 4）：snap 整表替换，导航/文档
 //!   替换事件按 targetId 定向失效（§3.5/§3.6）。
+//! - **导航命令族**（navigate/back/forward/reload，page 族后补）：同一 page
+//!   session 内 Page.navigate / 导航历史回退 / Page.reload——保留历史（实例级
+//!   navigate 的 new+close 组合近似会丢历史，该端点保留给 GUI，文档已指向
+//!   本族）。加载等待走 Page.loadEventFired 事件（命令发送前登记等待者，窗口
+//!   NAV_LOAD_TIMEOUT，未见 → loaded:false；同文档导航/同文档历史条目不触发
+//!   load，走响应分类 / 历史索引 + readyState 快路径）。
 //!
 //! IO 全部经 [`PageCdp`] trait（infrastructure/cdp/page_cdp.rs 的 dyn 适配），
 //! 测试注入 fake 即可覆盖全部编排路径，不依赖真 Chrome。
@@ -54,13 +60,14 @@ use std::time::{Duration, Instant};
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::oneshot;
 
 use crate::domain::instance::InstanceStatus;
 use crate::domain::page_control::{
     dialog_accept_params, fill_fillable_check_expr, hit_test_expr, largest_quad_centroid,
     locate_expr, normalize_ref, observed_matches_state, parse_dialog_opening, parse_duration,
-    parse_key, wait_observe_expr, DialogBuffer, DialogInfo, ObservedState, PageControlError, Point,
-    RefStore, WaitState, MAX_DIALOG_BUFFER,
+    parse_key, validate_http_url, wait_observe_expr, DialogBuffer, DialogInfo, ObservedState,
+    PageControlError, Point, RefStore, WaitState, MAX_DIALOG_BUFFER,
 };
 use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::{connect_page, SharedPageConn};
@@ -76,6 +83,16 @@ const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// mousePressed → mouseReleased 的间隔（TS dispatchClickAtPoint 的 50ms）
 const CLICK_RELEASE_DELAY: Duration = Duration::from_millis(50);
+/// 导航命令族（navigate/back/forward/reload）的加载等待窗口：CDP 导航命令返回
+/// ≠ 加载完成，命令后在同 session 上等待 Page.loadEventFired 至此窗口。
+/// 窗口耗尽 → 返回 loaded:false（诚实证据哲学：导航已开始但加载未证实，
+/// 不编造成功也不无限等死）。取 25s 而非 30s：给 CDP send（内建 15s）与响应
+/// 组装留余量，使「加载未确认」优先于工具预算 504 呈现；SPA 路由不触发 load
+/// 的场景见各工具注释与 AGENT-API。
+const NAV_LOAD_TIMEOUT: Duration = Duration::from_secs(25);
+/// back/forward 的提交确认轮询间隔（历史索引 currentIndex 到位即提交；与
+/// wait 轮询同量级，无需参数化）。
+const NAV_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// loadall 缺省轮询间隔（TS loadAllStr 的 1500ms）
 const DEFAULT_LOADALL_INTERVAL: Duration = Duration::from_millis(1500);
 /// loadall 缺省点击上限。TS 是 5min 硬顶（200 × 1500ms = 5min，量级对齐），
@@ -112,6 +129,25 @@ fn focus_failed(message: impl Into<String>) -> AppError {
 
 fn fill_focus_lost(message: impl Into<String>) -> AppError {
     AppError::conflict("PAGE_FILL_FOCUS_LOST", message)
+}
+
+/// 409：back/forward 已在历史边界（无更早/更晚条目）。message 携带方向，
+/// 调用方区分「到头了」与「失败」；这不属于错误用法，是可预期的边界探测。
+fn nav_no_history(direction: &str) -> AppError {
+    AppError::conflict(
+        "PAGE_NAV_NO_HISTORY",
+        format!("no {direction} history entry — already at the boundary of this tab's navigation history"),
+    )
+}
+
+/// 500：Page.navigate 响应携带 errorText（net::ERR_* 等导航失败）——导航
+/// 未发生，是失败；与 loaded:false（导航已开始、load 未确认）严格区分。
+fn nav_failed(error_text: &str) -> AppError {
+    AppError::business(
+        500,
+        "PAGE_NAV_FAILED",
+        format!("navigation failed: {error_text}"),
+    )
 }
 
 fn tool_timeout(tool: &str, budget: Duration) -> AppError {
@@ -186,6 +222,11 @@ struct Watched {
     refs: Mutex<HashMap<String, RefStore>>,
     /// per-tab 对话框缓冲（应答成功才入档）
     dialogs: Mutex<HashMap<String, DialogBuffer>>,
+    /// per-tab load 事件等待者（导航命令族）：命令发送前登记 oneshot Sender，
+    /// watch_loop 收到该 tab 的 Page.loadEventFired 时放行全部等待者。key =
+    /// targetId（与 refs/dialogs 同键，drop_tab 一并清理）；超时/失败路径的
+    /// Sender 残留至下次 load 事件（send 落空即弃，仅句柄暂存无泄漏风险）。
+    load_waiters: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<()>>>>,
     /// 代际计数：每次建连 +1。旧代 watch_loop 在清理点核对代际，新一代已
     /// 接管时不动登记表/连接槽（防僵尸 loop 误删新代状态）。
     generation: AtomicU64,
@@ -199,6 +240,7 @@ impl Watched {
             tabs: Mutex::new(TabTable::default()),
             refs: Mutex::new(HashMap::new()),
             dialogs: Mutex::new(HashMap::new()),
+            load_waiters: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         }
     }
@@ -283,10 +325,12 @@ impl PageService {
         )
         .await?;
         let gen = watched.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        // 旧代残留的 tabs/refs/dialogs 属于死会话（sessionId 已失效），整清
+        // 旧代残留的 tabs/refs/dialogs/load_waiters 属于死会话（sessionId 已
+        // 失效），整清（等待中的导航命令各自走到自己的超时分支）
         watched.tabs.lock().unwrap().clear();
         watched.refs.lock().unwrap().clear();
         watched.dialogs.lock().unwrap().clear();
+        watched.load_waiters.lock().unwrap().clear();
         *watched.conn.lock().unwrap() = Some(Arc::clone(&conn));
         tauri::async_runtime::spawn(watch_loop(
             ins_id.to_string(),
@@ -609,6 +653,73 @@ impl PageService {
         )
         .await
     }
+
+    /// navigate <tab> <url>：该 tab 的 page session 上直发 Page.navigate——
+    /// 与实例级 navigate（new+close 组合，丢历史）不同，这里在同一 target 内
+    /// 导航，历史/back/forward 全保留。等待 load 事件（NAV_LOAD_TIMEOUT 窗口，
+    /// 窗口内未见 → loaded:false 诚实返回），语义详见 navigate_tool。URL 白名单
+    /// 与实例级 tabs/navigate 同源（domain 共享校验），不合法在进串行锁前 400。
+    pub async fn navigate(&self, ins_id: &str, tab: &str, url: &str) -> Result<Value, AppError> {
+        validate_http_url(url)?;
+        self.command(
+            TOOL_TIMEOUT,
+            "navigate",
+            ins_id,
+            tab,
+            move |w, tid, sid| async move { navigate_tool(&w, &tid, &sid, url, NAV_LOAD_TIMEOUT).await },
+        )
+        .await
+    }
+
+    /// back <tab>：历史后退一步（无更早条目 → 409 PAGE_NAV_NO_HISTORY）。
+    /// 完成信号双轨（新文档 = load 事件；同文档条目 = 历史索引提交 +
+    /// readyState），详见 history_step_tool。
+    pub async fn back(&self, ins_id: &str, tab: &str) -> Result<Value, AppError> {
+        self.command(
+            TOOL_TIMEOUT,
+            "back",
+            ins_id,
+            tab,
+            move |w, tid, sid| async move {
+                history_step_tool(&w, &tid, &sid, -1, NAV_LOAD_TIMEOUT).await
+            },
+        )
+        .await
+    }
+
+    /// forward <tab>：历史前进一步（无更晚条目 → 409 PAGE_NAV_NO_HISTORY）。
+    pub async fn forward(&self, ins_id: &str, tab: &str) -> Result<Value, AppError> {
+        self.command(
+            TOOL_TIMEOUT,
+            "forward",
+            ins_id,
+            tab,
+            move |w, tid, sid| async move {
+                history_step_tool(&w, &tid, &sid, 1, NAV_LOAD_TIMEOUT).await
+            },
+        )
+        .await
+    }
+
+    /// reload <tab> [--ignore-cache]：Page.reload；等待语义同 navigate
+    /// （load 事件窗口，未见 → loaded:false）。
+    pub async fn reload(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        ignore_cache: bool,
+    ) -> Result<Value, AppError> {
+        self.command(
+            TOOL_TIMEOUT,
+            "reload",
+            ins_id,
+            tab,
+            move |w, tid, sid| async move {
+                reload_tool(&w, &tid, &sid, ignore_cache, NAV_LOAD_TIMEOUT).await
+            },
+        )
+        .await
+    }
 }
 
 /// 工具级预算：超时即放弃整个命令（连接守卫随 future 取消而释放，tokio
@@ -696,6 +807,18 @@ async fn handle_event(watched: &Watched, event: &Value) {
         "Page.javascriptDialogOpening" => {
             if let Some(sid) = event.get("sessionId").and_then(Value::as_str) {
                 on_dialog_opening(watched, sid, &params).await;
+            }
+        }
+        // 导航命令族（navigate/reload/back/forward）的加载信号：等待者在命令
+        // 发送前登记（见 register_load_waiter），load 事件到达即放行该 tab 全部
+        // 等待者。Page.enable 在 attach 时已发（on_attached），事件必然可达。
+        "Page.loadEventFired" => {
+            if let Some(tid) = tab_of_session(watched, event) {
+                if let Some(waiters) = watched.load_waiters.lock().unwrap().remove(&tid) {
+                    for tx in waiters {
+                        let _ = tx.send(());
+                    }
+                }
             }
         }
         // 仅根 frame（parentId 为空）才失效：子 frame 导航不换文档（§3.6）
@@ -803,11 +926,13 @@ async fn probe_reconnected_dialog(watched: &Watched, conn: &SharedPageConn, tid:
 }
 
 /// detachedFromTarget / targetDestroyed 的共同清理：映射 + 该 tab 的
-/// RefStore / DialogBuffer 一起删（会话已死，状态随之作废）。
+/// RefStore / DialogBuffer / load 等待者一起删（会话已死，状态随之作废；
+/// 等待中的导航命令各自走到自己的超时分支）。
 fn drop_tab(watched: &Watched, tid: &str) {
     watched.tabs.lock().unwrap().detach(tid);
     watched.refs.lock().unwrap().remove(tid);
     watched.dialogs.lock().unwrap().remove(tid);
+    watched.load_waiters.lock().unwrap().remove(tid);
 }
 
 fn on_detached(watched: &Watched, params: &Value) {
@@ -2194,6 +2319,230 @@ async fn loadall_tool(
 }
 
 // ============================================================================
+// 6c. 导航命令族（navigate/back/forward/reload）
+// ============================================================================
+
+/// load 等待登记：必须在导航命令发送**之前**调用——事件经 watch_loop 异步
+/// 分派，若先发送后登记，极速加载（磁盘缓存）的 load 事件可能在登记前到达，
+/// 造成永久等不到（假 loaded:false）。登记后发送即无错过窗口（命令响应与
+/// 事件同连接保序，load 必要晚于 Page.navigate 响应才可能发生）。
+fn register_load_waiter(watched: &Watched, tid: &str) -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel();
+    watched
+        .load_waiters
+        .lock()
+        .unwrap()
+        .entry(tid.to_string())
+        .or_default()
+        .push(tx);
+    rx
+}
+
+/// 等待 load 事件至截止线：true = 窗口内观察到 Page.loadEventFired。
+/// 已知边界（诚实披露而非修复）：loadEventFired 不携带 loaderId，若命令
+/// 发出时该 tab 恰有一个更早的在途加载，其 load 事件可能被计入（puppeteer
+/// 同类时序靠 loaderId 匹配根治，超出本层事件面）。
+async fn await_load(rx: oneshot::Receiver<()>, deadline: Instant) -> bool {
+    matches!(
+        tokio::time::timeout_at(deadline.into(), rx).await,
+        Ok(Ok(()))
+    )
+}
+
+/// navigate <url>：Page.navigate 直发到 page session。
+/// 等待语义（任务决策记录）：CDP 导航命令返回 ≠ 加载完成，本工具等待
+/// Page.loadEventFired（窗口 NAV_LOAD_TIMEOUT）后返回：
+/// - 窗口内观察到 → loaded:true；
+/// - 窗口耗尽 → loaded:false（导航已开始、加载未证实——不编造成功，也不
+///   无限等死；调用方用 snap/wait/eval 观察实际状态）；
+/// - 同文档导航（#fragment / pushState 型）：响应无新 loader
+///   （sameDocumentNavigation / loaderId 缺失）→ 不等待，loaded:true（DOM
+///   同步替换，无 load 事件可等）。
+///
+/// SPA 路由说明：页面内已加载 SPA 的路由切换（pushState/replaceState）不经
+/// 过本命令，自然也不触发 load 事件——观察 SPA 路由后的 DOM 用 snap/wait。
+async fn navigate_tool(
+    watched: &Watched,
+    tid: &str,
+    sid: &str,
+    url: &str,
+    load_timeout: Duration,
+) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    let load = register_load_waiter(watched, tid);
+    let resp = cdp_send(&conn, "Page.navigate", json!({ "url": url }), Some(sid)).await?;
+    // errorText（net::ERR_* 等）= 导航未发生 → 失败而非 loaded:false
+    if let Some(err) = resp
+        .get("errorText")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Err(nav_failed(err));
+    }
+    let same_doc = resp.get("sameDocumentNavigation").and_then(Value::as_bool) == Some(true)
+        || resp.get("loaderId").is_none_or(Value::is_null);
+    let deadline = Instant::now() + load_timeout;
+    let (loaded, note) = if same_doc {
+        (true, "same-document navigation")
+    } else if await_load(load, deadline).await {
+        (true, "load complete")
+    } else {
+        (
+            false,
+            "load not confirmed within the window — page may still be loading",
+        )
+    };
+    Ok(json!({
+        "result": format!("Navigated to {url} ({note})"),
+        "url": url,
+        "loaded": loaded,
+    }))
+}
+
+/// 取导航历史并做边界检查：返回 (target index, entryId, url)。
+/// 响应形状并带 → INTERNAL_ERROR（防御，CDP 正常不会发垃圾）。
+async fn nav_history_target(
+    conn: &SharedPageConn,
+    sid: &str,
+    delta: i64,
+) -> Result<(i64, Value, String), AppError> {
+    let hist = cdp_send(conn, "Page.getNavigationHistory", json!({}), Some(sid)).await?;
+    let current = hist
+        .get("currentIndex")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            AppError::internal("unexpected Page.getNavigationHistory response: no currentIndex")
+        })?;
+    let entries = hist.get("entries").and_then(Value::as_array).ok_or_else(|| {
+        AppError::internal("unexpected Page.getNavigationHistory response: no entries")
+    })?;
+    let target = current + delta;
+    if target < 0 || target >= entries.len() as i64 {
+        let direction = if delta < 0 { "earlier (back)" } else { "later (forward)" };
+        return Err(nav_no_history(direction));
+    }
+    let entry = &entries[target as usize];
+    let id = entry
+        .get("id")
+        .cloned()
+        .ok_or_else(|| AppError::internal("navigation history entry missing id"))?;
+    let url = entry
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok((target, id, url))
+}
+
+/// back/forward 共用（delta = -1/+1）：取历史 → 边界检查（409
+/// PAGE_NAV_NO_HISTORY）→ navigateToHistoryEntry → 等待完成。
+/// 完成信号双轨（历史条目分两类，事件面无法提前区分）：
+/// - 新文档条目：load 事件（navigate/reload 同款等待）；
+/// - 同文档条目（SPA pushState 产生）：不触发 load 事件——以历史索引提交
+///   为信号；提交确认后 readyState 已 complete 则立即返回（快路径，不等满
+///   窗口）。readyState=complete 与 load 事件触发是同一时刻（HTML 规范：
+///   readyState 在 load 触发时变为 complete），loaded:true 证据等价。
+async fn history_step_tool(
+    watched: &Watched,
+    tid: &str,
+    sid: &str,
+    delta: i64,
+    load_timeout: Duration,
+) -> Result<Value, AppError> {
+    let direction = if delta < 0 { "back" } else { "forward" };
+    let conn = require_conn(watched)?;
+    let (target, entry_id, url) = nav_history_target(&conn, sid, delta).await?;
+    let load = register_load_waiter(watched, tid);
+    cdp_send(
+        &conn,
+        "Page.navigateToHistoryEntry",
+        json!({ "entryId": entry_id }),
+        Some(sid),
+    )
+    .await?;
+    let deadline = Instant::now() + load_timeout;
+    // 提交确认轮询：currentIndex 到位 = 目标条目已激活（同文档条目同步到位，
+    // 新文档条目在提交时到位）
+    loop {
+        let committed =
+            match cdp_send(&conn, "Page.getNavigationHistory", json!({}), Some(sid)).await {
+                Ok(h) => h.get("currentIndex").and_then(Value::as_i64) == Some(target),
+                Err(_) => false, // 轮询期连接抖动按未提交继续（要么恢复要么超时）
+            };
+        if committed {
+            let ready_complete = matches!(
+                eval_raw(&conn, sid, "document.readyState").await,
+                Ok(v) if v.as_str() == Some("complete")
+            );
+            if ready_complete {
+                return Ok(json!({
+                    "result": format!(
+                        "Navigated {direction} to entry {target}: {url} (ready — same-document entry or already loaded)"
+                    ),
+                    "url": url,
+                    "index": target,
+                    "loaded": true,
+                }));
+            }
+            break; // 新文档已提交仍在加载 → 转 load 事件等待
+        }
+        if Instant::now() >= deadline {
+            return Ok(json!({
+                "result": format!(
+                    "Navigated {direction} to entry {target}: {url} (commit not confirmed within the window — navigation may still be pending)"
+                ),
+                "url": url,
+                "index": target,
+                "loaded": false,
+            }));
+        }
+        tokio::time::sleep(NAV_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))).await;
+    }
+    let loaded = await_load(load, deadline).await;
+    let note = if loaded {
+        "load complete"
+    } else {
+        "committed, load not confirmed within the window — page may still be loading"
+    };
+    Ok(json!({
+        "result": format!("Navigated {direction} to entry {target}: {url} ({note})"),
+        "url": url,
+        "index": target,
+        "loaded": loaded,
+    }))
+}
+
+/// reload [--ignore-cache]：Page.reload 无响应负载（错误走 CDP error 通道），
+/// 恒为新文档加载 → 一律等待 load 事件（窗口内未见 → loaded:false）。
+async fn reload_tool(
+    watched: &Watched,
+    tid: &str,
+    sid: &str,
+    ignore_cache: bool,
+    load_timeout: Duration,
+) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    let load = register_load_waiter(watched, tid);
+    cdp_send(
+        &conn,
+        "Page.reload",
+        json!({ "ignoreCache": ignore_cache }),
+        Some(sid),
+    )
+    .await?;
+    let loaded = await_load(load, Instant::now() + load_timeout).await;
+    let note = if loaded {
+        "load complete"
+    } else {
+        "load not confirmed within the window — page may still be loading"
+    };
+    Ok(json!({
+        "result": format!("Reloaded ({note})"),
+        "loaded": loaded,
+    }))
+}
+
+// ============================================================================
 // 测试：纯逻辑（AX 快照/路由/分类）+ fake CDP 编排全链路（不依赖真 Chrome）
 // ============================================================================
 
@@ -2421,6 +2770,20 @@ mod tests {
             "method": "Target.attachedToTarget",
             "params": { "sessionId": sid, "targetInfo": { "targetId": tid, "type": ty } }
         })
+    }
+
+    /// Page.loadEventFired（flatten 模式：sessionId 在顶层）
+    fn load_event(sid: &str) -> Value {
+        json!({ "method": "Page.loadEventFired", "sessionId": sid, "params": {} })
+    }
+
+    /// Page.getNavigationHistory 响应：currentIndex + entries（id/url）
+    fn hist(current: i64, ids: &[i64]) -> Result<Value, String> {
+        let entries: Vec<Value> = ids
+            .iter()
+            .map(|i| json!({ "id": i, "url": format!("https://a/{i}") }))
+            .collect();
+        Ok(json!({ "currentIndex": current, "entries": entries }))
     }
 
     // ---------------- 纯逻辑：tab 路由 / ref 分流 ---------------------------
@@ -4301,5 +4664,269 @@ mod tests {
         let e2 = svc.loadall(INS, "T1", "", None, None).await.unwrap_err();
         assert_eq!(e2.code(), "INVALID_REQUEST");
         assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 0);
+    }
+
+    // ---------------- 工具：navigate / back / forward / reload ---------------
+
+    /// URL 白名单在进串行锁/建连前拦截（400），与实例级 tabs/navigate 同源
+    ///（domain validate_http_url）；非 http(s) scheme 零 CDP 发送。
+    #[tokio::test]
+    async fn navigate_rejects_non_http_url_before_connecting() {
+        let (svc, _w, calls, _script) = armed();
+        for bad in ["ftp://x", "javascript:alert(1)", "file:///etc/hosts", ""] {
+            let e = svc.navigate(INS, "T1", bad).await.unwrap_err();
+            assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400), "应拒绝: {bad}");
+        }
+        assert_eq!(
+            calls_of(&calls, "Page.navigate").len(),
+            0,
+            "校验失败不建连不发送"
+        );
+    }
+
+    /// Page.navigate 响应携带 errorText（net::ERR_*）→ 500 PAGE_NAV_FAILED：
+    /// 导航未发生是失败，与 loaded:false（已开始、未证实）严格区分。
+    #[tokio::test]
+    async fn navigate_error_text_maps_to_page_nav_failed() {
+        let (svc, _w, _calls, script) = armed();
+        given(
+            &script,
+            "Page.navigate",
+            vec![Ok(json!({ "frameId": "F1", "errorText": "net::ERR_NAME_NOT_RESOLVED" }))],
+        );
+        let e = svc
+            .navigate(INS, "T1", "https://no-such-host.invalid/")
+            .await
+            .unwrap_err();
+        assert_eq!((e.code(), e.status()), ("PAGE_NAV_FAILED", 500));
+        assert!(e.to_string().contains("net::ERR_NAME_NOT_RESOLVED"));
+    }
+
+    /// 同文档导航（sameDocumentNavigation / 无新 loader）→ 不等待 load 事件，
+    /// 立即 loaded:true（DOM 同步替换，无 load 可等——等下去必假 loaded:false）。
+    #[tokio::test]
+    async fn navigate_same_document_returns_without_waiting() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Page.navigate",
+            vec![Ok(json!({ "frameId": "F1", "sameDocumentNavigation": true }))],
+        );
+        // 无 load 事件注入：若实现误等 load，此 await 会挂到超时
+        let resp = svc.navigate(INS, "T1", "https://a/#frag").await.unwrap();
+        assert_eq!(resp["loaded"], json!(true));
+        assert_eq!(resp["url"], json!("https://a/#frag"));
+        assert!(
+            resp["result"]
+                .as_str()
+                .unwrap()
+                .contains("same-document navigation")
+        );
+        assert_eq!(calls_of(&calls, "Page.navigate")[0].session.as_deref(), Some("S1"));
+    }
+
+    /// 新文档导航：命令后等 Page.loadEventFired，事件经 watch_loop 同款分派链
+    ///（handle_event）放行 → loaded:true。
+    #[tokio::test]
+    async fn navigate_waits_for_load_event() {
+        let (svc, watched, calls, script) = armed();
+        given(
+            &script,
+            "Page.navigate",
+            vec![Ok(json!({ "frameId": "F1", "loaderId": "L1" }))],
+        );
+        let task = async {
+            // Page.navigate 调用已记录 = 等待者已登记（登记先于发送）
+            eventually("Page.navigate 已发出", || {
+                calls_of(&calls, "Page.navigate").len() == 1
+            })
+            .await;
+            handle_event(&watched, &load_event("S1")).await;
+        };
+        let (resp, ()) = tokio::join!(svc.navigate(INS, "T1", "https://example.com/"), task);
+        let resp = resp.unwrap();
+        assert_eq!(resp["loaded"], json!(true));
+        assert!(resp["result"].as_str().unwrap().contains("load complete"));
+        assert_eq!(resp["url"], json!("https://example.com/"));
+        assert_eq!(resp["instanceId"], json!(INS));
+        assert_eq!(resp["targetId"], json!("T1"));
+    }
+
+    /// 加载等待窗口耗尽 → loaded:false 诚实返回（导航已开始，非失败）。
+    /// 直调内部工具注入小窗口（服务层常量 25s，测试不可等）。
+    #[tokio::test]
+    async fn navigate_load_timeout_reports_loaded_false() {
+        let (_svc, watched, _calls, script) = armed();
+        given(
+            &script,
+            "Page.navigate",
+            vec![Ok(json!({ "frameId": "F1", "loaderId": "L1" }))],
+        );
+        let resp = navigate_tool(
+            &watched,
+            "T1",
+            "S1",
+            "https://example.com/",
+            Duration::from_millis(120),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["loaded"], json!(false));
+        assert!(resp["result"].as_str().unwrap().contains("not confirmed"));
+    }
+
+    /// back/forward 边界：无更早/更晚历史条目 → 409 PAGE_NAV_NO_HISTORY，
+    /// message 携带方向（back/forward 各自到头）。
+    #[tokio::test]
+    async fn back_forward_at_history_boundaries_report_409() {
+        let (svc, _w, calls, script) = armed();
+        // 单条历史（current=0）：back 与 forward 都在边界
+        given(
+            &script,
+            "Page.getNavigationHistory",
+            vec![hist(0, &[1]), hist(0, &[1])],
+        );
+        let back = svc.back(INS, "T1").await.unwrap_err();
+        assert_eq!((back.code(), back.status()), ("PAGE_NAV_NO_HISTORY", 409));
+        assert!(back.to_string().contains("back"), "方向入 message: {back}");
+        let fwd = svc.forward(INS, "T1").await.unwrap_err();
+        assert_eq!((fwd.code(), fwd.status()), ("PAGE_NAV_NO_HISTORY", 409));
+        assert!(fwd.to_string().contains("forward"), "方向入 message: {fwd}");
+        // 两条历史（current=0）：forward 越界同理（另一侧边界）
+        let (svc2, _w2, _c2, script2) = armed();
+        given(
+            &script2,
+            "Page.getNavigationHistory",
+            vec![hist(1, &[1, 2])],
+        );
+        let fwd2 = svc2.forward(INS, "T1").await.unwrap_err();
+        assert_eq!((fwd2.code(), fwd2.status()), ("PAGE_NAV_NO_HISTORY", 409));
+        assert_eq!(calls_of(&calls, "Page.navigateToHistoryEntry").len(), 0);
+    }
+
+    /// 同文档历史条目（SPA pushState 产生）：不触发 load 事件，以历史索引
+    /// 提交 + readyState=complete 为完成信号 → 快路径立即 loaded:true，
+    /// 不等满窗口。
+    #[tokio::test]
+    async fn back_same_document_entry_commits_fast() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Page.getNavigationHistory",
+            vec![hist(1, &[1, 2]), hist(0, &[1, 2])],
+        );
+        given(&script, "Page.navigateToHistoryEntry", vec![Ok(json!({}))]);
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![rt_result(json!("complete"))],
+        );
+        // 无 load 事件注入：若实现误等 load，此 await 会挂到超时
+        let resp = svc.back(INS, "T1").await.unwrap();
+        assert_eq!(resp["loaded"], json!(true));
+        assert_eq!(resp["index"], json!(0));
+        assert_eq!(resp["url"], json!("https://a/1"));
+        let nav = calls_of(&calls, "Page.navigateToHistoryEntry");
+        assert_eq!((nav.len(), nav[0].param("entryId"), nav[0].session.as_deref()), (1, json!(1), Some("S1")));
+        assert!(resp["result"].as_str().unwrap().contains("back to entry 0"));
+        assert!(resp["result"].as_str().unwrap().contains("same-document"));
+    }
+
+    /// 新文档历史条目：提交确认后 readyState 仍在 loading → 转 load 事件
+    /// 等待，事件到达才 loaded:true。
+    #[tokio::test]
+    async fn back_full_document_load_waits_for_load_event() {
+        let (svc, watched, calls, script) = armed();
+        given(
+            &script,
+            "Page.getNavigationHistory",
+            vec![hist(1, &[1, 2]), hist(0, &[1, 2])],
+        );
+        given(&script, "Page.navigateToHistoryEntry", vec![Ok(json!({}))]);
+        given(
+            &script,
+            "Runtime.evaluate",
+            vec![rt_result(json!("loading"))],
+        );
+        let probe = async {
+            // readyState 探测已发出 = 提交已确认且等待者已登记（登记先于导航发送）
+            eventually("readyState 探测已发出", || {
+                calls_of(&calls, "Runtime.evaluate").len() == 1
+            })
+            .await;
+            handle_event(&watched, &load_event("S1")).await;
+        };
+        let (resp, ()) = tokio::join!(svc.back(INS, "T1"), probe);
+        let resp = resp.unwrap();
+        assert_eq!(resp["loaded"], json!(true));
+        assert!(resp["result"].as_str().unwrap().contains("load complete"));
+    }
+
+    /// 提交确认轮询窗口耗尽（currentIndex 一直未到目标）→ loaded:false，
+    /// result 明示 commit not confirmed（直调内部工具注入小窗口）。
+    #[tokio::test]
+    async fn back_commit_timeout_reports_loaded_false() {
+        let (_svc, watched, _calls, script) = armed();
+        given(&script, "Page.getNavigationHistory", vec![hist(1, &[1, 2])]);
+        given(&script, "Page.navigateToHistoryEntry", vec![Ok(json!({}))]);
+        // 后续 getNavigationHistory 轮询耗尽脚本队列 → Ok(Null)：无 currentIndex
+        let resp = history_step_tool(&watched, "T1", "S1", -1, Duration::from_millis(150))
+            .await
+            .unwrap();
+        assert_eq!(resp["loaded"], json!(false));
+        assert!(resp["result"]
+            .as_str()
+            .unwrap()
+            .contains("commit not confirmed"));
+    }
+
+    /// reload：等 load 事件 → loaded:true（params 携带 ignoreCache）；
+    /// 窗口耗尽 → loaded:false（直调内部工具注入小窗口）。
+    #[tokio::test]
+    async fn reload_waits_load_event_and_timeout_paths() {
+        let (svc, watched, calls, script) = armed();
+        given(&script, "Page.reload", vec![Ok(json!({}))]);
+        let probe = async {
+            eventually("Page.reload 已发出", || calls_of(&calls, "Page.reload").len() == 1).await;
+            assert_eq!(
+                calls_of(&calls, "Page.reload")[0].params,
+                json!({ "ignoreCache": true })
+            );
+            handle_event(&watched, &load_event("S1")).await;
+        };
+        let (resp, ()) = tokio::join!(svc.reload(INS, "T1", true), probe);
+        let resp = resp.unwrap();
+        assert_eq!(resp["loaded"], json!(true));
+        assert!(resp["result"].as_str().unwrap().contains("load complete"));
+
+        let (_svc2, watched2, _c2, script2) = armed();
+        given(&script2, "Page.reload", vec![Ok(json!({}))]);
+        let resp2 = reload_tool(&watched2, "T1", "S1", false, Duration::from_millis(120))
+            .await
+            .unwrap();
+        assert_eq!(resp2["loaded"], json!(false));
+        assert!(resp2["result"].as_str().unwrap().contains("not confirmed"));
+    }
+
+    /// load 事件按 tab 定向放行：其他 tab 的 loadEventFired 不误触；
+    /// tab 销毁时等待者随 per-tab 状态一并清理。
+    #[tokio::test]
+    async fn load_event_resolves_waiter_by_tab_and_cleanup_on_drop() {
+        let (_svc, watched, _calls, _script) = armed();
+        let mut rx = register_load_waiter(&watched, "T1");
+        // TAB2（session S2）的 load 事件不影响 T1 的等待者
+        handle_event(&watched, &load_event("S2")).await;
+        assert!(rx.try_recv().is_err(), "其他 tab 的事件不得放行");
+        handle_event(&watched, &load_event("S1")).await;
+        assert!(rx.try_recv().is_ok(), "本 tab 事件放行等待者");
+
+        // tab 销毁 → 等待者登记随之清理（drop_tab）
+        let _rx2 = register_load_waiter(&watched, "TAB2");
+        handle_event(
+            &watched,
+            &json!({ "method": "Target.targetDestroyed", "params": { "targetId": "TAB2" } }),
+        )
+        .await;
+        assert!(watched.load_waiters.lock().unwrap().get("TAB2").is_none());
     }
 }

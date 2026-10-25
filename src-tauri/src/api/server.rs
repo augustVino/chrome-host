@@ -241,6 +241,25 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/type",
             post(crate::api::pages::r#type),
         )
+        // page 导航命令族：navigate/back/forward/reload——page session 内
+        // Page.navigate / 导航历史 / Page.reload，保留历史（实例级 navigate 的
+        // new+close 组合近似会丢历史，该端点保留给 GUI，文档已指向本族）
+        .route(
+            "/api/v1/instances/{id}/page/navigate",
+            post(crate::api::pages::navigate),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/back",
+            post(crate::api::pages::back),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/forward",
+            post(crate::api::pages::forward),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/reload",
+            post(crate::api::pages::reload),
+        )
         .route(
             "/api/v1/login-profiles",
             get(crate::api::login_profiles::list),

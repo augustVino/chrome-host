@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::domain::environment::Environment;
 use crate::domain::instance::{self as instance_domain, Instance, InstanceStatus, RuntimeUpdate};
+use crate::domain::page_control::validate_http_url;
 use crate::error::AppError;
 use crate::infrastructure::cdp;
 use crate::infrastructure::cdp::ws::CdpConnection;
@@ -685,31 +686,23 @@ impl InstanceService {
             .collect())
     }
 
-    fn validate_http_url(url: &str) -> Result<(), AppError> {
-        let parsed = url::Url::parse(url)
-            .map_err(|_| AppError::invalid_request(format!("URL 不合法: {url}")))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(AppError::invalid_request("URL 必须 http/https 开头"));
-        }
-        Ok(())
-    }
-
-    /// POST tabs：新建标签页
+    /// POST tabs：新建标签页（URL 白名单 = domain 共享校验，与 page/navigate 同源）
     pub async fn open_tab(&self, id: &str, url: &str) -> Result<cdp::client::Target, AppError> {
-        Self::validate_http_url(url)?;
+        validate_http_url(url)?;
         let (_, port) = self.require_running(id).await?;
         cdp::client::new_target(port, url).await
     }
 
     /// POST navigate：MVP 用 new_target + close_target 组合近似（会丢失旧页历史，
-    /// API 文档已明示语义差异，Phase 2 WS Page.navigate 兕底）
+    /// API 文档已明示语义差异；保留历史用 page/navigate——page session 直发
+    /// Page.navigate，AGENT-API note 已指向）
     pub async fn navigate(
         &self,
         id: &str,
         tab_id: &str,
         url: &str,
     ) -> Result<cdp::client::Target, AppError> {
-        Self::validate_http_url(url)?;
+        validate_http_url(url)?;
         let (_, port) = self.require_running(id).await?;
         let new = cdp::client::new_target(port, url).await?;
         // 旧页关闭失败（已被用户关掉等）不影响新页已打开的事实
