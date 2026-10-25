@@ -247,6 +247,18 @@ export const API_CATALOG: CatalogGroup[] = [
       },
       {
         method: 'POST',
+        path: '/instances/:id/page/intercept',
+        desc: 'Fetch 会话层拦截：规则集整表替换（mock/setHeaders/block）',
+        body: '{ "rules": [{ "id": "r1", "match": { "urlPattern": "*://api.foo.com/v1/*" }, "action": { "type": "mock", "status": 200, "body": "{}" } }], "tab": null }',
+        note: '任务内动态规则（与 net-rules DNR 持久层互补）；本地决策不逐请求往返；连接重建自动失效；resourceTypes 合法集 Document/Stylesheet/Image/Media/Font/Script/XHR/Fetch/Ping/Other（大小写不敏感；WebSocket/Manifest 等被 CfT 131 拒）；未命中/失败一律放行',
+      },
+      {
+        method: 'GET',
+        path: '/instances/:id/page/intercept',
+        desc: '拦截状态：规则命中计数/剩余/活跃 + 干预记录环（200 条，url 脱敏）',
+      },
+      {
+        method: 'POST',
         path: '/instances/:id/page/loadall',
         desc: '循环点击"加载更多"直到元素消失',
         body: '{ "selector": ".more", "intervalMs": 1500, "tab": null }',

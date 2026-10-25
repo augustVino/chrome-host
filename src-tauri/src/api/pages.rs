@@ -376,6 +376,37 @@ pub async fn loadall(
     Ok(Json(resp))
 }
 
+/// POST /api/v1/instances/{id}/page/intercept —— Fetch 会话层拦截规则集
+/// 整表替换。body 即规则集 `{ "rules": [...], "tab?": ... }`（空 rules = 清空）。
+/// 生命周期绑定 page 控制连接：重建后自动失效（GET 披露 liveSince=null）。
+pub async fn intercept_set(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let tab = body.get("tab").and_then(Value::as_str).unwrap_or("");
+    let resp = state.page.intercept_set(&id, tab, &body).await?;
+    Ok(Json(resp))
+}
+
+/// GET /api/v1/instances/{id}/page/intercept —— 规则状态 + 干预记录环。
+#[derive(Deserialize)]
+pub struct InterceptQuery {
+    pub tab: Option<String>,
+}
+
+pub async fn intercept_get(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<InterceptQuery>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .intercept_get(&id, q.tab.as_deref().unwrap_or(""))
+        .await?;
+    Ok(Json(resp))
+}
+
 pub async fn r#type(
     State(state): State<ApiState>,
     Path(id): Path<String>,

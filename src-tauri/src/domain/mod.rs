@@ -2,6 +2,7 @@ pub mod diagnostics;
 pub mod emulate;
 pub mod environment;
 pub mod extension;
+pub mod fetch_rules;
 pub mod hosts;
 pub mod instance;
 pub mod login_profile;

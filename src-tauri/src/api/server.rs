@@ -264,6 +264,12 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/reload",
             post(crate::api::pages::reload),
         )
+        // Fetch 会话层拦截（W-fetch）：规则集整表下发 + 状态/干预记录查询。
+        // 决策在事件流内（不碰串行锁）；生命周期绑定 page 控制连接
+        .route(
+            "/api/v1/instances/{id}/page/intercept",
+            post(crate::api::pages::intercept_set).get(crate::api::pages::intercept_get),
+        )
         // page 控制命令族（W-cap）：元素截图 / PDF / 设备仿真——仍为薄透传
         .route(
             "/api/v1/instances/{id}/page/screenshot",
