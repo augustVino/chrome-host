@@ -1,17 +1,20 @@
 //! 敏感信息脱敏（纯函数、无 IO）——URL 与响应体落环前执行。
 //!
 //! 契约（AGENT-API.md「证据边界契约」同源披露）：
-//! - **环内与 API 输出一律存脱敏后的内容**：原始 URL/body 不进进程内存常驻
+//! - **环内与 API 输出一律存脱敏后的内容**：所有入环 URL（请求 URL、attach
+//!   页面 URL、Log 条目 URL——含 query 与 fragment）与 body 落环前单向脱敏
 //!   （诊断环是长生命周期状态，密钥一旦入环会随查询/HAR/SSE 反复外泄；
-//!   落环前单向脱敏让「查得到的一定安全」，无需信任每个消费面）；
+//!   落环前脱敏让「查得到的一定安全」，无需信任每个消费面）；
 //! - JSON 走**源码区间替换**而非 parse + reserialize：未命中敏感键的字节
 //!   原样保留——64 位数字 ID（>2^53）的十进制文本不经任何数值转换，精度
-//!   字节级不变；空白/键序/转义形态全部保持证据原貌；
+//!   字节级不变；空白/键序/转义形态全部保持证据原貌。值域凭证（Bearer/
+//!   k=v 形态出现在非敏感键的字符串值里）与文本模式共用同一扫描集；
 //! - 拒绝语义优先于部分保留：结构化 body 不可解析 / 深于 24 层 / 非 JSON
 //!   路径进来却是结构化形态 → 整体 `redact-failed`（宁可少证据，不可在
 //!   无法定界的内容里留一个可能截断在密钥中间的前缀）。
 //!
-//! 无正则依赖：Bearer/k=v 两类文本模式手写扫描（依赖清单冻结，不为脱敏破例）。
+//! 无正则依赖：Bearer / k=v（含 k:v）/ XML 文本节点三类文本模式手写扫描
+//! （依赖清单冻结，不为脱敏破例）。
 
 /// URL 最大保留长度（字符数）；超长截断并追加可见标记（截断必须显式）
 pub const URL_MAX_CHARS: usize = 2048;
@@ -25,10 +28,13 @@ pub const URL_TRUNCATED_MARK: &str = "[url-truncated]";
 /// 敏感类别词（全小写；匹配按词whole-word，见 [`split_words`]）。
 /// 取舍：`key` 单词会误伤 {"key": "...} 这类 KV 元数据（保守可接受）；
 /// 不收录 `code`（业务状态码高频，误伤面过大）、`refresh`（refreshInterval
-/// 等非密钥高频）——漏报风险由「宁少证据」的整体拒绝路径兜底。
+/// 等非密钥高频）。漏报即漏报——整体拒绝路径只兜 Unparseable/TooDeep/
+/// Uncertain 三种定界失败，格式合法 JSON 里的词表漏报不会被拒绝兜住，
+/// 因此词表按实测漏网补齐（passphrase/passcode/privatekey 连写形态）。
 const SENSITIVE_WORDS: &[&str] = &[
     "token", "secret", "password", "passwd", "pwd", "auth", "authorization", "signature", "sign",
     "session", "credential", "credentials", "cookie", "bearer", "apikey", "key", "jwt", "ticket",
+    "passphrase", "passcode", "privatekey",
 ];
 
 /// 字段名是否敏感：HTML 实体归一 → 分词（camelCase/kebab/snake/点号）→
@@ -90,9 +96,9 @@ fn split_words(input: &str) -> Vec<String> {
     words
 }
 
-/// URL 脱敏：query 敏感 key 的值 → `[redacted]`；超 2048 字符截断 + 标记。
-/// 手工字符串处理，不经 URL 解析器（parse + 重组会重排编码/规范化，
-/// 破坏原始证据形态）。
+/// URL 脱敏：query 与 fragment 中敏感 key 的值 → `[redacted]`；'&' 与 ';'
+/// 均作参数分隔符；超 2048 字符截断 + 标记。手工字符串处理，不经 URL
+/// 解析器（parse + 重组会重排编码/规范化，破坏原始证据形态）。
 pub fn redact_url(url: &str) -> String {
     let redacted = redact_query(url);
     if redacted.chars().count() > URL_MAX_CHARS {
@@ -103,41 +109,70 @@ pub fn redact_url(url: &str) -> String {
     }
 }
 
-/// query 段脱敏（保留 base、参数序、非敏感参数原样；fragment 原样回接）
+/// query/fragment 段脱敏（保留 base、参数序、分隔符与非敏感参数原样）。
+/// fragment 与 query 同构处理：OAuth implicit flow 的 access_token 恰走
+/// fragment（#access_token=eyJ...），只保 query 会留整段明文。
 fn redact_query(url: &str) -> String {
-    let Some(qpos) = url.find('?') else {
-        return url.to_string();
-    };
-    let (base, rest) = url.split_at(qpos + 1);
-    let (query, fragment) = match rest.find('#') {
-        Some(fpos) => (&rest[..fpos], &rest[fpos..]),
-        None => (rest, ""),
-    };
-    if query.is_empty() {
+    let qpos = url.find('?');
+    let hpos = url.find('#');
+    if qpos.is_none() && hpos.is_none() {
         return url.to_string();
     }
     let mut out = String::with_capacity(url.len());
-    out.push_str(base);
-    for (i, pair) in query.split('&').enumerate() {
-        if i > 0 {
-            out.push('&');
+    match (qpos, hpos) {
+        (Some(q), Some(h)) if q < h => {
+            out.push_str(&url[..=q]);
+            out.push_str(&redact_pairs(&url[q + 1..h]));
+            out.push('#');
+            out.push_str(&redact_pairs(&url[h + 1..]));
         }
-        match pair.find('=') {
-            Some(epos) => {
-                let (k, _v) = pair.split_at(epos);
-                if is_sensitive_key(k) {
-                    out.push_str(k);
-                    out.push('=');
-                    out.push_str(REDACTED);
-                } else {
-                    out.push_str(pair);
-                }
-            }
-            None => out.push_str(pair),
+        (Some(q), None) => {
+            out.push_str(&url[..=q]);
+            out.push_str(&redact_pairs(&url[q + 1..]));
+        }
+        // '#' 在 '?' 之前（或无 '?'）：'?' 属 fragment 内容，'#' 后整段按
+        // fragment 处理（redact_pairs 对无 '=' 的段原样）
+        (_, Some(h)) => {
+            out.push_str(&url[..=h]);
+            out.push_str(&redact_pairs(&url[h + 1..]));
+        }
+        (None, None) => unreachable!("入口已排除"),
+    }
+    out
+}
+
+/// '&' / ';' 分隔的 pair 序列逐段脱敏，分隔符形态原样保留（'&' 与 ';' 混用
+/// 时各归各）。';' 也作分隔符：部分框架/网关按分号解析 query，
+/// `?file=x;access_token=abc` 若只按 '&' 切分会整段漏判。
+fn redact_pairs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for chunk in s.split_inclusive(|c: char| c == '&' || c == ';') {
+        let (pair, sep) = match chunk.as_bytes().last() {
+            Some(b'&') => (&chunk[..chunk.len() - 1], '&'),
+            Some(b';') => (&chunk[..chunk.len() - 1], ';'),
+            _ => (chunk, '\0'),
+        };
+        out.push_str(&redact_pair(pair));
+        if sep != '\0' {
+            out.push(sep);
         }
     }
-    out.push_str(fragment);
     out
+}
+
+/// 单个 pair：键（首个 '=' 前）命中敏感词 → 值替换；非敏感 pair 原样
+fn redact_pair(pair: &str) -> String {
+    match pair.find('=') {
+        Some(epos) => {
+            let (k, _v) = pair.split_at(epos);
+            if is_sensitive_key(k) {
+                format!("{k}={REDACTED}")
+            } else {
+                pair.to_string()
+            }
+        }
+        None => pair.to_string(),
+    }
 }
 
 /// 脱敏拒绝原因（统一映射为 bodyReason: "redact-failed"）
@@ -155,9 +190,12 @@ pub enum RedactReject {
 // JSON：源码区间替换 tokenizer
 // ---------------------------------------------------------------------------
 
-/// JSON body 脱敏。敏感字段名（[`is_sensitive_key`]）的**字符串值**替换为
-/// `[redacted]`；其余字节原样（含 64 位大数、空白、键序）。数组元素继承
-/// 外层敏感字名的脱敏（`{"tokens": ["a","b"]}`）；嵌套对象回到按自身键判定。
+/// JSON body 脱敏。敏感字段名（[`is_sensitive_key`]）的值替换为 `"[redacted]"`
+/// ——字符串/数字/true/false/null 一视同仁（数字形态的 PIN、验证码、遗留
+/// 数字密钥与字符串同权；占位带引号，输出保持合法 JSON）；未命中的字符串
+/// 值再过一遍文本模式凭证扫描（Bearer/k=v，见 [`redact_text_patterns`]）。
+/// 其余字节原样（含 64 位大数、空白、键序）。数组元素继承外层敏感字名的
+/// 脱敏（`{"tokens": ["a","b"]}`）；嵌套对象回到按自身键判定。
 /// 语法不合法 / 深度超限 → 整体拒绝。
 pub fn redact_json_body(src: &str) -> Result<String, RedactReject> {
     let mut r = JsonRedactor {
@@ -202,7 +240,8 @@ impl JsonRedactor {
         self.chars.get(self.pos).copied()
     }
 
-    /// 解析一个值并写出到 out。`sensitive` = 外层字段名敏感（字符串叶子脱敏）。
+    /// 解析一个值并写出到 out。`sensitive` = 外层字段名敏感（叶子值一律
+    /// 脱敏：字符串/数字/布尔/null；容器回到自身键判定）。
     fn value(&mut self, depth: usize, sensitive: bool) -> Result<(), RedactReject> {
         if depth > MAX_JSON_DEPTH {
             return Err(Self::too_deep());
@@ -218,16 +257,28 @@ impl JsonRedactor {
                     self.out.push_str(REDACTED);
                     self.out.push('"');
                 } else {
-                    self.out.push_str(&raw);
+                    // 值域内嵌凭证扫描（与文本模式共用模式集）：同一份
+                    // Bearer/JWT 内容不应因载体是 JSON 字符串值而非 text/
+                    // plain 就漏网。替换只发生在原始区间内——[redacted] 不含
+                    // 引号/反斜杠，非命中字节原样，输出仍是合法 JSON 字符串
+                    let inner = &raw[1..raw.len() - 1];
+                    let scanned = redact_text_patterns(inner);
+                    if scanned == inner {
+                        self.out.push_str(&raw);
+                    } else {
+                        self.out.push('"');
+                        self.out.push_str(&scanned);
+                        self.out.push('"');
+                    }
                 }
-                // decoded 仅在 sensitive 判定外的场景由 object() 使用；此处消歧
+                // decoded 仅用于键敏感性判定（object() 消费）；此处消歧
                 let _ = decoded;
                 Ok(())
             }
-            Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
-            Some('t') => self.lit("true"),
-            Some('f') => self.lit("false"),
-            Some('n') => self.lit("null"),
+            Some(c) if c == '-' || c.is_ascii_digit() => self.number(sensitive),
+            Some('t') => self.lit("true", sensitive),
+            Some('f') => self.lit("false", sensitive),
+            Some('n') => self.lit("null", sensitive),
             _ => Err(RedactReject::Unparseable),
         }
     }
@@ -373,8 +424,10 @@ impl JsonRedactor {
         }
     }
 
-    /// 数字：只消费不转写（64 位精度保持的根），语法按 JSON 数字集
-    fn number(&mut self) -> Result<(), RedactReject> {
+    /// 数字：源码区间原样转写（64 位精度保持的根），语法按 JSON 数字集；
+    /// 敏感键下的数字叶子替换为带引号占位（裸 `[redacted]` 会把 body 变成
+    /// 非法 JSON——消费方按 JSON 解析 HAR/body 时不能碎）
+    fn number(&mut self, sensitive: bool) -> Result<(), RedactReject> {
         let start = self.pos;
         if self.peek() == Some('-') {
             self.pos += 1;
@@ -393,12 +446,18 @@ impl JsonRedactor {
         if digits == 0 {
             return Err(RedactReject::Unparseable);
         }
-        let raw: String = self.chars[start..self.pos].iter().collect();
-        self.out.push_str(&raw);
+        if sensitive {
+            self.out.push('"');
+            self.out.push_str(REDACTED);
+            self.out.push('"');
+        } else {
+            let raw: String = self.chars[start..self.pos].iter().collect();
+            self.out.push_str(&raw);
+        }
         Ok(())
     }
 
-    fn lit(&mut self, word: &str) -> Result<(), RedactReject> {
+    fn lit(&mut self, word: &str, sensitive: bool) -> Result<(), RedactReject> {
         let got: String = self
             .chars
             .get(self.pos..self.pos + word.len())
@@ -408,7 +467,13 @@ impl JsonRedactor {
             return Err(RedactReject::Unparseable);
         }
         self.pos += word.len();
-        self.out.push_str(word);
+        if sensitive {
+            self.out.push('"');
+            self.out.push_str(REDACTED);
+            self.out.push('"');
+        } else {
+            self.out.push_str(word);
+        }
         Ok(())
     }
 }
@@ -417,15 +482,22 @@ impl JsonRedactor {
 // 文本（非 JSON）：类密钥模式保守扫描
 // ---------------------------------------------------------------------------
 
-/// 文本 body 脱敏：`Bearer <凭证>` 与 `敏感key=值` 两类模式替换；
-/// 呈结构化形态（`{`/`[` 开头）→ 整体拒绝（定界不可信，宁可少证据）。
+/// 文本 body 脱敏：结构化形态（`{`/`[` 开头）→ 整体拒绝（定界不可信，
+/// 宁可少证据）；其余过文本模式集（Bearer / k=v 与 k:v / XML 文本节点）。
 pub fn redact_text_body(src: &str) -> Result<String, RedactReject> {
     let trimmed = src.trim_start();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
         return Err(RedactReject::Uncertain);
     }
+    Ok(redact_text_patterns(src))
+}
+
+/// 文本模式集（Bearer → k=v / k:v → XML 文本节点，逐层收敛）：JSON 路径的
+/// 非敏感字符串值也复用同一模式集——同一份凭证不因载体 mime 不同而漏网
+fn redact_text_patterns(src: &str) -> String {
     let pass1 = redact_bearer_tokens(src);
-    Ok(redact_kv_patterns(&pass1))
+    let pass2 = redact_kv_patterns(&pass1);
+    redact_xml_text_nodes(&pass2)
 }
 
 /// `Bearer xxx`（词首大小写不敏感）→ `Bearer [redacted]`
@@ -466,8 +538,10 @@ fn redact_bearer_tokens(src: &str) -> String {
     out
 }
 
-/// k=v 模式（含 `key="value"` 引号形态与 query 风格 `&` 终止）：
+/// k=v 与 k:v 模式（含 `key="value"` 引号形态与 query 风格 `&` 终止）：
 /// 标识符命中敏感类别词时值 → `[redacted]`（闭合引号原样保留）。
+/// ':' 形态覆盖 YAML/properties/日志行（`password: hunter2`）——值域取到
+/// 行尾（YAML 值可含空格，按词截断会把密钥后半留在环里）。
 fn redact_kv_patterns(src: &str) -> String {
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
@@ -479,12 +553,17 @@ fn redact_kv_patterns(src: &str) -> String {
                 i += 1;
             }
             let key: String = chars[start..i].iter().collect();
-            // 向后看：可选空白 + '='
+            // 向后看：可选空白 + '=' 或 ':'
             let mut j = i;
             while j < chars.len() && (chars[j] == ' ' || chars[j] == '\t') {
                 j += 1;
             }
-            if j < chars.len() && chars[j] == '=' && is_sensitive_key(&key) {
+            let sep = match chars.get(j) {
+                Some('=') => '=',
+                Some(':') => ':',
+                _ => '\0',
+            };
+            if sep != '\0' && is_sensitive_key(&key) {
                 j += 1;
                 while j < chars.len() && (chars[j] == ' ' || chars[j] == '\t') {
                     j += 1;
@@ -495,12 +574,18 @@ fn redact_kv_patterns(src: &str) -> String {
                     j += 1;
                 }
                 let vstart = j;
-                while j < chars.len() && !is_value_end(chars[j], quote) {
+                while j < chars.len()
+                    && !(if sep == '=' {
+                        is_value_end(chars[j], quote)
+                    } else {
+                        is_colon_value_end(chars[j], quote)
+                    })
+                {
                     j += 1;
                 }
                 if j > vstart {
                     out.push_str(&key);
-                    out.push('=');
+                    out.push(sep);
                     if quote != '\0' {
                         out.push(quote);
                     }
@@ -523,6 +608,7 @@ fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
 }
 
+/// '=' 形态的值终止：任意空白 / '&' / '<' / ',' / ';' / 闭合引号
 fn is_value_end(c: char, quote: char) -> bool {
     c.is_whitespace()
         || c == '&'
@@ -531,6 +617,105 @@ fn is_value_end(c: char, quote: char) -> bool {
         || c == ';'
         || (quote != '\0' && c == quote)
         || (quote == '\0' && (c == '"' || c == '\''))
+}
+
+/// ':' 形态的值终止：行尾（YAML/properties 值 = 余下整行）/ '<'（XML 标签
+/// 回开）/ 闭合引号。不以任意空白截断——多词值截断会泄漏密钥后半
+fn is_colon_value_end(c: char, quote: char) -> bool {
+    c == '\n'
+        || c == '\r'
+        || c == '<'
+        || (quote != '\0' && c == quote)
+        || (quote == '\0' && (c == '"' || c == '\''))
+}
+
+/// XML 文本节点：`<password>凭证</password>` / `<s:apiKey>sk-123</s:apiKey>`
+/// 形态——元素名（含命名空间前缀，归一后整词判定）命中敏感词时，开闭标签
+/// 之间的文本内容整体 → `[redacted]`（标签与属性原样保留，SAML/SOAP 常见
+/// 载体）。自闭合、无同名片闭合标签时不动（定界失败不臆造）。
+fn redact_xml_text_nodes(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '<' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // 闭合标签 / 注释 / 声明：交回主循环原样输出
+        let Some(&c0) = chars.get(i + 1) else {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        };
+        if c0 == '/' || c0 == '!' || c0 == '?' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // 元素名（含 ':' 命名空间前缀）
+        let mut j = i + 1;
+        let name_start = j;
+        while j < chars.len() && (is_ident_char(chars[j]) || chars[j] == ':') {
+            j += 1;
+        }
+        if j == name_start {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let name: String = chars[name_start..j].iter().collect();
+        // 属性区：扫到标签结束 '>'（含引号内的 '>' 时可能提前，可接受——
+        // 只影响定界起点，内容仍受前序 pass 扫描）
+        let mut k = j;
+        while k < chars.len() && chars[k] != '>' {
+            k += 1;
+        }
+        if k >= chars.len() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let open_tag: String = chars[i..=k].iter().collect();
+        // 自闭合 <name/>：无文本内容
+        if chars[k - 1] == '/' {
+            out.push_str(&open_tag);
+            i = k + 1;
+            continue;
+        }
+        if is_sensitive_key(&name) {
+            // 找同名片闭合标签 </name>（名字串全等，含命名空间）
+            let close = format!("</{name}");
+            if let Some(m) = find_substring(&chars, k + 1, &close) {
+                let mut e = m + close.chars().count();
+                while e < chars.len() && chars[e] != '>' {
+                    e += 1;
+                }
+                if e < chars.len() {
+                    out.push_str(&open_tag);
+                    out.push_str(REDACTED);
+                    let close_tag: String = chars[m..=e].iter().collect();
+                    out.push_str(&close_tag);
+                    i = e + 1;
+                    continue;
+                }
+            }
+            // 无同名闭合：定界失败，内容交给已跑过的 Bearer/k=v 扫描兜底
+        }
+        out.push_str(&open_tag);
+        i = k + 1;
+    }
+    out
+}
+
+/// 字符数组内找子串（从 `from` 起），返回起始下标
+fn find_substring(haystack: &[char], from: usize, needle: &str) -> Option<usize> {
+    let n: Vec<char> = needle.chars().collect();
+    if n.is_empty() || haystack.len() < n.len() {
+        return None;
+    }
+    (from..=haystack.len() - n.len()).find(|&s| haystack[s..s + n.len()] == n[..])
 }
 
 // ---------------------------------------------------------------------------
@@ -612,11 +797,39 @@ mod tests {
         // camelCase / 大小写不敏感
         let out = redact_url("https://a/x?sessionToken=s3cret&Signature=zz");
         assert_eq!(out, "https://a/x?sessionToken=[redacted]&Signature=[redacted]");
-        // 非敏感参数、裸参数、fragment 原样
+        // 非敏感参数、裸参数原样；fragment 同构脱敏（OAuth implicit 的
+        // access_token 走 fragment，与 query 同一套判定）
         let out = redact_url("https://a/x?flag&q=kw#frag?token=1");
-        assert_eq!(out, "https://a/x?flag&q=kw#frag?token=1");
+        assert_eq!(out, "https://a/x?flag&q=kw#frag?token=[redacted]");
         // 无 query 原样
         assert_eq!(redact_url("https://a/x"), "https://a/x");
+    }
+
+    /// 分号分隔参数与纯 fragment URL：部分网关按 ';' 解析 query（只按 '&'
+    /// 切分时 `?file=x;access_token=abc` 整段漏判）；无 '?' 的 fragment
+    /// 承载 URL（OAuth callback）同样要过脱敏
+    #[test]
+    fn redact_url_handles_semicolon_separators_and_fragment() {
+        // 分号后携带敏感参数：逐段判定
+        assert_eq!(
+            redact_url("https://api.example.com/dl?file=x;access_token=abc123;foo=1"),
+            "https://api.example.com/dl?file=x;access_token=[redacted];foo=1"
+        );
+        // 纯 fragment（无 query）：k=v 同构脱敏
+        assert_eq!(
+            redact_url("https://app.example.com/cb#access_token=eyJ.a.b&token_type=bearer"),
+            "https://app.example.com/cb#access_token=[redacted]&token_type=[redacted]"
+        );
+        // '&' 与 ';' 混用、非敏感段原样（分隔符形态不变）
+        assert_eq!(
+            redact_url("https://a/x?a=1;b=2&c=3"),
+            "https://a/x?a=1;b=2&c=3"
+        );
+        // 值内合法分号（非 k=v 段）不受影响
+        assert_eq!(redact_url("https://a/x?q=a;b"), "https://a/x?q=a;b");
+        // 空 query / 空 fragment 边界
+        assert_eq!(redact_url("https://a/x?"), "https://a/x?");
+        assert_eq!(redact_url("https://a/x#"), "https://a/x#");
     }
 
     #[test]
@@ -678,6 +891,57 @@ mod tests {
         assert_eq!(redact_json_body(src).unwrap(), src);
     }
 
+    /// 敏感键下的非字符串值（数字 PIN/验证码、布尔、null）同权脱敏；
+    /// 占位带引号——裸 [redacted] 会把 body 变成非法 JSON
+    #[test]
+    fn json_redacts_sensitive_non_string_values() {
+        let src = r#"{"password":123456,"secret":987654321,"ok":true,"flag":false,"token":null,"apiKey":true,"n":42}"#;
+        let out = redact_json_body(src).unwrap();
+        assert_eq!(
+            out,
+            r#"{"password":"[redacted]","secret":"[redacted]","ok":true,"flag":false,"token":"[redacted]","apiKey":"[redacted]","n":42}"#
+        );
+        // 数组元素继承：数字叶子同样替换
+        let out = redact_json_body(r#"{"tokens":[1,2],"ids":[3,4]}"#).unwrap();
+        assert_eq!(out, r#"{"tokens":["[redacted]","[redacted]"],"ids":[3,4]}"#);
+    }
+
+    /// 词表实测漏网补齐：passphrase/passcode/privatekey 连写形态
+    #[test]
+    fn sensitive_keys_cover_passphrase_variants() {
+        // 连写形态（分词后无 password/key 词根可命中）
+        for key in ["passphrase", "passcode", "privatekey", "PASSCODE"] {
+            assert!(is_sensitive_key(key), "应判定敏感: {key}");
+        }
+        // 分词形态（private_key）本就命中 key 词根；passPhrase 分词为
+        // pass+phrase，pass 不入词表（passRate/passCount 误伤面）——边界如注释
+        assert!(is_sensitive_key("private_key"));
+        assert!(!is_sensitive_key("passPhrase"));
+        // 误伤面不变
+        assert!(!is_sensitive_key("passenger"));
+        assert!(!is_sensitive_key("keyword"));
+    }
+
+    /// 值域内嵌凭证：非敏感键的字符串值也过文本模式集——同一份 JWT 不因
+    /// 载体是 application/json（错误响应回显、日志型接口）而非 text/plain 漏网
+    #[test]
+    fn json_scans_string_values_for_embedded_credentials() {
+        let out = redact_json_body(
+            r#"{"error":"upstream rejected Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"}"#,
+        )
+        .unwrap();
+        assert_eq!(out, r#"{"error":"upstream rejected Bearer [redacted]"}"#);
+        // k=v 形态
+        let out = redact_json_body(r#"{"log":"ok token=abc123 done"}"#).unwrap();
+        assert_eq!(out, r#"{"log":"ok token=[redacted] done"}"#);
+        // XML 文本节点形态
+        let out = redact_json_body(r#"{"payload":"<password>hunter2</password>"}"#).unwrap();
+        assert_eq!(out, r#"{"payload":"<password>[redacted]</password>"}"#);
+        // 无命中的值字节原样（含转义形态）
+        let src = r#"{"path":"a\"b\\c"}"#;
+        assert_eq!(redact_json_body(src).unwrap(), src);
+    }
+
     #[test]
     fn json_array_elements_inherit_sensitive_key() {
         let src = r#"{"tokens":["a","b"],"ids":[1,2],"mixed":{"token":"x"}}"#;
@@ -710,9 +974,11 @@ mod tests {
 
     #[test]
     fn text_redacts_bearer_and_kv_patterns() {
+        // 冒号形态在 kv pass 命中 Authorization（值域到行尾），先跑的 Bearer
+        // 扫描产物一并被值域覆盖——两层叠加后整值归 [redacted]
         assert_eq!(
             redact_text_body("Authorization: Bearer abc.def.ghi").unwrap(),
-            "Authorization: Bearer [redacted]"
+            "Authorization:[redacted]"
         );
         assert_eq!(
             redact_text_body("bearer XYZ123 ok").unwrap(),
@@ -732,6 +998,49 @@ mod tests {
         assert_eq!(
             redact_text_body("page=2&size=10").unwrap(),
             "page=2&size=10"
+        );
+    }
+
+    /// 冒号形态（YAML/properties/日志行）与 XML 文本节点：所在 mime
+    /// （application/yaml、xml 系）均在拉取白名单内，字段型凭证的常见载体
+    #[test]
+    fn text_redacts_colon_form_and_xml_text_nodes() {
+        // 冒号形态：值域到行尾（多词密钥不留后半）
+        assert_eq!(
+            redact_text_body("password: hunter2\nclient_secret: abc").unwrap(),
+            "password:[redacted]\nclient_secret:[redacted]"
+        );
+        assert_eq!(
+            redact_text_body("password: my secret phrase").unwrap(),
+            "password:[redacted]"
+        );
+        // 引号值：闭合引号由主循环原样回接，行内后续内容保留
+        assert_eq!(
+            redact_text_body("password: \"hunter2\" next").unwrap(),
+            "password:\"[redacted]\" next"
+        );
+        // 非敏感冒号行（时间戳、URL scheme）不受影响
+        assert_eq!(
+            redact_text_body("12:30:01 https://a/x ok").unwrap(),
+            "12:30:01 https://a/x ok"
+        );
+        // XML 元素内容（含命名空间前缀）；非敏感元素与其内容原样
+        assert_eq!(
+            redact_text_body(
+                "<s:Envelope><password>hunter2</password><apiKey>sk-123</apiKey><data id=\"1\">x</data></s:Envelope>"
+            )
+            .unwrap(),
+            "<s:Envelope><password>[redacted]</password><apiKey>[redacted]</apiKey><data id=\"1\">x</data></s:Envelope>"
+        );
+        // 敏感元素嵌套内容整体替换（内容里的子元素不逐个漏判）
+        assert_eq!(
+            redact_text_body("<credentials><user>a</user></credentials>").unwrap(),
+            "<credentials>[redacted]</credentials>"
+        );
+        // 自闭合与无闭合标签：定界失败不动（内容仍受 Bearer/k=v 扫描）
+        assert_eq!(
+            redact_text_body("<token/>ok").unwrap(),
+            "<token/>ok"
         );
     }
 

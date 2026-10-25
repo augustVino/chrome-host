@@ -94,6 +94,7 @@ pub struct ConsoleEntry {
     pub text: String,
     /// 来源标记：console（JS console API）或 Log.entryAdded 的 source（如 network）
     pub source: String,
+    /// 归属页面 URL（**已脱敏**：session 登记值或 Log 条目 url 冲口脱敏）
     pub target_url: String,
     /// 归属 tab 的 targetId（attach 时登记；None = 归属未知——未 attach/迟到的
     /// console 帧，tab 过滤对这类条目降级不过滤）
@@ -115,6 +116,7 @@ pub struct NetworkEntry {
     /// CDP errorText（loadingFailed 时）
     pub error: Option<String>,
     pub duration_ms: Option<i64>,
+    /// 归属页面 URL（**已脱敏**：session 登记值经 record_session 冲口）
     pub target_url: String,
     /// 归属 tab 的 targetId（requestWillBeSent 有 session 门卫，必有归属）
     pub target_id: Option<String>,
@@ -221,6 +223,7 @@ pub enum ApplyOutcome {
 }
 
 /// attach 登记的 session 归属：tab 的 targetId + attach 时的页面 URL
+/// （**已脱敏**——record_session 冲口统一处理，所有派生消费面免信任）
 #[derive(Debug, Clone)]
 struct SessionInfo {
     target_id: String,
@@ -256,7 +259,11 @@ impl DiagBuffer {
             session_id.to_string(),
             SessionInfo {
                 target_id: target_id.to_string(),
-                target_url: target_url.to_string(),
+                // 落环前脱敏（与 requestWillBeSent 同一契约）：attach 时刻的
+                // 页面/OOPIF iframe URL 常带 SSO token、OAuth code——session
+                // URL 派生出 console 条目 targetUrl、network 条目 targetUrl
+                // 与 HAR _targetUrl，原始值一旦入环会随查询/HAR 反复外泄
+                target_url: redact::redact_url(target_url),
             },
         );
     }
@@ -358,10 +365,12 @@ impl DiagBuffer {
                     level: level.to_lowercase(),
                     text: text.to_string(),
                     source: source.to_string(),
+                    // 落环前脱敏：CDP 网络资源加载失败日志的 url 携完整
+                    // query（签名 CDN、token 化接口极常见），与请求 URL 同权
                     target_url: entry
                         .get("url")
                         .and_then(Value::as_str)
-                        .map(str::to_string)
+                        .map(redact::redact_url)
                         .unwrap_or_else(|| {
                             session.map(|s| s.target_url.clone()).unwrap_or_default()
                         }),
@@ -1159,6 +1168,57 @@ mod tests {
         assert!(
             !result.meta.unwrap().tab_filter_unavailable,
             "network 环全归属，不降级"
+        );
+    }
+
+    // ---------- 环内 URL 全量脱敏 ----------
+
+    /// 环内非请求 URL 一并脱敏：attach 页面 URL（targetUrl——含 OOPIF iframe
+    /// 的 SSO token 场景）与 Log.entryAdded 的 entry.url（签名 CDN 查询串）
+    /// 都在落环前过 redact_url；console 回填、network targetUrl、HAR
+    /// _targetUrl 全部派生自已脱敏的 session 登记
+    #[test]
+    fn ring_urls_beyond_requests_are_redacted() {
+        let mut buf = DiagBuffer::default();
+        buf.apply(
+            &attached("https://sso.example.com/frame?token=sec1"),
+            1,
+        );
+        // console 条目回填的 targetUrl 来自 session 登记：已脱敏
+        buf.apply(
+            &json!({ "method": "Runtime.consoleAPICalled", "sessionId": SESS,
+                "params": { "type": "log", "args": [{ "type": "string", "value": "hi" }] } }),
+            2,
+        );
+        let c = &buf.console_entries(None, None, 10).entries[0];
+        assert_eq!(c.target_url, "https://sso.example.com/frame?token=[redacted]");
+
+        // Log.entryAdded 自带 url：脱敏后落环（敏感参数替换，非敏感参数原样）
+        buf.apply(
+            &json!({
+                "method": "Log.entryAdded", "sessionId": SESS,
+                "params": { "entry": { "level": "error", "source": "network",
+                    "text": "Failed to load resource: 404",
+                    "url": "https://cdn.example.com/signed.js?Signature=abc123&v=2" } }
+            }),
+            3,
+        );
+        let c = &buf.console_entries(None, None, 10).entries[1];
+        assert_eq!(c.target_url, "https://cdn.example.com/signed.js?Signature=[redacted]&v=2");
+
+        // network 条目 targetUrl 与 HAR _targetUrl：同一脱敏源（session 登记）
+        buf.apply(&req("r1", "https://a/api?token=z"), 4);
+        buf.apply(
+            &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                "params": { "requestId": "r1", "timestamp": 1.0 } }),
+            4,
+        );
+        let e = &buf.network_entries(false, None, 10).entries[0];
+        assert_eq!(e.target_url, "https://sso.example.com/frame?token=[redacted]");
+        let har = buf.to_har("t");
+        assert_eq!(
+            har["log"]["entries"][0]["_targetUrl"],
+            "https://sso.example.com/frame?token=[redacted]"
         );
     }
 
