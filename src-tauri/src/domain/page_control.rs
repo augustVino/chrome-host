@@ -1132,11 +1132,13 @@ fn absorb_hover_selector(sel: &str, out: &mut HoverRules) {
 }
 
 /// 段列表去裸 :hover 后按原分隔符拼接；任一段去后为空（如裸 ":hover"）
-/// → None（该角色放弃，不产出无效查询串）。
+/// → None（该角色放弃，不产出无效查询串）。伪元素段（::after 等）一并
+/// 剥离——产物是 DOM.querySelectorAll 查询串，伪元素不可查询（Chrome
+/// 直接报错），触发器回归宿主元素（`a:hover::after` → `a`）。
 fn join_stripped(segments: &[(char, String)]) -> Option<String> {
     let mut out = String::new();
     for (sep, seg) in segments {
-        let stripped = strip_bare_hover(seg);
+        let stripped = strip_pseudo_element(&strip_bare_hover(seg));
         if stripped.is_empty() {
             return None;
         }
@@ -1220,6 +1222,99 @@ fn push_dedup(list: &mut Vec<String>, item: String) {
     if !list.contains(&item) {
         list.push(item);
     }
+}
+
+/// 剥离伪元素 token：`::name`（任意名，含 `::part(...)` 括号体）与旧式
+/// 单冒号白名单 :before/:after/:first-line/:first-letter（CSS 规范的四个
+/// 合法旧写法）。深度 0、引号外才剥（`:not(::before)` 参数原样保留、
+/// `[data-x="::after"]` 字面量不动）；名字后必须是标识符边界
+/// （`:aftermath` 之类的伪类名不误伤）。无宿主的纯伪元素段
+/// （如 ":hover::after"）剥后为空 → join_stripped 判 None 整条跳过——
+/// 回归宿主 * 会误标全页，宁可漏标该规则。
+fn strip_pseudo_element(seg: &str) -> String {
+    const LEGACY: [&str; 4] = ["before", "after", "first-line", "first-letter"];
+    let mut out = String::with_capacity(seg.len());
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut chars = seg.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            '(' | '[' => {
+                depth += 1;
+                out.push(c);
+            }
+            ')' | ']' => {
+                depth -= 1;
+                out.push(c);
+            }
+            ':' if depth == 0 => {
+                if chars.peek() == Some(&':') {
+                    // `::name` / `::name(args)`：伪元素，名字与括号体一起消耗
+                    chars.next();
+                    while chars
+                        .peek()
+                        .is_some_and(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                    {
+                        chars.next();
+                    }
+                    if chars.peek() == Some(&'(') {
+                        chars.next();
+                        let mut d = 1i32;
+                        for c2 in chars.by_ref() {
+                            match c2 {
+                                '(' => d += 1,
+                                ')' => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // 旧式单冒号：仅白名单四者，且名字后是非标识符边界
+                let mut probe = chars.clone();
+                let head: String = (&mut probe).take("first-letter".len()).collect();
+                let matched = LEGACY.iter().find_map(|name| {
+                    if !head.starts_with(name) {
+                        return None;
+                    }
+                    let boundary = match head[name.len()..].chars().next() {
+                        Some(nx) => !(nx.is_alphanumeric() || nx == '-' || nx == '_'),
+                        None => probe
+                            .clone()
+                            .next()
+                            .is_none_or(|nx| !(nx.is_alphanumeric() || nx == '-' || nx == '_')),
+                    };
+                    boundary.then_some(name.len())
+                });
+                match matched {
+                    Some(n) => {
+                        for _ in 0..n {
+                            chars.next(); // 消耗名字（':' 已读，不输出 = 剥除）
+                        }
+                    }
+                    None => out.push(c),
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -1812,6 +1907,37 @@ mod tests {
         let r = scan_hover_rules(&[css], 1);
         assert_eq!(r.triggers, vec!["[data-list=\"a,b\"]", ".w :is(.p, .q)"],
             "括号/引号内的分隔符不切分；:is() 参数保留");
+    }
+
+    /// 伪元素剥离：产物是 DOM.querySelectorAll 查询串，伪元素不可查询
+    /// （Chrome 报错 → hoverScan 恒 truncated 的狼来了形态）。触发器/`reveal`
+    /// 回归宿主元素（`a:hover::after` → `a`）；无宿主的纯伪元素段整条跳过
+    /// （回归 * 会误标全页）；旧式单冒号四者、`::part(...)` 括号体、
+    /// `:aftermath` 类伪类名边界均钉住。
+    #[test]
+    fn hover_scan_strips_pseudo_elements_to_queryable_selectors() {
+        let css = r#"
+            .tip:hover::after { content: 'x'; }
+            .btn:hover { color: red; }
+            a:hover:before { content: '•'; }
+            .wrap:hover .panel::before { opacity: 1; }
+            input:hover::placeholder { color: gray; }
+            .tab:hover::part(label) { color: blue; }
+            :hover::first-line { color: green; }
+            .aftermath:hover { color: pink; }
+            a[data-x="::before"]:hover { color: teal; }
+        "#;
+        let r = scan_hover_rules(&[css], 1);
+        assert_eq!(
+            r.triggers,
+            vec![
+                ".tip", ".btn", "a", ".wrap", "input", ".tab", ".aftermath",
+                "a[data-x=\"::before\"]",
+            ],
+            "触发器回归宿主元素；:hover::first-line 无宿主整条跳过；::part 括号体一起剥；属性选择器字面量 ::before 不误伤"
+        );
+        assert_eq!(r.reveals, vec![".wrap .panel"], "reveal 同样剥伪元素段");
+        assert!(!r.truncated);
     }
 
     // ---------------- RefStore / normalize_ref（tests/ref-store.test.mjs）------
