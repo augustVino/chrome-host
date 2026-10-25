@@ -17,7 +17,11 @@ pnpm tauri dev     # beforeDevCommand 自动构建 CLI sidecar 到 src-tauri/bin
 ```bash
 cd src-tauri && cargo test    # Rust 单测（服务层 / 仓储 / 进程管理 / CDP 客户端）
 bash scripts/smoke.sh         # 冒烟（需应用运行中；HOSTS_SOURCE=<url> 可验证 hosts 注入）
+pnpm check:api                # API 目录守护：src/api/catalog.ts 与 server.rs 路由注册比对，不一致非零退出（可进 CI）
+node evals/cli.mjs run        # 浏览器操控真机评估（page 命令族行为回归；需应用运行中，用法见 evals/README.md）
 ```
+
+evals 是顶级 `evals/` 目录的零依赖评估框架（fixture 页面本地起服、操作走 CLI 子进程、三类证据源三态判定）；修 page 命令族 bug 时应同步补 regression case。
 
 ## 目录速览
 

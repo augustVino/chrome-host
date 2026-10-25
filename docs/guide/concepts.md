@@ -8,10 +8,18 @@
 
 - 独立 `user-data-dir`（Profile、Cookie、localStorage 全隔离）；
 - 独立 CDP 端口（本机 `9222` 起动态分配，实例重启可能变化——每次现查，不要缓存）；
-- 可选名字（创建时传入，同环境内唯一，CLI 可按名引用实例；不命名完全合法）；
+- 可选名字（创建时传入，同环境内唯一；多任务并行时按名锚定，见下文「实例命名」）；
 - 独立 Chrome 进程。实例数据随 profile 目录保留，直到显式删除实例。
 
 同一环境可以同时开多个实例，互不串扰；停止实例释放进程与端口，数据保留。
+
+### 实例命名
+
+多任务并行时按名锚定实例，比记 `ins_` id 省心：
+
+- **创建**：`instance create <envId> --name <任务名>`（REST body `{ "name": "checkout-e2e" }`）；名字 1-64 字符、非纯空白，**同环境内唯一**（重名 → 409 `INSTANCE_NAME_CONFLICT`）；不命名完全合法；
+- **按名引用**：CLI 的实例命令吃 id **或** name（name 全局唯一命中时自动解析），如 `instance stop qa任务A`；
+- **同名跨环境消歧**：按名引用命中多个环境的同名实例 → exit 2 列出候选，改用 id。
 
 ## 登录态快照（Login Profile）
 
@@ -49,9 +57,22 @@
   - **Net Rules**（网络规则）：按环境注入 block/redirect/headers 网络规则（浏览器层 DNR 生效，worker 休眠不影响拦截）；配置形状与作用域见 AGENT-API.md Extensions 节（GUI Extensions 页「配置」/ CLI `extension config` / MCP `set_extension_config` 均可写入，per-env 覆盖全局默认）；
   - **Page Diagnostics**（页面诊断）：在每个 http(s) 页面采集 JS 错误与失败资源（各环形 100 条）+ LCP/FCP，挂载在页面全局供查询端点透传（GUI 无独立入口；CLI `instance diagnostics` / REST `GET /instances/:id/diagnostics` / MCP `get_diagnostics`）；
   - **常驻诊断**（M6，非扩展）：实例启动后 chrome-host 维持一条只订阅的 CDP 连接（console 500 条 / 请求 1000 条环形缓冲，进程内态重启即清），提供 console/network/screenshot/HAR 查询（`GET /instances/:id/console|network|screenshot|har`，CLI/MCP 同名能力）；响应按「证据边界契约」（AGENT-API.md）自带 meta：`dropped`（环溢出累计丢弃）/`capacity`/`since`（watcher 挂载时刻，更早数据从未采集）/`live`，network 与 HAR 另声明 `scope:"completed"`（进行中的请求不可见），HAR 顶层 `_meta` 同时标注 -1 占位语义；网络条目另携带 `bodyState`/`bodyReason`（available/partial/evicted/unavailable 多态）：文本类 mime 的响应体自动拉取（单条 ≤256KiB、环级 8MiB 分层驱逐）、**落环前脱敏**（敏感 query/字段值 → `[redacted]`），可经 `GET /instances/:id/network/:requestId/body` 分页读（UTF-16 单位计量）；
-- **用户扩展**：任意本地扩展目录，GUI Extensions 页选目录注册，或 CLI `extension register`；可启停、可删除。
+- **用户扩展**：任意本地扩展目录，GUI Extensions 页选目录注册，或 CLI `extension add`；可启停、可删除。
 
 实例启动时自动以 `--load-extension` 注入当前启用的扩展；全部不可用时不阻断启动。
+
+## 诚实证据（证据边界）
+
+常驻诊断的 console / network / HAR 查询遵守同一条设计哲学：**「没采到」≠「没发生」**——宁可明说不完整，不静默装作完整。每份响应的 meta 自带证据边界：
+
+| meta 字段 | 含义 | 防的误读 |
+|---|---|---|
+| `dropped` | 环形缓冲溢出累计丢弃条数 | dropped ≠ 0 → 早于窗口的事件已丢失，别当「没有报错」 |
+| `since` | 采集窗口起点（watcher 挂载时刻） | 更早的数据**从未被采集**，不是「没查到」 |
+| `live` | 采集是否存活 | false = 已停止采集，数据是残照 |
+| `scope: "completed"` | 只见已完成的请求 | 进行中的请求不可见，等完成再查 |
+
+响应体另有 `bodyState`（available / partial / evicted / unavailable + reason）逐条披露 body 可用性（机制见上文「扩展 · 常驻诊断」）。排障读历史时先看 meta：**证据不完整时明说「证据不完整」，而不是把「没采到」误报成「没问题」**。缓冲是进程内态，实例重启即清；HAR 未采集字段以 -1/空集占位（占位语义在 HAR 顶层 `_meta` 声明）。
 
 ## 内核（Chrome for Testing）
 

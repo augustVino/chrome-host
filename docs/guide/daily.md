@@ -28,6 +28,18 @@
 
 排障时先看活动流，再跑 `chrome-host doctor`。
 
+## 页面排障：先查历史，再考虑复现
+
+实例在后台持续记录 console 与全部请求（环形缓冲，实例重启即清）。页面报错/白屏/接口失败时，**先查历史再考虑刷新复现**——重新加载会破坏现场（SPA 状态丢失、错误可能不再复现）：
+
+```bash
+chrome-host instance console  <insId> --level error     # JS 错误（含 unhandledrejection）
+chrome-host instance network  <insId> --failed-only     # 失败/HTTP≥400 请求（BODY 列 = 响应体状态）
+chrome-host instance network-body <insId> <requestId>   # 需要接口返回内容时：读脱敏响应体
+```
+
+network-body 的 requestId 从 `instance network --quiet`（每行第三列）或 `--json` 输出取；body 中的 `[redacted]` 是落环前脱敏的安全特性，不是数据损坏。完整排障决策见 [AI Agent Skills](./skills)。
+
 ## 数据目录与备份
 
 全部数据集中在应用数据目录（Tauri 标准位置，按平台）：

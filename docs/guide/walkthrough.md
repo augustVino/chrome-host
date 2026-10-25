@@ -83,7 +83,39 @@ playwright --browser "cdp://$WS" ...
 
 **方式 C：交给 AI Agent**：通过 MCP（含 `page_*` 工具族）或加载仓库 skills 接入，见 [AI Agent Skills](./skills)。
 
-## 6. 收尾清理
+## 6. 场景：跨域 iframe（OOPIF）内的表单
+
+第三方登录框、嵌入的支付/验证码组件常是跨域 iframe。`page snap` 会把帧内容以 `[frame]` 段内嵌输出，@eN **跨帧连续编号**：
+
+```text
+@e3 [textbox] 邮箱
+[frame] https://accounts.foo.com/embed
+  @e7 [textbox] 手机号
+  @e8 [button] 获取验证码
+```
+
+帧内元素与主文档同套操作：`page fill "$INS_ID" @e7 "13800138000"`、`page click "$INS_ID" @e8` 直接可用（点击自动做帧内坐标投影，输入走帧会话）——**不再需要 clickxy 点入 + type 的坐标兜底**（兜底路径仍可用）。CSS 选择器仍只查主 frame，帧内定位一律用 @eN。
+
+循环节奏：帧内导航/单帧重载只失效**该帧**的引用（报 `PAGE_REF_STALE`）——重新 snap 后继续，主文档引用照常可用；帧整体移除则该段消失，按新快照重定锚。
+
+## 7. 场景：表格数据提取（订单列表 → JSON）
+
+后台列表页拿结构化数据用 `page extract`，不要 `page eval` 手拼 innerText：
+
+```bash
+chrome-host page extract "$INS_ID"                    # 缺省 = 主文档最大表格自动发现
+chrome-host page extract "$INS_ID" @e12              # 用 snap 到的表格引用（更稳）
+chrome-host page extract "$INS_ID" '#orders table' --out orders.json   # 全量 JSON 写文件
+```
+
+输出 `{ columns, rows, coverage, meta }`，两个关键语义：
+
+- **单元格 `null` vs `""`**：`null` = 被合并单元格覆盖/空位（rowspan/colspan 占位），`""` = 真实空单元格——下游处理别把两者混为一谈；
+- **coverage 诚实标记**：`datasetComplete` 只有 `unknown` / `incomplete`，**永不装作取全**。虚拟化表格（DOM 只挂可见行）会标 `incomplete` 并附 `reasons`（如 aria-rowcount 超出可见行、预算 10000 单元格截断、空 tbody）——先 `page wait` 行出现或滚动加载后重取，绝不把 incomplete 当全量入库；`unknown` = 页面未声明总行数，无法判定。
+
+目标必须是 `table` / `[role=table|grid|treegrid]`，否则 422（exit 7）。
+
+## 8. 收尾清理
 
 ```bash
 chrome-host instance delete "$INS_ID" --yes    # 运行中实例自动 stop → delete
