@@ -1900,7 +1900,14 @@ fn visit_ax(
     hover: &HoverMarks,
     frame: Option<(&str, &str)>,
 ) {
-    let key = ax_key(node.get("nodeId").unwrap_or(&Value::Null));
+    // visited 键按树隔离：主树裸 nodeId；帧树加帧前缀（帧树与主树的 nodeId
+    // 是两套独立计数——都从 1 起，裸键共享会把帧节点误判重复直接剪掉，
+    // 帧内容间歇性整体缺席；owner 复测的稳定空帧正是全碰撞形态）
+    let raw_key = ax_key(node.get("nodeId").unwrap_or(&Value::Null));
+    let key = match frame {
+        Some((ftid, _)) => format!("{ftid}:{raw_key}"),
+        None => raw_key,
+    };
     if !v.visited.insert(key) {
         return;
     }
@@ -7527,4 +7534,35 @@ mod tests {
         assert_eq!(e1.frame_session_id.as_deref(), Some("S_FRM_SYNC"));
         assert!(refs.get("T1").unwrap().resolve("e2").unwrap().frame_target_id.is_none());
     }
+
+    /// nodeId 碰撞回归（owner 复测缺陷）：主树与帧树的 nodeId 是两套独立
+    /// 计数（都从 1 起）——裸键共享 visited 时帧节点被误判重复剪掉，
+    /// 帧内容**稳定**整体缺席（id 全碰撞形态）。修复 = 帧树 visited 键加
+    /// 帧前缀隔离。此前 armed 测试用 m*/f* 前缀 id 恰好不碰撞，未拦住。
+    #[tokio::test]
+    async fn snap_renders_frame_tree_despite_node_id_collision() {
+        let (svc, watched, _calls, script) = armed();
+        register_frame(&watched, "T1", "F_ROOT", "FRM_A", Some("S_FRM_A"), "F_ROOT", Some(9));
+        // 主树与帧树 nodeId **完全同名空间**（1/2/3 对 1/2/3）
+        let main_tree = json!({ "nodes": [
+            { "nodeId": 1, "role": { "value": "WebArea" }, "childIds": [2, 3] },
+            { "nodeId": 2, "parentId": 1, "role": { "value": "button" }, "name": { "value": "main" }, "backendDOMNodeId": 8 },
+            { "nodeId": 3, "parentId": 1, "role": { "value": "Iframe" }, "backendDOMNodeId": 9 },
+        ]});
+        let frame_tree = json!({ "nodes": [
+            { "nodeId": 1, "role": { "value": "WebArea" }, "childIds": [2, 3], "name": { "value": "fdoc" } },
+            { "nodeId": 2, "parentId": 1, "role": { "value": "textbox" }, "name": { "value": "uname" }, "backendDOMNodeId": 60 },
+            { "nodeId": 3, "parentId": 1, "role": { "value": "button" }, "name": { "value": "fbtn" }, "backendDOMNodeId": 61 },
+        ]});
+        given(&script, "Accessibility.getFullAXTree", vec![Ok(main_tree), Ok(frame_tree)]);
+
+        let resp = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp["refs_count"], 3, "主按钮 + 帧输入框 + 帧按钮——碰撞不再吞帧");
+        let text = resp["text"].as_str().unwrap();
+        assert!(text.contains("@e2 [textbox] uname"), "{text}");
+        assert!(text.contains("@e3 [button] fbtn"), "{text}");
+        let refs = watched.refs.lock().unwrap();
+        assert_eq!(refs.get("T1").unwrap().resolve("e2").unwrap().frame_target_id.as_deref(), Some("FRM_A"));
+    }
+
 }
