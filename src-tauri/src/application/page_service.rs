@@ -1378,15 +1378,6 @@ async fn handle_event(watched: &Watched, event: &Value) {
                         invalidate_frame_refs(watched, &tid, &fid, "frame navigation");
                     }
                 } else {
-                    if !fid.is_empty() {
-                        watched
-                            .frames
-                            .lock()
-                            .unwrap()
-                            .entry(tid.clone())
-                            .or_default()
-                            .root = Some(fid);
-                    }
                     invalidate_refs(watched, &tid, "navigation");
                     // 换文档 = 旧表全部失效：Chrome 在文档销毁时不保证逐张发
                     // styleSheetRemoved（真机实测：导航后登记表残留死表，
@@ -1394,8 +1385,15 @@ async fn handle_event(watched: &Watched, event: &Value) {
                     // hoverScan 恒 truncated）。新文档的表由 styleSheetAdded
                     // 重新登记（CSS 域 session 级持续有效，不依赖 Removed 语义）。
                     watched.sheets.lock().unwrap().remove(&tid);
-                    // 帧登记同理整体重建：新文档的 frameAttached/attach 会重登记
-                    watched.frames.lock().unwrap().remove(&tid);
+                    // 帧登记同理整体重建：新文档的 frameAttached/attach 会重登记。
+                    // root 必须在清表**之后**写入——先写后清会让 root 随整表
+                    // 删除丢失（root 恒 None：顶层 OOPIF 投影链 at_root 永不
+                    // 命中、主帧发起的下载无 tab 归属）。
+                    let mut tables = watched.frames.lock().unwrap();
+                    tables.remove(&tid);
+                    if !fid.is_empty() {
+                        tables.entry(tid.clone()).or_default().root = Some(fid);
+                    }
                 }
             }
         }
@@ -3459,10 +3457,16 @@ async fn project_frame_point(
         p = project_point(&quad, p).ok_or_else(|| {
             PageControlError::target_moved("iframe owner quad is degenerate")
         })?;
-        // 父级即根（或未知 → 视为主文档直属）：已到根视口
+        // 父级即根（或未知 → 视为主文档直属）：已到根视口。兑底：parent 未
+        // 登记在 frames 表（主帧从不入表，root 未知/丢失时同此收敛——
+        // frameAttached 对一切子帧都发，活着的中间帧必在表中）
         let at_root = match parent.as_deref() {
             None | Some("") => true,
-            Some(pf) => Some(pf.to_string()) == root,
+            Some(pf) => {
+                let tables = watched.frames.lock().unwrap();
+                Some(pf.to_string()) == root
+                    || !tables.get(tab_tid).is_some_and(|t| t.frames.contains_key(pf))
+            }
         };
         if at_root {
             return Ok(p);
@@ -8725,6 +8729,46 @@ mod tests {
         }).await;
         assert!(watched.sheets.lock().unwrap().get("TAB1").is_none(), "根导航清 sheets（hover 共存）");
     }
+    /// 根导航重建帧表：root 必须在清表**之后**写入——旧序（先写后清）会让
+    /// root 随整表删除丢失（生产代码 root 恒 None：顶层 OOPIF 投影链 at_root
+    /// 永不命中、主帧发起的下载无 tab 归属）。真实事件序列驱动，不预设表。
+    #[tokio::test]
+    async fn root_navigation_rebuilds_frame_table_with_root_set() {
+        let (svc, _calls, _script, tap) = fake_service();
+        let (watched, g) = svc.ensure(INS).await.unwrap();
+        drop(g);
+        let tx = tap.lock().unwrap().clone().unwrap();
+        tx.send(attach_event("TAB1", "SES1", "page")).unwrap();
+        eventually("TAB1 入表", || tab_session(&watched, "TAB1").is_some()).await;
+
+        // 旧表带着子帧与 root（模拟首次导航前的登记形态）
+        register_frame(&watched, "TAB1", "F_OLD", "FRM_OLD", None, "F_OLD", None);
+
+        // 连接存活期根导航：表重建，root = 新 fid
+        tx.send(json!({ "method": "Page.frameNavigated", "sessionId": "SES1",
+            "params": { "frame": { "id": "F_NEW", "url": "https://a/next" } } })).unwrap();
+        eventually("root 写入且旧子帧清空", || {
+            let tables = watched.frames.lock().unwrap();
+            tables.get("TAB1")
+                .map(|t| t.root.as_deref() == Some("F_NEW") && !t.frames.contains_key("FRM_OLD"))
+                .unwrap_or(false)
+        }).await;
+
+        // 事件路径登记的顶层 OOPIF（parent = 主帧 id）：帧表为空但 root 已知
+        tx.send(json!({ "method": "Page.frameAttached", "sessionId": "SES1",
+            "params": { "frameId": "FRM_A", "parentFrameId": "F_NEW" } })).unwrap();
+        eventually("FRM_A 登记", || {
+            watched.frames.lock().unwrap()
+                .get("TAB1").map(|t| t.frames.contains_key("FRM_A")).unwrap_or(false)
+        }).await;
+
+        // 主帧发起的下载归属：root == 主帧 frameId → tab 命中（旧序恒 None）
+        assert_eq!(
+            download_tab_of_frame(&watched, "F_NEW").as_deref(),
+            Some("TAB1"),
+            "root 存活 → 主帧下载可归属 tab"
+        );
+    }
 
     /// snap 合并：帧树渲染为挂接点下的 [frame] 段，@eN 连续编号，
     /// RefStore 条目携带帧维度（主树条目无）；owner 经 DOM.getFrameOwner 解析
@@ -8802,6 +8846,57 @@ mod tests {
         );
         assert_eq!(inputs[1].params["x"], 160.0);
         assert_eq!(inputs[1].params["y"], 240.0);
+    }
+
+    /// 事件路径登记的帧内点击投影（不用 register_frame 预设 root——它总把
+    /// root 填好，掩住了生产路径 root 丢失的缺陷）：(1) root 经 frameNavigated
+    /// 写入，frameAttached 登记 parent=主帧 id → pf == root 终止；(2) root
+    /// 未知（attach 到已加载页，连接后从未见 frameNavigated——SPA 动态注入
+    /// iframe 的常态）→ 兜底「parent 未登记在帧表 = 主文档直属」终止。
+    /// 两个形态都不得 409 owning iframe chain is not resolvable。
+    #[tokio::test]
+    async fn click_frame_ref_via_event_path_projects_without_preset_root() {
+        let (svc, watched, _calls, script) = armed();
+        // 形态 1：事件序建表（root 由根导航写入）
+        handle_event(&watched, &json!({ "method": "Page.frameNavigated", "sessionId": "S1",
+            "params": { "frame": { "id": "F_ROOT" } } })).await;
+        handle_event(&watched, &json!({ "method": "Page.frameAttached", "sessionId": "S1",
+            "params": { "frameId": "FRM_A", "parentFrameId": "F_ROOT" } })).await;
+        // 预置两条 ref：e1 走形态 1（root 已知），e2 稍后走形态 2（root 未知兑底）
+        watched.refs.lock().unwrap().entry("T1".into()).or_default().replace(&json!([
+            { "ref": "e1", "backendNodeId": 601, "frameTargetId": "FRM_A", "frameSessionId": "S_FRM_A", "name": "帧内按钮" },
+            { "ref": "e2", "backendNodeId": 602, "frameTargetId": "FRM_B", "frameSessionId": "S_FRM_B", "name": "动态帧按钮" },
+        ]));
+        // 几何链脚本（调用序）：形态 1 = 元素 quad(601@帧) → owner 解析(FRM_A@S1)
+        // → owner quad(501@S1)；形态 2 同构（602 → 502）
+        given(&script, "DOM.getContentQuads", vec![
+            Ok(json!({ "quads": [[10.0, 20.0, 110.0, 20.0, 110.0, 60.0, 10.0, 60.0]] })),
+            Ok(json!({ "quads": [[100.0, 200.0, 400.0, 200.0, 400.0, 350.0, 100.0, 350.0]] })),
+            Ok(json!({ "quads": [[10.0, 20.0, 110.0, 20.0, 110.0, 60.0, 10.0, 60.0]] })),
+            Ok(json!({ "quads": [[100.0, 200.0, 400.0, 200.0, 400.0, 350.0, 100.0, 350.0]] })),
+        ]);
+        given(&script, "DOM.getFrameOwner", vec![
+            Ok(json!({ "backendNodeId": 501 })),
+            Ok(json!({ "backendNodeId": 502 })),
+        ]);
+
+        let resp = svc.click(INS, "T1", "@e1").await.unwrap();
+        assert_eq!(
+            resp["result"],
+            json!("Clicked @e1 \"帧内按钮\" at CSS (160, 240)"),
+            "形态 1：parent == root（事件写入）→ 投影终止"
+        );
+
+        // 形态 2：root 未知——帧表整体重建为无 root 的纯事件登记
+        watched.frames.lock().unwrap().remove("T1");
+        handle_event(&watched, &json!({ "method": "Page.frameAttached", "sessionId": "S1",
+            "params": { "frameId": "FRM_B", "parentFrameId": "F_ROOT_UNSEEN" } })).await;
+        let resp2 = svc.click(INS, "T1", "@e2").await.unwrap();
+        assert_eq!(
+            resp2["result"],
+            json!("Clicked @e2 \"动态帧按钮\" at CSS (160, 240)"),
+            "形态 2：parent 未登记且 root 未知 → 主文档直属兑底，不 409"
+        );
     }
 
     /// fill 帧内 ref：DOM/Runtime 命令（resolveNode/focus/callFunctionOn/
