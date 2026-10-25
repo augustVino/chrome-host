@@ -214,6 +214,36 @@ impl TabTable {
             .find(|(_, s)| s.as_str() == sid)
             .map(|(t, _)| t.as_str())
     }
+
+    /// targetId 是否为已登记的 page tab（drop_target 分流用）
+    fn contains_target(&self, tid: &str) -> bool {
+        self.rows.iter().any(|(t, _)| t.as_str() == tid)
+    }
+
+}
+
+/// per-tab OOPIF 帧登记（W-oopif）。不变式：OOPIF 的 targetId == frameId
+///（Chrome 实现稳定不变式，Puppeteer 同样依赖）；同源 iframe 不是独立
+/// target（session 恒 None，内容已在主树中，不参与任何路由）。
+/// owner 元素（主文档/父帧中的 <iframe>）backendNodeId 惰性解析
+///（DOM.getFrameOwner，挂接渲染与坐标投影用），解析后缓存。
+#[derive(Default, Clone)]
+struct FrameTable {
+    /// 根 frame 的 frameId（frameNavigated 无 parentId 路径记录；
+    /// 投影链的终止判定用）
+    root: Option<String>,
+    /// frameId（== targetId）→ 信息
+    frames: HashMap<String, FrameInfo>,
+}
+
+#[derive(Default, Clone)]
+struct FrameInfo {
+    /// frame session（attach 后填；None = 同源 iframe 或 attach 未到）
+    session_id: Option<String>,
+    /// 父 frameId（frameAttached 记录；None = 未知）
+    parent_frame_id: Option<String>,
+    /// owner 元素 backendNodeId（DOM.getFrameOwner 惰性解析后缓存）
+    owner_backend_node_id: Option<i64>,
 }
 
 /// 一个实例的全部 page 控制运行态。
@@ -229,6 +259,11 @@ struct Watched {
     tabs: Mutex<TabTable>,
     /// per-tab @eN ref 表（snap 整表替换，事件定向失效）
     refs: Mutex<HashMap<String, RefStore>>,
+    /// per-tab OOPIF 帧登记（W-oopif）：frameAttached/attachedToTarget 维护
+    frames: Mutex<HashMap<String, FrameTable>>,
+    /// attach 先于 frameAttached 到达的孤儿 frame 会话（targetId → sessionId；
+    /// frameAttached 归属 tab 后认领）
+    orphan_frame_sessions: Mutex<HashMap<String, String>>,
     /// per-tab 对话框缓冲（应答成功才入档）
     dialogs: Mutex<HashMap<String, DialogBuffer>>,
     /// per-tab load 事件等待者（导航命令族）：命令发送前登记 oneshot Sender，
@@ -256,6 +291,8 @@ impl Watched {
             cmd_lock: Arc::new(tokio::sync::Mutex::new(())),
             tabs: Mutex::new(TabTable::default()),
             refs: Mutex::new(HashMap::new()),
+            frames: Mutex::new(HashMap::new()),
+            orphan_frame_sessions: Mutex::new(HashMap::new()),
             dialogs: Mutex::new(HashMap::new()),
             load_waiters: Mutex::new(HashMap::new()),
             sheets: Mutex::new(HashMap::new()),
@@ -344,11 +381,13 @@ impl PageService {
         )
         .await?;
         let gen = watched.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        // 旧代残留的 tabs/refs/dialogs/load_waiters/sheets 属于死会话（sessionId
-        // 已失效），整清（等待中的导航命令各自走到自己的超时分支；CSS.enable
-        // 重发后 styleSheetAdded 会重新回放）
+        // 旧代残留的 tabs/refs/dialogs/load_waiters/sheets/帧登记属于死会话
+        // （sessionId 已失效），整清（等待中的导航命令各自走到自己的超时
+        // 分支；CSS.enable 重发后 styleSheetAdded 会重新回放）
         watched.tabs.lock().unwrap().clear();
         watched.refs.lock().unwrap().clear();
+        watched.frames.lock().unwrap().clear();
+        watched.orphan_frame_sessions.lock().unwrap().clear();
         watched.dialogs.lock().unwrap().clear();
         watched.load_waiters.lock().unwrap().clear();
         watched.sheets.lock().unwrap().clear();
@@ -907,12 +946,13 @@ async fn handle_event(watched: &Watched, event: &Value) {
     };
     let params = event.get("params").cloned().unwrap_or(Value::Null);
     match method {
-        // §3.6 失效源接线（daemon.mjs bindRefInvalidation）+ attach 映射
+        // §3.6 失效源接线（daemon.mjs bindRefInvalidation）+ attach 映射 +
+        // OOPIF 帧登记（W-oopif）
         "Target.attachedToTarget" => on_attached(watched, &params).await,
         "Target.detachedFromTarget" => on_detached(watched, &params),
         "Target.targetDestroyed" => {
             if let Some(tid) = params.get("targetId").and_then(Value::as_str) {
-                drop_tab(watched, tid);
+                drop_target(watched, tid);
             }
         }
         "Page.javascriptDialogOpening" => {
@@ -978,14 +1018,34 @@ async fn handle_event(watched: &Watched, event: &Value) {
                 }
             }
         }
-        // 仅根 frame（parentId 为空）才失效：子 frame 导航不换文档（§3.6）
+        // 仅根 frame（parentId 为空）才整表失效：子 frame 导航不换文档（§3.6）。
+        // W-oopif：子 frame 导航 → 仅该 frame 的 ref 失效（stale 标记）；根导航
+        // 另清帧登记表（新文档的旧子帧全部死亡，frameDetached 不保证补发）。
         "Page.frameNavigated" => {
             if let Some(tid) = tab_of_session(watched, event) {
+                let fid = params
+                    .pointer("/frame/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let child_frame = params
                     .pointer("/frame/parentId")
                     .and_then(Value::as_str)
                     .is_some_and(|p| !p.is_empty());
-                if !child_frame {
+                if child_frame {
+                    if !fid.is_empty() {
+                        invalidate_frame_refs(watched, &tid, &fid, "frame navigation");
+                    }
+                } else {
+                    if !fid.is_empty() {
+                        watched
+                            .frames
+                            .lock()
+                            .unwrap()
+                            .entry(tid.clone())
+                            .or_default()
+                            .root = Some(fid);
+                    }
                     invalidate_refs(watched, &tid, "navigation");
                     // 换文档 = 旧表全部失效：Chrome 在文档销毁时不保证逐张发
                     // styleSheetRemoved（真机实测：导航后登记表残留死表，
@@ -993,6 +1053,44 @@ async fn handle_event(watched: &Watched, event: &Value) {
                     // hoverScan 恒 truncated）。新文档的表由 styleSheetAdded
                     // 重新登记（CSS 域 session 级持续有效，不依赖 Removed 语义）。
                     watched.sheets.lock().unwrap().remove(&tid);
+                    // 帧登记同理整体重建：新文档的 frameAttached/attach 会重登记
+                    watched.frames.lock().unwrap().remove(&tid);
+                }
+            }
+        }
+        // OOPIF 帧树维护（主 frame session 事件）：attach 登记（含父链），
+        // detach → 摘除 + 该帧 ref 失效
+        "Page.frameAttached" => {
+            if let Some(tid) = tab_of_session(watched, event) {
+                let (Some(fid), Some(parent)) = (
+                    params.get("frameId").and_then(Value::as_str),
+                    params.get("parentFrameId").and_then(Value::as_str),
+                ) else {
+                    return;
+                };
+                if fid.is_empty() {
+                    return;
+                }
+                let orphan = watched
+                    .orphan_frame_sessions
+                    .lock()
+                    .unwrap()
+                    .remove(fid);
+                let mut tables = watched.frames.lock().unwrap();
+                let table = tables.entry(tid).or_default();
+                let info = table.frames.entry(fid.to_string()).or_default();
+                info.parent_frame_id = Some(parent.to_string());
+                if orphan.is_some() {
+                    info.session_id = orphan;
+                }
+            }
+        }
+        "Page.frameDetached" => {
+            if let Some(tid) = tab_of_session(watched, event) {
+                if let Some(fid) = params.get("frameId").and_then(Value::as_str) {
+                    if !fid.is_empty() {
+                        drop_frame(watched, &tid, fid);
+                    }
                 }
             }
         }
@@ -1002,18 +1100,24 @@ async fn handle_event(watched: &Watched, event: &Value) {
             }
         }
         "DOM.documentUpdated" => {
-            if let Some(tid) = tab_of_session(watched, event) {
-                invalidate_refs(watched, &tid, "document updated");
+            // 主 frame session → 整表失效；frame session → 仅该帧失效（W-oopif）
+            match tab_of_session(watched, event) {
+                Some(tid) => invalidate_refs(watched, &tid, "document updated"),
+                None => {
+                    if let Some((tid, fid)) = frame_of_session(watched, event) {
+                        invalidate_frame_refs(watched, &tid, &fid, "frame document updated");
+                    }
+                }
             }
         }
         _ => {}
     }
 }
 
-/// attachedToTarget：type=page 建 targetId→sessionId 映射，并对该 session
-/// 补 Page.enable（对话框事件前置）+ DOM.enable（documentUpdated 前置）+
-/// 重连对话框盲探测（L3，见 [`probe_reconnected_dialog`]）。best-effort：
-/// enable/探测失败只缺对应能力，不影响命令路径。
+/// attachedToTarget：type=page 建 targetId→sessionId 映射并补域 enable；
+/// type=iframe 登记 OOPIF 帧会话（W-oopif，enable 复用同一套——fill/press/
+/// eval 的 DOM/Runtime 命令将路由到 frame session）。best-effort：enable/
+/// 探测失败只缺对应能力，不影响命令路径。
 async fn on_attached(watched: &Watched, params: &Value) {
     let ty = params
         .pointer("/targetInfo/type")
@@ -1028,24 +1132,72 @@ async fn on_attached(watched: &Watched, params: &Value) {
     let Some(sid) = params.get("sessionId").and_then(Value::as_str) else {
         return;
     };
-    if ty != "page" {
-        return; // iframe/worker 等 target 不参与 page 命令路由
-    }
-    watched.tabs.lock().unwrap().attach(tid, sid);
     let Some(conn) = watched.conn.lock().unwrap().clone() else {
         return;
     };
+    match ty {
+        "page" => {
+            watched.tabs.lock().unwrap().attach(tid, sid);
+            enable_session_domains(watched, &conn, tid, sid, true).await;
+        }
+        // OOPIF（W-oopif）：targetId == frameId（Chrome 不变式）。归属 tab 未知
+        // 时先存孤儿会话（frameAttached 到达时认领）；enable 照发——frame
+        // session 的 Page/DOM 域是 fill/press 跨 frame 的命令通道
+        "iframe" => {
+            let owner_tab = {
+                let mut tables = watched.frames.lock().unwrap();
+                let mut owner = None;
+                for (tab_tid, table) in tables.iter_mut() {
+                    if let Some(info) = table.frames.get_mut(tid) {
+                        info.session_id = Some(sid.to_string());
+                        owner = Some(tab_tid.clone());
+                        break;
+                    }
+                }
+                owner
+            };
+            let owner_tab = match owner_tab {
+                Some(tab) => tab,
+                None => {
+                    watched
+                        .orphan_frame_sessions
+                        .lock()
+                        .unwrap()
+                        .insert(tid.to_string(), sid.to_string());
+                    String::new()
+                }
+            };
+            enable_session_domains(watched, &conn, &owner_tab, sid, false).await;
+        }
+        _ => {}
+    }
+}
+
+/// per-session 域启用（page 与 iframe attach 共用，W-oopif 抽出）：
+/// 对话框盲探测先行（L3，悬挂对话框时唯一不被阻塞的命令）→ Page/DOM/CSS
+/// enable。`is_page`：仅 page target 记 css_since（hover 结算窗口起点）——
+/// frame target 不记（hover 扫描不进 frame，其样式表事件无 tab 可归属）。
+async fn enable_session_domains(
+    watched: &Watched,
+    conn: &SharedPageConn,
+    tid: &str,
+    sid: &str,
+    is_page: bool,
+) {
     // L3：盲探测必须**先于** enable 发出——对话框悬挂时唯一不被 renderer
     // 阻塞的命令就是 handleJavaScriptDialog（Page/Runtime.enable 等都会挂起
     // 至超时）；若 alert 挂着，先探测 accept 再 enable 才能全部成功。探测
-    // 与常规事件驱动路径互不干扰（无对话框时 -32602 静默）。
-    probe_reconnected_dialog(watched, &conn, tid, sid).await;
-    // CSS.enable 与 Page/DOM 同点位：hover 扫描的 styleSheetAdded 回放从 attach
-    // 起积累（snap 时按需 enable 无法同步拿到回放——事件异步，注册表会是空）。
-    // 成功时刻入 css_since：hover 扫描的结算窗口以此为起点。
+    // 与常规事件驱动路径互不干扰（无对话框时 -32602 静默）。frame 会话
+    // 归属未知（孤儿）时跳过：无 tid 可归档，frame 内 alert 走事件驱动。
+    if !tid.is_empty() {
+        probe_reconnected_dialog(watched, conn, tid, sid).await;
+    }
+    // CSS.enable 与 Page/DOM 同点位：hover 扫描的 styleSheetAdded 回放从
+    // attach 起积累（snap 时按需 enable 无法同步拿到回放——事件异步，注册
+    // 表会是空）。成功时刻入 css_since：hover 扫描的结算窗口以此为起点。
     let mut css_enabled = false;
     for method in ["Page.enable", "DOM.enable", "CSS.enable"] {
-        let ok = match cdp_send(&conn, method, json!({}), Some(sid)).await {
+        let ok = match cdp_send(conn, method, json!({}), Some(sid)).await {
             Ok(_) => true,
             Err(e) => {
                 tracing::debug!("[page] session {sid} {method} 失败: {e}");
@@ -1056,7 +1208,22 @@ async fn on_attached(watched: &Watched, params: &Value) {
             css_enabled = ok;
         }
     }
-    if css_enabled {
+    // session 级 auto-attach（W-oopif）：browser 级 setAutoAttach 只覆盖顶层
+    // target，OOPIF（type=iframe）的 attachedToTarget 由 page/帧 session 自己
+    // 的 autoAttach 产生（flatten：事件发到父 session，params.sessionId =
+    // 新帧会话——on_attached 按 params 处理，天然兼容）。帧会话同样下发，
+    // 支持嵌套 iframe。best-effort：失败只缺帧能力，不影响主路径。
+    if let Err(e) = cdp_send(
+        conn,
+        "Target.setAutoAttach",
+        json!({ "autoAttach": true, "flatten": true, "waitForDebuggerOnStart": false }),
+        Some(sid),
+    )
+    .await
+    {
+        tracing::debug!("[page] session {sid} 级 setAutoAttach 失败: {e}");
+    }
+    if css_enabled && is_page {
         watched
             .css_since
             .lock()
@@ -1106,23 +1273,47 @@ async fn probe_reconnected_dialog(watched: &Watched, conn: &SharedPageConn, tid:
     }
 }
 
-/// detachedFromTarget / targetDestroyed 的共同清理：映射 + 该 tab 的
-/// RefStore / DialogBuffer / load 等待者一起删（会话已死，状态随之作废；
-/// 等待中的导航命令各自走到自己的超时分支）。
-fn drop_tab(watched: &Watched, tid: &str) {
-    watched.tabs.lock().unwrap().detach(tid);
-    watched.refs.lock().unwrap().remove(tid);
-    watched.dialogs.lock().unwrap().remove(tid);
-    watched.load_waiters.lock().unwrap().remove(tid);
-    watched.sheets.lock().unwrap().remove(tid);
-    watched.css_since.lock().unwrap().remove(tid);
+/// detachedFromTarget / targetDestroyed 的共同清理：page target → 整 tab
+/// 摘除（映射 + RefStore / DialogBuffer / load 等待者一起删——会话已死，
+/// 状态随之作废；等待中的导航命令各自走到自己的超时分支）；
+/// frame target → 仅摘除该帧登记 + 帧内 ref 失效（W-oopif）。
+fn drop_target(watched: &Watched, tid: &str) {
+    if watched.tabs.lock().unwrap().contains_target(tid) {
+        drop_tab(watched, tid);
+        return;
+    }
+    let mut owner: Option<(String, String)> = None;
+    {
+        let mut tables = watched.frames.lock().unwrap();
+        for (tab_tid, table) in tables.iter_mut() {
+            if table.frames.remove(tid).is_some() {
+                owner = Some((tab_tid.clone(), tid.to_string()));
+                break;
+            }
+        }
+    }
+    watched.orphan_frame_sessions.lock().unwrap().remove(tid);
+    if let Some((tab_tid, fid)) = owner {
+        invalidate_frame_refs(watched, &tab_tid, &fid, "frame detached");
+    }
+}
+
+/// 摘除单个 OOPIF 帧登记 + 该帧 ref 失效（frameDetached / drop_target 共用）
+fn drop_frame(watched: &Watched, tab_tid: &str, fid: &str) {
+    watched
+        .frames
+        .lock()
+        .unwrap()
+        .get_mut(tab_tid)
+        .map(|t| t.frames.remove(fid));
+    invalidate_frame_refs(watched, tab_tid, fid, "frame detached");
 }
 
 fn on_detached(watched: &Watched, params: &Value) {
     let tid = params.get("targetId").and_then(Value::as_str);
     let sid = params.get("sessionId").and_then(Value::as_str);
     match (tid, sid) {
-        (Some(t), _) => drop_tab(watched, t),
+        (Some(t), _) => drop_target(watched, t),
         (None, Some(s)) => {
             let target = watched
                 .tabs
@@ -1132,10 +1323,45 @@ fn on_detached(watched: &Watched, params: &Value) {
                 .map(str::to_string);
             if let Some(t) = target {
                 drop_tab(watched, &t);
+                return;
+            }
+            // frame session（W-oopif）：按会话反查帧
+            if let Some((tab_tid, fid)) = frame_session_lookup(watched, s) {
+                drop_frame(watched, &tab_tid, &fid);
             }
         }
         (None, None) => {}
     }
+}
+
+/// detachedFromTarget（page target）的整 tab 清理（原 drop_tab，语义不变）
+fn drop_tab(watched: &Watched, tid: &str) {
+    watched.tabs.lock().unwrap().detach(tid);
+    watched.refs.lock().unwrap().remove(tid);
+    watched.dialogs.lock().unwrap().remove(tid);
+    watched.load_waiters.lock().unwrap().remove(tid);
+    watched.sheets.lock().unwrap().remove(tid);
+    watched.css_since.lock().unwrap().remove(tid);
+    watched.frames.lock().unwrap().remove(tid);
+}
+
+/// frame session → (tab tid, frame tid)；未登记返回 None
+fn frame_session_lookup(watched: &Watched, sid: &str) -> Option<(String, String)> {
+    let tables = watched.frames.lock().unwrap();
+    for (tab_tid, table) in tables.iter() {
+        for (fid, info) in table.frames.iter() {
+            if info.session_id.as_deref() == Some(sid) {
+                return Some((tab_tid.clone(), fid.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// 事件（顶层 sessionId）→ (tab tid, frame tid)：帧会话维度事件的定位入口
+fn frame_of_session(watched: &Watched, event: &Value) -> Option<(String, String)> {
+    let sid = event.get("sessionId").and_then(Value::as_str)?;
+    frame_session_lookup(watched, sid)
 }
 
 /// 顶层 sessionId → targetId（session 维度事件定位 tab 用）。
@@ -1155,6 +1381,13 @@ fn invalidate_refs(watched: &Watched, tid: &str, reason: &str) {
     }
 }
 
+/// 单帧 ref 失效（W-oopif）：仅标记该帧条目 stale，主 frame 条目不动
+fn invalidate_frame_refs(watched: &Watched, tid: &str, frame_tid: &str, reason: &str) {
+    if let Some(store) = watched.refs.lock().unwrap().get_mut(tid) {
+        store.invalidate_frame(frame_tid, reason);
+    }
+}
+
 /// 对话框接管（§1.4/§1.5）：无条件 accept（prompt 带 promptText =
 /// defaultPrompt ?? ""，P2-A 构造）；**成功后**才入缓冲——失败仅日志，
 /// 对话框保持打开、CDP 命令继续阻塞直至各自超时（与上游一致）。
@@ -1163,12 +1396,16 @@ fn invalidate_refs(watched: &Watched, tid: &str, reason: &str) {
 /// 命令天然并发——sessionId 是**连接级作用域**，换连接发必 -32001
 /// Session not found（旁路短连接方案真机已证伪并回滚）。
 async fn on_dialog_opening(watched: &Watched, session_id: &str, params: &Value) {
-    let tid = watched
-        .tabs
-        .lock()
-        .unwrap()
-        .target_of_session(session_id)
-        .map(str::to_string);
+    let tid = {
+        let tabs = watched.tabs.lock().unwrap();
+        let mut tid = tabs.target_of_session(session_id).map(str::to_string);
+        drop(tabs);
+        if tid.is_none() {
+            // frame 会话的对话框（W-oopif）：按帧归属到 tab
+            tid = frame_session_lookup(watched, session_id).map(|(tab, _)| tab);
+        }
+        tid
+    };
     let Some(tid) = tid else {
         return; // 未映射 session（attach 竞态/非 page target）：无法归属 tab
     };
@@ -1633,28 +1870,43 @@ struct AxVisit {
     next_ref: u32,
 }
 
+/// 一棵 AX 树（主文档或某 OOPIF 帧）的挂接描述（W-oopif）：owner 元素的
+/// backendNodeId 处展开该帧子树。arena 下标互相引用支持嵌套 iframe。
+struct FrameSubtree {
+    frame_tid: String,
+    frame_sid: String,
+    /// [frame] 行的可读标注（帧 url/id）
+    label: String,
+    nodes: Vec<Value>,
+    /// 本树内的挂接点：owner backendNodeId → arena 下标（该帧内的更深帧）
+    attaches: HashMap<i64, usize>,
+}
+
 /// 前序 DFS：只有 ref-worthy 节点消耗编号（从 1 起）；无 backendDOMNodeId
 /// 的节点不发 ref（无法解析到 CDP 节点的 ref 必是死点击）；childIds 优先、
 /// parent 反查表补位（TS orderedAxChildren）；游离节点兜底遍历（visited 去重）。
+/// W-oopif：`frame` 非空 = 当前遍历的是某帧子树——ref 条目携带帧维度、
+/// hover 标记不适用（backendNodeId 跨进程可碰撞，帧树一律无标记）；命中
+/// 挂接点时输出 `[frame]` 头行并就地展开帧子树（@eN 连续编号）。
+#[allow(clippy::too_many_arguments)]
 fn visit_ax(
     node: &Value,
     depth: usize,
     v: &mut AxVisit,
     by_id: &HashMap<String, &Value>,
     by_parent: &HashMap<String, Vec<&Value>>,
+    attach: &HashMap<i64, usize>,
+    arena: &[FrameSubtree],
     hover: &HoverMarks,
+    frame: Option<(&str, &str)>,
 ) {
     let key = ax_key(node.get("nodeId").unwrap_or(&Value::Null));
     if !v.visited.insert(key) {
         return;
     }
+    let backend = node.get("backendDOMNodeId").and_then(Value::as_i64);
     let mut assigned: Option<String> = None;
-    if is_ref_worthy(node)
-        && node
-            .get("backendDOMNodeId")
-            .and_then(Value::as_i64)
-            .is_some()
-    {
+    if is_ref_worthy(node) && backend.is_some() {
         let r = format!("e{}", v.next_ref);
         v.next_ref += 1;
         let mut entry = json!({
@@ -1664,16 +1916,51 @@ fn visit_ax(
         if let Some(name) = ax_field(node, "name").filter(|n| !n.is_empty()) {
             entry["name"] = json!(name);
         }
+        if let Some((ftid, fsid)) = frame {
+            entry["frameTargetId"] = json!(ftid);
+            entry["frameSessionId"] = json!(fsid);
+        }
         v.refs.push(entry);
         assigned = Some(r);
     }
     if should_show(node) {
-        let mark = node
-            .get("backendDOMNodeId")
-            .and_then(Value::as_i64)
-            .and_then(|b| hover.get(&b).copied());
+        // 帧子树不参与 hover 标记（backendNodeId 跨进程可碰撞，主树标记
+        // 误落到帧节点 = 假阳性；帧内 hover 扫描为后续迭代边界）
+        let mark = if frame.is_none() {
+            backend.and_then(|b| hover.get(&b).copied())
+        } else {
+            None
+        };
         v.lines
             .push(format_ax_line(node, depth, assigned.as_deref(), mark));
+    }
+    // W-oopif 挂接：owner 元素节点行后展开帧子树（同深度+1；头行带 [frame]）
+    if let Some(&idx) = backend.and_then(|b| attach.get(&b)) {
+        let sub = &arena[idx];
+        v.lines.push(format!(
+            "{}[frame] {}",
+            "  ".repeat((depth + 1).min(10)),
+            sub.label
+        ));
+        let (fid_by, fid_bp) = forest_indexes(&sub.nodes);
+        let roots: Vec<&Value> = sub
+            .nodes
+            .iter()
+            .filter(|n| is_root(n, &fid_by))
+            .collect();
+        for root in roots {
+            visit_ax(
+                root,
+                depth + 1,
+                v,
+                &fid_by,
+                &fid_bp,
+                &sub.attaches,
+                arena,
+                &HoverMarks::default(),
+                Some((sub.frame_tid.as_str(), sub.frame_sid.as_str())),
+            );
+        }
     }
     let own_key = ax_key(node.get("nodeId").unwrap_or(&Value::Null));
     let mut seen: HashSet<String> = HashSet::new();
@@ -1698,20 +1985,22 @@ fn visit_ax(
         }
     }
     for child in children {
-        visit_ax(child, depth + 1, v, by_id, by_parent, hover);
+        visit_ax(
+            child,
+            depth + 1,
+            v,
+            by_id,
+            by_parent,
+            attach,
+            arena,
+            hover,
+            frame,
+        );
     }
 }
 
-/// snap hover 感知：backendNodeId → 标记（"hover" = hover 触发器，
-/// "hover-reveal" = hover 后才显示/变化的目标）。
-type HoverMarks = HashMap<i64, &'static str>;
-/// per-tab 样式表登记：targetId → { styleSheetId → (origin, disabled) }。
-type SheetRegistry = HashMap<String, HashMap<String, (String, bool)>>;
-
-/// Accessibility.getFullAXTree 的 nodes → (text, refs)。refs 形状 = TS
-/// collectSnapshot 的 `[{ref, backendNodeId, name?}]`（RefStore::replace 入参）。
-/// hover：ref 命中的 hover 标记（第二遍渲染传入；第一遍传空表只取 refs）。
-fn collect_ax_tree(nodes: &[Value], hover: &HoverMarks) -> (String, Vec<Value>) {
+/// 一棵树的 (by_id, by_parent) 索引（visit_ax 与帧子树共用）
+fn forest_indexes(nodes: &[Value]) -> (HashMap<String, &Value>, HashMap<String, Vec<&Value>>) {
     let by_id: HashMap<String, &Value> = nodes
         .iter()
         .map(|n| (ax_key(n.get("nodeId").unwrap_or(&Value::Null)), n))
@@ -1724,21 +2013,45 @@ fn collect_ax_tree(nodes: &[Value], hover: &HoverMarks) -> (String, Vec<Value>) 
             }
         }
     }
+    (by_id, by_parent)
+}
+
+/// snap hover 感知：backendNodeId → 标记（"hover" = hover 触发器，
+/// "hover-reveal" = hover 后才显示/变化的目标）。
+type HoverMarks = HashMap<i64, &'static str>;
+/// per-tab 样式表登记：targetId → { styleSheetId → (origin, disabled) }。
+type SheetRegistry = HashMap<String, HashMap<String, (String, bool)>>;
+
+/// 主树 + 帧子树的整树收集（W-oopif）。帧条目在挂接点处展开，@eN 连续编号；
+/// refs 条目携带 frameTargetId/frameSessionId（主树条目无此二字段）。
+fn collect_ax_tree_multi(
+    main_nodes: &[Value],
+    hover: &HoverMarks,
+    main_attaches: &HashMap<i64, usize>,
+    arena: &[FrameSubtree],
+) -> (String, Vec<Value>) {
+    let (by_id, by_parent) = forest_indexes(main_nodes);
     let mut v = AxVisit {
         lines: Vec::new(),
         refs: Vec::new(),
         visited: HashSet::new(),
         next_ref: 1,
     };
-    for n in nodes {
+    for n in main_nodes {
         if is_root(n, &by_id) {
-            visit_ax(n, 0, &mut v, &by_id, &by_parent, hover);
+            visit_ax(n, 0, &mut v, &by_id, &by_parent, main_attaches, arena, hover, None);
         }
     }
-    for n in nodes {
-        visit_ax(n, 0, &mut v, &by_id, &by_parent, hover); // 兜底：游离节点（visited 已去重）
+    for n in main_nodes {
+        visit_ax(n, 0, &mut v, &by_id, &by_parent, main_attaches, arena, hover, None); // 兜底：游离节点
     }
     (v.lines.join("\n"), v.refs)
+}
+
+/// 单树收集（无帧；旧入口，测试与 hover 首遍共用）
+#[allow(dead_code)]
+fn collect_ax_tree(nodes: &[Value], hover: &HoverMarks) -> (String, Vec<Value>) {
+    collect_ax_tree_multi(nodes, hover, &HashMap::new(), &[])
 }
 
 // ============================================================================
@@ -1753,12 +2066,24 @@ async fn snap_tool(watched: &Watched, _tid: &str, sid: &str) -> Result<Value, Ap
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    // 两遍渲染：第一遍只取 refs（backendNodeId 全集，hover 桥接的输入），
+    // W-oopif：已 attach 的 OOPIF 帧逐个拉 AX 树 + 解析 owner 挂接点；
+    // 同源 iframe 不是独立 target（无 session），内容已在主树中——天然跳过。
+    // 主树 nodes 传入 sync：owner 探测命中后校验宿主文档中该 bni 确为 iframe
+    // 元素（防已销毁文档的残留 target 污染——getFrameOwner 对死帧返回的
+    // 节点不可信，真机实测撞上 button 的 bni）
+    let (arena, main_attaches) = collect_frame_subtrees(watched, &conn, _tid, sid, &nodes).await;
+    // 两遍渲染：第一遍只取 refs（backendNodeId 全集，hover 桥接的输入——
+    // 仅主树条目参与，帧内 backendNodeId 属另一 DOM agent 无法在主会话桥接），
     // hover 扫描后第二遍带标记渲染文本树（纯内存重入，代价可忽略）
-    let (_, refs) = collect_ax_tree(&nodes, &HoverMarks::default());
+    let (_, refs) = collect_ax_tree_multi(&nodes, &HoverMarks::default(), &main_attaches, &arena);
+    let main_refs: Vec<Value> = refs
+        .iter()
+        .filter(|r| r.get("frameTargetId").is_none())
+        .cloned()
+        .collect();
     // hover 感知（增强项：任何失败不阻断 snap 主体，状态如实上报）
-    let hover = hover_scan(watched, &conn, _tid, sid, &refs).await;
-    let (text, refs) = collect_ax_tree(&nodes, &hover.marks);
+    let hover = hover_scan(watched, &conn, _tid, sid, &main_refs).await;
+    let (text, refs) = collect_ax_tree_multi(&nodes, &hover.marks, &main_attaches, &arena);
     let refs_count = refs.len();
     // 整表替换 + generation+1 + 清 stale（§3.5）：refs 只描述最后一次 snap
     let generation = {
@@ -1768,6 +2093,346 @@ async fn snap_tool(watched: &Watched, _tid: &str, sid: &str) -> Result<Value, Ap
         store.generation()
     };
     Ok(json!({ "text": text, "refs_count": refs_count, "generation": generation, "hoverScan": hover.status }))
+}
+
+/// OOPIF 帧子树采集（W-oopif）：对 tab 已 attach 的每个帧 target 拉
+/// getFullAXTree，解析 owner 元素 backendNodeId（DOM.getFrameOwner，父文档
+/// session），组装 arena（支持嵌套：帧内 iframe 挂接在其父帧树下）。
+/// 单帧失败（导航中/会话死）跳过不阻断——该帧内容缺席于快照，主树完整。
+async fn collect_frame_subtrees(
+    watched: &Watched,
+    conn: &SharedPageConn,
+    tab_tid: &str,
+    main_sid: &str,
+    main_nodes: &[Value],
+) -> (Vec<FrameSubtree>, HashMap<i64, usize>) {
+    // 帧树主动同步（W-oopif）：frameAttached/attachedToTarget 只覆盖**增量**——
+    // 页面早于命令连接存在的帧拿不到事件（Page 域不回放历史帧树）。snap 前
+    // getFrameTree 全量同步结构 + attachToTarget 主动认领会话（同源帧非
+    // target，attach 报错即天然过滤）；与事件路径合流（幂等）。
+    sync_frame_tree(watched, conn, tab_tid, main_sid, main_nodes).await;
+    // 帧快照（锁内一次性取，避免跨 await 持锁）
+    let snapshot: Vec<(String, String, Option<String>)> = {
+        let tables = watched.frames.lock().unwrap();
+        let Some(table) = tables.get(tab_tid) else {
+            return (Vec::new(), HashMap::new());
+        };
+        table
+            .frames
+            .iter()
+            .filter_map(|(fid, info)| {
+                info.session_id
+                    .as_ref()
+                    .map(|sid| (fid.clone(), sid.clone(), info.parent_frame_id.clone()))
+            })
+            .collect()
+    };
+    if snapshot.is_empty() {
+        return (Vec::new(), HashMap::new());
+    }
+    let root = {
+        let tables = watched.frames.lock().unwrap();
+        tables.get(tab_tid).and_then(|t| t.root.clone())
+    };
+    // 逐帧拉树（失败跳过）+ owner 解析
+    struct Raw {
+        tid: String,
+        sid: String,
+        parent: Option<String>,
+        owner: i64,
+        nodes: Vec<Value>,
+        label: String,
+    }
+    let mut raws: Vec<Raw> = Vec::new();
+    for (fid, fsid, parent) in snapshot {
+        let nodes = fetch_frame_ax(conn, &fsid).await;
+        // owner：getFrameOwner 在父文档 session（父帧 OOPIF 用父帧会话，其余主会话）
+        let parent_sid = match parent.as_deref() {
+            Some(p) if !p.is_empty() && Some(p.to_string()) != root => {
+                let tables = watched.frames.lock().unwrap();
+                tables
+                    .get(tab_tid)
+                    .and_then(|t| t.frames.get(p))
+                    .and_then(|i| i.session_id.clone())
+                    .unwrap_or_else(|| main_sid.to_string())
+            }
+            _ => main_sid.to_string(),
+        };
+        let owner = resolve_frame_owner(watched, conn, tab_tid, &fid, &parent, &parent_sid).await;
+        let Some(owner_bni) = owner else { continue };
+        let label = nodes
+            .first()
+            .and_then(|n| ax_field(n, "name"))
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| fid.clone());
+        raws.push(Raw {
+            tid: fid,
+            sid: fsid,
+            parent,
+            owner: owner_bni,
+            nodes,
+            label,
+        });
+    }
+    // 组 arena：按父子关系挂接（父帧是 OOPIF → 挂到父帧树；否则挂主树）
+    let mut arena: Vec<FrameSubtree> = Vec::new();
+    let mut main_attaches: HashMap<i64, usize> = HashMap::new();
+    // 两轮：先全部入 arena（下标稳定），再连挂接点（引用后入的帧）
+    for r in &raws {
+        arena.push(FrameSubtree {
+            frame_tid: r.tid.clone(),
+            frame_sid: r.sid.clone(),
+            label: r.label.clone(),
+            nodes: r.nodes.clone(),
+            attaches: HashMap::new(),
+        });
+    }
+    for (i, r) in raws.iter().enumerate() {
+        let host = match r.parent.as_deref() {
+            Some(p) if !p.is_empty() && Some(p.to_string()) != root => {
+                arena.iter().position(|s| s.frame_tid == p)
+            }
+            _ => None,
+        };
+        match host {
+            Some(h) => {
+                arena[h].attaches.insert(r.owner, i);
+            }
+            None => {
+                main_attaches.insert(r.owner, i);
+            }
+        };
+    }
+    (arena, main_attaches)
+}
+
+/// 帧树主动同步（W-oopif，幂等，每次 snap 前跑）：事件路径
+/// （frameAttached/attachedToTarget）只覆盖**增量**——页面早于命令连接存在
+/// 的帧拿不到事件（Page 域不回放，getFrameTree 快照亦不含跨进程子帧，
+/// CfT 131 实测）。故走 target 面探测：
+/// 1. browser 级 Target.getTargets → type=iframe 列表（= 本实例全部 OOPIF；
+///    同源 iframe 不是 target，天然排除）；
+/// 2. 逐帧归属探测：DOM.getFrameOwner 发到各候选 session（page 会话优先、
+///    已知帧会话次之），成功者即宿主（owner 元素所在文档），响应的
+///    backendNodeId 顺手缓存（挂接点与投影共用）；
+/// 3. 无会话帧 → orphan 认领或 browser 级 attachToTarget 主动建会话 + 补域
+///    enable。任何失败不阻断 snap（该帧缺席，主树完整）。
+async fn sync_frame_tree(
+    watched: &Watched,
+    conn: &SharedPageConn,
+    tab_tid: &str,
+    main_sid: &str,
+    main_nodes: &[Value],
+) {
+    let Ok(resp) = cdp_send(conn, "Target.getTargets", json!({}), None).await else {
+        return;
+    };
+    let iframes: Vec<(String, String)> = resp
+        .get("targetInfos")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|t| t.get("type").and_then(Value::as_str) == Some("iframe"))
+                .filter_map(|t| {
+                    Some((
+                        t.get("targetId")?.as_str()?.to_string(),
+                        t.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if iframes.is_empty() {
+        return;
+    }
+    let orphans: Vec<(String, String)> = {
+        let o = watched.orphan_frame_sessions.lock().unwrap();
+        o.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    for (fid, _url) in iframes {
+        // 已有会话且 owner 已缓存的帧跳过（幂等；owner 缓存 miss 时仍探测补齐）
+        let (has_session, owner_cached) = {
+            let tables = watched.frames.lock().unwrap();
+            let info = tables
+                .get(tab_tid)
+                .and_then(|t| t.frames.get(&fid));
+            (info.and_then(|i| i.session_id.clone()).is_some(), info.and_then(|i| i.owner_backend_node_id).is_some())
+        };
+        if has_session && owner_cached {
+            continue;
+        }
+        // 归属探测：候选 = **本 tab** 的 page 会话 + 本 tab 已知帧会话（嵌套
+        // 宿主）。getFrameOwner 精确到宿主文档（非宿主一律 ERR，真机矩阵
+        // 实测）——把别的 tab 的会话放进候选会用错主树校验/写错登记表
+        // （每个 tab 的帧由该 tab 自己的 sync 登记）。
+        let mut candidates: Vec<(Option<String>, String)> = vec![(None, main_sid.to_string())];
+        {
+            let tables = watched.frames.lock().unwrap();
+            if let Some(table) = tables.get(tab_tid) {
+                for (other_fid, info) in table.frames.iter() {
+                    if let Some(sid) = &info.session_id {
+                        candidates.push((Some(other_fid.clone()), sid.clone()));
+                    }
+                }
+            }
+        }
+        let mut hit: Option<(Option<String>, i64)> = None;
+        for (host_frame, sid) in &candidates {
+            if let Ok(r) = cdp_send(
+                conn,
+                "DOM.getFrameOwner",
+                json!({ "frameId": fid }),
+                Some(sid),
+            )
+            .await
+            {
+                if let Some(bni) = r.get("backendNodeId").and_then(Value::as_i64) {
+                    hit = Some((host_frame.clone(), bni));
+                    break;
+                }
+            }
+        }
+        let Some((host_frame, owner_bni)) = hit else {
+            continue; // 宿主不明（探测期页面导航等）：留待事件路径/下轮 sync
+        };
+        // owner 校验（顶层帧）：宿主文档（主树）AX 中该 bni 的节点必须是
+        // iframe/容器类——死帧（旧文档残留 target）的 getFrameOwner 返回值
+        // 不可信（真机实测指向无关元素）。嵌套帧的宿主树本轮未拉，跳过校验。
+        if host_frame.is_none() {
+            let is_iframe_node = main_nodes.iter().any(|n| {
+                n.get("backendDOMNodeId").and_then(Value::as_i64) == Some(owner_bni)
+                    && ax_field(n, "role")
+                        .map(|r| {
+                            let r = r.to_lowercase();
+                            r == "iframe" || r == "document" || r.contains("frame")
+                        })
+                        .unwrap_or(false)
+            });
+            if !is_iframe_node {
+                tracing::debug!(
+                    "[page] OOPIF {fid} owner bni {owner_bni} 非当前文档 iframe 元素（死帧残留？），拒绝登记"
+                );
+                continue;
+            }
+        }
+        // 会话：已有 > orphan > 主动 attach
+        let sid = if has_session {
+            None
+        } else {
+            match orphans
+                .iter()
+                .find(|(f, _)| f == &fid)
+                .map(|(_, s)| s.clone())
+            {
+                Some(sid) => Some(sid),
+                None => match cdp_send(
+                    conn,
+                    "Target.attachToTarget",
+                    json!({ "targetId": fid, "flatten": true }),
+                    None,
+                )
+                .await
+                {
+                    Ok(r) => r
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    Err(_) => None,
+                },
+            }
+        };
+        if let Some(sid) = &sid {
+            enable_session_domains(watched, conn, tab_tid, sid, false).await;
+        }
+        let mut tables = watched.frames.lock().unwrap();
+        let table = tables.entry(tab_tid.to_string()).or_default();
+        let info = table.frames.entry(fid.clone()).or_default();
+        if info.parent_frame_id.is_none() {
+            info.parent_frame_id = host_frame.clone();
+        }
+        info.owner_backend_node_id = Some(owner_bni);
+        if let Some(sid) = sid {
+            info.session_id = Some(sid);
+            tracing::debug!("[page] OOPIF {fid} 同步登记（宿主 {:?}，owner bni {owner_bni}）", host_frame.as_deref().unwrap_or(main_sid));
+        }
+    }
+}
+
+/// 帧内 AX 树拉取（带就绪重试）：OOPIF session 刚 attach 时 AX agent 可能
+/// 尚未构建（返回仅根节点/空）——短退避重试至出现内容或预算（~1s）耗尽。
+/// 这是真机实测的时序窗口：首轮 snap 恰逢 attach 即空，事件无从感知。
+async fn fetch_frame_ax(conn: &SharedPageConn, fsid: &str) -> Vec<Value> {
+    for attempt in 0..7 {
+        if let Ok(resp) = cdp_send(
+            conn,
+            "Accessibility.getFullAXTree",
+            json!({}),
+            Some(fsid),
+        )
+        .await
+        {
+            let nodes = resp
+                .get("nodes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            // 仅根（或空）= 未就绪；有 2+ 节点即认为内容可见
+            if nodes.len() >= 2 {
+                return nodes;
+            }
+            if attempt == 6 {
+                return nodes; // 末轮：有多少给多少（诚实缺席好过假等待）
+            }
+        } else {
+            return Vec::new(); // 会话已死：立即放弃
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    Vec::new()
+}
+
+/// 帧 owner 元素解析（缓存优先；miss 时在指定父文档 session 发
+/// DOM.getFrameOwner 并回写登记表）。None = 解析失败（帧正死/导航中）。
+async fn resolve_frame_owner(
+    watched: &Watched,
+    conn: &SharedPageConn,
+    tab_tid: &str,
+    frame_tid: &str,
+    parent_frame_id: &Option<String>,
+    parent_sid: &str,
+) -> Option<i64> {
+    {
+        let tables = watched.frames.lock().unwrap();
+        if let Some(bni) = tables
+            .get(tab_tid)
+            .and_then(|t| t.frames.get(frame_tid))
+            .and_then(|i| i.owner_backend_node_id)
+        {
+            return Some(bni);
+        }
+    }
+    let resp = cdp_send(
+        conn,
+        "DOM.getFrameOwner",
+        json!({ "frameId": frame_tid }),
+        Some(parent_sid),
+    )
+    .await;
+    let bni = resp
+        .ok()
+        .and_then(|r| r.get("backendNodeId").and_then(Value::as_i64));
+    if let Some(bni) = bni {
+        let mut tables = watched.frames.lock().unwrap();
+        if let Some(info) = tables
+            .get_mut(tab_tid)
+            .and_then(|t| t.frames.get_mut(frame_tid))
+        {
+            info.owner_backend_node_id = Some(bni);
+        }
+    }
+    let _ = parent_frame_id; // 仅文档语义提示：owner 查询本就发往父文档 session
+    bni
 }
 
 /// snap hover 感知的扫描结果：ref 行标记 + meta 状态。
@@ -1956,6 +2621,152 @@ async fn wait_sheets(watched: &Watched, tid: &str) {
 }
 
 /// ref → backendNodeId 查表（miss 按 P2-A ref_miss 语义选 stale/not_found）。
+/// 帧的当前会话（优先活登记表，回落 snap 时记忆的会话 id）
+fn live_frame_session(
+    watched: &Watched,
+    tab_tid: &str,
+    frame_tid: &str,
+    fallback: Option<&str>,
+) -> Option<String> {
+    let live = {
+        let tables = watched.frames.lock().unwrap();
+        tables
+            .get(tab_tid)
+            .and_then(|t| t.frames.get(frame_tid))
+            .and_then(|i| i.session_id.clone())
+    };
+    live.or_else(|| fallback.map(str::to_string))
+}
+
+/// 投影链单步：帧 → (父 frameId[None/根=主文档], 父文档 session, owner 元素
+/// backendNodeId)。父帧已 attach（OOPIF）用其会话，否则主会话（同源中间帧
+/// 的 DOM 本就属于主文档进程，getFrameOwner 在主会话可解析任意后代）。
+async fn frame_chain_step(
+    watched: &Watched,
+    conn: &SharedPageConn,
+    tab_tid: &str,
+    main_sid: &str,
+    frame_tid: &str,
+) -> Option<(Option<String>, String, i64)> {
+    let (parent, parent_session) = {
+        let tables = watched.frames.lock().unwrap();
+        let table = tables.get(tab_tid)?;
+        let info = table.frames.get(frame_tid)?;
+        let root = table.root.clone();
+        let parent = info.parent_frame_id.clone();
+        let parent_session = match parent.as_deref() {
+            Some(p) if !p.is_empty() && Some(p.to_string()) != root => table
+                .frames
+                .get(p)
+                .and_then(|i| i.session_id.clone()),
+            _ => None,
+        };
+        (parent, parent_session)
+    };
+    let parent_sid = parent_session.unwrap_or_else(|| main_sid.to_string());
+    let owner = resolve_frame_owner(watched, conn, tab_tid, frame_tid, &parent, &parent_sid).await?;
+    Some((parent, parent_sid, owner))
+}
+
+/// 帧内点 → 根视口坐标（逐级投影：owner 元素 quad 平移+夹取；嵌套逐级上投）。
+/// 上限 8 级防御环/脏数据。失败按 target_moved（几何链断 = 目标已不可用）。
+async fn project_frame_point(
+    watched: &Watched,
+    conn: &SharedPageConn,
+    tab_tid: &str,
+    main_sid: &str,
+    frame_tid: &str,
+    p: crate::domain::page_control::Point,
+) -> Result<crate::domain::page_control::Point, AppError> {
+    use crate::domain::page_control::project_point;
+    let root = {
+        let tables = watched.frames.lock().unwrap();
+        tables.get(tab_tid).and_then(|t| t.root.clone())
+    };
+    let mut cur = frame_tid.to_string();
+    let mut p = p;
+    for _ in 0..8 {
+        let (parent, parent_sid, owner_bni) =
+            frame_chain_step(watched, conn, tab_tid, main_sid, &cur)
+                .await
+                .ok_or_else(|| {
+                    PageControlError::target_moved(
+                        "owning iframe chain is not resolvable (frame detached or navigating?)",
+                    )
+                })?;
+        let quads = content_quads(conn, &parent_sid, owner_bni).await.map_err(|e| {
+            PageControlError::target_moved(&format!("iframe owner geometry failed: {e}"))
+        })?;
+        let quad = largest_quad(&quads).ok_or_else(|| {
+            PageControlError::target_moved("iframe owner has no usable quad (zero area?)")
+        })?;
+        p = project_point(&quad, p).ok_or_else(|| {
+            PageControlError::target_moved("iframe owner quad is degenerate")
+        })?;
+        // 父级即根（或未知 → 视为主文档直属）：已到根视口
+        let at_root = match parent.as_deref() {
+            None | Some("") => true,
+            Some(pf) => Some(pf.to_string()) == root,
+        };
+        if at_root {
+            return Ok(p);
+        }
+        cur = parent.expect("非空已判");
+    }
+    Err(AppError::internal("iframe 投影链超限（嵌套 >8 或登记表成环）"))
+}
+
+/// getContentQuads 的原始四边形集合（数值防御：非有限数剔除）
+async fn content_quads(
+    conn: &SharedPageConn,
+    sid: &str,
+    backend_node_id: i64,
+) -> Result<Vec<Vec<f64>>, String> {
+    let resp = cdp_send(
+        conn,
+        "DOM.getContentQuads",
+        json!({ "backendNodeId": backend_node_id }),
+        Some(sid),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(resp
+        .get("quads")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .flat_map(|q| {
+                    q.as_array().map(|nums| {
+                        nums.iter().filter_map(Value::as_f64).collect::<Vec<f64>>()
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// 面积最大的四边形（投影用本体；质心场景另用 largest_quad_centroid）
+fn largest_quad(quads: &[Vec<f64>]) -> Option<Vec<f64>> {
+    let mut best: Option<&Vec<f64>> = None;
+    let mut best_area = 0.0f64;
+    for q in quads {
+        if q.len() != 8 || q.iter().any(|n| !n.is_finite()) {
+            continue;
+        }
+        let mut area2 = 0.0;
+        for i in 0..4 {
+            let j = ((i + 1) % 4) * 2;
+            area2 += q[i * 2] * q[j + 1] - q[j] * q[i * 2 + 1];
+        }
+        let area = area2.abs() / 2.0;
+        if area > best_area {
+            best_area = area;
+            best = Some(q);
+        }
+    }
+    best.cloned()
+}
+
 fn resolve_ref_entry(
     watched: &Watched,
     tid: &str,
@@ -1966,6 +2777,11 @@ fn resolve_ref_entry(
         // 无表 = 从未 snap：等价 TS 的 throwaway store → ref_not_found
         None => Err(PageControlError::ref_not_found(raw_ref).into()),
         Some(store) => match store.resolve(raw_ref) {
+            // 帧级失效（W-oopif）：条目仍在表但所在 iframe 已导航/移除——
+            // 报 stale（重 snap）而非 not_found（语义精确：曾经存在，已失效）
+            Some(e) if e.stale_reason.is_some() => {
+                Err(PageControlError::ref_stale(e.stale_reason.as_deref()).into())
+            }
             Some(entry) => Ok(entry.clone()),
             None => Err(PageControlError::ref_miss(store, raw_ref).into()),
         },
@@ -2168,9 +2984,28 @@ async fn click_tool(
     }
     let conn = require_conn(watched)?;
     let text = if is_ref_target(target) {
-        // ref 路径：查表 → 几何 → 原生坐标点击（refs 永远走原生输入）
+        // ref 路径：查表 → 几何 → 原生坐标点击（refs 永远走原生输入）。
+        // W-oopif：帧内 ref 的 quad 是帧本地坐标——逐级投影到根视口后，
+        // Input.dispatchMouseEvent 发根 target（浏览器按命中测试路由进 OOPIF）
         let entry = resolve_ref_entry(watched, tid, target)?;
-        let p = resolve_ref_point(&conn, sid, entry.backend_node_id).await?;
+        let p = match &entry.frame_target_id {
+            None => resolve_ref_point(&conn, sid, entry.backend_node_id).await?,
+            Some(fid) => {
+                let Some(fsid) = live_frame_session(
+                    watched,
+                    tid,
+                    fid,
+                    entry.frame_session_id.as_deref(),
+                ) else {
+                    return Err(PageControlError::target_moved(
+                        "owning iframe session is gone (frame detached?) — re-snap",
+                    )
+                    .into());
+                };
+                let local = resolve_ref_point(&conn, &fsid, entry.backend_node_id).await?;
+                project_frame_point(watched, &conn, tid, sid, fid, local).await?
+            }
+        };
         dispatch_click(&conn, sid, p.x, p.y).await?;
         let label = entry.name.map(|n| format!(" \"{n}\"")).unwrap_or_default();
         format!(
@@ -2186,23 +3021,35 @@ async fn click_tool(
     Ok(json!({ "result": text }))
 }
 
-/// fill 目标解析 → 稳定 objectId（SPEC DOM-script 原则：两次 eval 之间选择器
-/// 可能命中不同元素，对象句柄跨调用稳定）。ref 路径失败 = target_moved；
-/// selector 路径 nodeId 0 = element_not_found（与 click 同码）。
+/// fill 目标解析 → (稳定 objectId, ref 名, 描述, **执行会话**)（SPEC
+/// DOM-script 原则：两次 eval 之间选择器可能命中不同元素，对象句柄跨调用
+/// 稳定）。ref 路径失败 = target_moved；selector 路径 nodeId 0 =
+/// element_not_found（与 click 同码）。W-oopif：帧内 ref 的 DOM/Runtime
+/// 命令全部路由到 frame session（backendNodeId 属帧自己的 DOM agent）。
+#[allow(clippy::type_complexity)]
 async fn resolve_fill_target(
     watched: &Watched,
     conn: &SharedPageConn,
     tid: &str,
     sid: &str,
     target: &str,
-) -> Result<(String, Option<String>, String), AppError> {
+) -> Result<(String, Option<String>, String, String), AppError> {
     if is_ref_target(target) {
         let entry = resolve_ref_entry(watched, tid, target)?;
+        let esid = match &entry.frame_target_id {
+            None => sid.to_string(),
+            Some(fid) => live_frame_session(watched, tid, fid, entry.frame_session_id.as_deref())
+                .ok_or_else(|| {
+                    PageControlError::target_moved(
+                        "owning iframe session is gone (frame detached?) — re-snap",
+                    )
+                })?,
+        };
         let resp = match cdp_send(
             conn,
             "DOM.resolveNode",
             json!({ "backendNodeId": entry.backend_node_id }),
-            Some(sid),
+            Some(&esid),
         )
         .await
         {
@@ -2216,6 +3063,7 @@ async fn resolve_fill_target(
             object_id.to_string(),
             entry.name,
             format!("@{}", normalize_ref(target)),
+            esid,
         ))
     } else {
         if target.is_empty() {
@@ -2259,7 +3107,7 @@ async fn resolve_fill_target(
                 "fill: could not resolve {target} to a node (no objectId)"
             )));
         };
-        Ok((object_id.to_string(), None, target.to_string()))
+        Ok((object_id.to_string(), None, target.to_string(), sid.to_string()))
     }
 }
 
@@ -2278,14 +3126,16 @@ async fn fill_tool(
     value: &str,
 ) -> Result<Value, AppError> {
     let conn = require_conn(watched)?;
-    let (object_id, ref_name, desc) = resolve_fill_target(watched, &conn, tid, sid, target).await?;
-    let outcome = fill_pipeline(&conn, sid, &object_id, &desc, ref_name, value).await;
-    // finally 语义（TS）：无论成败都归还对象句柄（best-effort）
+    let (object_id, ref_name, desc, esid) =
+        resolve_fill_target(watched, &conn, tid, sid, target).await?;
+    let outcome = fill_pipeline(&conn, &esid, &object_id, &desc, ref_name, value).await;
+    // finally 语义（TS）：无论成败都归还对象句柄（best-effort）——归还发到
+    // 解析它的同一会话（objectId 会话作用域）
     let _ = cdp_send(
         &conn,
         "Runtime.releaseObject",
         json!({ "objectId": object_id }),
-        Some(sid),
+        Some(&esid),
     )
     .await;
     Ok(json!({ "result": outcome? }))
@@ -2402,27 +3252,38 @@ async fn fill_pipeline(
 
 /// press 的 --target focus（TS focusPressTarget）：ref 走 DOM.focus
 /// （backendNodeId），selector 走页内 eval（scrollIntoView + focus + 复查）。
+#[allow(clippy::type_complexity)]
 async fn focus_press_target(
     watched: &Watched,
     conn: &SharedPageConn,
     tid: &str,
     sid: &str,
     target: &str,
-) -> Result<String, AppError> {
+) -> Result<(String, String), AppError> {
     if is_ref_target(target) {
         let entry = resolve_ref_entry(watched, tid, target)?;
+        // W-oopif：帧内 ref 的滚动/聚焦在 frame session 上做
+        let esid = match &entry.frame_target_id {
+            None => sid.to_string(),
+            Some(fid) => live_frame_session(watched, tid, fid, entry.frame_session_id.as_deref())
+                .ok_or_else(|| {
+                    PageControlError::target_moved(
+                        "owning iframe session is gone (frame detached?) — re-snap",
+                    )
+                })?,
+        };
         let _ = cdp_send(
             conn,
             "DOM.scrollIntoViewIfNeeded",
             json!({ "backendNodeId": entry.backend_node_id }),
-            Some(sid),
+            Some(&esid),
         )
         .await;
         if let Err(e) = cdp_send(
             conn,
             "DOM.focus",
             json!({ "backendNodeId": entry.backend_node_id }),
-            Some(sid),
+            Some(&esid),
         )
         .await
         {
@@ -2431,10 +3292,13 @@ async fn focus_press_target(
             )));
         }
         let key = normalize_ref(target);
-        Ok(entry
-            .name
-            .map(|n| format!("@{key} \"{n}\""))
-            .unwrap_or(format!("@{key}")))
+        Ok((
+            entry
+                .name
+                .map(|n| format!("@{key} \"{n}\""))
+                .unwrap_or(format!("@{key}")),
+            esid,
+        ))
     } else {
         let r = eval_json(conn, sid, &press_focus_expr(target), "press").await?;
         match r.get("error").and_then(Value::as_str) {
@@ -2452,9 +3316,12 @@ async fn focus_press_target(
                     .get("label")
                     .and_then(Value::as_str)
                     .filter(|l| !l.is_empty());
-                Ok(label
-                    .map(|l| format!("<{tag}> \"{l}\""))
-                    .unwrap_or(format!("<{tag}>")))
+                Ok((
+                    label
+                        .map(|l| format!("<{tag}> \"{l}\""))
+                        .unwrap_or(format!("<{tag}>")),
+                    sid.to_string(),
+                ))
             }
         }
     }
@@ -2474,12 +3341,12 @@ async fn press_tool(
     }
     let kp = parse_key(key)?; // PAGE_KEY_UNKNOWN 400（P2-A）
     let conn = require_conn(watched)?;
-    let where_on = match target.filter(|t| !t.is_empty()) {
-        None => String::new(),
-        Some(t) => format!(
-            " on {}",
-            focus_press_target(watched, &conn, tid, sid, t).await?
-        ),
+    let (where_on, key_sid) = match target.filter(|t| !t.is_empty()) {
+        None => (String::new(), sid.to_string()),
+        Some(t) => {
+            let (label, esid) = focus_press_target(watched, &conn, tid, sid, t).await?;
+            (format!(" on {label}"), esid)
+        }
     };
     // rawKeyDown (+char) → keyUp（P2-A 序列生成，绝不发裸 keyDown）。
     // char/keyUp 失败补一发 keyUp（按键绝不卡死按下态）；rawKeyDown 失败
@@ -2491,12 +3358,12 @@ async fn press_tool(
             &conn,
             "Input.dispatchKeyEvent",
             serde_json::to_value(ev).unwrap(),
-            Some(sid),
+            Some(&key_sid),
         )
         .await
         {
             if i > 0 {
-                let _ = cdp_send(&conn, "Input.dispatchKeyEvent", last.clone(), Some(sid)).await;
+                let _ = cdp_send(&conn, "Input.dispatchKeyEvent", last.clone(), Some(&key_sid)).await;
             }
             return Err(e);
         }
@@ -3770,7 +4637,9 @@ mod tests {
 
     // ---------------- watch_loop 事件接线 ------------------------------------
 
-    /// attachedToTarget(page) 建映射 + 双 enable；非 page target 不入表
+    /// attachedToTarget(page) 建映射 + 双 enable；iframe target 不入 tabs 表
+    /// 但得同一套 enable（W-oopif：frame session 是跨 frame 命令通道）；
+    /// worker 等其他 target 完全不参与
     #[tokio::test]
     async fn attached_registers_page_tab_and_enables_domains() {
         let (svc, calls, _script, tap) = fake_service();
@@ -3780,28 +4649,27 @@ mod tests {
         let tx = tap.lock().unwrap().clone().unwrap();
         tx.send(attach_event("TAB_A", "SES_A", "page")).unwrap();
         tx.send(attach_event("TAB_B", "SES_B", "iframe")).unwrap();
+        tx.send(attach_event("TAB_W", "SES_W", "worker")).unwrap();
 
         eventually("TAB_A 入表", || tab_session(&watched, "TAB_A").is_some()).await;
         assert_eq!(tab_session(&watched, "TAB_A").as_deref(), Some("SES_A"));
-        // iframe 等 target 不参与 page 命令路由（enable 只对 page session 发）
-        eventually("双 enable 已发出", || {
-            calls_of(&calls, "Page.enable").len() == 1
+        // iframe 等 target 不参与 page 命令路由（tabs 表只有 page），但
+        // frame session 照发 enable（孤儿会话先登记，frameAttached 后认领）
+        eventually("iframe enable 已发出", || {
+            calls_of(&calls, "Page.enable").len() == 2
         })
         .await;
-        assert_eq!(
-            calls_of(&calls, "Page.enable")[0].session.as_deref(),
-            Some("SES_A")
-        );
-        assert_eq!(
-            calls_of(&calls, "DOM.enable")[0].session.as_deref(),
-            Some("SES_A")
-        );
-        assert!(tab_session(&watched, "TAB_B").is_none());
-        assert_eq!(
-            calls_of(&calls, "Page.enable").len(),
-            1,
-            "非 page 不发 enable"
-        );
+        let enables = calls_of(&calls, "Page.enable");
+        let page_enables: Vec<&str> = enables
+            .iter()
+            .filter_map(|r| r.session.as_deref())
+            .collect();
+        assert!(page_enables.contains(&"SES_A"));
+        assert!(page_enables.contains(&"SES_B"), "iframe session 同套 enable");
+        assert!(tab_session(&watched, "TAB_B").is_none(), "iframe 不入 tabs 表");
+        // worker 等其余 target 零参与
+        assert!(!page_enables.contains(&"SES_W"));
+        assert_eq!(calls_of(&calls, "Page.enable").len(), 2);
     }
 
     /// L2（冒烟遗留）：首条 attachedToTarget 延迟 100ms 到达（真机形态：事件
@@ -6336,5 +7204,327 @@ mod tests {
             .filter(|c| c.method.starts_with("Emulation."))
             .count();
         assert_eq!(emulate_calls, 0);
+    }
+
+    // ---------------- W-oopif：帧登记 / snap 合并 / 投影 / 帧会话路由 ----------------
+
+    fn register_frame(
+        watched: &Watched,
+        tab: &str,
+        root: &str,
+        fid: &str,
+        sid: Option<&str>,
+        parent: &str,
+        owner: Option<i64>,
+    ) {
+        let mut tables = watched.frames.lock().unwrap();
+        let t = tables.entry(tab.to_string()).or_default();
+        t.root = Some(root.to_string());
+        t.frames.insert(
+            fid.to_string(),
+            FrameInfo {
+                session_id: sid.map(str::to_string),
+                parent_frame_id: Some(parent.to_string()),
+                owner_backend_node_id: owner,
+            },
+        );
+    }
+
+    /// frameAttached → iframe attach 认领 → frameDetached 摘除 + 帧内 ref 失效；
+    /// attach 先于 frameAttached 的孤儿路径同样收敛
+    #[tokio::test]
+    async fn frame_registry_lifecycle_via_events() {
+        let (svc, calls, _script, tap) = fake_service();
+        let (watched, g) = svc.ensure(INS).await.unwrap();
+        drop(g);
+        // 预置 ref 表（帧条目 + 主条目），验证事件驱动的失效
+        watched.refs.lock().unwrap().entry("TAB1".into()).or_default().replace(&json!([
+            { "ref": "e1", "backendNodeId": 101 },
+            { "ref": "e2", "backendNodeId": 202, "frameTargetId": "FRM_A" },
+        ]));
+
+        let tx = tap.lock().unwrap().clone().unwrap();
+        tx.send(attach_event("TAB1", "SES1", "page")).unwrap();
+        eventually("TAB1 入表", || tab_session(&watched, "TAB1").is_some()).await;
+
+        // 路径一：frameAttached 先到，attach 认领
+        tx.send(json!({ "method": "Page.frameAttached", "sessionId": "SES1",
+            "params": { "frameId": "FRM_A", "parentFrameId": "F_ROOT" } })).unwrap();
+        eventually("FRM_A 登记", || {
+            watched.frames.lock().unwrap()
+                .get("TAB1").map(|t| t.frames.contains_key("FRM_A")).unwrap_or(false)
+        }).await;
+        tx.send(attach_event("FRM_A", "SES_FRM_A", "iframe")).unwrap();
+        eventually("FRM_A 会话认领", || {
+            watched.frames.lock().unwrap()
+                .get("TAB1").and_then(|t| t.frames.get("FRM_A"))
+                .and_then(|i| i.session_id.clone()).as_deref() == Some("SES_FRM_A")
+        }).await;
+
+        // 路径二：孤儿 attach 先到（归属未知），frameAttached 后认领
+        tx.send(attach_event("FRM_B", "SES_FRM_B", "iframe")).unwrap();
+        eventually("孤儿 enable 已发", || {
+            calls_of(&calls, "Page.enable").iter().any(|r| r.session.as_deref() == Some("SES_FRM_B"))
+        }).await;
+        tx.send(json!({ "method": "Page.frameAttached", "sessionId": "SES1",
+            "params": { "frameId": "FRM_B", "parentFrameId": "F_ROOT" } })).unwrap();
+        eventually("FRM_B 孤儿认领", || {
+            watched.frames.lock().unwrap()
+                .get("TAB1").and_then(|t| t.frames.get("FRM_B"))
+                .and_then(|i| i.session_id.clone()).as_deref() == Some("SES_FRM_B")
+        }).await;
+
+        // frameDetached：登记摘除 + 帧内 ref 失效（主条目不动）
+        tx.send(json!({ "method": "Page.frameDetached", "sessionId": "SES1",
+            "params": { "frameId": "FRM_A", "reason": "replaced" } })).unwrap();
+        eventually("FRM_A 摘除", || {
+            !watched.frames.lock().unwrap()
+                .get("TAB1").map(|t| t.frames.contains_key("FRM_A")).unwrap_or(false)
+        }).await;
+        let refs = watched.refs.lock().unwrap();
+        let store = refs.get("TAB1").unwrap();
+        assert!(store.resolve("e1").unwrap().stale_reason.is_none(), "主 frame 条目不受影响");
+        assert!(store.resolve("e2").unwrap().stale_reason.is_some(), "帧条目已随帧失效");
+    }
+
+    /// frameNavigated：子帧 → 仅该帧条目 stale；根帧 → 整表失效 + 帧登记清空
+    /// （与 hover 的根导航清 sheets 逻辑共存）
+    #[tokio::test]
+    async fn frame_navigation_scopes_invalidation() {
+        let (svc, _calls, _script, tap) = fake_service();
+        let (watched, g) = svc.ensure(INS).await.unwrap();
+        drop(g);
+        watched.refs.lock().unwrap().entry("TAB1".into()).or_default().replace(&json!([
+            { "ref": "e1", "backendNodeId": 101 },
+            { "ref": "e2", "backendNodeId": 202, "frameTargetId": "FRM_A" },
+        ]));
+        let tx = tap.lock().unwrap().clone().unwrap();
+        tx.send(attach_event("TAB1", "SES1", "page")).unwrap();
+        eventually("TAB1 入表", || tab_session(&watched, "TAB1").is_some()).await;
+        tx.send(json!({ "method": "Page.frameAttached", "sessionId": "SES1",
+            "params": { "frameId": "FRM_A", "parentFrameId": "F_ROOT" } })).unwrap();
+        eventually("FRM_A 登记", || {
+            watched.frames.lock().unwrap()
+                .get("TAB1").map(|t| t.frames.contains_key("FRM_A")).unwrap_or(false)
+        }).await;
+
+        // 子帧导航：只失效 FRM_A 条目
+        tx.send(json!({ "method": "Page.frameNavigated", "sessionId": "SES1",
+            "params": { "frame": { "id": "FRM_A", "parentId": "F_ROOT", "url": "https://b/x2" } } })).unwrap();
+        eventually("帧条目 stale", || {
+            watched.refs.lock().unwrap().get("TAB1")
+                .and_then(|s| s.resolve("e2")).and_then(|e| e.stale_reason.clone()).is_some()
+        }).await;
+        {
+            let refs = watched.refs.lock().unwrap();
+            assert!(!refs.get("TAB1").unwrap().stale(), "整表 stale 不置位");
+            assert!(refs.get("TAB1").unwrap().resolve("e1").unwrap().stale_reason.is_none());
+        }
+
+        // 根导航：整表失效 + 帧登记清空 + sheets 清空（hover 共存）
+        watched.sheets.lock().unwrap().insert("TAB1".into(), Default::default());
+        tx.send(json!({ "method": "Page.frameNavigated", "sessionId": "SES1",
+            "params": { "frame": { "id": "F_ROOT", "url": "https://a/next" } } })).unwrap();
+        eventually("整表 stale", || {
+            watched.refs.lock().unwrap().get("TAB1").map(|s| s.stale()).unwrap_or(false)
+        }).await;
+        eventually("帧登记清空", || {
+            watched.frames.lock().unwrap().get("TAB1").map(|t| t.frames.is_empty()).unwrap_or(true)
+        }).await;
+        assert!(watched.sheets.lock().unwrap().get("TAB1").is_none(), "根导航清 sheets（hover 共存）");
+    }
+
+    /// snap 合并：帧树渲染为挂接点下的 [frame] 段，@eN 连续编号，
+    /// RefStore 条目携带帧维度（主树条目无）；owner 经 DOM.getFrameOwner 解析
+    #[tokio::test]
+    async fn snap_merges_frame_subtree_with_continuous_refs() {
+        let (svc, watched, _calls, script) = armed();
+        register_frame(&watched, "T1", "F_ROOT", "FRM_A", Some("S_FRM_A"), "F_ROOT", None);
+        let main_tree = json!({ "nodes": [
+            ax_node("m1", "WebArea", json!({ "childIds": ["m2", "m3"] })),
+            ax_node("m2", "iframe", json!({ "parentId": "m1", "name": { "value": "跨域表单" }, "backendDOMNodeId": 501 })),
+            ax_node("m3", "button", json!({ "parentId": "m1", "name": { "value": "OK" }, "backendDOMNodeId": 101 })),
+        ]});
+        let frame_tree = json!({ "nodes": [
+            ax_node("f1", "WebArea", json!({ "childIds": ["f2", "f3"], "name": { "value": "frame doc" } })),
+            ax_node("f2", "button", json!({ "parentId": "f1", "name": { "value": "提交" }, "backendDOMNodeId": 601 })),
+            ax_node("f3", "textbox", json!({ "parentId": "f1", "name": { "value": "用户名" }, "backendDOMNodeId": 602 })),
+        ]});
+        // 调用序：主树（S1）先、帧树（S_FRM_A）后 —— FakeCdp 按队列序消耗
+        given(&script, "Accessibility.getFullAXTree", vec![Ok(main_tree), Ok(frame_tree)]);
+        given(&script, "DOM.getFrameOwner", vec![Ok(json!({ "backendNodeId": 501 }))]);
+
+        let resp = svc.snap(INS, "T1").await.unwrap();
+        let text = resp["text"].as_str().unwrap();
+        assert!(text.contains("[iframe] 跨域表单"), "挂接点（owner 元素）行存在:\n{text}");
+        assert!(text.contains("[frame] frame doc"), "[frame] 段头行:\n{text}");
+        assert!(text.contains("@e1 [button] 提交"), "帧内按钮获连续编号:\n{text}");
+        assert!(text.contains("@e3 [button] OK"), "主树按钮编号顺延:\n{text}");
+        assert_eq!(resp["refs_count"], 3);
+
+        let store = watched.refs.lock().unwrap();
+        let st = store.get("T1").unwrap();
+        let e1 = st.resolve("e1").unwrap();
+        assert_eq!(e1.backend_node_id, 601);
+        assert_eq!(e1.frame_target_id.as_deref(), Some("FRM_A"));
+        assert_eq!(e1.frame_session_id.as_deref(), Some("S_FRM_A"));
+        assert_eq!(st.resolve("e3").unwrap().frame_target_id, None, "主树条目无帧维度");
+        // owner 解析已缓存（后续 click 投影免查）
+        drop(store);
+        assert_eq!(
+            watched.frames.lock().unwrap().get("T1").unwrap().frames.get("FRM_A").unwrap().owner_backend_node_id,
+            Some(501)
+        );
+    }
+
+    /// click 帧内 ref：元素 quad 在帧会话解析 → owner quad 在主会话解析 →
+    /// 投影坐标 → Input 三段派发发**根 target**（浏览器按命中测试路由进 OOPIF）
+    #[tokio::test]
+    async fn click_ref_in_frame_projects_and_dispatches_on_root() {
+        let (svc, watched, _calls, script) = armed();
+        register_frame(&watched, "T1", "F_ROOT", "FRM_A", Some("S_FRM_A"), "F_ROOT", Some(501));
+        watched.refs.lock().unwrap().entry("T1".into()).or_default().replace(&json!([
+            { "ref": "e1", "backendNodeId": 601, "frameTargetId": "FRM_A", "frameSessionId": "S_FRM_A", "name": "提交" },
+        ]));
+        // 队列序：先帧内元素 quad（帧会话），后 owner quad（主会话）
+        given(&script, "DOM.getContentQuads", vec![
+            Ok(json!({ "quads": [[10.0, 20.0, 110.0, 20.0, 110.0, 60.0, 10.0, 60.0]] })),
+            Ok(json!({ "quads": [[100.0, 200.0, 400.0, 200.0, 400.0, 350.0, 100.0, 350.0]] })),
+        ]);
+
+        let resp = svc.click(INS, "T1", "@e1").await.unwrap();
+        assert_eq!(
+            resp["result"],
+            json!("Clicked @e1 \"提交\" at CSS (160, 240)"),
+            "帧内 (60,40) 经 owner (100,200) 平移 = 根视口 (160,240)"
+        );
+        let quads = calls_of(&_calls, "DOM.getContentQuads");
+        assert_eq!(quads.len(), 2);
+        assert_eq!(quads[0].session.as_deref(), Some("S_FRM_A"), "元素 quad 在帧会话");
+        assert_eq!(quads[1].session.as_deref(), Some("S1"), "owner quad 在主会话");
+        let inputs = calls_of(&_calls, "Input.dispatchMouseEvent");
+        assert_eq!(inputs.len(), 3, "三段鼠标事件");
+        assert!(
+            inputs.iter().all(|r| r.session.as_deref() == Some("S1")),
+            "Input 派发全部在根 target"
+        );
+        assert_eq!(inputs[1].params["x"], 160.0);
+        assert_eq!(inputs[1].params["y"], 240.0);
+    }
+
+    /// fill 帧内 ref：DOM/Runtime 命令（resolveNode/focus/callFunctionOn/
+    /// insertText/releaseObject）全部路由到 frame session
+    #[tokio::test]
+    async fn fill_ref_in_frame_runs_on_frame_session() {
+        let (svc, watched, _calls, script) = armed();
+        register_frame(&watched, "T1", "F_ROOT", "FRM_A", Some("S_FRM_A"), "F_ROOT", Some(501));
+        watched.refs.lock().unwrap().entry("T1".into()).or_default().replace(&json!([
+            { "ref": "e1", "backendNodeId": 602, "frameTargetId": "FRM_A", "frameSessionId": "S_FRM_A", "name": "用户名" },
+        ]));
+        given(&script, "DOM.resolveNode", vec![Ok(json!({ "object": { "objectId": "objF" } }))]);
+        given(&script, "Runtime.callFunctionOn", vec![
+            Ok(json!({ "result": { "value": { "tag": "INPUT", "kind": "native", "label": "用户名" } } })),
+            Ok(json!({ "result": { "value": { "cleared": true } } })),
+            Ok(json!({ "result": { "value": { "matches": true } } })),
+        ]);
+
+        let resp = svc.fill(INS, "T1", "@e1", "vincent").await.unwrap();
+        assert_eq!(
+            resp["result"],
+            json!("Filled <INPUT> \"用户名\" with \"vincent\" (7 chars)")
+        );
+        let resolve = calls_of(&_calls, "DOM.resolveNode");
+        assert_eq!(resolve.len(), 1);
+        assert_eq!(resolve[0].session.as_deref(), Some("S_FRM_A"), "resolveNode 在帧会话");
+        for r in calls_of(&_calls, "Runtime.callFunctionOn") {
+            assert_eq!(r.session.as_deref(), Some("S_FRM_A"), "callFunctionOn 在帧会话");
+        }
+        let insert = calls_of(&_calls, "Input.insertText");
+        assert_eq!(insert.len(), 1);
+        assert_eq!(insert[0].session.as_deref(), Some("S_FRM_A"), "insertText 在帧会话");
+        assert_eq!(
+            calls_of(&_calls, "Runtime.releaseObject")[0].session.as_deref(),
+            Some("S_FRM_A"),
+            "对象归还到解析它的同一会话"
+        );
+    }
+
+    /// 帧级失效后的 ref 使用 → 409 PAGE_REF_STALE（曾存在、已随帧死亡，
+    /// 语义区别于 NOT_FOUND）
+    #[tokio::test]
+    async fn stale_frame_ref_reports_ref_stale() {
+        let (svc, watched, _calls, _script) = armed();
+        {
+            let mut refs = watched.refs.lock().unwrap();
+            let store = refs.entry("T1".into()).or_default();
+            store.replace(&json!([
+                { "ref": "e1", "backendNodeId": 101 },
+                { "ref": "e2", "backendNodeId": 601, "frameTargetId": "FRM_A" },
+            ]));
+            store.invalidate_frame("FRM_A", "frame navigation");
+        }
+        let err = svc.click(INS, "T1", "@e2").await.unwrap_err();
+        assert_eq!((err.status(), err.code()), (409, "PAGE_REF_STALE"));
+        assert!(err.to_string().contains("frame navigation"), "message 携带失效原因");
+        // 主 frame ref 不受影响（该路径正常走几何链，此处只需确认不报 stale）
+        let err2 = svc.click(INS, "T1", "@e99").await.unwrap_err();
+        assert_eq!(err2.code(), "PAGE_REF_NOT_FOUND", "未知 ref 仍 404");
+    }
+
+    /// sync 帧树主动路径（真机打磨核心）：未注入登记时，snap 内联完成
+    /// getTargets 发现 → getFrameOwner 归属（owner 校验：主树 bni 必须是
+    /// iframe 类节点，防死帧/异页污染）→ attachToTarget 认领会话 → 帧树
+    /// 拉取合并。死帧（owner 命中非 iframe 节点）拒绝登记。
+    #[tokio::test]
+    async fn snap_syncs_frame_registry_via_target_probe() {
+        let (svc, watched, _calls, script) = armed();
+        // 无任何帧登记（同步路径全自驱）；root 由 sync 后首次使用仍 None——
+        // 投影链在 root 未知时按"parent None/主会话"收敛，功能不受阻
+        let main_tree = json!({ "nodes": [
+            ax_node("m1", "WebArea", json!({ "childIds": ["m2", "m3"] })),
+            ax_node("m2", "iframe", json!({ "parentId": "m1", "name": { "value": "跨域" }, "backendDOMNodeId": 10 })),
+            ax_node("m3", "button", json!({ "parentId": "m1", "name": { "value": "OK" }, "backendDOMNodeId": 9 })),
+        ]});
+        let frame_tree = json!({ "nodes": [
+            ax_node("f1", "WebArea", json!({ "childIds": ["f2"], "name": { "value": "fdoc" } })),
+            ax_node("f2", "button", json!({ "parentId": "f1", "name": { "value": "帧按钮" }, "backendDOMNodeId": 600 })),
+        ]});
+        given(&script, "Target.getTargets", vec![Ok(json!({ "targetInfos": [
+            { "targetId": "PAGE_OTHER", "type": "page", "url": "https://other/" },
+            { "targetId": "FRM_SYNC", "type": "iframe", "url": "https://frame.example/" },
+            { "targetId": "FRM_DEAD", "type": "iframe", "url": "https://dead.example/" },
+        ] }))]);
+        // 归属探测：FRM_SYNC 命中主会话返回 bni=10（主树 Iframe 节点）；
+        // FRM_DEAD 返回 bni=9（主树 button——死帧污染形态，必须被校验拒绝）
+        given(&script, "DOM.getFrameOwner", vec![
+            Ok(json!({ "backendNodeId": 10 })),
+            Ok(json!({ "backendNodeId": 9 })),
+        ]);
+        given(&script, "Target.attachToTarget", vec![Ok(json!({ "sessionId": "S_FRM_SYNC" }))]);
+        // AX 拉取序：主树（S1）→ FRM_SYNC 帧（S_FRM_SYNC）
+        given(&script, "Accessibility.getFullAXTree", vec![Ok(main_tree), Ok(frame_tree)]);
+
+        let resp = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp["refs_count"], 2, "主按钮 + 帧按钮");
+        let text = resp["text"].as_str().unwrap();
+        assert!(text.contains("[frame] fdoc"), "{text}");
+        // 主树序：m2(iframe) 先于 m3(button)——挂接处帧内容先编号（前序 DFS）
+        assert!(text.contains("@e1 [button] 帧按钮"), "{text}");
+        assert!(text.contains("@e2 [button] OK"), "{text}");
+
+        // 登记：FRM_SYNC 会话/owner 就位；FRM_DEAD 未登记（校验拒绝）
+        let tables = watched.frames.lock().unwrap();
+        let table = tables.get("T1").unwrap();
+        let synced = table.frames.get("FRM_SYNC").unwrap();
+        assert_eq!(synced.session_id.as_deref(), Some("S_FRM_SYNC"));
+        assert_eq!(synced.owner_backend_node_id, Some(10));
+        assert!(!table.frames.contains_key("FRM_DEAD"), "死帧拒绝登记");
+        drop(tables);
+        // RefStore 条目带帧维度
+        let refs = watched.refs.lock().unwrap();
+        let e1 = refs.get("T1").unwrap().resolve("e1").unwrap();
+        assert_eq!(e1.frame_target_id.as_deref(), Some("FRM_SYNC"));
+        assert_eq!(e1.frame_session_id.as_deref(), Some("S_FRM_SYNC"));
+        assert!(refs.get("T1").unwrap().resolve("e2").unwrap().frame_target_id.is_none());
     }
 }
