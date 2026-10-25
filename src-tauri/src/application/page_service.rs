@@ -24,6 +24,13 @@
 //!   本族）。加载等待走 Page.loadEventFired 事件（命令发送前登记等待者，窗口
 //!   NAV_LOAD_TIMEOUT，未见 → loaded:false；同文档导航/同文档历史条目不触发
 //!   load，走响应分类 / 历史索引 + readyState 快路径）。
+//! - **文件传输**（W-file）：establish 时 browser 级
+//!   Browser.setDownloadBehavior{allow, <profile>/downloads, events}，
+//!   downloadWillBegin/Progress 事件在 handle_event 登记/结算（终态入环 20
+//!   条 + 命令式等待者先到先得）；upload = 定位 + describeNode 校验
+//!   input[type=file] + DOM.setFileInputFiles（不拷贝文件，主机侧拒软链/
+//!   超 100MB）。download_wait **不占实例串行锁**（等待期 click 正是要并发
+//!   执行的命令）。
 //!
 //! IO 全部经 [`PageCdp`] trait（infrastructure/cdp/page_cdp.rs 的 dyn 适配），
 //! 测试注入 fake 即可覆盖全部编排路径，不依赖真 Chrome。
@@ -129,6 +136,12 @@ const ATTACH_HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// DPR=2 → 8192）。超限显式截断并标 truncated（诚实证据，不产出可疑图，
 /// 也不让调用方拿到裸 500）。png 实际尺寸 = 响应 width/height × DPR。
 const FULL_SHOT_MAX_DEVICE_SIDE: f64 = 16384.0;
+/// download-wait 缺省等待窗口（W-file 任务口径：30s）。
+const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// 下载终态环形记录容量（GET /page/downloads 查询面；W-file 任务口径 20）。
+const MAX_DOWNLOAD_HISTORY: usize = 20;
+/// upload 单文件大小上限（W-file 任务口径：100MB，读取前显式拒绝）。
+const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 
 /// 连接工厂：生产 = connect_page（browser 级 eventing WS），测试注入 fake。
 type Connector = Arc<
@@ -178,6 +191,30 @@ fn tool_timeout(tool: &str, budget: Duration) -> AppError {
             "page tool {tool} 超出 {}ms 预算（连接停滞或页面无响应）",
             budget.as_millis()
         ),
+    )
+}
+
+/// 409：download-wait 超时 = 窗口内无终态到达。in_flight 非空时披露
+/// 「已有下载在进行但未完成」——与 PAGE_DOWNLOAD_FAILED（下载了但失败）
+/// 严格区分（任务红线：超时 = 无下载完成的证据，不是失败断言）。
+fn download_timeout(in_flight: usize, timeout: Duration) -> AppError {
+    let detail = if in_flight > 0 {
+        format!("（{} 个下载仍在进行中未完成）", in_flight)
+    } else {
+        "（窗口内无任何下载终态——确认触发动作是否已执行）".to_string()
+    };
+    AppError::conflict(
+        "PAGE_DOWNLOAD_TIMEOUT",
+        format!("等待下载完成超时（{}ms 上限）{detail}", timeout.as_millis()),
+    )
+}
+
+/// 500：下载已开始但终态为失败/取消/被拒——与超时（无下载）严格区分。
+fn download_failed(state: &str, file_name: &str) -> AppError {
+    AppError::business(
+        500,
+        "PAGE_DOWNLOAD_FAILED",
+        format!("下载 \"{file_name}\" 终态 = {state}（interrupted=中断 / canceled=取消 / rejected=文件名不安全拒绝）"),
     )
 }
 
@@ -296,6 +333,11 @@ struct Watched {
     /// cmd_lock）；拦截响应命令走 conn 的并发 send（&self），与 in-flight
     /// 工具命令互不阻塞。
     intercept: Mutex<HashMap<String, InterceptState>>,
+    /// 实例级下载运行态（W-file）：Browser 域下载事件无 session 维度，整实例
+    /// 一份（非 per-tab）。in_flight = WillBegin 登记；history = 终态环形
+    /// 记录（容量 20）；waiters = download-wait 的等待者（先注册后触发，
+    /// 命令式等待）。establish 整体重置（等待者 rx 收 Err 诚实报失效）。
+    downloads: Mutex<DownloadState>,
     /// 代际计数：每次建连 +1。旧代 watch_loop 在清理点核对代际，新一代已
     /// 接管时不动登记表/连接槽（防僵尸 loop 误删新代状态）。
     generation: AtomicU64,
@@ -315,6 +357,7 @@ impl Watched {
             sheets: Mutex::new(HashMap::new()),
             css_since: Mutex::new(HashMap::new()),
             intercept: Mutex::new(HashMap::new()),
+            downloads: Mutex::new(DownloadState::default()),
             generation: AtomicU64::new(0),
         }
     }
@@ -369,7 +412,8 @@ impl PageService {
         // 先拿串行锁再查连接：并发首命令不会双建连（见 cmd_lock 注释）
         let serial = watched.cmd_lock.clone().lock_owned().await;
         if watched.conn.lock().unwrap().is_none() {
-            self.establish(ins_id, &watched, port).await?;
+            self.establish(ins_id, &watched, port, &ins.profile_dir)
+                .await?;
             // L2：establish 返回 ≠ 首批 attachedToTarget 已入表（事件异步在
             // 途），建连分支内短等首个 page target 再放行（见常量注释）。
             // 仅建连分支调用：连接已在位（已有命令在跑）时不经过这里，无额外阻塞。
@@ -386,6 +430,7 @@ impl PageService {
         ins_id: &str,
         watched: &Arc<Watched>,
         port: u16,
+        profile_dir: &str,
     ) -> Result<(), AppError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let conn = (self.connector)(port, tx).await?;
@@ -395,6 +440,24 @@ impl PageService {
             &conn,
             "Target.setAutoAttach",
             json!({ "autoAttach": true, "flatten": true, "waitForDebuggerOnStart": false }),
+            None,
+        )
+        .await?;
+        // W-file：下载落盘目录 = 实例 profile 下 downloads/ 子目录（每实例
+        // 隔离，实例删除随 profile 清理——天然生命周期）。browser 级设置
+        //（session=None）：downloadWillBegin/Progress 事件因此无 session 维度，
+        // 由 handle_event 直接分派。目录创建失败 = establish 失败（不静默
+        // 降级：缺目录时 download-wait 会永远等不到事件，宁可建连期暴露）。
+        let dl_dir = std::path::Path::new(profile_dir).join("downloads");
+        std::fs::create_dir_all(&dl_dir)?;
+        cdp_send(
+            &conn,
+            "Browser.setDownloadBehavior",
+            json!({
+                "behavior": "allow",
+                "downloadPath": dl_dir,
+                "eventsEnabled": true
+            }),
             None,
         )
         .await?;
@@ -413,6 +476,9 @@ impl PageService {
         // Fetch 拦截随死会话失效（Fetch.enable 是 session 级，新连接需重新
         // 下发规则——契约：连接重建即失效，GET intercept 返回空 + liveSince null）
         watched.intercept.lock().unwrap().clear();
+        // 下载运行态同理重建：新连接重发 setDownloadBehavior + 新目录；
+        // 等待者被 drop → 各自 download_wait 的 rx Err 分支诚实报「等待失效」
+        watched.downloads.lock().unwrap().reset(dl_dir);
         *watched.conn.lock().unwrap() = Some(Arc::clone(&conn));
         tauri::async_runtime::spawn(watch_loop(
             ins_id.to_string(),
@@ -638,6 +704,104 @@ impl PageService {
             ins_id,
             tab,
             |w, _tid, sid| async move { raw_tool(&w, &sid, method, params, browser).await },
+        )
+        .await
+    }
+
+    /// download-wait <tab>（W-file）：等待**下一次**下载完成（从调用时刻起
+    /// 算，命令式等待：先调 wait 再触发点击）。语义决策：
+    /// - **不占实例串行锁**（drop(serial) 后再等）：典型用法是 wait 挂着、
+    ///   随后 click 触发下载——若等待期持锁会死锁到超时（click 排不上队）；
+    /// - 等待者先注册后触发：终态由 watch_loop 结算（completed → 记录；
+    ///   canceled/interrupted/名字不安全 → PAGE_DOWNLOAD_FAILED 如实报错）；
+    /// - 超时 → PAGE_DOWNLOAD_TIMEOUT（无终态证据；in_flight 非空时披露
+    ///   「进行中未完成」）；连接重建 → 等待登记被清，诚实报失效可重试；
+    /// - 并发下载（罕见）：多个等待者按终态到达序先到先得；无等待者的
+    ///   终态留在环形记录（GET /page/downloads 可查）。
+    pub async fn download_wait(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, AppError> {
+        let timeout = timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT);
+        let (watched, serial) = self.ensure(ins_id).await?;
+        let (tid, _sid) = resolve_target(&watched.tabs.lock().unwrap(), tab)?;
+        // 关键：释放实例串行锁再等——触发下载的 click/fill 正是等待期间
+        // 要执行的命令（与 command() 骨架的差异点，见方法注释）
+        drop(serial);
+        let (tx, rx) = oneshot::channel();
+        watched
+            .downloads
+            .lock()
+            .unwrap()
+            .waiters
+            .push_back(tx);
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(mut record))) => {
+                record["instanceId"] = json!(ins_id);
+                record["targetId"] = json!(tid);
+                Ok(record)
+            }
+            Ok(Ok(Err(e))) => Err(e),
+            // 发送端被 drop 而未送数：等待期间连接重建（establish 清空等待
+            // 登记）——诚实报失效，调用方可立即重新 download-wait
+            Ok(Err(_dropped)) => Err(unavailable(
+                "等待期间 page 连接重建（等待登记已随死会话清空），请重新 download-wait",
+            )),
+            Err(_elapsed) => {
+                let in_flight = watched.downloads.lock().unwrap().in_flight.len();
+                Err(download_timeout(in_flight, timeout))
+            }
+        }
+    }
+
+    /// downloads <tab>（W-file）：终态记录环查询（最近 MAX_DOWNLOAD_HISTORY
+    /// 条，含被等待者消费的——审计面；matched 字段区分）。
+    pub async fn downloads_list(&self, ins_id: &str, tab: &str) -> Result<Value, AppError> {
+        self.command(
+            TOOL_TIMEOUT,
+            "downloads",
+            ins_id,
+            tab,
+            |w, _tid, _sid| async move {
+                let st = w.downloads.lock().unwrap();
+                Ok(json!({
+                    "downloads": st.history.iter().cloned().collect::<Vec<_>>(),
+                    "capacity": MAX_DOWNLOAD_HISTORY,
+                }))
+            },
+        )
+        .await
+    }
+
+    /// upload <tab> <target> <filePath>（W-file）：主机文件设入页面 file
+    /// input（DOM.setFileInputFiles， chooser 模式）。主机侧校验（绝对路径 /
+    /// 拒符号链接 / 存在性 / ≤100MB）在锁外快速失败；页面侧校验（必须是
+    /// input[type=file]，否则 422）+ setFileInputFiles 在命令内完成。
+    /// 不拷贝文件：CDP 直接引用主机路径（实例与本机同机；远程接入场景
+    /// 本端点走 API 侧主机路径——文档已披露）。
+    pub async fn upload(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        target: &str,
+        file_path: &str,
+    ) -> Result<Value, AppError> {
+        if target.is_empty() {
+            return Err(AppError::invalid_request("target required（@eN 或 CSS 选择器）"));
+        }
+        let (path, file_name, size) = validate_upload_file(file_path)?;
+        self.command(
+            TOOL_TIMEOUT,
+            "upload",
+            ins_id,
+            tab,
+            move |w, tid, sid| async move {
+                upload_tool(&w, &tid, &sid, target, &path, &file_name, size).await
+            },
         )
         .await
     }
@@ -1190,6 +1354,11 @@ async fn handle_event(watched: &Watched, event: &Value) {
                 on_request_paused(watched, sid, &params).await;
             }
         }
+        // W-file：browser 级下载事件（无 session 维度，establish 时
+        // setDownloadBehavior{eventsEnabled} 开启）：WillBegin 登记、
+        // Progress 终态结算 + 等待者放行（同步登记，不发命令，不碰串行锁）
+        "Browser.downloadWillBegin" => on_download_begin(watched, &params),
+        "Browser.downloadProgress" => on_download_progress(watched, &params),
         // 仅根 frame（parentId 为空）才整表失效：子 frame 导航不换文档（§3.6）。
         // W-oopif：子 frame 导航 → 仅该 frame 的 ref 失效（stale 标记）；根导航
         // 另清帧登记表（新文档的旧子帧全部死亡，frameDetached 不保证补发）。
@@ -1620,6 +1789,50 @@ fn merge_request_headers(original: Option<&Value>, overrides: &[(String, String)
     out
 }
 
+// ============================================================================
+// 3c. 下载运行态（W-file）：browser 级事件登记 + 终态结算 + 命令式等待
+// ============================================================================
+
+/// 实例级下载运行态（Browser 域事件无 session 维度，故非 per-tab）。
+/// 生命周期 = page 控制连接：establish 整体重置（重新 setDownloadBehavior
+/// 与新目录），等待者随登记一起被 drop（download_wait 的 rx 收 Err 诚实报
+/// 失效，而非挂死到自己的超时）。
+#[derive(Default)]
+struct DownloadState {
+    /// 落盘目录（establish 时解析 = <profile>/downloads）
+    dir: std::path::PathBuf,
+    /// guid → WillBegin 登记信息（Progress 终态时摘除）
+    in_flight: HashMap<String, InflightDownload>,
+    /// 终态记录环（含被等待者消费的；容量 MAX_DOWNLOAD_HISTORY）
+    history: std::collections::VecDeque<Value>,
+    /// download-wait 等待者（先注册后触发；超时方 drop rx，残留 sender
+    /// 在下次结算时 send 失败被丢弃——与 load_waiters 同款懒清理）
+    waiters: std::collections::VecDeque<oneshot::Sender<Result<Value, AppError>>>,
+}
+
+/// WillBegin 登记信息（downloadProgress 只带 guid，需回查这些字段）。
+struct InflightDownload {
+    /// 净化后的展示名（unsafe 时可能为空串）
+    file_name: String,
+    /// 原始 url（记录时脱敏，与 intercept journal 同策略）
+    url: String,
+    /// frameId 归属的 tab targetId（无法归属 = None）
+    tab: Option<String>,
+    started_ms: i64,
+    /// suggestedFilename 含路径分隔符/../ 等（拒绝拼路径，防逃逸）
+    unsafe_name: bool,
+}
+
+impl DownloadState {
+    /// establish 时整体重建（新连接/新目录；等待者 drop → rx Err 分支）
+    fn reset(&mut self, dir: std::path::PathBuf) {
+        self.dir = dir;
+        self.in_flight.clear();
+        self.history.clear();
+        self.waiters.clear();
+    }
+}
+
 /// requestPaused 事件流内决策（红线 ①不碰串行锁；红线 ②任何错误必放行）。
 /// 无规则/未命中/耗尽 → continueRequest 裸放行；决策命令失败 → 裸 continue
 /// 兑底（requestPaused 不回应 = 页面挂死，spike 实测）；兑底也失败（连接
@@ -1780,6 +1993,147 @@ fn invalidate_refs(watched: &Watched, tid: &str, reason: &str) {
 fn invalidate_frame_refs(watched: &Watched, tid: &str, frame_tid: &str, reason: &str) {
     if let Some(store) = watched.refs.lock().unwrap().get_mut(tid) {
         store.invalidate_frame(frame_tid, reason);
+    }
+}
+
+/// 下载文件名净化（W-file 安全边界）：拒路径分隔符与 ../ 逃逸。
+/// 返回 (展示名, 是否拒绝拼路径)。判定规则：
+/// - 含 '/' 或 '\\'、或 file_name() 取出的末段 ≠ 原文（含 ../ 类形态）、
+///   或末段为空/. /.. → unsafe；
+/// - unsafe 时展示名仍保末段（可读），但 filePath 不拼（拒绝逃逸）。
+fn sanitize_download_filename(raw: &str) -> (String, bool) {
+    let trimmed = raw.trim();
+    let has_sep = trimmed.contains('/') || trimmed.contains('\\');
+    let base = std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let degenerate = base.is_empty() || base == "." || base == "..";
+    let unsafe_name = has_sep || degenerate || base != trimmed;
+    (base.to_string(), unsafe_name)
+}
+
+/// WillBegin 的 frameId → 归属 tab（root 或任一已登记子帧；含 OOPIF——
+/// frameAttached 对同源/跨域子帧都发）。归属不了（无 frames 表/未知帧）
+/// = None：记录仍生成，只是无 tab 标注（诚实披露，不猜）。
+fn download_tab_of_frame(watched: &Watched, frame_id: &str) -> Option<String> {
+    if frame_id.is_empty() {
+        return None;
+    }
+    let tables = watched.frames.lock().unwrap();
+    for (tid, table) in tables.iter() {
+        if table.root.as_deref() == Some(frame_id) || table.frames.contains_key(frame_id) {
+            return Some(tid.clone());
+        }
+    }
+    None
+}
+
+/// Browser.downloadWillBegin：登记 in_flight（同步登记，不发命令——
+/// 事件流内不碰串行锁，与 on_request_paused 同纪律）。
+fn on_download_begin(watched: &Watched, params: &Value) {
+    let (Some(guid), Some(name)) = (
+        params.get("guid").and_then(Value::as_str),
+        params.get("suggestedFilename").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    if guid.is_empty() {
+        return;
+    }
+    let (file_name, unsafe_name) = sanitize_download_filename(name);
+    if unsafe_name {
+        tracing::warn!("[page] 下载 {guid} suggestedFilename 含路径形态（{:?}），路径拼接已拒绝", name);
+    }
+    let url = params.get("url").and_then(Value::as_str).unwrap_or("");
+    let frame_id = params.get("frameId").and_then(Value::as_str).unwrap_or("");
+    let tab = download_tab_of_frame(watched, frame_id);
+    watched.downloads.lock().unwrap().in_flight.insert(
+        guid.to_string(),
+        InflightDownload {
+            file_name,
+            url: url.to_string(),
+            tab,
+            started_ms: chrono::Utc::now().timestamp_millis(),
+            unsafe_name,
+        },
+    );
+}
+
+/// Browser.downloadProgress 终态结算：completed/canceled/interrupted
+/// → 摘除 in_flight、生成记录入环、结算最早一个等待者（completed 且安全
+/// → Ok(record)；失败/取消/名字不安全 → Err，如实报错）。inProgress 与
+/// 未知状态（前向兼容）忽略。
+fn on_download_progress(watched: &Watched, params: &Value) {
+    let (Some(guid), Some(state)) = (
+        params.get("guid").and_then(Value::as_str),
+        params.get("state").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    if !matches!(state, "completed" | "canceled" | "interrupted") {
+        return;
+    }
+    let mut st = watched.downloads.lock().unwrap();
+    let Some(info) = st.in_flight.remove(guid) else {
+        return; // 无 WillBegin 登记（跨连接残留/事件乱序）：无从结算，丢弃
+    };
+    let received = params.get("receivedBytes").and_then(Value::as_u64).unwrap_or(0);
+    let completed_ms = chrono::Utc::now().timestamp_millis();
+    // 落盘核证（仅 completed 且名字安全）：文件在 → bytes 用真实大小；
+    // 不在（Chrome 可能因重名改为 "name (1)"）→ bytes 用事件 receivedBytes
+    // 且 verified=false（诚实披露：路径是预期值，未实测）
+    let expected_path = if info.unsafe_name || info.file_name.is_empty() {
+        None
+    } else {
+        Some(st.dir.join(&info.file_name))
+    };
+    let (bytes, verified) = match (state, &expected_path) {
+        ("completed", Some(p)) => match std::fs::metadata(p) {
+            Ok(m) => (m.len(), true),
+            Err(_) => (received, false),
+        },
+        _ => (received, false),
+    };
+    let mut record = json!({
+        "guid": guid,
+        "state": state,
+        "fileName": if info.file_name.is_empty() { Value::Null } else { json!(info.file_name) },
+        "filePath": expected_path.as_ref().map(|p| json!(p.display().to_string())).unwrap_or(Value::Null),
+        "bytes": bytes,
+        "mimeType": null, // CDP 下载事件不携带 mimeType（诚实置 null，不猜扩展名）
+        "url": crate::domain::redact::redact_url(&info.url),
+        "tab": info.tab,
+        "startedAt": info.started_ms,
+        "completedAt": completed_ms,
+        "verified": verified,
+    });
+    if info.unsafe_name {
+        record["note"] = json!("suggestedFilename 含路径形态，路径拼接已拒绝");
+    }
+    // 等待者结算：弹栈直到 send 成功（超时残留的死 sender 在此清理）；
+    // 先到先得 = 多下载并行时等待者拿最早结算的（任务口径：wait 返回
+    // 最先完成的；其余留在环里供 GET /page/downloads 查询）
+    let mut matched = false;
+    while let Some(tx) = st.waiters.pop_front() {
+        // 发送给等待者的副本自带 matched=true（正在被它消费）；历史环的
+        // 记录随后统一打标（未被消费 = false）
+        let mut payload = record.clone();
+        payload["matched"] = json!(true);
+        let outcome = match state {
+            "completed" if !info.unsafe_name => Ok(payload),
+            "canceled" | "interrupted" => Err(download_failed(state, &info.file_name)),
+            _ => Err(download_failed("rejected", &info.file_name)),
+        };
+        if tx.send(outcome).is_ok() {
+            matched = true;
+            break;
+        }
+    }
+    record["matched"] = json!(matched);
+    st.history.push_back(record);
+    while st.history.len() > MAX_DOWNLOAD_HISTORY {
+        st.history.pop_front();
     }
 }
 
@@ -3518,6 +3872,193 @@ fn require_fillable(r: &Value, desc: &str) -> Result<(), AppError> {
         return Err(PageControlError::target_not_fillable(desc, why).into());
     }
     Ok(())
+}
+
+/// 主机文件校验（W-file 安全边界，锁外快速失败）：
+/// 1. 必须绝对路径（防相对路径歧义）；
+/// 2. 拒符号链接：逐组件 symlink_metadata 检查（canonicalize 对比会把
+///    macOS /tmp→/private/tmp 这类系统别名也判死，逐组件只拒真软链——
+///    任务括注「canonicalize 校验」的意图是拒逃逸，不拒系统默认别名）；
+/// 3. 必须存在且是普通文件（目录/不存在分列 422/404）；
+/// 4. ≤ 100MB（超出显式报错，不读入内存）。
+fn validate_upload_file(raw: &str) -> Result<(std::path::PathBuf, String, u64), AppError> {
+    use std::path::{Component, Path};
+    let path_invalid = |msg: String| {
+        AppError::business(422, "PAGE_UPLOAD_PATH_INVALID", msg)
+    };
+    if raw.trim().is_empty() {
+        return Err(AppError::invalid_request("filePath required（主机绝对路径）"));
+    }
+    let p = Path::new(raw);
+    if !p.is_absolute() {
+        return Err(path_invalid(format!(
+            "filePath 必须是主机绝对路径（got \"{raw}\"；相对路径有歧义，拒绝）"
+        )));
+    }
+    // 逐组件拒真软链（存在性在下一步整体检查：不存在 → 404）。错误信息附
+    // canonicalize 物理路径——macOS 的 /tmp、/var 本身就是软链（→ /private/...），
+    // 调用方按提示改传物理路径即可通过。
+    let mut cur = std::path::PathBuf::new();
+    for comp in p.components() {
+        cur.push(comp.as_os_str());
+        if let Component::Normal(_) = comp {
+            if let Ok(md) = std::fs::symlink_metadata(&cur) {
+                if md.file_type().is_symlink() {
+                    let resolved = std::fs::canonicalize(&cur)
+                        .map(|c| c.display().to_string())
+                        .unwrap_or_else(|_| "?".into());
+                    return Err(path_invalid(format!(
+                        "filePath 经符号链接（\"{}\" → {resolved}），拒绝（防路径逃逸）；请改传物理路径",
+                        cur.display()
+                    )));
+                }
+            }
+        }
+    }
+    let md = std::fs::metadata(p).map_err(|_| {
+        AppError::not_found(
+            "PAGE_UPLOAD_FILE_NOT_FOUND",
+            format!("主机文件不存在：\"{raw}\""),
+        )
+    })?;
+    if !md.is_file() {
+        return Err(path_invalid(format!(
+            "filePath 指向的不是普通文件（目录/设备节点等）：\"{raw}\""
+        )));
+    }
+    if md.len() > MAX_UPLOAD_BYTES {
+        return Err(AppError::business(
+            422,
+            "PAGE_UPLOAD_FILE_TOO_LARGE",
+            format!(
+                "文件 {:.1}MB 超出 100.0MB 上限（\"{raw}\"）",
+                md.len() as f64 / 1024.0 / 1024.0
+            ),
+        ));
+    }
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    Ok((p.to_path_buf(), name, md.len()))
+}
+
+/// describeNode 响应 → 是否 input[type=file]（W-file：不是则 422，任务
+/// 口径「校验是 file input（不是则 422）」）。attributes 是扁平数组
+/// ["type","file","name","f",...]；input 无 type 属性 = 默认 text，拒绝。
+fn ensure_file_input(desc_resp: &Value, target_desc: &str) -> Result<(), AppError> {
+    let err = |detail: String| {
+        AppError::business(
+            422,
+            "PAGE_TARGET_NOT_FILE_INPUT",
+            format!("upload 目标 {target_desc} 不是 file input：{detail}"),
+        )
+    };
+    let node = desc_resp
+        .get("node")
+        .ok_or_else(|| err("describeNode 无 node".into()))?;
+    let node_name = node
+        .get("nodeName")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !node_name.eq_ignore_ascii_case("input") {
+        return Err(err(format!("是 <{node_name}> 元素")));
+    }
+    let mut ty: Option<String> = None;
+    if let Some(attrs) = node.get("attributes").and_then(Value::as_array) {
+        for pair in attrs.chunks(2) {
+            if pair.len() == 2
+                && pair[0]
+                    .as_str()
+                    .is_some_and(|k| k.eq_ignore_ascii_case("type"))
+            {
+                ty = pair[1].as_str().map(str::to_string);
+            }
+        }
+    }
+    match ty.as_deref() {
+        Some(t) if t.eq_ignore_ascii_case("file") => Ok(()),
+        Some(t) => Err(err(format!("是 input[type=\"{t}\"]，需要 type=\"file\""))),
+        None => Err(err("input 无 type 属性（默认 text），需要 type=\"file\"".into())),
+    }
+}
+
+/// upload 工具编排：定位（ref → backendNodeId + 帧会话路由；selector →
+/// nodeId，同 fill 的定位链）→ describeNode 校验 file input →
+/// DOM.setFileInputFiles（不拷贝文件，CDP 直接引用主机路径）。
+/// setFileInputFiles 会触发页面原生 change 事件（React 受控表单同常收到
+/// ——真机验证见任务报告）。
+async fn upload_tool(
+    watched: &Watched,
+    tid: &str,
+    sid: &str,
+    target: &str,
+    path: &std::path::Path,
+    file_name: &str,
+    size: u64,
+) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    // 定位：(参数键, 节点 id, 发送会话, 描述)
+    let (key, node_id, esid, desc) = if is_ref_target(target) {
+        let entry = resolve_ref_entry(watched, tid, target)?;
+        let esid = match &entry.frame_target_id {
+            None => sid.to_string(),
+            Some(fid) => {
+                live_frame_session(watched, tid, fid, entry.frame_session_id.as_deref())
+                    .ok_or_else(|| {
+                        PageControlError::target_moved(
+                            "owning iframe session is gone (frame detached?) — re-snap",
+                        )
+                    })?
+            }
+        };
+        (
+            "backendNodeId",
+            entry.backend_node_id,
+            esid,
+            format!("@{}", normalize_ref(target)),
+        )
+    } else {
+        let doc = cdp_send(&conn, "DOM.getDocument", json!({}), Some(sid)).await?;
+        let root = doc
+            .pointer("/root/nodeId")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let q = cdp_send(
+            &conn,
+            "DOM.querySelector",
+            json!({ "nodeId": root, "selector": target }),
+            Some(sid),
+        )
+        .await?;
+        let node_id = q.get("nodeId").and_then(Value::as_i64).unwrap_or(0);
+        if node_id == 0 {
+            return Err(PageControlError::element_not_found(target).into());
+        }
+        ("nodeId", node_id, sid.to_string(), target.to_string())
+    };
+    // 校验 file input（不是 → 422，先于任何写入）
+    let described = cdp_send(
+        &conn,
+        "DOM.describeNode",
+        json!({ key: node_id }),
+        Some(&esid),
+    )
+    .await?;
+    ensure_file_input(&described, &desc)?;
+    cdp_send(
+        &conn,
+        "DOM.setFileInputFiles",
+        json!({ "files": [path.display().to_string()], key: node_id }),
+        Some(&esid),
+    )
+    .await?;
+    Ok(json!({
+        "result": format!("Set file \"{file_name}\" ({size} bytes) on {desc}"),
+        "fileName": file_name,
+        "bytes": size,
+    }))
 }
 
 async fn fill_tool(
@@ -8407,6 +8948,387 @@ mod tests {
         assert!(text.contains("@e3 [button] fbtn"), "{text}");
         let refs = watched.refs.lock().unwrap();
         assert_eq!(refs.get("T1").unwrap().resolve("e2").unwrap().frame_target_id.as_deref(), Some("FRM_A"));
+    }
+
+    // ---------------- W-file：下载等待 / 记录环 / 上传 ----------------------
+
+    /// 临时目录里的真实文件（上传校验用；目录唯一防并发测试互踩）。
+    /// 返回 canonicalize 物理路径——macOS 的 temp 在 /var 软链下，upload 的
+    /// 拒软链校验按契约拒别名形态（真实调用方改传物理路径，同测试）
+    fn temp_upload_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cem-upload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        std::fs::canonicalize(&p).unwrap()
+    }
+
+    /// armed() 绕过 establish，手动设下载目录
+    fn set_download_dir(watched: &Watched, dir: &std::path::Path) {
+        watched.downloads.lock().unwrap().dir = dir.to_path_buf();
+    }
+
+    /// 新临时下载目录（canonicalize 物理路径，理由同 temp_upload_file）
+    fn temp_download_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cem-dl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    fn will_begin(guid: &str, name: &str, frame_id: &str) -> Value {
+        json!({ "method": "Browser.downloadWillBegin", "params": {
+            "guid": guid, "suggestedFilename": name,
+            "url": "https://dl.example/f?token=sekret", "frameId": frame_id } })
+    }
+
+    fn progress(guid: &str, state: &str, received: u64) -> Value {
+        json!({ "method": "Browser.downloadProgress", "params": {
+            "guid": guid, "state": state, "receivedBytes": received, "totalBytes": received } })
+    }
+
+    /// establish 与域启用集同点位下发 Browser.setDownloadBehavior（browser 级，
+    /// 目录 = profile/downloads）——连接重建时随 establish 重发
+    #[tokio::test]
+    async fn establish_sends_download_behavior_pointing_at_profile_downloads() {
+        let (svc, calls, _script, _tap) = fake_service();
+        let (_w, g) = svc.ensure(INS).await.unwrap();
+        drop(g);
+        let set = calls_of(&calls, "Browser.setDownloadBehavior");
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].session, None, "browser 级（无 session）");
+        assert_eq!(set[0].param("behavior"), "allow");
+        assert_eq!(set[0].param("eventsEnabled"), true);
+        assert_eq!(set[0].param("downloadPath"), "/tmp/x/downloads");
+    }
+
+    /// 主路径：先注册等待者，WillBegin + Progress(completed) 到达 → 返回记录
+    ///（bytes 取落盘实测值；url 脱敏；记录环同步留痕）
+    #[tokio::test]
+    async fn download_wait_returns_first_completed_record() {
+        let (svc, watched, _calls, _script) = armed();
+        let svc = std::sync::Arc::new(svc);
+        let dir = temp_download_dir();
+        std::fs::write(dir.join("hello.txt"), vec![7u8; 1024]).unwrap();
+        set_download_dir(&watched, &dir);
+
+        let task = tokio::spawn({
+            let svc = std::sync::Arc::clone(&svc);
+            async move { svc.download_wait(INS, "T1", Some(3000)).await }
+        });
+        eventually("等待者登记", || !watched.downloads.lock().unwrap().waiters.is_empty()).await;
+        handle_event(&watched, &will_begin("g1", "hello.txt", "F_UNKN")).await;
+        handle_event(&watched, &progress("g1", "completed", 1024)).await;
+
+        let resp = task.await.unwrap().unwrap();
+        assert_eq!(resp["fileName"], "hello.txt");
+        assert_eq!(resp["filePath"], dir.join("hello.txt").display().to_string());
+        assert_eq!(resp["bytes"], 1024, "落盘实测大小");
+        assert_eq!(resp["verified"], true);
+        assert_eq!(resp["matched"], true);
+        assert_eq!(resp["instanceId"], INS);
+        assert!(!resp["url"].as_str().unwrap().contains("sekret"), "url 脱敏");
+        // 记录环同步留痕（审计面含已消费条目，matched 区分）
+        let ring = svc.downloads_list(INS, "T1").await.unwrap();
+        assert_eq!(ring["downloads"].as_array().unwrap().len(), 1);
+    }
+
+    /// 诚实证据：canceled/interrupted 如实报 PAGE_DOWNLOAD_FAILED（区别于超时）；
+    /// 记录环留痕失败终态
+    #[tokio::test]
+    async fn download_wait_reports_failure_terminal_states() {
+        let (svc, watched, _c, _s) = armed();
+        let svc = std::sync::Arc::new(svc);
+        set_download_dir(&watched, &temp_download_dir());
+
+        for (guid, name, state) in [("g1", "a.zip", "canceled"), ("g2", "b.zip", "interrupted")] {
+            let task = tokio::spawn({
+                let svc = std::sync::Arc::clone(&svc);
+                async move { svc.download_wait(INS, "T1", Some(3000)).await }
+            });
+            eventually("等待者登记", || !watched.downloads.lock().unwrap().waiters.is_empty()).await;
+            handle_event(&watched, &will_begin(guid, name, "")).await;
+            handle_event(&watched, &progress(guid, state, 10)).await;
+            let err = task.await.unwrap().unwrap_err();
+            assert_eq!((err.code(), err.status()), ("PAGE_DOWNLOAD_FAILED", 500), "{state}");
+        }
+        let ring = svc.downloads_list(INS, "T1").await.unwrap();
+        let list = ring["downloads"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["state"], "canceled");
+        assert_eq!(list[1]["state"], "interrupted");
+        assert_eq!(list[0]["matched"], true, "失败也被等待者消费（如实报错而非挂起）");
+    }
+
+    /// 超时 = 窗口内无终态（不是失败断言）；有 in_flight 时披露「进行中未完成」
+    #[tokio::test]
+    async fn download_wait_timeout_means_no_terminal_state() {
+        let (svc, watched, _c, _s) = armed();
+        set_download_dir(&watched, &temp_download_dir());
+
+        let err = svc.download_wait(INS, "T1", Some(60)).await.unwrap_err();
+        assert_eq!((err.code(), err.status()), ("PAGE_DOWNLOAD_TIMEOUT", 409));
+        assert!(!err.to_string().contains("仍在进行"), "无 in_flight 时不说「进行中」");
+
+        // WillBegin 已到但未完成：超时披露进行中（区分「下载了但未完成」）
+        handle_event(&watched, &will_begin("g9", "slow.bin", "")).await;
+        let err2 = svc.download_wait(INS, "T1", Some(60)).await.unwrap_err();
+        assert_eq!(err2.code(), "PAGE_DOWNLOAD_TIMEOUT");
+        assert!(err2.to_string().contains("仍在进行"));
+    }
+
+    /// 记录环容量 20：最旧滚出；GET 面返回存活的 20 条
+    #[tokio::test]
+    async fn download_history_ring_keeps_last_20() {
+        let (svc, watched, _c, _s) = armed();
+        set_download_dir(&watched, &temp_download_dir());
+        for i in 0..22 {
+            let guid = format!("g{i}");
+            handle_event(&watched, &will_begin(&guid, &format!("f{i}.bin"), "")).await;
+            handle_event(&watched, &progress(&guid, "completed", i)).await;
+        }
+        let ring = svc.downloads_list(INS, "T1").await.unwrap();
+        let list = ring["downloads"].as_array().unwrap();
+        assert_eq!(list.len(), 20);
+        assert_eq!(list[0]["fileName"], "f2.bin", "最旧的滚出");
+        assert_eq!(list[19]["fileName"], "f21.bin");
+        assert_eq!(list[0]["matched"], false, "无等待者消费");
+        assert_eq!(list[0]["verified"], false, "文件未真实落盘（FakeCdp）：bytes 用事件值");
+        assert_eq!(list[0]["bytes"], 2);
+    }
+
+    /// 安全边界：suggestedFilename 含路径形态（../）→ 拼路径拒绝，等待者
+    /// 收 PAGE_DOWNLOAD_FAILED；记录 note 披露拒绝原因
+    #[tokio::test]
+    async fn download_with_path_separators_in_name_is_rejected() {
+        let (svc, watched, _c, _s) = armed();
+        let svc = std::sync::Arc::new(svc);
+        set_download_dir(&watched, &temp_download_dir());
+        let task = tokio::spawn({
+            let svc = std::sync::Arc::clone(&svc);
+            async move { svc.download_wait(INS, "T1", Some(3000)).await }
+        });
+        eventually("等待者登记", || !watched.downloads.lock().unwrap().waiters.is_empty()).await;
+        handle_event(&watched, &will_begin("g1", "../../evil.sh", "")).await;
+        handle_event(&watched, &progress("g1", "completed", 5)).await;
+        let err = task.await.unwrap().unwrap_err();
+        assert_eq!((err.code(), err.status()), ("PAGE_DOWNLOAD_FAILED", 500));
+        let ring = svc.downloads_list(INS, "T1").await.unwrap();
+        let rec = &ring["downloads"][0];
+        assert_eq!(rec["filePath"], serde_json::Value::Null, "不拼路径");
+        assert!(rec["note"].as_str().unwrap().contains("拒绝"));
+    }
+
+    /// 并发等待：终态先到先得（最早注册的等待者拿走）；未拿到的等自己超时
+    #[tokio::test]
+    async fn concurrent_download_waits_resolve_first_terminal_only() {
+        let (svc, watched, _c, _s) = armed();
+        let svc = std::sync::Arc::new(svc);
+        set_download_dir(&watched, &temp_download_dir());
+        let t1 = tokio::spawn({
+            let svc = std::sync::Arc::clone(&svc);
+            async move { svc.download_wait(INS, "T1", Some(3000)).await }
+        });
+        eventually("首个等待者登记", || watched.downloads.lock().unwrap().waiters.len() == 1).await;
+        let t2 = tokio::spawn({
+            let svc = std::sync::Arc::clone(&svc);
+            async move { svc.download_wait(INS, "T1", Some(80)).await }
+        });
+        eventually("第二个等待者登记", || watched.downloads.lock().unwrap().waiters.len() == 2).await;
+        handle_event(&watched, &will_begin("g1", "a.bin", "")).await;
+        handle_event(&watched, &progress("g1", "completed", 1)).await;
+        let r1 = t1.await.unwrap().unwrap();
+        assert_eq!(r1["fileName"], "a.bin");
+        let err = t2.await.unwrap().unwrap_err();
+        assert_eq!(err.code(), "PAGE_DOWNLOAD_TIMEOUT", "未匹配的等待者各自超时");
+    }
+
+    /// 红线：download-wait 等待期**不占实例串行锁**——等待挂起时另一命令
+    ///（downloads_list，command 骨架要拿串行锁）必须立即完成。若回归为
+    /// 持锁等待（典型用法 wait→click 会死锁到超时），本测试失败。
+    #[tokio::test]
+    async fn download_wait_does_not_block_other_commands_while_waiting() {
+        let (svc, watched, _c, _s) = armed();
+        let svc = std::sync::Arc::new(svc);
+        set_download_dir(&watched, &temp_download_dir());
+        let task = tokio::spawn({
+            let svc = std::sync::Arc::clone(&svc);
+            async move { svc.download_wait(INS, "T1", Some(2000)).await }
+        });
+        eventually("等待者登记", || !watched.downloads.lock().unwrap().waiters.is_empty()).await;
+        let t0 = Instant::now();
+        let ring = svc.downloads_list(INS, "T1").await.expect("等待期间另一命令不应被阻塞");
+        assert_eq!(ring["capacity"], 20);
+        assert!(
+            t0.elapsed() < Duration::from_millis(1000),
+            "downloads_list 耗时 {:?}——被挂起的 download-wait 阻塞了",
+            t0.elapsed()
+        );
+        // 收尾：完成下载，避免任务悬挂
+        handle_event(&watched, &will_begin("g1", "x.bin", "")).await;
+        handle_event(&watched, &progress("g1", "completed", 1)).await;
+        task.await.unwrap().unwrap();
+    }
+
+    /// 等待期间连接重建（establish 整体重置下载态）→ 等待者诚实收
+    /// PAGE_SERVICE_UNAVAILABLE（可重试），而非挂到自己的超时
+    #[tokio::test]
+    async fn connection_rebuild_during_wait_fails_waiter_honestly() {
+        let (svc, calls, _script, tap) = fake_service();
+        let svc = std::sync::Arc::new(svc);
+        let (_w, g) = svc.ensure(INS).await.unwrap();
+        drop(g);
+        // 建一个 page tab（空 tab 路由会在等待者登记前就 404）
+        let watched = svc.watched.lock().unwrap().get(INS).unwrap().clone();
+        let tx = tap.lock().unwrap().clone().unwrap();
+        tx.send(attach_event("TAB_R", "SES_R", "page")).unwrap();
+        eventually("TAB_R 入表", || tab_session(&watched, "TAB_R").is_some()).await;
+        let task = tokio::spawn({
+            let svc = std::sync::Arc::clone(&svc);
+            async move { svc.download_wait(INS, "TAB_R", Some(3000)).await }
+        });
+        eventually("等待者登记", || !watched.downloads.lock().unwrap().waiters.is_empty()).await;
+        // 模拟断连：清连接槽 → 下一条命令触发重建（establish 清空等待登记）
+        *watched.conn.lock().unwrap() = None;
+        let _ = svc.downloads_list(INS, "TAB_R").await; // 错误无所谓，重建已发生
+        let err = task.await.unwrap().unwrap_err();
+        assert_eq!((err.code(), err.status()), ("PAGE_SERVICE_UNAVAILABLE", 409));
+        assert!(err.to_string().contains("download-wait"));
+        // 重建即重发 setDownloadBehavior
+        assert_eq!(calls_of(&calls, "Browser.setDownloadBehavior").len(), 2);
+    }
+
+    /// tab 归属：WillBegin 的 frameId 命中帧登记表（root/子帧）→ 记录带 tab
+    #[tokio::test]
+    async fn download_records_tab_attribution_from_frame_registry() {
+        let (svc, watched, _c, _s) = armed();
+        set_download_dir(&watched, &temp_download_dir());
+        register_frame(&watched, "T1", "F_ROOT", "FRM_A", Some("S_FRM_A"), "F_ROOT", Some(9));
+        handle_event(&watched, &will_begin("g1", "x.bin", "F_ROOT")).await;
+        handle_event(&watched, &progress("g1", "completed", 1)).await;
+        let ring = svc.downloads_list(INS, "T1").await.unwrap();
+        assert_eq!(ring["downloads"][0]["tab"], "T1");
+    }
+
+    /// upload 主路径（selector）：定位链 → describeNode 校验 → setFileInputFiles
+    ///（nodeId + 主会话；files = 主机绝对路径原样——不拷贝）
+    #[tokio::test]
+    async fn upload_selector_path_validates_and_sets_files() {
+        let (svc, _w, calls, script) = armed();
+        let f = temp_upload_file("a.png", b"abc");
+        given(&script, "DOM.getDocument", vec![Ok(json!({ "root": { "nodeId": 1 } }))]);
+        given(&script, "DOM.querySelector", vec![Ok(json!({ "nodeId": 5 }))]);
+        given(
+            &script,
+            "DOM.describeNode",
+            vec![Ok(json!({ "node": { "nodeName": "INPUT", "attributes": ["type", "file", "accept", ".png"] } }))],
+        );
+        let resp = svc
+            .upload(INS, "T1", "input[type=file]", &f.display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(resp["fileName"], "a.png");
+        assert_eq!(resp["bytes"], 3);
+        assert!(resp["result"].as_str().unwrap().contains("a.png"));
+        let set = calls_of(&calls, "DOM.setFileInputFiles");
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].param("files"), json!([f.display().to_string()]));
+        assert_eq!(set[0].param("nodeId"), 5);
+        assert_eq!(set[0].session.as_deref(), Some("S1"));
+    }
+
+    /// 校验红线：非 file input（input[type=text] / BUTTON）→ 422
+    /// PAGE_TARGET_NOT_FILE_INPUT，且**不发送** setFileInputFiles
+    #[tokio::test]
+    async fn upload_rejects_non_file_input_targets() {
+        let (svc, _w, calls, script) = armed();
+        let f = temp_upload_file("a.png", b"abc");
+        given(&script, "DOM.getDocument", vec![Ok(json!({ "root": { "nodeId": 1 } })), Ok(json!({ "root": { "nodeId": 1 } }))]);
+        given(&script, "DOM.querySelector", vec![Ok(json!({ "nodeId": 5 })), Ok(json!({ "nodeId": 5 }))]);
+        given(
+            &script,
+            "DOM.describeNode",
+            vec![
+                Ok(json!({ "node": { "nodeName": "INPUT", "attributes": ["type", "text"] } })),
+                Ok(json!({ "node": { "nodeName": "BUTTON" } })),
+            ],
+        );
+        for target in ["#q", "#b"] {
+            let err = svc.upload(INS, "T1", target, &f.display().to_string()).await.unwrap_err();
+            assert_eq!((err.code(), err.status()), ("PAGE_TARGET_NOT_FILE_INPUT", 422), "{target}");
+        }
+        assert!(calls_of(&calls, "DOM.setFileInputFiles").is_empty(), "校验失败不发送");
+    }
+
+    /// ref 路径：@eN → backendNodeId 直用（免前端化），帧内 ref 路由帧会话
+    #[tokio::test]
+    async fn upload_ref_path_uses_backend_node_id() {
+        let (svc, watched, calls, script) = armed();
+        let f = temp_upload_file("b.bin", b"12345");
+        watched
+            .refs
+            .lock()
+            .unwrap()
+            .entry("T1".into())
+            .or_default()
+            .replace(&json!([{ "ref": "e1", "backendNodeId": 42 }]));
+        given(
+            &script,
+            "DOM.describeNode",
+            vec![Ok(json!({ "node": { "nodeName": "INPUT", "attributes": ["type", "file"] } }))],
+        );
+        let resp = svc.upload(INS, "T1", "@e1", &f.display().to_string()).await.unwrap();
+        assert_eq!(resp["bytes"], 5);
+        let set = calls_of(&calls, "DOM.setFileInputFiles");
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].param("backendNodeId"), 42, "ref 路径直用 backendNodeId");
+        assert!(set[0].params.get("nodeId").is_none(), "ref 路径不带 nodeId");
+        assert_eq!(set[0].session.as_deref(), Some("S1"), "主文档 ref 走主会话");
+    }
+
+    /// selector 未命中 → 404 PAGE_ELEMENT_NOT_FOUND（同 fill 定位链语义）
+    #[tokio::test]
+    async fn upload_selector_miss_is_element_not_found() {
+        let (svc, _w, _calls, script) = armed();
+        let f = temp_upload_file("a.png", b"abc");
+        given(&script, "DOM.getDocument", vec![Ok(json!({ "root": { "nodeId": 1 } }))]);
+        given(&script, "DOM.querySelector", vec![Ok(json!({ "nodeId": 0 }))]);
+        let err = svc.upload(INS, "T1", "#none", &f.display().to_string()).await.unwrap_err();
+        assert_eq!((err.code(), err.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
+    }
+
+    /// 主机侧校验矩阵：绝对路径/拒符号链接/存在性/目录/100MB 上限
+    #[test]
+    fn validate_upload_file_enforces_host_side_rules() {
+        // 相对路径 → 422
+        let err = validate_upload_file("rel/a.png").unwrap_err();
+        assert_eq!((err.code(), err.status()), ("PAGE_UPLOAD_PATH_INVALID", 422));
+        // 不存在（绝对）→ 404
+        let err = validate_upload_file("/nonexistent/definitely-missing-file-xyz").unwrap_err();
+        assert_eq!(err.code(), "PAGE_UPLOAD_FILE_NOT_FOUND");
+        // 目录 → 422
+        let dir = temp_download_dir();
+        let err = validate_upload_file(&dir.display().to_string()).unwrap_err();
+        assert_eq!(err.code(), "PAGE_UPLOAD_PATH_INVALID");
+        // 符号链接 → 422（逐组件检查：链接本身存在且指向真实文件，仍拒绝）
+        let real = temp_upload_file("real.txt", b"x");
+        let link = real.parent().unwrap().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = validate_upload_file(&link.display().to_string()).unwrap_err();
+        assert_eq!((err.code(), err.status()), ("PAGE_UPLOAD_PATH_INVALID", 422));
+        // 超 100MB → 422（稀疏文件，不真写 100MB）
+        let big = temp_upload_file("big.bin", b"");
+        std::fs::File::options()
+            .write(true)
+            .open(&big)
+            .unwrap()
+            .set_len(MAX_UPLOAD_BYTES + 1)
+            .unwrap();
+        let err = validate_upload_file(&big.display().to_string()).unwrap_err();
+        assert_eq!((err.code(), err.status()), ("PAGE_UPLOAD_FILE_TOO_LARGE", 422));
+        // 合法：返回（路径, 文件名, 大小）
+        let ok = temp_upload_file("ok.txt", b"hello");
+        let (_p, name, size) = validate_upload_file(&ok.display().to_string()).unwrap();
+        assert_eq!((name.as_str(), size), ("ok.txt", 5));
     }
 
 }

@@ -121,6 +121,9 @@ chrome-host page clickxy <id> <x> <y> [--tab t]        # 视口 CSS 像素坐标
 chrome-host page type    <id> <text> [--tab t]         # 焦点处输入（clickxy 点入跨域 iframe 后用它）
 chrome-host page loadall <id> <sel> [--interval 1.5s] [--tab t]  # 反复点"加载更多"直到消失
 chrome-host page dialogs <id> [--tab t] [--since N]    # 自动接管的弹窗历史（近 32 条）
+chrome-host page download-wait <id> [--timeout-ms 30000] [--tab t]  # 等下一次下载完成（命令式：先调它再 click 触发；落盘实例 profile/downloads/）
+chrome-host page downloads <id> [--tab t]             # 下载终态记录环（近 20 条，含失败与已消费）
+chrome-host page upload <id> <sel|@eN> <主机绝对路径> [--tab t]  # 文件设入 input[type=file]（触发原生 change；拒符号链接/超100MB）
 ```
 
 操作循环：**`snap → 用 @eN 操作 → 页面变化后重 snap`**。页内跳转用 `page navigate`（保留历史可 back/forward；实例级 `instance navigate` 是新开+关旧近似会丢历史，仅 GUI 兼容保留）。
@@ -133,6 +136,7 @@ chrome-host page dialogs <id> [--tab t] [--since N]    # 自动接管的弹窗�
 - **弹窗已自动接管**：页面 alert/confirm/prompt/beforeunload 由应用自动 accept（beforeunload=放行离开，prompt 提交默认文本），不阻塞命令；命令期间弹过的窗以 `dialogs_seen` 附在输出里，`page dialogs` 查历史。
 - **错误看 [PAGE_*] 前缀分支处置**，不解析文案：`PAGE_ELEMENT_BLOCKED`（被浮层遮挡，先处理遮挡）/ `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_REF_NOT_FOUND`·`PAGE_REF_STALE`（重 snap）/ `PAGE_TARGET_NOT_FILLABLE` / `PAGE_FILL_VALUE_MISMATCH`（写入可能部分生效，先观察再重试）/ `PAGE_WAIT_TIMEOUT` / `PAGE_DISPATCH_FAILED`（附 effect_state：none=未发出可重试，unknown=已发出禁盲目重试）/ `PAGE_TAB_AMBIGUOUS`（多 tab，带列表重选）。
 - **跨域 iframe（OOPIF）**：snap 已内嵌帧内容（`[frame]` 段，@eN 跨帧连续编号），click/fill/press 对帧内 @eN 直接可用（点击自动坐标投影、输入走帧会话）；CSS 选择器仍只查主 frame，帧内 selector 找不到时改用 @eN；帧内导航/移除后帧内 ref 报 `PAGE_REF_STALE`（重新 snap）；坐标级兑底（clickxy+type）仍可用。
+- **文件下载/上传（W-file）**：下载是**命令式等待**——先 `page download-wait` 挂住，再另行 `page click` 点下载链接（等待不阻塞 click），返回落盘路径/大小（目录 = 实例 profile 的 `downloads/`，随实例删除清理）；`page downloads` 查终态记录环（失败/已消费都在）。上传 `page upload` 吃 @eN 或选择器，主机路径**必须物理绝对路径**（macOS 的 /tmp、/var 是软链会被拒，改传 /private/tmp/... 形态）；非 input[type=file] → 422。超时（409 PAGE_DOWNLOAD_TIMEOUT）= 无下载发生，与失败（500 PAGE_DOWNLOAD_FAILED）严格区分；drop 拖拽上传不支持。
 - **无主对话框卡死（罕见）**：对话框在应用无连接期间弹出（如应用重启前埋的 setTimeout alert）时，CDP 通道不认识它——命令大面积超时但 `page dialogs` 无记录。恢复：`chrome-host page raw <id> "Page.navigate" '{"url":"<当前页>"}' --tab <t>`（强制导航丢弃对话框），或让用户在浏览器窗口点掉。
 - **首条命令偶发 PAGE_TAB_NOT_FOUND**：连接刚建立的 attach 竞态，提示语含 retry——直接重试同一命令即可。
 - **多实例调试互不干扰**：page 命令经应用持有的独立 CDP 通道，与其他工具（DevTools、Playwright 直连）并存无冲突。

@@ -234,6 +234,9 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 | `POST /api/v1/instances/{id}/page/clickxy` | 视口坐标点击（CSS 像素，无定位/遮挡校验）。body `{ "x", "y", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/loadall` | 循环点击直到选择器消失。body `{ "selector", "interval?", "maxClicks?", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/type` | 向当前焦点元素输入文本（跨域 iframe 唯一输入路径）。body `{ "text", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/download-wait` | 等待**下一次**下载完成（W-file；命令式等待：先调本端点再触发点击）。body `{ "timeoutMs?"（缺省 30000）, "tab?" }` |
+| `GET /api/v1/instances/{id}/page/downloads` | 下载终态记录环（最近 20 条，含已消费——matched 字段区分） |
+| `POST /api/v1/instances/{id}/page/upload` | 主机文件设入页面 file input。body `{ "target", "filePath", "tab?" }` |
 
 参数语义：
 
@@ -260,6 +263,29 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 - **`text`**（type）：非空文本，直接输入到当前焦点元素（无定位、无校验）——
   跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达跨域 frame，先用
   clickxy 点入获得焦点）；空串 → `400`。
+- **`timeoutMs`**（download-wait）：等待窗口毫秒数，缺省 30000。语义 =
+  **命令式等待**：调用即登记等待者，等待**下一次**下载终态（从调用时刻起算
+  ——不是轮询历史）；典型用法 = 先调本端点，再另行 click 触发下载（等待
+  期间不占实例串行锁，click 可立即执行）。返回最早到达的终态：完成 →
+  记录（`filePath/fileName/bytes/mimeType`，另含 `state/url/tab/startedAt/`
+  `completedAt/verified/matched`；`bytes` 优先取落盘实测大小，取不到时用
+  事件值且 `verified:false`）；取消/中断 → `500 PAGE_DOWNLOAD_FAILED`；
+  窗口耗尽 → `409 PAGE_DOWNLOAD_TIMEOUT`（无终态证据——若有下载在进行
+  中会在 message 披露，与「下载了但失败」严格区分）。落盘目录 = 实例
+  profile 下 `downloads/` 子目录（每实例隔离，实例删除随 profile 清理）；
+  文件名净化：suggestedFilename 含路径分隔符时拒绝拼路径（record 附 note，
+  等待者收 PAGE_DOWNLOAD_FAILED）。并发下载：多等待者按终态到达序先到
+  先得；未被等待者拿走的终态留在记录环（GET downloads 查询）。
+- **`target`**（upload）：file input 目标，`@eN` 引用或 CSS 选择器；非
+  input 或非 `type="file"` → `422 PAGE_TARGET_NOT_FILE_INPUT`（先于任何
+  写入校验）。
+- **`filePath`**（upload）：**主机本地绝对路径**（远程接入场景 = API 侧
+  主机路径）。安全边界：非绝对路径/路径任一组件是符号链接/非普通文件 →
+  `422 PAGE_UPLOAD_PATH_INVALID`（message 附物理路径提示——macOS 的
+  /tmp、/var 本身是软链，请传 /private/... 物理路径）；不存在 → `404
+  PAGE_UPLOAD_FILE_NOT_FOUND`；大于 100MB → `422 PAGE_UPLOAD_FILE_TOO_LARGE`。
+  不拷贝文件：CDP `DOM.setFileInputFiles` 直接引用主机路径，并触发页面
+  原生 change 事件（React 受控表单同常收到）；drop 拖拽上传不支持。
 
 ```json
 // POST .../page/snap 响应（蛇形键对齐 TS wire 字段）
@@ -291,6 +317,24 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 { "result": "Clicked at CSS (150, 130)", "instanceId": "ins_...", "targetId": "ABC123" }
 { "result": "Clicked \".load-more\" 3 time(s) until it disappeared", ... }
 { "result": "Typed 12 characters", ... }
+
+// POST .../page/download-wait 响应（终态记录平铺；本例落盘已核证）
+{ "guid": "g-1", "state": "completed", "fileName": "report.csv",
+  "filePath": "~/Library/.../instances/ins_.../downloads/report.csv",
+  "bytes": 1024, "mimeType": null, "url": "https://dl.example.com/f",
+  "tab": "ABC123", "startedAt": 1710000000000, "completedAt": 1710000002100,
+  "verified": true, "matched": true,
+  "instanceId": "ins_...", "targetId": "ABC123" }
+
+// GET .../page/downloads 响应（环形记录，旧→新；含已消费与失败终态）
+{ "downloads": [ { "guid": "g-1", "state": "completed", "fileName": "report.csv",
+    "filePath": "...", "bytes": 1024, "mimeType": null, "url": "...", "tab": "ABC123",
+    "startedAt": ..., "completedAt": ..., "verified": true, "matched": true } ],
+  "capacity": 20, "instanceId": "ins_...", "targetId": "ABC123" }
+
+// POST .../page/upload 响应
+{ "result": "Set file \"a.png\" (3 bytes) on #upload", "fileName": "a.png", "bytes": 3,
+  "instanceId": "ins_...", "targetId": "ABC123" }
 ```
 
 对话框接管：alert/confirm/prompt/beforeunload 一律自动 `accept: true`（prompt 提交
@@ -483,6 +527,10 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `PAGE_ELEMENT_BLOCKED` / `PAGE_FILL_VALUE_MISMATCH` / `PAGE_WAIT_TIMEOUT` | 点击点被遮挡 / fill 回读不一致（写入可能已部分生效，先观察再决定）/ 等待超时 |
 | 409 | `PAGE_FOCUS_FAILED` / `PAGE_FILL_FOCUS_LOST` | page press/fill 焦点失败 / 页面在 fill 过程中抢走焦点 |
 | 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / fill 目标不可编辑 |
+| 422 | `PAGE_TARGET_NOT_FILE_INPUT` / `PAGE_UPLOAD_PATH_INVALID` / `PAGE_UPLOAD_FILE_TOO_LARGE` | upload 目标非 input[type=file] / filePath 非绝对路径或经符号链接或非普通文件 / 超 100MB 上限（W-file） |
+| 404 | `PAGE_UPLOAD_FILE_NOT_FOUND` | upload 的主机文件不存在（W-file） |
+| 409 | `PAGE_DOWNLOAD_TIMEOUT` | download-wait 窗口耗尽且无终态证据（有下载在进行中会在 message 披露；与失败严格区分，W-file） |
+| 500 | `PAGE_DOWNLOAD_FAILED` | 下载终态 = interrupted/canceled（或文件名不安全被拒）——下载了但失败（W-file） |
 | 500 | `PAGE_DISPATCH_FAILED` | Input 派发失败（message 附 effect_state：`none`=未发出可重试 / `unknown`=已发出禁盲目重试） |
 | 500 | `PAGE_EVAL_FAILED` / `CDP_COMMAND_FAILED` | page 工具页内 eval 失败 / CDP 发送失败 |
 | 504 | `PAGE_TOOL_TIMEOUT` | page 工具超出预算（常规 30s；wait = 用户 timeout + 5s） |

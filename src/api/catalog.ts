@@ -317,6 +317,25 @@ export const API_CATALOG: CatalogGroup[] = [
         body: '{ "target": "@e1", "tab": null }',
         note: 'null 单元格 = 被合并覆盖/空位、"" = 真实空单元格；coverage.datasetComplete 只有 unknown/incomplete（永不装作取全）；非表格目标 → 422 PAGE_EXTRACT_NOT_A_TABLE；单元格预算 10000 超限整行截断',
       },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/download-wait',
+        desc: '等待下一次下载完成（命令式：先调本端点再触发点击）；返回 filePath/fileName/bytes/mimeType',
+        body: '{ "timeoutMs": 30000, "tab": null }',
+        note: '落盘在实例 profile 的 downloads/ 目录（随实例删除清理）；失败/取消 → 500 PAGE_DOWNLOAD_FAILED；超时（无终态）→ 409 PAGE_DOWNLOAD_TIMEOUT；并发下载先到先得，其余进记录环',
+      },
+      {
+        method: 'GET',
+        path: '/instances/:id/page/downloads',
+        desc: '下载终态记录环（最近 20 条，含已消费——matched 字段区分）',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/upload',
+        desc: '上传：主机文件设入页面 file input（DOM.setFileInputFiles，触发原生 change）',
+        body: '{ "target": "input[type=file]", "filePath": "/abs/path/file.png", "tab": null }',
+        note: 'filePath 必须绝对路径且拒符号链接（422）；不存在 → 404；超 100MB → 422；非 input[type=file] → 422 PAGE_TARGET_NOT_FILE_INPUT；不拷贝文件（CDP 引用主机路径）；drop 上传不支持',
+      },
     ],
   },
   {

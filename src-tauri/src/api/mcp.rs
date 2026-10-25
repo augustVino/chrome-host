@@ -531,6 +531,45 @@ struct PageExtractArgs {
     tab: Option<String>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageDownloadWaitArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "等待窗口毫秒数；缺省 30000。命令式等待：先调本工具再触发点击（click 另行调用）"
+    )]
+    timeout_ms: Option<u64>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageDownloadsArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageUploadArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "file input 目标：@eN 引用（上次 page_snap 产生）或 CSS 选择器（input[type=file]）"
+    )]
+    target: String,
+    #[schemars(
+        description = "主机本地绝对路径（API 侧主机；拒符号链接；不存在 → 404；超 100MB → 422）"
+    )]
+    file_path: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
 // ---------- MCP Server ----------
 
 #[derive(Clone)]
@@ -1295,6 +1334,56 @@ impl ChromeHostMcp {
                 &a.instance_id,
                 a.tab.as_deref().unwrap_or(""),
                 a.target.as_deref(),
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "等待下一次下载完成（命令式等待：先调本工具，再另行 click 触发下载）：返回 { filePath, fileName, bytes, mimeType, state, url, tab, startedAt, completedAt, verified }（落盘在实例 profile 的 downloads/ 目录）。失败/取消 → 500 PAGE_DOWNLOAD_FAILED；超时（窗口内无终态）→ 409 PAGE_DOWNLOAD_TIMEOUT；等待期间连接重建 → 409 可重试"
+    )]
+    async fn page_download_wait(
+        &self,
+        Parameters(a): Parameters<PageDownloadWaitArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.download_wait(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.timeout_ms,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "查询下载终态记录环（最近 20 条：完成/取消/中断均入环，含已被 download-wait 消费的——matched 字段区分）；并发下载未被等待者拿走的也在此可查"
+    )]
+    async fn page_downloads(
+        &self,
+        Parameters(a): Parameters<PageDownloadsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .downloads_list(&a.instance_id, a.tab.as_deref().unwrap_or(""))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "上传：把主机文件设入页面 file input（DOM.setFileInputFiles，不拷贝文件，会触发原生 change 事件）。target 非输入框或非 type=file → 422 PAGE_TARGET_NOT_FILE_INPUT；路径非绝对/含符号链接 → 422 PAGE_UPLOAD_PATH_INVALID；不存在 → 404；超 100MB → 422 PAGE_UPLOAD_FILE_TOO_LARGE"
+    )]
+    async fn page_upload(
+        &self,
+        Parameters(a): Parameters<PageUploadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.upload(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.target,
+                &a.file_path,
             )
         })
         .await

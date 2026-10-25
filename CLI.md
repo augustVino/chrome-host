@@ -226,6 +226,9 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 | `page clickxy <ID> <x> <y> [--tab T]` | 视口坐标点击（CSS 像素；无定位/遮挡校验，坐标即意图） |
 | `page loadall <ID> <selector> [--interval 1500ms] [--max-clicks 200] [--tab T]` | 循环点击「加载更多」直到消失；达上限仍未消失时结果明示 still present |
 | `page type <ID> <text> [--tab T]` | 向当前焦点元素输入文本（跨域 iframe 唯一输入路径；先 clickxy 点入）；空文本 → 400 exit 7 |
+| `page download-wait <ID> [--timeout-ms 30000] [--tab T]` | 等待下一次下载完成（命令式：先调本命令，再另行 click 触发下载）；落盘在实例 profile 的 downloads/；失败 → exit 5，超时 → exit 5（message 区分） |
+| `page downloads <ID> [--tab T]` | 下载终态记录环（最近 20 条，含已消费；STATE/FILE/BYTES/MATCHED 表） |
+| `page upload <ID> <sel\|@eN> <主机绝对路径> [--tab T]` | 主机文件设入 input[type=file]（触发原生 change）；路径拒符号链接（422 exit 7，macOS /tmp→/private/tmp 类软链拒绝——改传物理路径）；不存在 → 404 exit 3；超 100MB → 422 exit 7 |
 
 `tab` 取值 = targetId 或唯一前缀（`instance tabs` 获得）；省略 = 唯一页面标签
 时自动选中，多标签 → 409 `PAGE_TAB_AMBIGUOUS` 且错误 message 列出全部
@@ -257,6 +260,11 @@ chrome-host page loadall ins_xxx '.load-more' --interval 2s --max-clicks 50
 chrome-host page clickxy ins_xxx 320 240
 chrome-host page type ins_xxx 'hello iframe'
 chrome-host page eval ins_xxx 'document.title'   # 高权限，最后手段
+
+# 文件传输（W-file）：命令式等待下载 → click 触发 → 落盘路径/大小；上传
+chrome-host page download-wait ins_xxx --timeout-ms 60000   # 挂住等下载（另终端 click）
+chrome-host page downloads ins_xxx                          # 终态记录环（含失败与已消费）
+chrome-host page upload ins_xxx 'input[type=file]' /private/tmp/avatar.png
 ```
 
 ### extension — 扩展管理

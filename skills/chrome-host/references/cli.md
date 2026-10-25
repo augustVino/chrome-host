@@ -84,6 +84,9 @@ page clickxy <id> <x> <y> [--tab t]         视口 CSS 像素坐标点击（无 
 page type    <id> <text> [--tab t]          当前焦点处输入（clickxy 点入跨域 iframe 后用它）
 page loadall <id> <sel> [--interval 1.5s] [--tab t]  循环点击直到元素消失
 page dialogs <id> [--tab t] [--since N]     自动接管弹窗历史（近 32 条；--since 增量拉取）
+page download-wait <id> [--timeout-ms 30000] [--tab t]  等下一次下载完成（命令式：先调它，再另行 click 触发下载；落盘实例 profile/downloads/；超时 409 = 无下载发生，失败 500 = 下载了但失败）
+page downloads <id> [--tab t]               下载终态记录环（近 20 条；STATE/FILE/BYTES/MATCHED；含失败与已被 download-wait 消费的）
+page upload <id> <sel|@eN> <abs> [--tab t]  主机文件设入 input[type=file]（触发原生 change；必须物理绝对路径——macOS /tmp、/var 软链拒绝改传 /private/...；拒软链/目录/超100MB → 422，不存在 → 404）
 ```
 
 **操作循环**：snap → 用 @eN 操作 → 页面变化后重 snap。导航后 @eN 整表失效（PAGE_REF_STALE），重新 snap，不要对旧引用重试。
@@ -104,6 +107,12 @@ page dialogs <id> [--tab t] [--since N]     自动接管弹窗历史（近 32 �
 | PAGE_NAV_FAILED | Page.navigate 返回 net::ERR_*（导航未发生）；与 loaded:false（已开始未证实）严格区分 |
 | PAGE_EMULATE_UNKNOWN_PRESET | 预设名不在表内（422），message 列出全部可用预设 |
 | PAGE_DISPATCH_FAILED | 附 effect_state：none=未发出可重试；unknown=已发出禁盲目重试，先观察 |
+| PAGE_DOWNLOAD_TIMEOUT | download-wait 窗口耗尽且无终态（409）：确认触发动作是否执行；有下载在进行中会在 message 披露——加大 --timeout-ms 再试 |
+| PAGE_DOWNLOAD_FAILED | 下载了但终态失败（interrupted/canceled/文件名不安全被拒，500）：重触发下载，勿盲目重试 |
+| PAGE_UPLOAD_PATH_INVALID | 路径非绝对/经符号链接/非普通文件（422）：message 附物理路径提示，改传物理绝对路径 |
+| PAGE_UPLOAD_FILE_NOT_FOUND | 主机文件不存在（404）：核对 API 侧主机路径（远程接入 = 运行 chrome-host 的机器） |
+| PAGE_UPLOAD_FILE_TOO_LARGE | 超 100MB 上限（422）：拆分或换文件 |
+| PAGE_TARGET_NOT_FILE_INPUT | upload 目标非 input[type=file]（422）：重 snap 核对目标元素 |
 | CDP_COMMAND_FAILED（大面积超时 + dialogs 无记录） | 疑似无主对话框卡死（对话框在应用断连期间弹出，CDP 通道不注册）：用 page raw 发 Page.navigate 强制导航恢复，或让用户在浏览器点掉 |
 | PAGE_EVAL_FAILED | 表达式抛异常（信息含异常文本） |
 

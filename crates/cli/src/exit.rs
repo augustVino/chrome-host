@@ -57,6 +57,9 @@ const RUNTIME_ERROR_CODES: &[&str] = &[
     "PAGE_TOOL_TIMEOUT",
     "PAGE_EVAL_FAILED",
     "PAGE_NAV_FAILED",
+    // W-file：下载已开始但终态失败/取消（与 PAGE_DOWNLOAD_TIMEOUT 超时=无
+    // 终态严格区分；后者 409 走 status 分支 → 5，无需入表）
+    "PAGE_DOWNLOAD_FAILED",
     "CDP_COMMAND_FAILED",
 ];
 
@@ -323,6 +326,32 @@ mod tests {
                 api(422, "PAGE_EXTRACT_NOT_A_TABLE"),
                 ExitCode::VALIDATION,
             ),
+            // —— W-file：上传校验族（422/404）+ 下载超时/失败 ——
+            (
+                "422 PAGE_TARGET_NOT_FILE_INPUT（upload 目标非 file input）",
+                api(422, "PAGE_TARGET_NOT_FILE_INPUT"),
+                ExitCode::VALIDATION,
+            ),
+            (
+                "422 PAGE_UPLOAD_PATH_INVALID（非绝对路径/符号链接/非普通文件）",
+                api(422, "PAGE_UPLOAD_PATH_INVALID"),
+                ExitCode::VALIDATION,
+            ),
+            (
+                "422 PAGE_UPLOAD_FILE_TOO_LARGE（超 100MB 上限）",
+                api(422, "PAGE_UPLOAD_FILE_TOO_LARGE"),
+                ExitCode::VALIDATION,
+            ),
+            (
+                "404 PAGE_UPLOAD_FILE_NOT_FOUND（主机文件不存在）",
+                api(404, "PAGE_UPLOAD_FILE_NOT_FOUND"),
+                ExitCode::NOT_FOUND,
+            ),
+            (
+                "409 PAGE_DOWNLOAD_TIMEOUT（等待窗口内无下载终态）",
+                api(409, "PAGE_DOWNLOAD_TIMEOUT"),
+                ExitCode::RUNTIME,
+            ),
             // —— page 控制族：5xx 运行时码表（非 GENERAL 兑底）——
             (
                 "500 PAGE_DISPATCH_FAILED（Input 派发失败，附 effect_state）",
@@ -332,6 +361,11 @@ mod tests {
             (
                 "500 PAGE_NAV_FAILED（Page.navigate errorText，net::ERR_*）",
                 api(500, "PAGE_NAV_FAILED"),
+                ExitCode::RUNTIME,
+            ),
+            (
+                "500 PAGE_DOWNLOAD_FAILED（下载终态失败/取消/被拒）",
+                api(500, "PAGE_DOWNLOAD_FAILED"),
                 ExitCode::RUNTIME,
             ),
             (
