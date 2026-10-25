@@ -121,7 +121,7 @@ fn dispatch_menu_action(app: &AppHandle, id: &str) {
             let svc = st.instance_service.clone();
             let env_id = target.to_string();
             tauri::async_runtime::spawn(async move {
-                match svc.create(&env_id).await {
+                match svc.create(&env_id, None).await {
                     Ok(_) => tracing::info!("托盘新建实例成功: env={env_id}"),
                     Err(e) => tracing::warn!("托盘新建实例失败: {e}"),
                 }

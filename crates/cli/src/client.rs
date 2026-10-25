@@ -375,11 +375,14 @@ impl AgentClient {
 
     /// POST /api/v1/environments/{environment_id}/instances —— 创建即启动的复合语义，
     /// 首次可能阻塞于内核下载，**long = true**（无总超时，见 [`AgentClient::new`]）。
-    pub fn instance_create(&self, env_id: &str) -> Result<Instance, CliError> {
+    /// body `{"name": <name>}`（None 序列化为 null = 不命名；无 body 也兼容，
+    /// 这里恒发 body 保证形状稳定）。409 INSTANCE_NAME_CONFLICT → exit 5。
+    pub fn instance_create(&self, env_id: &str, name: Option<&str>) -> Result<Instance, CliError> {
+        let body = serde_json::json!({ "name": name });
         Self::decode(self.send(
             Method::POST,
             &format!("/api/v1/environments/{env_id}/instances"),
-            None,
+            Some(body),
             true,
         ))
     }

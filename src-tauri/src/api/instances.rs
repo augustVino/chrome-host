@@ -13,6 +13,14 @@ pub struct OpenTabBody {
     pub url: String,
 }
 
+/// POST .../instances 可选 body：无 body（GUI/旧客户端）与空对象均合法。
+#[derive(Deserialize, Default)]
+pub struct CreateInstanceBody {
+    /// 可选实例名（1-64 字符、非纯空白；同环境唯一，冲突 → 409 INSTANCE_NAME_CONFLICT）
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct NavigateBody {
     #[serde(rename = "tabId")]
@@ -21,20 +29,31 @@ pub struct NavigateBody {
 }
 
 /// POST /api/v1/environments/{environmentId}/instances
+/// body 可选（无 body / 空 / {"name": null} = 不命名）
 pub async fn create(
     State(state): State<ApiState>,
     Path(environment_id): Path<String>,
+    body: Option<Json<CreateInstanceBody>>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    let ins = state.instance_service.create(&environment_id).await?;
+    let name = body.and_then(|Json(b)| b.name);
+    let ins = state
+        .instance_service
+        .create(&environment_id, name.as_deref())
+        .await?;
     Ok((StatusCode::CREATED, Json(json!(ins))))
 }
 
-/// POST /api/v1/environments/{environmentId}/open
+/// POST /api/v1/environments/{environmentId}/open（create 的别名，body 语义同）
 pub async fn open(
     State(state): State<ApiState>,
     Path(environment_id): Path<String>,
+    body: Option<Json<CreateInstanceBody>>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    let ins = state.instance_service.create(&environment_id).await?;
+    let name = body.and_then(|Json(b)| b.name);
+    let ins = state
+        .instance_service
+        .create(&environment_id, name.as_deref())
+        .await?;
     Ok((StatusCode::CREATED, Json(json!(ins))))
 }
 

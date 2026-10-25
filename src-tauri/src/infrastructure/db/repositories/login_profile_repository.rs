@@ -291,6 +291,7 @@ mod tests {
         instances
             .insert(&crate::domain::instance::Instance {
                 id: "ins_1".into(),
+                name: None,
                 environment_id: "env_a".into(),
                 login_profile_id: Some(lp.id.clone()),
                 profile_dir: "/tmp/ins_1".into(),

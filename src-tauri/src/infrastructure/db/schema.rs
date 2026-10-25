@@ -50,8 +50,13 @@ CREATE TABLE IF NOT EXISTS instances (
     started_at       INTEGER,
     stopped_at       INTEGER,
     created_at       INTEGER NOT NULL,
-    updated_at       INTEGER NOT NULL
+    updated_at       INTEGER NOT NULL,
+    name             TEXT
 );
+
+-- 注意：instances 的同环境 name 唯一索引（partial，NULL 不参与）不在本 batch 内
+-- 创建——旧库执行到此处时 name 列尚不存在（列由 ensure_instances_name_column
+-- ALTER 追加），索引统一在该函数内建，新旧库路径收敛。
 
 CREATE INDEX IF NOT EXISTS idx_instances_env ON instances(environment_id);
 CREATE INDEX IF NOT EXISTS idx_instances_status ON instances(status);
@@ -107,6 +112,7 @@ pub fn init_schema(pool: &DbPool) -> Result<(), AppError> {
     drop_legacy_columns(&conn)?;
     drop_login_profile_cdp_port(&conn)?;
     ensure_session_capture_column(&conn)?;
+    ensure_instances_name(&conn)?;
     Ok(())
 }
 
@@ -145,6 +151,28 @@ fn drop_login_profile_cdp_port(conn: &PooledConnection<SqliteConnectionManager>)
     Ok(())
 }
 
+/// 迁移：为旧库的 instances 补 name 列（实例可选名，同环境唯一）。
+/// 与 ensure_session_capture_column 同款 pragma 检查 + 幂等；列固定加在末尾，
+/// 保证新库（CREATE 内联）与旧库（ALTER 追加）的列序一致。
+/// 唯一索引随列远迁在本函数内统一创建（不在 SCHEMA batch 内，原因见
+/// instances 表旁注释）：partial unique index，NULL name 不参与约束。
+fn ensure_instances_name(conn: &PooledConnection<SqliteConnectionManager>) -> Result<(), AppError> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('instances') WHERE name = 'name'",
+        [],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        conn.execute("ALTER TABLE instances ADD COLUMN name TEXT", [])?;
+        tracing::info!("[schema] 已为 instances 增加 name 列（可空，同环境唯一）");
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_instances_env_name \
+         ON instances(environment_id, name) WHERE name IS NOT NULL",
+    )?;
+    Ok(())
+}
+
 /// 迁移：为旧库的 environments 补 session_capture 列（身份层回写策略）。
 /// 与 drop_legacy_columns 同款 pragma 检查 + 幂等；列固定加在末尾，
 /// 保证新库（CREATE 内联）与旧库（ALTER 追加）的 SELECT * 列序一致。
@@ -179,6 +207,46 @@ mod tests {
             startup_args     TEXT,
             auto_start       INTEGER NOT NULL DEFAULT 0,
             keep_alive       INTEGER NOT NULL DEFAULT 0,
+            created_at       INTEGER NOT NULL,
+            updated_at       INTEGER NOT NULL
+        );
+    "#;
+
+    /// 旧构建的 instances 表结构（无 name 列），用于 name 迁移测试
+    const LEGACY_INSTANCES_SCHEMA: &str = r#"
+        CREATE TABLE IF NOT EXISTS environments (
+            id               TEXT PRIMARY KEY,
+            name             TEXT NOT NULL,
+            hosts_source_url TEXT,
+            icon             TEXT,
+            startup_args     TEXT,
+            keep_alive       INTEGER NOT NULL DEFAULT 0,
+            created_at       INTEGER NOT NULL,
+            updated_at       INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS login_profiles (
+            id                TEXT PRIMARY KEY,
+            environment_id    TEXT NOT NULL REFERENCES environments(id),
+            name              TEXT NOT NULL,
+            profile_dir       TEXT NOT NULL,
+            snapshot_version  INTEGER NOT NULL DEFAULT 0,
+            status            TEXT NOT NULL DEFAULT 'not_configured',
+            last_captured_at  INTEGER,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS instances (
+            id               TEXT PRIMARY KEY,
+            environment_id   TEXT NOT NULL REFERENCES environments(id),
+            login_profile_id TEXT REFERENCES login_profiles(id),
+            profile_dir      TEXT NOT NULL,
+            pid              INTEGER,
+            cdp_port         INTEGER,
+            status           TEXT NOT NULL DEFAULT 'created',
+            host_rules       TEXT,
+            browser_version  TEXT,
+            started_at       INTEGER,
+            stopped_at       INTEGER,
             created_at       INTEGER NOT NULL,
             updated_at       INTEGER NOT NULL
         );
@@ -245,5 +313,72 @@ mod tests {
         let pool = crate::infrastructure::db::client::init_pool(&dir.join("test.db")).unwrap();
         init_schema(&pool).unwrap();
         init_schema(&pool).unwrap();
+    }
+
+    /// 迁移：旧库 instances（无 name 列 + 数据）→ init_schema 后 name 列补上、
+    /// 存量行 name 为 NULL、数据完整，且同环境唯一索引立即生效。
+    /// 表达迁移核心价值：升级不丢实例，唯一约束在旧库上立即兜底。
+    #[test]
+    fn legacy_instances_get_name_column_and_unique_index() {
+        let dir = std::env::temp_dir().join(format!("cem-mig3-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::infrastructure::db::client::init_pool(&dir.join("test.db")).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute_batch(LEGACY_INSTANCES_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO environments (id, name, created_at, updated_at) VALUES ('env_a', 'A', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO instances (id, environment_id, profile_dir, status, created_at, updated_at)
+             VALUES ('ins_old', 'env_a', '/tmp/ins_old', 'stopped', 1, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        init_schema(&pool).unwrap();
+
+        let conn = pool.get().unwrap();
+        let cols = column_names(&conn, "instances");
+        assert!(cols.contains(&"name".to_string()), "旧库自动补 name 列: {cols:?}");
+        let (status, name): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, name FROM instances WHERE id = 'ins_old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "stopped", "存量行数据完整");
+        assert_eq!(name, None, "存量行 name 为 NULL（不参与唯一约束）");
+
+        // 唯一索引语义：同环境同名拒绝、同环境多个 NULL 允许、跨环境同名允许
+        let ins = |id: &str, env: &str, name: Option<&str>| {
+            format!(
+                "INSERT INTO instances (id, environment_id, profile_dir, status, created_at, updated_at, name)
+                 VALUES ('{id}', '{env}', '/tmp/{id}', 'created', 1, 1, {})",
+                name.map(|n| format!("'{n}'")).unwrap_or_else(|| "NULL".into())
+            )
+        };
+        assert!(conn.execute(&ins("ins_n1", "env_a", Some("task-1")), []).is_ok());
+        assert!(
+            conn.execute(&ins("ins_n2", "env_a", Some("task-1")), []).is_err(),
+            "同环境同名 → 唯一索引拒绝"
+        );
+        assert!(
+            conn.execute(&ins("ins_n3", "env_a", None), []).is_ok(),
+            "同环境多个 NULL name 允许"
+        );
+        // 跨环境同名：需第二个环境行（FK）
+        conn.execute(
+            "INSERT INTO environments (id, name, created_at, updated_at) VALUES ('env_b', 'B', 1, 1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(&ins("ins_n4", "env_b", Some("task-1")), []).is_ok(),
+            "跨环境同名允许（唯一性是环境级的）"
+        );
     }
 }

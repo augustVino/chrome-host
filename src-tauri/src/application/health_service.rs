@@ -300,6 +300,7 @@ mod tests {
     fn sample_instance(env_id: &str, id: &str, port: u16, status: InstanceStatus) -> Instance {
         Instance {
             id: id.to_string(),
+            name: None,
             environment_id: env_id.to_string(),
             login_profile_id: None,
             profile_dir: format!("/tmp/health/{id}"),

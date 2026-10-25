@@ -89,6 +89,15 @@ struct InstanceArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct CreateInstanceArgs {
+    #[schemars(description = "环境 id（env_ 前缀）")]
+    environment_id: String,
+    #[schemars(description = "可选实例名：1-64 字符、非纯空白；同环境内唯一，重名 → 409 INSTANCE_NAME_CONFLICT。多任务并行时建议命名，便于后续按名锚定")]
+    name: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct CreateEnvironmentArgs {
     #[schemars(description = "环境名，如 qapub")]
     name: String,
@@ -510,16 +519,21 @@ impl ChromeHostMcp {
     // ── 实例 ────────────────────────────────────────────────────────────
 
     #[tool(
-        description = "为环境创建并启动完全隔离的 Chrome 实例（独立 profile + hosts 注入 + 登录态克隆）。首次运行可能阻塞于内核下载。错误时先查 kernel_status"
+        description = "为环境创建并启动完全隔离的 Chrome 实例（独立 profile + hosts 注入 + 登录态克隆）。首次运行可能阻塞于内核下载。错误时先查 kernel_status。可选 name（1-64 字符，同环境唯一，重名 → 409 INSTANCE_NAME_CONFLICT）"
     )]
     async fn create_instance(
         &self,
-        Parameters(a): Parameters<EnvironmentArgs>,
+        Parameters(a): Parameters<CreateInstanceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        run(|| self.state.instance_service.create(&a.environment_id)).await
+        run(|| {
+            self.state
+                .instance_service
+                .create(&a.environment_id, a.name.as_deref())
+        })
+        .await
     }
 
-    #[tool(description = "列出环境下的全部实例（含状态/端口/pid）")]
+    #[tool(description = "列出环境下的全部实例（含 name/状态/端口/pid；name 在同环境内唯一，可用于任务锚定）")]
     async fn list_instances(
         &self,
         Parameters(a): Parameters<EnvironmentArgs>,

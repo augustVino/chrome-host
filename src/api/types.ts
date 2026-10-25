@@ -27,6 +27,8 @@ export type InstanceStatus =
 
 export interface Instance {
   id: string;
+  /** 可选实例名（同环境内唯一）；旧版应用无此字段 */
+  name?: string | null;
   environmentId: string;
   loginProfileId: string | null;
   profileDir: string;
