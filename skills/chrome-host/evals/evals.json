@@ -26,6 +26,32 @@
         "page click 后正确解读 dialogs_seen / page dialogs（beforeunload/confirm 的 accept 语义）",
         "不因弹窗阻塞而归因为超时/端口/授权问题"
       ]
+    },
+    {
+      "id": "nav-history-back",
+      "prompt": "在 qa12345 实例里打开商品列表页，进入一个商品详情，再返回列表页继续看下一个商品",
+      "checks": [
+        "页内跳转用 page navigate（保留历史），返回用 page back 而不是重新 open/navigate 重载",
+        "若 back 报 PAGE_NAV_NO_HISTORY 能正确解读为历史边界"
+      ]
+    },
+    {
+      "id": "hover-menu-reveal",
+      "prompt": "在 qa12345 实例里打开后台首页，把鼠标悬停到顶部导航的「系统设置」上看展开的子菜单，点进「用户管理」",
+      "checks": [
+        "snap 后能识别 [hover] / [hover-reveal] 标记并理解其含义（悬停触发器/悬停展开目标）",
+        "悬停后重新 snap 拿展开后的新 @eN 引用再点击，而非盲点旧引用",
+        "hoverScan 状态被正确忽略或利用（不因 truncated 而放弃任务）"
+      ]
+    },
+    {
+      "id": "network-body-evidence",
+      "prompt": "qa12345 实例里提交订单接口报 500，帮我看看接口返回了什么错误信息",
+      "checks": [
+        "用 instance network --failed-only 定位请求，再 network-body 读响应体（而非 page eval 拦截或重放请求）",
+        "正确解读 bodyState（unavailable 时不硬造内容，[redacted] 不当成 bug）",
+        "查历史而不是 reload 重放（保现场意识）"
+      ]
     }
   ]
 }

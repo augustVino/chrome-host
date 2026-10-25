@@ -43,7 +43,7 @@ chrome-host env activity <id> [--limit N]   事件审计流（排查启动失败
 chrome-host instance list [--env <envId>]   列表
 chrome-host instance get <id>               详情（status/pid/cdpPort/profileDir）
 chrome-host instance status <id>            轻量状态（轮询用）
-chrome-host instance create <envId>         创建即启动（同步阻塞；长操作无总超时）
+chrome-host instance create <envId> [--name NAME]  创建即启动（同步阻塞；长操作无总超时）。--name 可选（1-64 字符、同环境唯一，重名 409 INSTANCE_NAME_CONFLICT）；多任务并行建议命名，后续命令按名引用（同名跨环境 → exit 2 列候选，改用 id）
 chrome-host instance start|stop|restart <id>   生命周期（restart 重拉 hosts）
 chrome-host instance open <id> <url>        新开标签页并导航（http/https 本地校验）
 chrome-host instance tabs <id>              标签页列表（仅 page 类型；id 即 page 命令的 tab 参数）
@@ -52,9 +52,10 @@ chrome-host instance focus <id>             唤出窗口到前台
 chrome-host instance cdp <id>               CDP endpoint（供 Playwright/DevTools 等外部工具；page 命令族不需要它）
 chrome-host instance cdp-session <id>       发放 CDP 会话 URL（外部 CDP 客户端远程接入用，30 分钟有效）
 chrome-host instance console <id> [--level error] [--tab T] [--limit N]   console 环（500 条，重启即清；--tab 按 tab 过滤）
-chrome-host instance network <id> [--failed-only] [--tab T]               请求环（失败/HTTP≥400 过滤；--tab 按 tab 过滤）
+chrome-host instance network <id> [--failed-only] [--tab T]               请求环（失败/HTTP≥400 过滤；--tab 按 tab 过滤；条目带 bodyState，table 另有 BODY 列）
+chrome-host instance network-body <id> <requestId> [--offset N] [--limit N]  读响应体（已脱敏；UTF-16 单位分页，truncated=true 时续读；404=不在环 409=不可读含归因）
 chrome-host instance screenshot <id> [--out F]  当前页 png（缺省 <id>.png）
-chrome-host instance har <id> [--out F]         请求环生成 HAR 1.2（缺省 <id>.har）
+chrome-host instance har <id> [--out F]         请求环生成 HAR 1.2（缺省 <id>.har；body 可用条目含脱敏后 text）
 chrome-host instance diagnostics <id>          页面诊断快照（错误/失败资源/LCP/FCP）
 chrome-host instance delete <id> --yes      删除（运行中自动 stop→delete）
 ```
@@ -64,11 +65,18 @@ chrome-host instance delete <id> --yes      删除（运行中自动 stop→dele
 命令结构：`chrome-host page <子命令> <insId> [tab] ...`。`tab` 是 `instance tabs` 输出的 targetId 唯一前缀；单标签实例可省略，多标签缺省报 `PAGE_TAB_AMBIGUOUS` 并列出全部 tab。本地/远程同用，无需 CDP 端口或代理凭证。
 
 ```text
-page snap    <id> [tab]                     可访问性树 + @eN 引用（--json 机器可读）
+page snap    <id> [tab]                     可访问性树 + @eN 引用 + [hover]/[hover-reveal] 标记（--json 另含 hoverScan 状态）
 page click   <id> <sel|@eN> [--tab t]       原生输入点击：可见性检查 + hit-test 拦截遮挡 + 三段鼠标事件
 page fill    <id> <sel|@eN> <value> [--tab t]  聚焦+清空+输入+回读校验；空 value = 仅清空
 page press   <id> <key> [--target <sel|@eN>] [--tab t]  键入：命名键/单字符/组合键（Control+A、Meta+V）；可先聚焦
 page wait    <id> <sel> [--state visible|hidden|attached|detached] [--timeout 10s] [--tab t]  轮询等待（缺省 visible）
+page navigate <id> <url> [--tab t]         页内导航（Page.navigate，保留历史；等 load 至多 25s，未证实 → loaded:false；net::ERR_* → 500 PAGE_NAV_FAILED）
+page back    <id> [--tab t]                历史后退一步（边界 → 409 PAGE_NAV_NO_HISTORY）
+page forward <id> [--tab t]               历史前进一步（边界 → 409 PAGE_NAV_NO_HISTORY）
+page reload  <id> [--ignore-cache] [--tab t]  重载当前页（等待语义同 navigate）
+page screenshot <id> [sel|@eN] [--out f] [--tab t]  png 截图：目标缺省=当前视口；元素路径先滚入视口再截包围盒（跨行取并集）
+page pdf     <id> [--out f] [--landscape] [--no-print-background] [--paper-width 8.5] [--paper-height 11] [--tab t]  整页 PDF（缺省 Letter 纵向带背景）
+page emulate <id> --preset NAME | --viewport WxH [--user-agent UA] [--mobile] [--touch] | --off [--tab t]  设备仿真（预设：iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p；仅作用该 tab，重复=覆盖，--off 恢复）
 page eval    <id> <expr> [--tab t]          执行 JS（returnByValue+awaitPromise；优先用上面的原语）
 page raw     <id> <method> [json] [--tab t] [--browser]  任意 CDP 命令透传（⚠ 最高权限逃生舱；--browser 发 browser 级）
 page html    <id> [selector] [--tab t]      页面/元素 outerHTML
@@ -92,6 +100,9 @@ page dialogs <id> [--tab t] [--since N]     自动接管弹窗历史（近 32 �
 | PAGE_FILL_VALUE_MISMATCH | 写入可能部分生效——先观察实际值再决定，勿盲目重试 |
 | PAGE_KEY_UNKNOWN | 键名不支持，见 press --help 键表 |
 | PAGE_WAIT_TIMEOUT | 超时，信息含最后观察态 |
+| PAGE_NAV_NO_HISTORY | back/forward 已在历史边界（409），换方向或继续任务 |
+| PAGE_NAV_FAILED | Page.navigate 返回 net::ERR_*（导航未发生）；与 loaded:false（已开始未证实）严格区分 |
+| PAGE_EMULATE_UNKNOWN_PRESET | 预设名不在表内（422），message 列出全部可用预设 |
 | PAGE_DISPATCH_FAILED | 附 effect_state：none=未发出可重试；unknown=已发出禁盲目重试，先观察 |
 | CDP_COMMAND_FAILED（大面积超时 + dialogs 无记录） | 疑似无主对话框卡死（对话框在应用断连期间弹出，CDP 通道不注册）：用 page raw 发 Page.navigate 强制导航恢复，或让用户在浏览器点掉 |
 | PAGE_EVAL_FAILED | 表达式抛异常（信息含异常文本） |
@@ -207,7 +218,7 @@ CLI 错误行格式 `[CODE] message（HTTP status）`。exit 3/6/8 已被退出�
 
 ## MCP 入口
 
-应用内嵌 MCP server（`http://127.0.0.1:17890/mcp`，Streamable HTTP，33 个 tools，能力为 CLI 子集——无 settings / 内核下载）。已配置 MCP 的会话可直接用 tools；本 skill 默认走 CLI，因为退出码契约与确认闸门对 agent 更安全。两者调用同一服务层，状态一致。
+应用内嵌 MCP server（`http://127.0.0.1:17890/mcp`，Streamable HTTP，53 个 tools，能力为 CLI 子集——无 settings / 内核下载）。已配置 MCP 的会话可直接用 tools；本 skill 默认走 CLI，因为退出码契约与确认闸门对 agent 更安全。两者调用同一服务层，状态一致。
 
 ## 安全与边界
 

@@ -1,6 +1,6 @@
 ---
 name: chrome-host
-description: chrome-host 桌面应用的完整 agent 技能：编排多环境隔离 Chrome 实例（查/建环境、启停实例、开标签页、登录态快照、hosts 注入、扩展与内核管理），并用 chrome-host page 命令族直接做页面操控（snap @eN 引用、原生点击、表单填写 fill/press、元素等待 wait、eval、坐标点击、弹窗自动接管）。只要用户提到"用 XX 环境打开/排查/测试"（qa、sandbox 等环境名）、需要独立 profile / hosts 注入 / 免登录的浏览器、在隔离浏览器里点按钮/填表单/提交/截图/读 DOM、或管理 chrome-host 的环境实例，就必须使用本 skill。与本机手动以 --remote-debugging-port 启动、与 chrome-host 无关的调试 Chrome 相关的纯页面操作不走本 skill。
+description: chrome-host 桌面应用的完整 agent 技能：编排多环境隔离 Chrome 实例（查/建环境、实例命名锚定、启停实例、开标签页、登录态快照、hosts 注入、扩展与内核管理），并用 chrome-host page 命令族直接做页面操控（snap @eN 引用与 hover 提示、原生点击、表单填写 fill/press、元素等待 wait、页内导航与历史回退、元素/视口截图、PDF 导出、设备仿真、eval、坐标点击、弹窗自动接管），以及排障取证（console/请求历史、脱敏响应体读取、HAR 导出）。只要用户提到"用 XX 环境打开/排查/测试"（qa、sandbox 等环境名）、需要独立 profile / hosts 注入 / 免登录的浏览器、在隔离浏览器里点按钮/填表单/提交/截图/读 DOM/看接口返回、或管理 chrome-host 的环境实例，就必须使用本 skill。与本机手动以 --remote-debugging-port 启动、与 chrome-host 无关的调试 Chrome 相关的纯页面操作不走本 skill。
 ---
 
 # Chrome Host — 隔离 Chrome 编排 + 页面自动化
@@ -66,7 +66,9 @@ chrome-host instance list --env <envId> --json
 
 - 有 `running` → **直接复用**（登录态、已开页面都在）。
 - 有 `stopped` → `chrome-host instance start <insId>`（保留 profile，登录态还在）。
-- 无 → `chrome-host instance create <envId> --quiet`。
+- 无 → `chrome-host instance create <envId> --name <任务名> --quiet`。
+
+实例可命名（1-64 字符、同环境唯一、重名 409）：**多任务并行时务必命名**——后续命令按名引用（如 `instance stop qa任务A`），免得拿 uuid 锚错实例。同名实例存在于多个环境时按名引用会报错并列出候选，改用 id 消歧。
 
 `instance create` 创建即启动、同步阻塞，CLI 对启动类长操作不设总超时——首次运行阻塞于内核下载（~200MB）是正常现象，不会误判失败。想先确认内核：`chrome-host runtime version`；未装则 `chrome-host runtime install`（默认上限 900s，超时 exit 9）。
 
@@ -100,11 +102,18 @@ URL 必须 http:// 或 https:// 开头（本地校验，非法 exit 2 且请求�
 操控命令直连应用 API——**本地与远程接入（exit 10）均直接可用，无需拿 CDP 端口或代理凭证**。`<tab>` 是 `instance tabs` 输出的 targetId 唯一前缀（如 `6BE8AB81`）；单标签实例可省略，多标签缺省会报 `PAGE_TAB_AMBIGUOUS` 并列出全部 tab 供选择。
 
 ```bash
-chrome-host page snap    <id> [tab]                    # 可访问性树 + @eN 引用（操作循环起点）
+chrome-host page snap    <id> [tab]                    # 可访问性树 + @eN 引用 + [hover] 提示（操作循环起点）
 chrome-host page click   <id> <sel|@eN> [--tab t]      # 原生输入点击（非 el.click()）
 chrome-host page fill    <id> <sel|@eN> <value> [--tab t]  # 聚焦+清空+输入+回读校验（表单用它，别 eval 手写）
 chrome-host page press   <id> <key> [--target <sel|@eN>] [--tab t]  # Enter/Tab/箭头/F1-F12/Control+A 组合键
 chrome-host page wait    <id> <sel> [--state visible|hidden|attached|detached] [--timeout 10s] [--tab t]  # SPA 渲染等待用它，别 sleep
+chrome-host page navigate <id> <url> [--tab t]         # 页内导航（保留历史；等 load 至多 25s，未证实 → loaded:false）
+chrome-host page back    <id> [--tab t]                # 历史后退（边界 → 409 PAGE_NAV_NO_HISTORY）
+chrome-host page forward <id> [--tab t]               # 历史前进
+chrome-host page reload  <id> [--ignore-cache] [--tab t]  # 重载当前页
+chrome-host page screenshot <id> [sel|@eN] [--out f] [--tab t]  # 视口/元素截图（png 写文件）
+chrome-host page pdf     <id> [--out f] [--landscape] [--paper-width 8.5] [--paper-height 11] [--tab t]  # 整页 PDF
+chrome-host page emulate <id> --preset iphone-14|... | --viewport WxH [--user-agent UA] | --off [--tab t]  # 设备仿真（仅作用该 tab）
 chrome-host page eval    <id> <expr> [--tab t]         # 执行 JS（优先用上面的原语，eval 是逃生舱）
 chrome-host page raw     <id> <method> [json] [--tab t] [--browser]  # 任意 CDP 命令透传（最高权限逃生舱，未覆盖场景用）
 chrome-host page html    <id> [selector] [--tab t]     # 页面/元素 HTML
@@ -114,11 +123,13 @@ chrome-host page loadall <id> <sel> [--interval 1.5s] [--tab t]  # 反复点"加
 chrome-host page dialogs <id> [--tab t] [--since N]    # 自动接管的弹窗历史（近 32 条）
 ```
 
-操作循环：**`snap → 用 @eN 操作 → 页面变化后重 snap`**。
+操作循环：**`snap → 用 @eN 操作 → 页面变化后重 snap`**。页内跳转用 `page navigate`（保留历史可 back/forward；实例级 `instance navigate` 是新开+关旧近似会丢历史，仅 GUI 兼容保留）。
 
 关键约定（断链几乎都出在这里）：
 
 - **元素定位优先 @eN 引用**：snap 给可交互节点（button/link/textbox/checkbox…）编号输出 `@e3 [button] 提交`，click/fill/press 直接吃引用，比 CSS 选择器稳（不受 CSS-in-JS hash、动态列表位移影响）。导航后引用整表失效（报 `PAGE_REF_STALE`）——这是特性：重新 snap 再操作，不要对旧引用重试。
+- **[hover] / [hover-reveal] 提示（菜单类页面必看）**：snap 会静态扫描页面 CSS 的 :hover 规则，标记两类元素——`@e1 [button] [hover] 菜单` = 悬停它有反应（先 `page press`/无直接命令时用 `page raw` 发 Input.dispatchMouseEvent 悬停，或用 clickxy 悬停坐标），`@e2 [button] [hover-reveal] 子项` = 它藏在某 hover 展开区里（先悬停触发器再重 snap 拿展开后的新引用）。没有标记 ≠ 确认无 hover（响应 meta 的 hoverScan: ok|truncated|skipped|error 披露扫描完整性，truncated=可能漏看）。
+- **截图/PDF/仿真**：`page screenshot` 带选择器或 @eN 截该元素（跨行元素取完整包围盒），不带截当前视口；`page pdf` 整页导出（默认 Letter 纵向带背景）；`page emulate --preset iphone-14` 模拟设备视口+UA+触控（仅该 tab，`--off` 恢复，重复 emulate=覆盖）。
 - **弹窗已自动接管**：页面 alert/confirm/prompt/beforeunload 由应用自动 accept（beforeunload=放行离开，prompt 提交默认文本），不阻塞命令；命令期间弹过的窗以 `dialogs_seen` 附在输出里，`page dialogs` 查历史。
 - **错误看 [PAGE_*] 前缀分支处置**，不解析文案：`PAGE_ELEMENT_BLOCKED`（被浮层遮挡，先处理遮挡）/ `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_REF_NOT_FOUND`·`PAGE_REF_STALE`（重 snap）/ `PAGE_TARGET_NOT_FILLABLE` / `PAGE_FILL_VALUE_MISMATCH`（写入可能部分生效，先观察再重试）/ `PAGE_WAIT_TIMEOUT` / `PAGE_DISPATCH_FAILED`（附 effect_state：none=未发出可重试，unknown=已发出禁盲目重试）/ `PAGE_TAB_AMBIGUOUS`（多 tab，带列表重选）。
 - **跨域 iframe**：eval/fill 的 selector 均不可达；用 `clickxy`（视口坐标，事件穿透 iframe 边界）点入目标获得焦点后 `type` 输入。
@@ -132,13 +143,16 @@ chrome-host page dialogs <id> [--tab t] [--since N]    # 自动接管的弹窗�
 
 ```bash
 chrome-host instance console  <insId> --level error        # JS 错误（含 unhandledrejection）
-chrome-host instance network  <insId> --failed-only        # 失败请求或 HTTP ≥400
+chrome-host instance network  <insId> --failed-only        # 失败请求或 HTTP ≥400（table 含 BODY 列 = bodyState）
+chrome-host instance network-body <insId> <requestId> [--offset N]  # 读响应体（已脱敏；分页续读看 truncated）
 chrome-host instance screenshot <insId> --out /tmp/now.png # 不动页面看当前现场（png）
 chrome-host instance har      <insId> --out /tmp/trace.har # 完整时序导出（HAR 1.2，可直接给 LLM 分析）
 chrome-host instance diagnostics <insId>                    # 当前页快照：JS 错误/失败资源/LCP/FCP
 ```
 
-选择顺序：console/network 先定位直接证据 → screenshot 看视觉现场 → diagnostics 拿性能指标 → har 导出做完整时序分析（无请求/响应头、分阶段耗时以 -1 占位）。注意：缓冲随实例重启清空，重启后查不到重启前的记录。
+选择顺序：console/network 先定位直接证据 → 需要看接口返回内容时 `network-body`（requestId 从 network 输出拿；仅 bodyState=available/partial 可读，响应已自动脱敏——敏感字段值变 [redacted] 是安全特性不是 bug）→ screenshot 看视觉现场 → diagnostics 拿性能指标 → har 导出做完整时序分析。
+
+**证据边界意识（诚实证据）**：console/network 的 `--json` 输出带 meta（dropped=环溢出丢弃数、since=采集窗口起点、live=采集是否存活、scope="completed"=进行中请求不可见）；条目的 bodyState 披露响应体可用性（available/partial/evicted/unavailable + reason）。**meta 里 dropped≠0 或 since 晚于事发时刻时，明确告知用户"证据不完整"而不是当作"没有问题"**——这不是额外负担，是防止把"没采到"误读成"没发生"。缓冲随实例重启清空；har 未采集字段以 -1/空集占位（语义见 har 顶层 _meta）。
 
 ### 7. 拦截/改写网络（net-rules 扩展，按环境配置）
 
@@ -178,4 +192,8 @@ agent 的 shell 是非交互环境（非 TTY），缺 `--yes` 时这些命令直
 | page 命令族全量速查与 PAGE_* 错误码表 | references/cli.md「页面操控（page 命令族）」 |
 | 登录态自动保存 / 显式固化 / 回滚 | references/cli.md「登录态」 |
 | 远程接入原理与隧道排障 | references/cli.md「远程接入」 |
-| MCP 入口（44 个 tools，含 page_* 十一族）与安全边界 | references/cli.md 末尾两章 |
+| MCP 入口（53 个 tools，含 page_* 十八族）与安全边界 | references/cli.md 末尾两章 |
+
+## 评估与回归（evals/）
+
+项目内置浏览器能力评估框架（顶级 `evals/` 目录，node 零依赖）：`CARGO_TARGET_DIR=<target> node evals/cli.mjs run` 跑三类证据源（页面事件/CLI 输出标记/外部事实）× 三态判定（证据缺失 ≠ 通过）。修 page 命令族 bug 时应同步补 regression case——详见 evals/README.md。
