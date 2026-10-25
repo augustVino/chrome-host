@@ -1,0 +1,29 @@
+{
+  "id": "page-controls-basic",
+  "title": "表单填写与导航基础链",
+  "fixture": { "startPath": "/form" },
+  "task": "用 chrome-host CLI 在 fixture 页完成：snap 拿到 AX 树与 @eN 引用 → fill 把 eval-{runId} 填入搜索框 → click 提交 → 页内回显包含所填值",
+  "assertions": {
+    "site": [
+      { "event": "form.submitted", "where": { "data.text": "eval-{runId}" }, "minCount": 1 }
+    ],
+    "response": [
+      { "pattern": "refs_count", "name": "response:snap产出refs" },
+      { "pattern": "Filled .*eval-{runId}" }
+    ],
+    "adapter": [
+      { "evidenceKey": "result_html", "contains": "eval-{runId}", "name": "adapter:页内回显含所填值" }
+    ]
+  },
+  "smoke": [
+    { "step": "cli", "args": ["env", "create", "eval-{runId}", "--json"], "saveAs": "envId", "path": "id" },
+    { "step": "cli", "args": ["instance", "create", "{envId}", "--name", "eval-{runId}", "--json"], "saveAs": "insId", "path": "id" },
+    { "step": "cli", "args": ["instance", "open", "{insId}", "{baseUrl}/form", "--json"], "saveAs": "tabId", "path": "id" },
+    { "step": "wait", "args": ["page", "html", "{insId}", "#demo-input", "--tab", "{tabId}"], "until": { "path": "html", "contains": "demo-input" }, "timeoutMs": 15000, "intervalMs": 500 },
+    { "step": "cli", "args": ["page", "snap", "{insId}", "{tabId}", "--json"] },
+    { "step": "cli", "args": ["page", "fill", "{insId}", "#demo-input", "eval-{runId}", "--tab", "{tabId}", "--json"] },
+    { "step": "cli", "args": ["page", "click", "{insId}", "#submit-btn", "--tab", "{tabId}", "--json"] },
+    { "step": "sleep", "ms": 400 },
+    { "step": "cli", "args": ["page", "html", "{insId}", "#form-result", "--tab", "{tabId}", "--json"], "saveAs": "result_html", "path": "html" }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "id": "instance-naming",
+  "title": "实例命名与按名引用",
+  "task": "命名创建实例：同环境重名第二次创建报 409 INSTANCE_NAME_CONFLICT；用 name（而非 id）引用实例执行 stop，得到 stopped 快照",
+  "assertions": {
+    "response": [
+      { "pattern": "INSTANCE_NAME_CONFLICT", "name": "response:重名409标记" },
+      { "pattern": "\"name\": \"eval-{runId}\"", "name": "response:创建快照含命名" }
+    ],
+    "adapter": [
+      { "evidenceKey": "dup_err", "equals": "INSTANCE_NAME_CONFLICT", "name": "adapter:重名错误码" },
+      { "evidenceKey": "stopped_status", "equals": "stopped", "name": "adapter:按名stop后状态" }
+    ]
+  },
+  "smoke": [
+    { "step": "cli", "args": ["env", "create", "eval-{runId}", "--json"], "saveAs": "envId", "path": "id" },
+    { "step": "cli", "args": ["instance", "create", "{envId}", "--name", "eval-{runId}", "--json"], "saveAs": "insId", "path": "id" },
+    { "step": "cli", "args": ["instance", "create", "{envId}", "--name", "eval-{runId}", "--json"], "allowFailure": true, "saveAs": "dup_err", "path": "error.code" },
+    { "step": "cli", "args": ["instance", "stop", "eval-{runId}", "--json"], "saveAs": "stopped_status", "path": "status" }
+  ]
+}
