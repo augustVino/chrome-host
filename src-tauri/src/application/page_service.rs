@@ -66,8 +66,9 @@ use crate::domain::instance::InstanceStatus;
 use crate::domain::page_control::{
     dialog_accept_params, fill_fillable_check_expr, hit_test_expr, largest_quad_centroid,
     locate_expr, normalize_ref, observed_matches_state, parse_dialog_opening, parse_duration,
-    parse_key, quads_bbox, rounded_clip, validate_http_url, wait_observe_expr, DialogBuffer,
-    DialogInfo, ObservedState, PageControlError, Point, RefStore, WaitState, MAX_DIALOG_BUFFER,
+    parse_key, quads_bbox, rounded_clip, scan_hover_rules, validate_http_url, wait_observe_expr,
+    DialogBuffer, DialogInfo, HoverRules, ObservedState, PageControlError, Point, RefStore,
+    WaitState, MAX_DIALOG_BUFFER, MAX_HOVER_SHEETS,
 };
 use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::{connect_page, SharedPageConn};
@@ -93,6 +94,14 @@ const NAV_LOAD_TIMEOUT: Duration = Duration::from_secs(25);
 /// back/forward 的提交确认轮询间隔（历史索引 currentIndex 到位即提交；与
 /// wait 轮询同量级，无需参数化）。
 const NAV_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// hover 扫描：样式表登记回放等待窗口（attach 后 CSS.enable 的
+/// styleSheetAdded 事件异步在途，首条 snap 可能赶在回放前）；与 attach 握手
+/// 窗口同量级。无表页（about:blank）每次 snap 付此窗口——接受（低频场景）。
+const HOVER_SETTLE_WINDOW: Duration = Duration::from_millis(300);
+const HOVER_SETTLE_POLL: Duration = Duration::from_millis(10);
+/// hover 扫描：单选择器命中上限，超出按截断处理（防 `div` 类选择器命中
+/// 万级节点；漏标优于错标，状态诚实报 truncated）。
+const MAX_HOVER_QUERY_HITS: usize = 1000;
 /// loadall 缺省轮询间隔（TS loadAllStr 的 1500ms）
 const DEFAULT_LOADALL_INTERVAL: Duration = Duration::from_millis(1500);
 /// loadall 缺省点击上限。TS 是 5min 硬顶（200 × 1500ms = 5min，量级对齐），
@@ -227,6 +236,14 @@ struct Watched {
     /// targetId（与 refs/dialogs 同键，drop_tab 一并清理）；超时/失败路径的
     /// Sender 残留至下次 load 事件（send 落空即弃，仅句柄暂存无泄漏风险）。
     load_waiters: Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<()>>>>,
+    /// per-tab 样式表登记（hover 扫描用）：CSS.enable 后 styleSheetAdded/
+    /// Removed 事件维护。key = targetId → { styleSheetId → (origin, disabled) }；
+    /// 读取侧才按 origin=regular 且未 disabled 过滤（登记全量，事件流不打折扣）。
+    sheets: Mutex<SheetRegistry>,
+    /// per-tab CSS.enable 成功时刻：hover 扫描的结算窗口只在该时刻后的首个
+    /// HOVER_SETTLE_WINDOW 内生效（styleSheetAdded 回放可能仍在途）；窗口过后
+    /// 登记仍空 = 真无表，后续 snap 即时返回（不为无表页付每快照等待）。
+    css_since: Mutex<HashMap<String, Instant>>,
     /// 代际计数：每次建连 +1。旧代 watch_loop 在清理点核对代际，新一代已
     /// 接管时不动登记表/连接槽（防僵尸 loop 误删新代状态）。
     generation: AtomicU64,
@@ -241,6 +258,8 @@ impl Watched {
             refs: Mutex::new(HashMap::new()),
             dialogs: Mutex::new(HashMap::new()),
             load_waiters: Mutex::new(HashMap::new()),
+            sheets: Mutex::new(HashMap::new()),
+            css_since: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         }
     }
@@ -325,12 +344,15 @@ impl PageService {
         )
         .await?;
         let gen = watched.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        // 旧代残留的 tabs/refs/dialogs/load_waiters 属于死会话（sessionId 已
-        // 失效），整清（等待中的导航命令各自走到自己的超时分支）
+        // 旧代残留的 tabs/refs/dialogs/load_waiters/sheets 属于死会话（sessionId
+        // 已失效），整清（等待中的导航命令各自走到自己的超时分支；CSS.enable
+        // 重发后 styleSheetAdded 会重新回放）
         watched.tabs.lock().unwrap().clear();
         watched.refs.lock().unwrap().clear();
         watched.dialogs.lock().unwrap().clear();
         watched.load_waiters.lock().unwrap().clear();
+        watched.sheets.lock().unwrap().clear();
+        watched.css_since.lock().unwrap().clear();
         *watched.conn.lock().unwrap() = Some(Arc::clone(&conn));
         tauri::async_runtime::spawn(watch_loop(
             ins_id.to_string(),
@@ -910,6 +932,39 @@ async fn handle_event(watched: &Watched, event: &Value) {
                 }
             }
         }
+        // hover 扫描的样式表登记：CSS.enable（on_attached）后 Chrome 回放/增量
+        // 推送 styleSheetAdded；Removed 按表撤销。读取侧才过滤 origin/disabled。
+        "CSS.styleSheetAdded" => {
+            if let Some(tid) = tab_of_session(watched, event) {
+                let Some(header) = params.get("header") else { return };
+                let (Some(id), Some(origin)) = (
+                    header.get("styleSheetId").and_then(Value::as_str),
+                    header.get("origin").and_then(Value::as_str),
+                ) else {
+                    return;
+                };
+                let disabled = header
+                    .get("disabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                watched
+                    .sheets
+                    .lock()
+                    .unwrap()
+                    .entry(tid)
+                    .or_default()
+                    .insert(id.to_string(), (origin.to_string(), disabled));
+            }
+        }
+        "CSS.styleSheetRemoved" => {
+            if let Some(tid) = tab_of_session(watched, event) {
+                if let Some(id) = params.get("styleSheetId").and_then(Value::as_str) {
+                    if let Some(m) = watched.sheets.lock().unwrap().get_mut(&tid) {
+                        m.remove(id);
+                    }
+                }
+            }
+        }
         // 仅根 frame（parentId 为空）才失效：子 frame 导航不换文档（§3.6）
         "Page.frameNavigated" => {
             if let Some(tid) = tab_of_session(watched, event) {
@@ -966,10 +1021,28 @@ async fn on_attached(watched: &Watched, params: &Value) {
     // 至超时）；若 alert 挂着，先探测 accept 再 enable 才能全部成功。探测
     // 与常规事件驱动路径互不干扰（无对话框时 -32602 静默）。
     probe_reconnected_dialog(watched, &conn, tid, sid).await;
-    for method in ["Page.enable", "DOM.enable"] {
-        if let Err(e) = cdp_send(&conn, method, json!({}), Some(sid)).await {
-            tracing::debug!("[page] session {sid} {method} 失败: {e}");
+    // CSS.enable 与 Page/DOM 同点位：hover 扫描的 styleSheetAdded 回放从 attach
+    // 起积累（snap 时按需 enable 无法同步拿到回放——事件异步，注册表会是空）。
+    // 成功时刻入 css_since：hover 扫描的结算窗口以此为起点。
+    let mut css_enabled = false;
+    for method in ["Page.enable", "DOM.enable", "CSS.enable"] {
+        let ok = match cdp_send(&conn, method, json!({}), Some(sid)).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::debug!("[page] session {sid} {method} 失败: {e}");
+                false
+            }
+        };
+        if method == "CSS.enable" {
+            css_enabled = ok;
         }
+    }
+    if css_enabled {
+        watched
+            .css_since
+            .lock()
+            .unwrap()
+            .insert(tid.to_string(), Instant::now());
     }
 }
 
@@ -1022,6 +1095,8 @@ fn drop_tab(watched: &Watched, tid: &str) {
     watched.refs.lock().unwrap().remove(tid);
     watched.dialogs.lock().unwrap().remove(tid);
     watched.load_waiters.lock().unwrap().remove(tid);
+    watched.sheets.lock().unwrap().remove(tid);
+    watched.css_since.lock().unwrap().remove(tid);
 }
 
 fn on_detached(watched: &Watched, params: &Value) {
@@ -1482,7 +1557,12 @@ fn should_show(node: &Value) -> bool {
     true
 }
 
-fn format_ax_line(node: &Value, depth: usize, r#ref: Option<&str>) -> String {
+fn format_ax_line(
+    node: &Value,
+    depth: usize,
+    r#ref: Option<&str>,
+    hover: Option<&str>,
+) -> String {
     let role = ax_field(node, "role").unwrap_or("");
     let name = ax_field(node, "name").unwrap_or("");
     let value = node.get("value").and_then(|v| v.get("value"));
@@ -1491,6 +1571,11 @@ fn format_ax_line(node: &Value, depth: usize, r#ref: Option<&str>) -> String {
         line.push_str(&format!("@{r} "));
     }
     line.push_str(&format!("[{role}]"));
+    // hover 感知标记（紧随 role，grep "[hover]" 直接命中）：[hover] = hover
+    // 它会有效果；[hover-reveal] = hover 后才显示/变化的目标
+    if let Some(m) = hover {
+        line.push_str(&format!(" [{m}]"));
+    }
     if !name.is_empty() {
         line.push_str(&format!(" {name}"));
     }
@@ -1538,6 +1623,7 @@ fn visit_ax(
     v: &mut AxVisit,
     by_id: &HashMap<String, &Value>,
     by_parent: &HashMap<String, Vec<&Value>>,
+    hover: &HoverMarks,
 ) {
     let key = ax_key(node.get("nodeId").unwrap_or(&Value::Null));
     if !v.visited.insert(key) {
@@ -1563,8 +1649,12 @@ fn visit_ax(
         assigned = Some(r);
     }
     if should_show(node) {
+        let mark = node
+            .get("backendDOMNodeId")
+            .and_then(Value::as_i64)
+            .and_then(|b| hover.get(&b).copied());
         v.lines
-            .push(format_ax_line(node, depth, assigned.as_deref()));
+            .push(format_ax_line(node, depth, assigned.as_deref(), mark));
     }
     let own_key = ax_key(node.get("nodeId").unwrap_or(&Value::Null));
     let mut seen: HashSet<String> = HashSet::new();
@@ -1589,13 +1679,20 @@ fn visit_ax(
         }
     }
     for child in children {
-        visit_ax(child, depth + 1, v, by_id, by_parent);
+        visit_ax(child, depth + 1, v, by_id, by_parent, hover);
     }
 }
 
+/// snap hover 感知：backendNodeId → 标记（"hover" = hover 触发器，
+/// "hover-reveal" = hover 后才显示/变化的目标）。
+type HoverMarks = HashMap<i64, &'static str>;
+/// per-tab 样式表登记：targetId → { styleSheetId → (origin, disabled) }。
+type SheetRegistry = HashMap<String, HashMap<String, (String, bool)>>;
+
 /// Accessibility.getFullAXTree 的 nodes → (text, refs)。refs 形状 = TS
 /// collectSnapshot 的 `[{ref, backendNodeId, name?}]`（RefStore::replace 入参）。
-fn collect_ax_tree(nodes: &[Value]) -> (String, Vec<Value>) {
+/// hover：ref 命中的 hover 标记（第二遍渲染传入；第一遍传空表只取 refs）。
+fn collect_ax_tree(nodes: &[Value], hover: &HoverMarks) -> (String, Vec<Value>) {
     let by_id: HashMap<String, &Value> = nodes
         .iter()
         .map(|n| (ax_key(n.get("nodeId").unwrap_or(&Value::Null)), n))
@@ -1616,11 +1713,11 @@ fn collect_ax_tree(nodes: &[Value]) -> (String, Vec<Value>) {
     };
     for n in nodes {
         if is_root(n, &by_id) {
-            visit_ax(n, 0, &mut v, &by_id, &by_parent);
+            visit_ax(n, 0, &mut v, &by_id, &by_parent, hover);
         }
     }
     for n in nodes {
-        visit_ax(n, 0, &mut v, &by_id, &by_parent); // 兜底：游离节点（visited 已去重）
+        visit_ax(n, 0, &mut v, &by_id, &by_parent, hover); // 兜底：游离节点（visited 已去重）
     }
     (v.lines.join("\n"), v.refs)
 }
@@ -1637,7 +1734,12 @@ async fn snap_tool(watched: &Watched, _tid: &str, sid: &str) -> Result<Value, Ap
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let (text, refs) = collect_ax_tree(&nodes);
+    // 两遍渲染：第一遍只取 refs（backendNodeId 全集，hover 桥接的输入），
+    // hover 扫描后第二遍带标记渲染文本树（纯内存重入，代价可忽略）
+    let (_, refs) = collect_ax_tree(&nodes, &HoverMarks::default());
+    // hover 感知（增强项：任何失败不阻断 snap 主体，状态如实上报）
+    let hover = hover_scan(watched, &conn, _tid, sid, &refs).await;
+    let (text, refs) = collect_ax_tree(&nodes, &hover.marks);
     let refs_count = refs.len();
     // 整表替换 + generation+1 + 清 stale（§3.5）：refs 只描述最后一次 snap
     let generation = {
@@ -1646,7 +1748,192 @@ async fn snap_tool(watched: &Watched, _tid: &str, sid: &str) -> Result<Value, Ap
         store.replace(&Value::Array(refs));
         store.generation()
     };
-    Ok(json!({ "text": text, "refs_count": refs_count, "generation": generation }))
+    Ok(json!({ "text": text, "refs_count": refs_count, "generation": generation, "hoverScan": hover.status }))
+}
+
+/// snap hover 感知的扫描结果：ref 行标记 + meta 状态。
+struct HoverOutcome {
+    /// backendNodeId → "hover" | "hover-reveal"（collect_ax_tree 第二遍入参）
+    marks: HoverMarks,
+    /// "ok" | "truncated" | "skipped" | "error"——任务书三值外增加 error
+    ///（桥接等基础设施故障，诚实区分「没扫出」与「扫不了」），报告披露
+    status: &'static str,
+}
+
+/// hover 扫描编排（spike 定案路径，全部 CDP 域、零注入）：
+/// 样式表登记（CSS.enable@attach → styleSheetAdded 事件，origin=regular 且
+/// 未 disabled）→ CSS.getStyleSheetText → domain 提取（预算 MAX_HOVER_*）→
+/// DOM.querySelectorAll 逐选择器求值（spike 验证：纯选择器零文本污染、
+/// display:none 的 reveal 目标可命中）→ DOM.pushNodesByBackendIdsToFrontend
+/// 一次批量桥 backendNodeId → nodeId → 命中映射 ref 行标记。
+/// 失败语义（诚实证据）：单表/单选择器失败 → 截断标记继续（部分数据优于
+/// 无数据）；桥接失败 → status error（标记无法落到 ref，snap 主体不受影响）。
+async fn hover_scan(
+    watched: &Watched,
+    conn: &SharedPageConn,
+    tid: &str,
+    sid: &str,
+    refs: &[Value],
+) -> HoverOutcome {
+    // 登记为空时短等回放窗口（attach 后 CSS.enable 的 styleSheetAdded 在途）
+    wait_sheets(watched, tid).await;
+    let regular: Vec<String> = {
+        let sheets = watched.sheets.lock().unwrap();
+        let Some(m) = sheets.get(tid) else {
+            return HoverOutcome { marks: HoverMarks::default(), status: "skipped" };
+        };
+        let mut ids: Vec<String> = m
+            .iter()
+            .filter(|(_, (origin, disabled))| origin == "regular" && !disabled)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort(); // HashMap 迭代序随机，排序保证扫描/截断可复现
+        ids
+    };
+    let total = regular.len();
+    if total == 0 {
+        return HoverOutcome { marks: HoverMarks::default(), status: "skipped" };
+    }
+    let mut truncated = total > MAX_HOVER_SHEETS;
+    // 取文本（≤32 张；单表失败跳过 + 截断标记）
+    let mut texts: Vec<String> = Vec::new();
+    for id in regular.iter().take(MAX_HOVER_SHEETS) {
+        match cdp_send(
+            conn,
+            "CSS.getStyleSheetText",
+            json!({ "styleSheetId": id }),
+            Some(sid),
+        )
+        .await
+        {
+            Ok(r) => {
+                if let Some(t) = r.get("text").and_then(Value::as_str) {
+                    texts.push(t.to_string());
+                }
+            }
+            Err(_) => truncated = true,
+        }
+    }
+    // domain 纯函数提取（预算：单表 2MiB / 总规则 256，内部如实置 truncated）
+    let slices: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    let rules: HoverRules = scan_hover_rules(&slices, total);
+    truncated |= rules.truncated;
+    if rules.triggers.is_empty() && rules.reveals.is_empty() {
+        // 无 hover 规则（或仅 :not(:hover) 等）→ skipped；有截断则 truncated 优先
+        //（可能漏看了未扫到的规则，不装作「确认无」）
+        let status = if truncated { "truncated" } else { "skipped" };
+        return HoverOutcome { marks: HoverMarks::default(), status };
+    }
+    // DOM 求值：根 nodeId（fill 定位链同款 getDocument；退化值 1 = 主文档恒为
+    // 首个 getDocument 的 nodeId，spike 实测）
+    let root = match cdp_send(conn, "DOM.getDocument", json!({}), Some(sid)).await {
+        Ok(r) => r.pointer("/root/nodeId").and_then(Value::as_i64).unwrap_or(1),
+        Err(_) => 1,
+    };
+    let mut trigger_hits: HashSet<i64> = HashSet::new();
+    let mut reveal_hits: HashSet<i64> = HashSet::new();
+    for sel in &rules.triggers {
+        hover_query_hits(conn, sid, root, sel, &mut trigger_hits, &mut truncated).await;
+    }
+    for sel in &rules.reveals {
+        hover_query_hits(conn, sid, root, sel, &mut reveal_hits, &mut truncated).await;
+    }
+    // 桥接：ref 的 backendNodeId 全集 → nodeId（一次批量，spike 验证逐位对齐）
+    let backends: Vec<i64> = refs
+        .iter()
+        .filter_map(|e| e.get("backendNodeId").and_then(Value::as_i64))
+        .collect();
+    let node_ids: Vec<i64> = match cdp_send(
+        conn,
+        "DOM.pushNodesByBackendIdsToFrontend",
+        json!({ "backendNodeIds": backends }),
+        Some(sid),
+    )
+    .await
+    {
+        Ok(r) => r
+            .get("nodeIds")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_i64).collect())
+            .unwrap_or_default(),
+        Err(_) => {
+            return HoverOutcome { marks: HoverMarks::default(), status: "error" };
+        }
+    };
+    if node_ids.len() != backends.len() {
+        // 形状防御（逐位映射的前提）：宁可放弃标记也不错位错标
+        return HoverOutcome { marks: HoverMarks::default(), status: "error" };
+    }
+    // 映射：hover 优先于 hover-reveal（既是触发器又是目标时，hover 语义对
+    // agent 更可操作：hover 它一定有效果）
+    let mut marks = HoverMarks::new();
+    for (backend, nid) in backends.iter().zip(node_ids) {
+        if trigger_hits.contains(&nid) {
+            marks.insert(*backend, "hover");
+        } else if reveal_hits.contains(&nid) {
+            marks.insert(*backend, "hover-reveal");
+        }
+    }
+    let status = if truncated { "truncated" } else { "ok" };
+    HoverOutcome { marks, status }
+}
+
+/// 单选择器求值：命中 nodeId 集合（上限 MAX_HOVER_QUERY_HITS，超出截断）。
+/// 选择器非法（CDP 报错，启发式提取产物可能的形态）→ 跳过该选择器 + 截断。
+async fn hover_query_hits(
+    conn: &SharedPageConn,
+    sid: &str,
+    root: i64,
+    sel: &str,
+    hits: &mut HashSet<i64>,
+    truncated: &mut bool,
+) {
+    match cdp_send(
+        conn,
+        "DOM.querySelectorAll",
+        json!({ "nodeId": root, "selector": sel }),
+        Some(sid),
+    )
+    .await
+    {
+        Ok(r) => {
+            let ids = r
+                .get("nodeIds")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if ids.len() > MAX_HOVER_QUERY_HITS {
+                *truncated = true;
+            }
+            for nid in ids.into_iter().take(MAX_HOVER_QUERY_HITS) {
+                if let Some(n) = nid.as_i64() {
+                    hits.insert(n);
+                }
+            }
+        }
+        Err(_) => *truncated = true,
+    }
+}
+
+/// 登记为空时短等 styleSheetAdded 回放：仅当 CSS.enable 刚发出（css_since
+/// 在窗口内）时生效——窗口起点是 enable 时刻而非本次 snap（无表页只有首个
+/// 窗口期内的 snap 付等待，之后即时返回）。到点放行，空登记按无表处理。
+async fn wait_sheets(watched: &Watched, tid: &str) {
+    let since = watched.css_since.lock().unwrap().get(tid).copied();
+    let Some(t0) = since else { return };
+    let deadline = t0 + HOVER_SETTLE_WINDOW;
+    loop {
+        let empty = watched
+            .sheets
+            .lock()
+            .unwrap()
+            .get(tid)
+            .is_none_or(|m| m.is_empty());
+        if !empty || Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(HOVER_SETTLE_POLL).await;
+    }
 }
 
 /// ref → backendNodeId 查表（miss 按 P2-A ref_miss 语义选 stale/not_found）。
@@ -3263,7 +3550,8 @@ mod tests {
                 }),
             ),
         ];
-        let (text, refs) = collect_ax_tree(&nodes);
+        let marks = HoverMarks::default();
+        let (text, refs) = collect_ax_tree(&nodes, &marks);
         assert_eq!(
             text, "[WebArea] Home\n  @e1 [button] OK\n  @e2 [textbox] q = \"hi\"",
             "generic 隐藏；interactive 前序编号；值按 JSON.stringify 形态"
@@ -3301,7 +3589,8 @@ mod tests {
             ax_node("6", "InlineTextBox", json!({ "name": { "value": "xx" } })), // compact 隐藏
             ax_node("7", "heading", json!({ "backendDOMNodeId": 7 })), // 无名无值且不可引用 → 隐藏
         ];
-        let (text, refs) = collect_ax_tree(&nodes);
+        let marks = HoverMarks::default();
+        let (text, refs) = collect_ax_tree(&nodes, &marks);
         // 别名折叠只影响 ref 判定，显示行保留原始角色名（TS formatAxNode 同）
         assert!(text.contains("@e1 [textfield]"));
         assert!(text.contains("@e2 [row] https://x/"));
@@ -3350,7 +3639,8 @@ mod tests {
         ];
         let mut with_parent = nodes.clone();
         with_parent[3]["parentId"] = json!("1"); // 4 挂 1
-        let (text, refs) = collect_ax_tree(&with_parent);
+        let marks = HoverMarks::default();
+        let (text, refs) = collect_ax_tree(&with_parent, &marks);
         // childIds 顺序（3 在 2 前）优先于反查表（4 最后）；listitem 非 URL 名无 ref
         let items: Vec<&str> = text
             .lines()
@@ -3364,7 +3654,8 @@ mod tests {
             "无 URL 名的 listitem 与无 backend 的 tab 都不发 ref"
         );
         // 防御：nodes 缺失时输出空表而非 panic
-        let (empty_text, empty_refs) = collect_ax_tree(&[]);
+        let marks = HoverMarks::default();
+        let (empty_text, empty_refs) = collect_ax_tree(&[], &marks);
         assert_eq!((empty_text.as_str(), empty_refs.len()), ("", 0));
     }
 
@@ -4081,6 +4372,215 @@ mod tests {
         let store = binding.get("T1").unwrap();
         assert_eq!(store.resolve("e2"), None, "旧 ref 必须死");
         assert_eq!(store.resolve("e1").map(|e| e.backend_node_id), Some(201));
+    }
+
+    // ---------------- 工具：snap hover 感知 -----------------------------------
+
+    /// styleSheetAdded 事件登记（含 origin/disabled 元数据，读取侧才过滤）
+    fn sheet_added_event(sid: &str, sheet_id: &str, origin: &str, disabled: bool) -> Value {
+        json!({
+            "method": "CSS.styleSheetAdded", "sessionId": sid,
+            "params": { "header": { "styleSheetId": sheet_id, "origin": origin, "disabled": disabled } }
+        })
+    }
+
+    /// 端到端：登记表 → 取文本 → domain 提取 → querySelectorAll 逐选择器 →
+    /// pushNodes 桥 → 第二遍渲染标 [hover] / [hover-reveal]，hoverScan=ok。
+    /// spike 定案路径全链（display:none 的 reveal 目标在真实浏览器可命中，
+    /// FakeCdp 只验证链路形状）。
+    #[tokio::test]
+    async fn snap_marks_hover_and_reveal_from_css() {
+        let (svc, watched, calls, script) = armed();
+        // 登记两张表：regular（可读）+ user-agent（读取侧过滤）
+        handle_event(&watched, &sheet_added_event("S1", "s2", "regular", false)).await;
+        handle_event(&watched, &sheet_added_event("S1", "s1", "user-agent", false)).await;
+        given(
+            &script,
+            "CSS.getStyleSheetText",
+            vec![Ok(json!({ "text": ".menu-item:hover { background: yellow; }\n.menu-item:hover a.drop-link { color: blue; }" }))],
+        );
+        given(
+            &script,
+            "Accessibility.getFullAXTree",
+            vec![Ok(json!({ "nodes": [
+                { "nodeId": "1", "role": { "value": "WebArea" }, "name": { "value": "Menu Page" } },
+                { "nodeId": "2", "role": { "value": "button" }, "name": { "value": "Menu" }, "parentId": "1", "backendDOMNodeId": 101 },
+                { "nodeId": "3", "role": { "value": "link" }, "name": { "value": "Item" }, "parentId": "1", "backendDOMNodeId": 102 },
+            ]}))],
+        );
+        given(&script, "DOM.getDocument", vec![Ok(json!({ "root": { "nodeId": 1 } }))]);
+        // 查询顺序：triggers（去重后 [".menu-item"]）→ reveals
+        given(
+            &script,
+            "DOM.querySelectorAll",
+            vec![Ok(json!({ "nodeIds": [8] })), Ok(json!({ "nodeIds": [9] }))],
+        );
+        given(
+            &script,
+            "DOM.pushNodesByBackendIdsToFrontend",
+            vec![Ok(json!({ "nodeIds": [8, 9] }))],
+        );
+
+        let resp = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp["hoverScan"], json!("ok"));
+        assert_eq!(resp["refs_count"], json!(2));
+        let text = resp["text"].as_str().unwrap();
+        assert!(text.contains("@e1 [button] [hover] Menu"), "{text}");
+        assert!(text.contains("@e2 [link] [hover-reveal] Item"), "{text}");
+        // 文本取自 sheet s2（排序后 s1 在前但 origin 过滤跳过）；桥接逐位对齐
+        let sheet = calls_of(&calls, "CSS.getStyleSheetText");
+        assert_eq!(sheet.len(), 1);
+        assert_eq!(sheet[0].param("styleSheetId"), json!("s2"));
+        let push = calls_of(&calls, "DOM.pushNodesByBackendIdsToFrontend");
+        assert_eq!(push[0].param("backendNodeIds"), json!([101, 102]));
+    }
+
+    /// 有表但无 hover 规则 → skipped；文本树无标记，hover 链零 DOM 查询。
+    #[tokio::test]
+    async fn snap_hover_scan_skipped_when_no_hover_rules() {
+        let (svc, watched, calls, script) = armed();
+        handle_event(&watched, &sheet_added_event("S1", "s1", "regular", false)).await;
+        given(
+            &script,
+            "CSS.getStyleSheetText",
+            vec![Ok(json!({ "text": ".plain { color: red; }" }))],
+        );
+        given(&script, "Accessibility.getFullAXTree", vec![Ok(json!({ "nodes": [
+            { "nodeId": "1", "role": { "value": "button" }, "name": { "value": "OK" }, "backendDOMNodeId": 7 },
+        ]}))]);
+        let resp = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp["hoverScan"], json!("skipped"));
+        let text = resp["text"].as_str().unwrap();
+        assert!(text.contains("@e1 [button] OK") && !text.contains("[hover"), "{text}");
+        assert_eq!(calls_of(&calls, "DOM.querySelectorAll").len(), 0);
+    }
+
+    /// 登记表空（无表页/事件未达）→ skipped（snap 不挂）。两路径：
+    /// 无 css_since（未 attach 过/CSS.enable 失败）即时返回；css_since 在
+    /// 窗口期内（回放可能在途）等到窗口耗尽再放行。
+    #[tokio::test]
+    async fn snap_hover_scan_skipped_when_registry_empty() {
+        let (svc, watched, _calls, script) = armed();
+        given(
+            &script,
+            "Accessibility.getFullAXTree",
+            vec![Ok(json!({ "nodes": [] })), Ok(json!({ "nodes": [] }))],
+        );
+        // 路径 1：armed 未走 on_attached，无 css_since → 即时 skipped
+        let t0 = Instant::now();
+        let resp = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp["hoverScan"], json!("skipped"));
+        assert!(
+            t0.elapsed() < HOVER_SETTLE_WINDOW,
+            "无 css_since 不等窗口（{:?}）",
+            t0.elapsed()
+        );
+        // 路径 2：css_since 刚登记（模拟 CSS.enable 刚成功）→ 等满窗口仍空 → skipped
+        watched
+            .css_since
+            .lock()
+            .unwrap()
+            .insert("T1".into(), Instant::now());
+        let t1 = Instant::now();
+        let resp2 = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp2["hoverScan"], json!("skipped"));
+        assert!(
+            t1.elapsed() >= HOVER_SETTLE_WINDOW,
+            "窗口期内确实等满（{:?}）",
+            t1.elapsed()
+        );
+        // 窗口过后（人工把 css_since 回拨）→ 即时返回，不为无表页付每次等待
+        watched
+            .css_since
+            .lock()
+            .unwrap()
+            .insert("T1".into(), Instant::now() - HOVER_SETTLE_WINDOW - Duration::from_millis(50));
+        let t2 = Instant::now();
+        let resp3 = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp3["hoverScan"], json!("skipped"));
+        assert!(t2.elapsed() < HOVER_SETTLE_WINDOW);
+    }
+
+    /// 规则预算 256 超限 → truncated（诚实证据）；snap 主体照常出树。
+    #[tokio::test]
+    async fn snap_hover_scan_truncated_by_rule_budget() {
+        let (svc, watched, _calls, script) = armed();
+        handle_event(&watched, &sheet_added_event("S1", "s1", "regular", false)).await;
+        let css = (0..300)
+            .map(|i| format!(".c{i}:hover {{ color: red; }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        given(
+            &script,
+            "CSS.getStyleSheetText",
+            vec![Ok(json!({ "text": css }))],
+        );
+        given(&script, "Accessibility.getFullAXTree", vec![Ok(json!({ "nodes": [] }))]);
+        // 后续 querySelectorAll/push 不脚本化 → Ok(Null)/空命中，链路不炸
+        let resp = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp["hoverScan"], json!("truncated"));
+        assert_eq!(resp["refs_count"], json!(0));
+    }
+
+    /// 桥接失败（pushNodes 报错）→ status=error（任务书三值外的第四值：
+    /// 诚实区分「没扫出」与「扫不了」）；标记放弃但 snap 主体不受影响。
+    #[tokio::test]
+    async fn snap_hover_scan_error_when_bridge_fails() {
+        let (svc, watched, _calls, script) = armed();
+        handle_event(&watched, &sheet_added_event("S1", "s1", "regular", false)).await;
+        given(
+            &script,
+            "CSS.getStyleSheetText",
+            vec![Ok(json!({ "text": ".menu-item:hover { color: red; }" }))],
+        );
+        given(&script, "Accessibility.getFullAXTree", vec![Ok(json!({ "nodes": [
+            { "nodeId": "1", "role": { "value": "button" }, "name": { "value": "Menu" }, "backendDOMNodeId": 101 },
+        ]}))]);
+        given(&script, "DOM.getDocument", vec![Ok(json!({ "root": { "nodeId": 1 } }))]);
+        given(
+            &script,
+            "DOM.querySelectorAll",
+            vec![Ok(json!({ "nodeIds": [8] }))],
+        );
+        given(
+            &script,
+            "DOM.pushNodesByBackendIdsToFrontend",
+            vec![Err("backend node not found".into())],
+        );
+        let resp = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp["hoverScan"], json!("error"));
+        let text = resp["text"].as_str().unwrap();
+        assert!(text.contains("@e1 [button] Menu") && !text.contains("[hover"), "{text}");
+    }
+
+    /// styleSheetAdded/Removed 事件维护登记表；drop_tab 随 per-tab 状态清理。
+    #[tokio::test]
+    async fn style_sheet_events_maintain_registry_per_tab() {
+        let (_svc, watched, _calls, _script) = armed();
+        handle_event(&watched, &sheet_added_event("S1", "s1", "regular", false)).await;
+        handle_event(&watched, &sheet_added_event("S1", "s2", "user-agent", false)).await;
+        handle_event(&watched, &sheet_added_event("S2", "other-tab-sheet", "regular", false)).await;
+        {
+            let sheets = watched.sheets.lock().unwrap();
+            let t1 = sheets.get("T1").unwrap();
+            assert_eq!(t1.len(), 2, "登记全量（origin 过滤在读取侧）");
+            assert_eq!(t1.get("s1"), Some(&("regular".into(), false)));
+            assert_eq!(sheets.get("TAB2").unwrap().len(), 1, "按 tab 隔离");
+        }
+        // Removed 按表撤销
+        handle_event(
+            &watched,
+            &json!({ "method": "CSS.styleSheetRemoved", "sessionId": "S1", "params": { "styleSheetId": "s1" } }),
+        )
+        .await;
+        assert!(!watched.sheets.lock().unwrap()["T1"].contains_key("s1"));
+        // tab 销毁 → 登记随 per-tab 状态清理
+        handle_event(
+            &watched,
+            &json!({ "method": "Target.targetDestroyed", "params": { "targetId": "T1" } }),
+        )
+        .await;
+        assert!(watched.sheets.lock().unwrap().get("T1").is_none());
     }
 
     // ---------------- 工具：click（ref / selector 两路）----------------------
