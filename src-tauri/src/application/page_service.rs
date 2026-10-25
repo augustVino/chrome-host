@@ -1378,24 +1378,22 @@ async fn handle_event(watched: &Watched, event: &Value) {
                         invalidate_frame_refs(watched, &tid, &fid, "frame navigation");
                     }
                 } else {
-                    if !fid.is_empty() {
-                        watched
-                            .frames
-                            .lock()
-                            .unwrap()
-                            .entry(tid.clone())
-                            .or_default()
-                            .root = Some(fid);
-                    }
                     invalidate_refs(watched, &tid, "navigation");
                     // 换文档 = 旧表全部失效：Chrome 在文档销毁时不保证逐张发
                     // styleSheetRemoved（真机实测：导航后登记表残留死表，
                     // getStyleSheetText 报 No style sheet with given id found →
                     // hoverScan 恒 truncated）。新文档的表由 styleSheetAdded
                     // 重新登记（CSS 域 session 级持续有效，不依赖 Removed 语义）。
-                    watched.sheets.lock().unwrap().remove(&tid);
-                    // 帧登记同理整体重建：新文档的 frameAttached/attach 会重登记
-                    watched.frames.lock().unwrap().remove(&tid);
+                    reset_sheet_registry(watched, &tid);
+                    // 帧登记同理整体重建：新文档的 frameAttached/attach 会重登记。
+                    // root 必须在清表**之后**写入——先写后清会让 root 随整表
+                    // 删除丢失（root 恒 None：顶层 OOPIF 投影链 at_root 永不
+                    // 命中、主帧发起的下载无 tab 归属）。
+                    let mut tables = watched.frames.lock().unwrap();
+                    tables.remove(&tid);
+                    if !fid.is_empty() {
+                        tables.entry(tid.clone()).or_default().root = Some(fid);
+                    }
                 }
             }
         }
@@ -1438,6 +1436,10 @@ async fn handle_event(watched: &Watched, event: &Value) {
         "Page.documentOpened" => {
             if let Some(tid) = tab_of_session(watched, event) {
                 invalidate_refs(watched, &tid, "document opened");
+                // document.open() 同样换文档：旧样式表全部销毁且
+                // styleSheetRemoved 不保证补发（与根导航同一死表形态）——
+                // 清登记 + 重开结算窗口，新表由 styleSheetAdded 重放。
+                reset_sheet_registry(watched, &tid);
             }
         }
         "DOM.documentUpdated" => {
@@ -3319,7 +3321,11 @@ async fn hover_scan(
 }
 
 /// 单选择器求值：命中 nodeId 集合（上限 MAX_HOVER_QUERY_HITS，超出截断）。
-/// 选择器非法（CDP 报错，启发式提取产物可能的形态）→ 跳过该选择器 + 截断。
+/// 选择器非法（真机报文：CfT 131 为 "DOM Error while querying"，旧变体
+/// "... is not a valid selector"——启发式提取产物仍可能的形态，如预处理器的
+/// /deep/、>>> 组合子）→ 跳过该选择器（该规则无标记，不装作预算截断：
+/// truncated 语义 = 预算内不完整，狼来了效应会让真截断失去信号）；其他
+/// 错误（会话/超时/节点失放）→ 截断标记。
 async fn hover_query_hits(
     conn: &SharedPageConn,
     sid: &str,
@@ -3351,7 +3357,30 @@ async fn hover_query_hits(
                 }
             }
         }
-        Err(_) => *truncated = true,
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("dom error while querying")
+                || msg.contains("is not a valid selector")
+            {
+                tracing::debug!("[page] hover 选择器非法，跳过: {sel}（{e}）");
+                return;
+            }
+            *truncated = true;
+        }
+    }
+}
+
+/// 换文档（根导航 / document.open）后的样式表登记重建：清空登记 + 把
+/// css_since 重置为当下（仅对 attach 时 CSS.enable 成功过的 tab——entry
+/// 已存在才刷新；从未成功的 tab 重置只会白付结算等待）。新文档的
+/// styleSheetAdded 回放从该时刻起重新享受 HOVER_SETTLE_WINDOW 结算窗口，
+/// 否则窗口起点仍停在 attach 时刻，导航后首个 snap 会在回放未到时被
+/// 立即放行（空登记假报 skipped，或部分登记被当完整扫描）。
+fn reset_sheet_registry(watched: &Watched, tid: &str) {
+    watched.sheets.lock().unwrap().remove(tid);
+    let mut since = watched.css_since.lock().unwrap();
+    if since.contains_key(tid) {
+        since.insert(tid.to_string(), Instant::now());
     }
 }
 
@@ -3459,10 +3488,16 @@ async fn project_frame_point(
         p = project_point(&quad, p).ok_or_else(|| {
             PageControlError::target_moved("iframe owner quad is degenerate")
         })?;
-        // 父级即根（或未知 → 视为主文档直属）：已到根视口
+        // 父级即根（或未知 → 视为主文档直属）：已到根视口。兜底：parent 未
+        // 登记在 frames 表（主帧从不入表，root 未知/丢失时同此收敛——
+        // frameAttached 对一切子帧都发，活着的中间帧必在表中）
         let at_root = match parent.as_deref() {
             None | Some("") => true,
-            Some(pf) => Some(pf.to_string()) == root,
+            Some(pf) => {
+                let tables = watched.frames.lock().unwrap();
+                Some(pf.to_string()) == root
+                    || !tables.get(tab_tid).is_some_and(|t| t.frames.contains_key(pf))
+            }
         };
         if at_root {
             return Ok(p);
@@ -6538,6 +6573,44 @@ mod tests {
         assert_eq!(push[0].param("backendNodeIds"), json!([101, 102]));
     }
 
+    /// querySelectorAll 报选择器非法（真机 CfT 131 报文 "DOM Error while
+    /// querying"；旧变体 "... is not a valid selector"——启发式提取产物仍
+    /// 可能的形态，如预处理器 /deep/ 组合子）→ 跳过该选择器而非 truncated：
+    /// truncated 语义 = 预算内不完整，语法失败只丢该条规则，不能让含非法
+    /// 形态的页面恒报狼来了。
+    #[tokio::test]
+    async fn snap_hover_scan_skips_invalid_selectors_instead_of_truncating() {
+        let (svc, watched, _calls, script) = armed();
+        handle_event(&watched, &sheet_added_event("S1", "s1", "regular", false)).await;
+        given(
+            &script,
+            "CSS.getStyleSheetText",
+            vec![Ok(json!({ "text": ".btn:hover { color: red; }\n.legacy:hover /deep/ .tip { color: blue; }" }))],
+        );
+        given(&script, "Accessibility.getFullAXTree", vec![Ok(json!({ "nodes": [
+            { "nodeId": "1", "role": { "value": "button" }, "name": { "value": "B" }, "backendDOMNodeId": 9 },
+        ]}))]);
+        given(&script, "DOM.getDocument", vec![Ok(json!({ "root": { "nodeId": 1 } }))]);
+        // 查询序：trigger ".btn" 命中；reveal ".legacy /deep/ .tip" 被拒（非法）
+        given(
+            &script,
+            "DOM.querySelectorAll",
+            vec![
+                Ok(json!({ "nodeIds": [3] })),
+                Err("-32000 DOM Error while querying".to_string()),
+            ],
+        );
+        given(
+            &script,
+            "DOM.pushNodesByBackendIdsToFrontend",
+            vec![Ok(json!({ "nodeIds": [3] }))],
+        );
+
+        let resp = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp["hoverScan"], json!("ok"), "非法选择器只跳过该条，不截断");
+        assert!(resp["text"].as_str().unwrap().contains("[hover]"), "合法规则照常标记");
+    }
+
     /// 有表但无 hover 规则 → skipped；文本树无标记，hover 链零 DOM 查询。
     #[tokio::test]
     async fn snap_hover_scan_skipped_when_no_hover_rules() {
@@ -6731,6 +6804,58 @@ mod tests {
         let resp = svc.snap(INS, "T1").await.unwrap();
         assert_eq!(resp["hoverScan"], json!("ok"));
         assert!(resp["text"].as_str().unwrap().contains("[hover]"));
+    }
+
+    /// 根导航清 sheets 同时重置 css_since：结算窗口对文档代际重开——否则
+    /// 窗口起点仍停在 attach 时刻，导航后首个 snap 被立即放行，
+    /// styleSheetAdded 回放在途时空登记假报 skipped（或部分登记被当完整扫描）。
+    /// 未 attach 过 CSS（无 css_since 条目）的 tab 不人为造条目（不白付等待）。
+    #[tokio::test]
+    async fn root_navigation_reopens_css_settle_window() {
+        let (_svc, watched, _calls, _script) = armed();
+        handle_event(&watched, &sheet_added_event("S1", "s1", "regular", false)).await;
+        // 人工老化：模拟 attach 已远（窗口早已过）
+        watched.css_since.lock().unwrap().insert(
+            "T1".into(),
+            Instant::now() - HOVER_SETTLE_WINDOW - Duration::from_millis(50),
+        );
+
+        // 无 css_since 的 tab（TAB2 从未 attach CSS）：根导航不造条目
+        handle_event(&watched, &json!({ "method": "Page.frameNavigated", "sessionId": "S2",
+            "params": { "frame": { "id": "r2" } } })).await;
+        assert!(watched.css_since.lock().unwrap().get("TAB2").is_none(), "未 attach CSS 的 tab 不重置");
+
+        // T1 根导航：登记清空 + 窗口重置为当下
+        handle_event(&watched, &json!({ "method": "Page.frameNavigated", "sessionId": "S1",
+            "params": { "frame": { "id": "r1" } } })).await;
+        let since = watched.css_since.lock().unwrap().get("T1").copied();
+        assert!(
+            since.is_some_and(|t| Instant::now().duration_since(t) < HOVER_SETTLE_WINDOW),
+            "css_since 重置为当下（首个 snap 重新进入回放等待窗口）"
+        );
+        assert!(watched.sheets.lock().unwrap().get("T1").is_none(), "登记同时清空");
+    }
+
+    /// document.open() 换文档（Page.documentOpened）与根导航同形态：旧样式表
+    /// 全部销毁且 styleSheetRemoved 不保证补发（死表残留 → hoverScan 恒
+    /// truncated）——清登记 + 重开结算窗口。
+    #[tokio::test]
+    async fn document_opened_clears_sheet_registry_and_reopens_window() {
+        let (_svc, watched, _calls, _script) = armed();
+        handle_event(&watched, &sheet_added_event("S1", "s1", "regular", false)).await;
+        assert_eq!(watched.sheets.lock().unwrap()["T1"].len(), 1);
+        watched.css_since.lock().unwrap().insert(
+            "T1".into(),
+            Instant::now() - HOVER_SETTLE_WINDOW - Duration::from_millis(50),
+        );
+
+        handle_event(&watched, &json!({ "method": "Page.documentOpened", "sessionId": "S1" })).await;
+        assert!(watched.sheets.lock().unwrap().get("T1").is_none(), "登记清空（旧表全死）");
+        let since = watched.css_since.lock().unwrap().get("T1").copied();
+        assert!(
+            since.is_some_and(|t| Instant::now().duration_since(t) < HOVER_SETTLE_WINDOW),
+            "结算窗口重开（新文档回放可等待）"
+        );
     }
 
     /// styleSheetAdded/Removed 事件维护登记表；drop_tab 随 per-tab 状态清理。
@@ -8726,6 +8851,47 @@ mod tests {
         assert!(watched.sheets.lock().unwrap().get("TAB1").is_none(), "根导航清 sheets（hover 共存）");
     }
 
+    /// 根导航重建帧表：root 必须在清表**之后**写入——旧序（先写后清）会让
+    /// root 随整表删除丢失（生产代码 root 恒 None：顶层 OOPIF 投影链 at_root
+    /// 永不命中、主帧发起的下载无 tab 归属）。真实事件序列驱动，不预设表。
+    #[tokio::test]
+    async fn root_navigation_rebuilds_frame_table_with_root_set() {
+        let (svc, _calls, _script, tap) = fake_service();
+        let (watched, g) = svc.ensure(INS).await.unwrap();
+        drop(g);
+        let tx = tap.lock().unwrap().clone().unwrap();
+        tx.send(attach_event("TAB1", "SES1", "page")).unwrap();
+        eventually("TAB1 入表", || tab_session(&watched, "TAB1").is_some()).await;
+
+        // 旧表带着子帧与 root（模拟首次导航前的登记形态）
+        register_frame(&watched, "TAB1", "F_OLD", "FRM_OLD", None, "F_OLD", None);
+
+        // 连接存活期根导航：表重建，root = 新 fid
+        tx.send(json!({ "method": "Page.frameNavigated", "sessionId": "SES1",
+            "params": { "frame": { "id": "F_NEW", "url": "https://a/next" } } })).unwrap();
+        eventually("root 写入且旧子帧清空", || {
+            let tables = watched.frames.lock().unwrap();
+            tables.get("TAB1")
+                .map(|t| t.root.as_deref() == Some("F_NEW") && !t.frames.contains_key("FRM_OLD"))
+                .unwrap_or(false)
+        }).await;
+
+        // 事件路径登记的顶层 OOPIF（parent = 主帧 id）：帧表为空但 root 已知
+        tx.send(json!({ "method": "Page.frameAttached", "sessionId": "SES1",
+            "params": { "frameId": "FRM_A", "parentFrameId": "F_NEW" } })).unwrap();
+        eventually("FRM_A 登记", || {
+            watched.frames.lock().unwrap()
+                .get("TAB1").map(|t| t.frames.contains_key("FRM_A")).unwrap_or(false)
+        }).await;
+
+        // 主帧发起的下载归属：root == 主帧 frameId → tab 命中（旧序恒 None）
+        assert_eq!(
+            download_tab_of_frame(&watched, "F_NEW").as_deref(),
+            Some("TAB1"),
+            "root 存活 → 主帧下载可归属 tab"
+        );
+    }
+
     /// snap 合并：帧树渲染为挂接点下的 [frame] 段，@eN 连续编号，
     /// RefStore 条目携带帧维度（主树条目无）；owner 经 DOM.getFrameOwner 解析
     #[tokio::test]
@@ -8802,6 +8968,57 @@ mod tests {
         );
         assert_eq!(inputs[1].params["x"], 160.0);
         assert_eq!(inputs[1].params["y"], 240.0);
+    }
+
+    /// 事件路径登记的帧内点击投影（不用 register_frame 预设 root——它总把
+    /// root 填好，掩住了生产路径 root 丢失的缺陷）：(1) root 经 frameNavigated
+    /// 写入，frameAttached 登记 parent=主帧 id → pf == root 终止；(2) root
+    /// 未知（attach 到已加载页，连接后从未见 frameNavigated——SPA 动态注入
+    /// iframe 的常态）→ 兜底「parent 未登记在帧表 = 主文档直属」终止。
+    /// 两个形态都不得 409 owning iframe chain is not resolvable。
+    #[tokio::test]
+    async fn click_frame_ref_via_event_path_projects_without_preset_root() {
+        let (svc, watched, _calls, script) = armed();
+        // 形态 1：事件序建表（root 由根导航写入）
+        handle_event(&watched, &json!({ "method": "Page.frameNavigated", "sessionId": "S1",
+            "params": { "frame": { "id": "F_ROOT" } } })).await;
+        handle_event(&watched, &json!({ "method": "Page.frameAttached", "sessionId": "S1",
+            "params": { "frameId": "FRM_A", "parentFrameId": "F_ROOT" } })).await;
+        // 预置两条 ref：e1 走形态 1（root 已知），e2 稍后走形态 2（root 未知兑底）
+        watched.refs.lock().unwrap().entry("T1".into()).or_default().replace(&json!([
+            { "ref": "e1", "backendNodeId": 601, "frameTargetId": "FRM_A", "frameSessionId": "S_FRM_A", "name": "帧内按钮" },
+            { "ref": "e2", "backendNodeId": 602, "frameTargetId": "FRM_B", "frameSessionId": "S_FRM_B", "name": "动态帧按钮" },
+        ]));
+        // 几何链脚本（调用序）：形态 1 = 元素 quad(601@帧) → owner 解析(FRM_A@S1)
+        // → owner quad(501@S1)；形态 2 同构（602 → 502）
+        given(&script, "DOM.getContentQuads", vec![
+            Ok(json!({ "quads": [[10.0, 20.0, 110.0, 20.0, 110.0, 60.0, 10.0, 60.0]] })),
+            Ok(json!({ "quads": [[100.0, 200.0, 400.0, 200.0, 400.0, 350.0, 100.0, 350.0]] })),
+            Ok(json!({ "quads": [[10.0, 20.0, 110.0, 20.0, 110.0, 60.0, 10.0, 60.0]] })),
+            Ok(json!({ "quads": [[100.0, 200.0, 400.0, 200.0, 400.0, 350.0, 100.0, 350.0]] })),
+        ]);
+        given(&script, "DOM.getFrameOwner", vec![
+            Ok(json!({ "backendNodeId": 501 })),
+            Ok(json!({ "backendNodeId": 502 })),
+        ]);
+
+        let resp = svc.click(INS, "T1", "@e1").await.unwrap();
+        assert_eq!(
+            resp["result"],
+            json!("Clicked @e1 \"帧内按钮\" at CSS (160, 240)"),
+            "形态 1：parent == root（事件写入）→ 投影终止"
+        );
+
+        // 形态 2：root 未知——帧表整体重建为无 root 的纯事件登记
+        watched.frames.lock().unwrap().remove("T1");
+        handle_event(&watched, &json!({ "method": "Page.frameAttached", "sessionId": "S1",
+            "params": { "frameId": "FRM_B", "parentFrameId": "F_ROOT_UNSEEN" } })).await;
+        let resp2 = svc.click(INS, "T1", "@e2").await.unwrap();
+        assert_eq!(
+            resp2["result"],
+            json!("Clicked @e2 \"动态帧按钮\" at CSS (160, 240)"),
+            "形态 2：parent 未登记且 root 未知 → 主文档直属兑底，不 409"
+        );
     }
 
     /// fill 帧内 ref：DOM/Runtime 命令（resolveNode/focus/callFunctionOn/
