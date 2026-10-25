@@ -31,20 +31,22 @@ pub const MAX_CDP_PATTERNS: usize = 64;
 /// 干预记录环上限（per-tab，GET intercept 返回最近的 N 条）。
 pub const JOURNAL_CAPACITY: usize = 200;
 
-/// CDP resourceType 白名单（ResourceType 枚举，小写形态对齐协议）。
-pub const RESOURCE_TYPES: [&str; 12] = [
-    "document",
-    "stylesheet",
-    "image",
-    "media",
-    "font",
-    "script",
-    "websocket",
-    "xhr",
-    "fetch",
-    "ping",
-    "cspreport",
-    "other",
+/// CDP Fetch 域 pattern 的 resourceType 合法集（**真机逐值实测** CfT
+/// 131.0.6778.204：接受下列 10 值；**拒绝** WebSocket/Manifest/EventSource/
+/// CSPReport/Preflight/SignedExchange——与协议文档的 Fetch 枚举不一致，
+/// 以真机为准）。注意 CDP 校验**大小写敏感**（"xhr"/"document" 均 -32602）
+/// ——wire 输入大小写不敏感，存储/下发一律用此处的规范形态。
+pub const RESOURCE_TYPES: [&str; 10] = [
+    "Document",
+    "Stylesheet",
+    "Image",
+    "Media",
+    "Font",
+    "Script",
+    "XHR",
+    "Fetch",
+    "Ping",
+    "Other",
 ];
 
 /// 单个头的黑名单判定：精确名（cookie 等）或前缀（sec-/proxy-）。
@@ -129,13 +131,18 @@ pub fn compile_rules(rules: &[Value]) -> Result<Vec<InterceptRule>, AppError> {
                     let s = t
                         .as_str()
                         .ok_or_else(|| invalid(format!("{at}.match.resourceTypes 须为字符串数组")))?;
-                    if !RESOURCE_TYPES.iter().any(|t| *t == s.to_lowercase()) {
+                    // 输入大小写不敏感，存储 CDP 规范形态（大小写敏感：小写会被
+                    // Fetch.enable 拒 -32602——真机实测，owner 复测打回根因）
+                    let Some(canonical) = RESOURCE_TYPES
+                        .iter()
+                        .find(|c| c.eq_ignore_ascii_case(s))
+                    else {
                         return Err(invalid(format!(
-                            "{at}.match.resourceTypes: 未知类型 {s:?}（白名单 {:?}）",
+                            "{at}.match.resourceTypes: 未知类型 {s:?}（合法集（大小写不敏感）: {:?}；WebSocket/Manifest 等被 CfT 131 Fetch.enable 拒绝，勿用）",
                             RESOURCE_TYPES
                         )));
-                    }
-                    ts.push(s.to_lowercase());
+                    };
+                    ts.push(canonical.to_string());
                 }
                 Some(ts)
             }
@@ -297,10 +304,12 @@ pub fn first_live_match<'a>(
     let rt = resource_type.to_lowercase();
     rules.iter().find(|r| {
         let times_ok = r.times == 0 || used.get(&r.id).copied().unwrap_or(0) < u64::from(r.times);
+        // requestPaused 事件的 resourceType 是 Network 域形态（首字母大写，
+        // 如 "XHR"/"Script"），规则侧存 Fetch 规范形——共同值大小写归一比较
         let type_ok = r
             .resource_types
             .as_ref()
-            .is_none_or(|ts| ts.contains(&rt));
+            .is_none_or(|ts| ts.iter().any(|t| t.eq_ignore_ascii_case(&rt)));
         times_ok && type_ok && glob_match(&r.url_pattern, url)
     })
 }
@@ -431,7 +440,7 @@ mod tests {
         assert_eq!(rules[0].times, 1);
         assert_eq!(
             rules[0].resource_types,
-            Some(vec!["xhr".to_string(), "fetch".to_string()])
+            Some(vec!["XHR".to_string(), "Fetch".to_string()])
         );
         match &rules[0].action {
             Action::Mock { status, headers, body, delay_ms } => {
@@ -504,15 +513,24 @@ mod tests {
             .to_string()
             .contains("scheme"));
 
+        // 大小写不敏感输入（"xhr"/"FETCH" 均过），存储 CDP 规范形态
         let mut bad = base.clone();
-        bad["rules"][0]["match"]["resourceTypes"] = json!(["XHR"]);
-        // 大小写不敏感：XHR → xhr 合法
-        assert!(compile_rules(bad["rules"].as_array().unwrap()).is_ok());
+        bad["rules"][0]["match"]["resourceTypes"] = json!(["xhr", "FETCH"]);
+        let compiled = compile_rules(bad["rules"].as_array().unwrap()).unwrap();
+        assert_eq!(
+            compiled[0].resource_types,
+            Some(vec!["XHR".to_string(), "Fetch".to_string()]),
+            "存储/下发一律规范形（小写会被 CDP 拒 -32602）"
+        );
+        // 非法值：message 列合法集
         bad["rules"][0]["match"]["resourceTypes"] = json!(["banana"]);
-        assert!(compile_rules(bad["rules"].as_array().unwrap())
-            .unwrap_err()
-            .to_string()
-            .contains("banana"));
+        let e = compile_rules(bad["rules"].as_array().unwrap()).unwrap_err();
+        assert!(e.to_string().contains("banana"));
+        assert!(e.to_string().contains("XHR"), "message 列合法集: {e}");
+        // WebSocket：协议文档有，但 CfT 131 Fetch.enable 真机拒绝 → 白名单不含
+        bad["rules"][0]["match"]["resourceTypes"] = json!(["WebSocket"]);
+        let e2 = compile_rules(bad["rules"].as_array().unwrap()).unwrap_err();
+        assert!(e2.to_string().contains("WebSocket"), "{e2}");
 
         let mut bad = base.clone();
         // body 文本优先：须先移除 body，坏 bodyBase64 才进入解码路径
@@ -588,6 +606,8 @@ mod tests {
         // resourceType 不匹配 r1 → 落到 r2？r2 pattern *://*.foo.com/* 匹配
         let m = first_live_match(&rules, &used, "https://api.foo.com/v1/x", "Script").unwrap();
         assert_eq!(m.id, "r2");
+        // 事件值大小写不敏感（规范形 "XHR" 匹配事件 "xhr"/"XHR"）
+        assert!(first_live_match(&rules, &used, "https://api.foo.com/v1/x", "xhr").is_some());
         // r1 耗尽 → 同 URL 命中 r2
         used.insert("r1".to_string(), 1);
         let m = first_live_match(&rules, &used, "https://api.foo.com/v1/x", "Fetch").unwrap();
@@ -619,7 +639,7 @@ mod tests {
         let pats = cdp_patterns(&rules).unwrap();
         assert_eq!(pats.len(), 4); // r1 两类型 + r2 一条 + r3 一条
         assert_eq!(pats[0]["urlPattern"], json!("https://api.foo.com/v1/*"));
-        assert_eq!(pats[0]["resourceType"], json!("xhr"));
+        assert_eq!(pats[0]["resourceType"], json!("XHR"), "CDP 规范形态");
         assert_eq!(pats[0]["requestStage"], json!("Request"));
         assert!(pats[2].get("resourceType").is_none(), "缺省类型不带 resourceType");
 

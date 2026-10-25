@@ -6736,7 +6736,7 @@ mod tests {
         assert_eq!(pats.as_array().unwrap().len(), 4);
         assert_eq!(pats[0]["urlPattern"], json!("*://127.0.0.1:18799/api/*"));
         assert_eq!(pats[0]["requestStage"], json!("Request"));
-        assert_eq!(pats[0]["resourceType"], json!("xhr"));
+        assert_eq!(pats[0]["resourceType"], json!("XHR"), "CDP 规范形态（大小写敏感）");
         assert!(pats[2].get("resourceType").is_none(), "缺省类型不带 resourceType");
     }
 
