@@ -132,7 +132,7 @@ chrome-host page dialogs <id> [--tab t] [--since N]    # 自动接管的弹窗�
 - **截图/PDF/仿真**：`page screenshot` 带选择器或 @eN 截该元素（跨行元素取完整包围盒），不带截当前视口；`page pdf` 整页导出（默认 Letter 纵向带背景）；`page emulate --preset iphone-14` 模拟设备视口+UA+触控（仅该 tab，`--off` 恢复，重复 emulate=覆盖）。
 - **弹窗已自动接管**：页面 alert/confirm/prompt/beforeunload 由应用自动 accept（beforeunload=放行离开，prompt 提交默认文本），不阻塞命令；命令期间弹过的窗以 `dialogs_seen` 附在输出里，`page dialogs` 查历史。
 - **错误看 [PAGE_*] 前缀分支处置**，不解析文案：`PAGE_ELEMENT_BLOCKED`（被浮层遮挡，先处理遮挡）/ `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_REF_NOT_FOUND`·`PAGE_REF_STALE`（重 snap）/ `PAGE_TARGET_NOT_FILLABLE` / `PAGE_FILL_VALUE_MISMATCH`（写入可能部分生效，先观察再重试）/ `PAGE_WAIT_TIMEOUT` / `PAGE_DISPATCH_FAILED`（附 effect_state：none=未发出可重试，unknown=已发出禁盲目重试）/ `PAGE_TAB_AMBIGUOUS`（多 tab，带列表重选）。
-- **跨域 iframe**：eval/fill 的 selector 均不可达；用 `clickxy`（视口坐标，事件穿透 iframe 边界）点入目标获得焦点后 `type` 输入。
+- **跨域 iframe（OOPIF）**：snap 已内嵌帧内容（`[frame]` 段，@eN 跨帧连续编号），click/fill/press 对帧内 @eN 直接可用（点击自动坐标投影、输入走帧会话）；CSS 选择器仍只查主 frame，帧内 selector 找不到时改用 @eN；帧内导航/移除后帧内 ref 报 `PAGE_REF_STALE`（重新 snap）；坐标级兑底（clickxy+type）仍可用。
 - **无主对话框卡死（罕见）**：对话框在应用无连接期间弹出（如应用重启前埋的 setTimeout alert）时，CDP 通道不认识它——命令大面积超时但 `page dialogs` 无记录。恢复：`chrome-host page raw <id> "Page.navigate" '{"url":"<当前页>"}' --tab <t>`（强制导航丢弃对话框），或让用户在浏览器窗口点掉。
 - **首条命令偶发 PAGE_TAB_NOT_FOUND**：连接刚建立的 attach 竞态，提示语含 retry——直接重试同一命令即可。
 - **多实例调试互不干扰**：page 命令经应用持有的独立 CDP 通道，与其他工具（DevTools、Playwright 直连）并存无冲突。
@@ -154,10 +154,11 @@ chrome-host instance diagnostics <insId>                    # 当前页快照：
 
 **证据边界意识（诚实证据）**：console/network 的 `--json` 输出带 meta（dropped=环溢出丢弃数、since=采集窗口起点、live=采集是否存活、scope="completed"=进行中请求不可见）；条目的 bodyState 披露响应体可用性（available/partial/evicted/unavailable + reason）。**meta 里 dropped≠0 或 since 晚于事发时刻时，明确告知用户"证据不完整"而不是当作"没有问题"**——这不是额外负担，是防止把"没采到"误读成"没发生"。缓冲随实例重启清空；har 未采集字段以 -1/空集占位（语义见 har 顶层 _meta）。
 
-### 7. 拦截/改写网络（net-rules 扩展，按环境配置）
+### 7. 拦截/改写网络（net-rules 扩展持久层 + Fetch 会话层动态规则）
 
-需要屏蔽埋点、或把前端接口指到本地 mock 服务时，不必改代码/代理——写环境级网络规则（对新启动实例生效）：
+需要屏蔽埋点、或把前端接口指到本地 mock 服务时，不必改代码/代理：
 
+- **持久环境级**（对新启动实例生效，跨会话存活）：写环境级网络规则——
 ```bash
 NR=$(chrome-host extension list --json | jq -r '.[] | select(.name=="Net Rules") | .id')
 # 屏蔽埋点域（域及全部子域；对新启动的实例生效）
@@ -165,8 +166,9 @@ chrome-host extension config set $NR '{"block":["*.google-analytics.com"]}'
 # api 指到本地 mock（仅该环境）：https://api.foo.com/v1/x → http://localhost:3000/v1/x（* 依序对应 $1 $2…）
 chrome-host extension config set $NR '{"redirect":[{"from":"https://api.foo.com/*","to":"http://localhost:3000/$1"}]}' --env <envId>
 ```
+要点：省略 `--env` 写全局默认；headers 注入用 `[{"url":"...","set":{"X-Debug-Uid":"42"}}]`；语法参考 `chrome-host extension get $NR` 输出的 configDocsUrl。
 
-要点：省略 `--env` 写全局默认，`--env` 写环境覆盖；headers 注入用 `[{"url":"...","set":{"X-Debug-Uid":"42"}}]`；语法参考 `chrome-host extension get $NR` 输出的 configDocsUrl。
+- **会话级动态规则**（任务内即时生效，REST `POST /instances/{id}/page/intercept`，连接重建自动失效）：mock 响应（status/headers/body/delay）/ 请求头注入 / block，支持 times 次数；干预记录可查（GET 同路径）。注意：匹配 XHR/fetch 请求时**省略 resourceTypes**（Fetch 域枚举坑，详见 AGENT-API「Fetch 会话层拦截」章）；任何规则错误都不会挂起页面（无命中即放行）。适合「测一个异常分支」「注入调试头」这类一次性场景。
 
 ### 8. 收尾
 

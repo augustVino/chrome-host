@@ -52,6 +52,14 @@
         "正确解读 bodyState（unavailable 时不硬造内容，[redacted] 不当成 bug）",
         "查历史而不是 reload 重放（保现场意识）"
       ]
+    },
+    {
+      "id": "oopif-frame-ops",
+      "prompt": "在 qa12345 实例里打开带跨域 iframe 的页面（iframe 内有登录表单），把 iframe 里的用户名填上 test@x.com 并点掉 iframe 里的提交按钮",
+      "checks": [
+        "snap 后能发现 [frame] 段与帧内 @eN 引用，直接 fill/click 帧内 @eN（而不是立刻退到 clickxy+type 坐标兜底）",
+        "帧内 ref 失效（PAGE_REF_STALE）时重新 snap 而非重试旧引用"
+      ]
     }
   ]
 }
