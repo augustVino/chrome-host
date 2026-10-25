@@ -1,0 +1,28 @@
+{
+  "id": "navigate-history",
+  "title": "页内导航与历史边界",
+  "fixture": { "startPath": "/start" },
+  "task": "在 fixture 页验证历史保留导航：page navigate 到 /other（loaded 证实）→ back 回 /start → forward 再到 /other → back 回 /start → 已在最早条目再 back 报 PAGE_NAV_NO_HISTORY",
+  "assertions": {
+    "response": [
+      { "pattern": "PAGE_NAV_NO_HISTORY", "name": "response:边界409标记" }
+    ],
+    "adapter": [
+      { "evidenceKey": "nav_loaded", "equals": true, "name": "adapter:navigate完成load" },
+      { "evidenceKey": "navigate_back_url", "equals": "{baseUrl}/start", "name": "adapter:back回到起点" },
+      { "evidenceKey": "navigate_forward_url", "equals": "{baseUrl}/other", "name": "adapter:forward再到目标" },
+      { "evidenceKey": "boundary_err", "equals": "PAGE_NAV_NO_HISTORY", "name": "adapter:边界错误码" }
+    ]
+  },
+  "smoke": [
+    { "step": "cli", "args": ["env", "create", "eval-{runId}", "--json"], "saveAs": "envId", "path": "id" },
+    { "step": "cli", "args": ["instance", "create", "{envId}", "--name", "eval-{runId}", "--json"], "saveAs": "insId", "path": "id" },
+    { "step": "cli", "args": ["instance", "open", "{insId}", "{baseUrl}/start", "--json"], "saveAs": "tabId", "path": "id" },
+    { "step": "wait", "args": ["page", "html", "{insId}", "#nav-marker", "--tab", "{tabId}"], "until": { "path": "html", "contains": "start-page" }, "timeoutMs": 15000, "intervalMs": 500 },
+    { "step": "cli", "args": ["page", "navigate", "{insId}", "{baseUrl}/other", "--tab", "{tabId}", "--json"], "saveAs": "nav_loaded", "path": "loaded" },
+    { "step": "cli", "args": ["page", "back", "{insId}", "--tab", "{tabId}", "--json"], "saveAs": "navigate_back_url", "path": "url" },
+    { "step": "cli", "args": ["page", "forward", "{insId}", "--tab", "{tabId}", "--json"], "saveAs": "navigate_forward_url", "path": "url" },
+    { "step": "cli", "args": ["page", "back", "{insId}", "--tab", "{tabId}", "--json"] },
+    { "step": "cli", "args": ["page", "back", "{insId}", "--tab", "{tabId}", "--json"], "allowFailure": true, "saveAs": "boundary_err", "path": "error.code" }
+  ]
+}
