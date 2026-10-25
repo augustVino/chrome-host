@@ -111,6 +111,23 @@ pub enum InstanceCommands {
         out: Option<String>,
     },
 
+    /// 读网络请求的响应体（脱敏后，分页）
+    #[command(
+        about = "读网络请求响应体（bodyState available/partial 才可读；--offset/--limit 为 UTF-16 单位）"
+    )]
+    NetworkBody {
+        /// 实例 id 或 name（name 全局唯一命中时自动解析）
+        id: String,
+        /// 请求 id（network 命令的 REQUESTID 列）
+        request_id: String,
+        /// 窗口起点（UTF-16 code unit；缺省 0）
+        #[arg(long)]
+        offset: Option<usize>,
+        /// 窗口长度（UTF-16 code unit；缺省 8192，上限 65536）
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+
     /// 创建实例（创建即启动；首次运行可能阻塞于内核下载）
     #[command(about = "创建实例（创建即启动；首次运行可能阻塞于内核下载）")]
     Create {
@@ -233,6 +250,12 @@ pub fn run(
         } => network(globals, client, id, *failed_only, tab.as_deref(), *limit),
         InstanceCommands::Screenshot { id, out } => screenshot(globals, client, id, out.as_deref()),
         InstanceCommands::Har { id, out } => har(globals, client, id, out.as_deref()),
+        InstanceCommands::NetworkBody {
+            id,
+            request_id,
+            offset,
+            limit,
+        } => network_body(globals, client, id, request_id, *offset, *limit),
         InstanceCommands::Create { env_id, name } => create(globals, client, env_id, name.as_deref()),
         InstanceCommands::Start { id } => start(globals, client, id),
         InstanceCommands::Stop { id } => stop(globals, client, id),
@@ -475,7 +498,9 @@ fn console(
 }
 
 /// `chrome-host instance network <ID> [--failed-only] [--tab] [--limit]`：请求环渲染。
-/// table：METHOD STATUS URL 列表；quiet：每行 `status\turl`；tab 过滤条件同 console。
+/// table：METHOD STATUS URL BODY 列表（BODY = bodyState，缺省 `-` 兼容旧服务端，
+/// unavailable 时附 reason 如 `unavailable(mime)`；v0.6+ 列集）；quiet：每行
+/// `status\turl\trequestId`（requestId 供 network-body 取用）；tab 过滤条件同 console。
 fn network(
     globals: &GlobalArgs,
     client: &AgentClient,
@@ -495,46 +520,64 @@ fn network(
     if out.quiet {
         for e in &entries {
             out.print_id(&format!(
-                "{}\t{}",
+                "{}\t{}\t{}",
                 e.get("status")
                     .and_then(|v| v.as_i64())
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "FAIL".into()),
-                e.get("url").and_then(|v| v.as_str()).unwrap_or("")
+                e.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                e.get("requestId").and_then(|v| v.as_str()).unwrap_or(""),
             ));
         }
         return Ok(());
     }
     let rows: Vec<TableRow> = entries
         .iter()
-        .map(|e| TableRow {
-            id: e
-                .get("ts")
-                .and_then(|v| v.as_i64())
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            cells: vec![
-                e.get("method")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-                    .to_string(),
-                e.get("status")
+        .map(|e| {
+            TableRow {
+                id: e
+                    .get("ts")
                     .and_then(|v| v.as_i64())
                     .map(|v| v.to_string())
-                    .unwrap_or_else(|| {
-                        e.get("error")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("FAIL")
-                            .to_string()
-                    }),
-                truncate(e.get("url").and_then(|v| v.as_str()).unwrap_or(""), 70),
-            ],
-            json: e.clone(),
+                    .unwrap_or_default(),
+                cells: vec![
+                    e.get("method")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    e.get("status")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| {
+                            e.get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("FAIL")
+                                .to_string()
+                        }),
+                    truncate(e.get("url").and_then(|v| v.as_str()).unwrap_or(""), 60),
+                    body_state_cell(e),
+                ],
+                json: e.clone(),
+            }
         })
         .collect();
     print_tab_filter_note(&out, &resp);
-    out.render_list(&["METHOD", "STATUS", "URL"], &rows);
+    out.render_list(&["METHOD", "STATUS", "URL", "BODY"], &rows);
     Ok(())
+}
+
+/// BODY 列单元格：bodyState（旧服务端无此字段 → `-`）；unavailable 附归因
+fn body_state_cell(e: &serde_json::Value) -> String {
+    let Some(state) = e.get("bodyState").and_then(|v| v.as_str()) else {
+        return "-".into();
+    };
+    match state {
+        "unavailable" => format!(
+            "unavailable({})",
+            e.get("bodyReason").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
+        other => other.to_string(),
+    }
 }
 
 /// tab 过滤条件标注（仅 table 模式；json 模式响应原样含 meta，quiet 保持纯行输出）。
@@ -633,6 +676,48 @@ fn har(
             ],
             serde_json::json!({ "file": path, "entries": entries }),
         );
+    }
+    Ok(())
+}
+
+/// `chrome-host instance network-body <ID> <REQUEST_ID> [--offset N] [--limit N]`：
+/// 分页读响应体（脱敏后）。table：元信息 kv + body 文本块；quiet：仅 body 原文
+/// （供管道/重定向）；json：响应原样（含 bodyState/totalLength/truncated 等）。
+/// 404（不在环）→ exit 3；409（状态不可读，message 含 bodyState/bodyReason）→ exit 5。
+fn network_body(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    request_id: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let id = resolve_instance_ref(client, id)?;
+    let resp = client.instance_network_body(&id, request_id, offset, limit)?;
+    if out.quiet {
+        out.print_id(resp.get("body").and_then(|v| v.as_str()).unwrap_or(""));
+        return Ok(());
+    }
+    let body = resp.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    if out.json {
+        out.render_kv(&[], resp);
+        return Ok(());
+    }
+    let mut kv = vec![
+        ("bodyState".into(), body_state_cell(&resp)),
+        ("offset".into(), resp["offset"].to_string()),
+        ("returned".into(), resp["returned"].to_string()),
+        ("totalLength".into(), resp["totalLength"].to_string()),
+        ("bodyBytes".into(), resp["bodyBytes"].to_string()),
+        ("truncated".into(), resp["truncated"].to_string()),
+    ];
+    if let Some(reason) = resp.get("bodyReason").and_then(|v| v.as_str()) {
+        kv.insert(1, ("bodyReason".into(), reason.to_string()));
+    }
+    out.render_kv(&kv, serde_json::Value::Null);
+    if !body.is_empty() {
+        out.render_text(body.to_string());
     }
     Ok(())
 }

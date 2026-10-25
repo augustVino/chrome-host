@@ -175,6 +175,10 @@ fn routes(state: ApiState) -> Router {
             get(crate::api::instances::network),
         )
         .route(
+            "/api/v1/instances/{id}/network/{request_id}/body",
+            get(crate::api::instances::network_body),
+        )
+        .route(
             "/api/v1/instances/{id}/screenshot",
             get(crate::api::instances::screenshot),
         )

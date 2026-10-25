@@ -208,6 +208,19 @@ struct NetworkArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct NetworkBodyArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = "请求 id（network 工具的 entries[].requestId）")]
+    request_id: String,
+    #[schemars(description = "窗口起点，UTF-16 code unit（JS String 同构）；缺省 0")]
+    offset: Option<usize>,
+    #[schemars(description = "窗口长度（UTF-16 unit）；缺省 8192，上限 65536。truncated=true 时用 offset+=returned 续读")]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct SetExtensionConfigArgs {
     #[schemars(description = "扩展 id（ext_ 前缀）")]
     extension_id: String,
@@ -775,6 +788,20 @@ impl ChromeHostMcp {
                 a.tab.as_deref(),
                 a.limit,
             )
+        })
+    }
+
+    #[tool(
+        description = "读取网络请求的响应体（脱敏后，分页）：仅 bodyState available/partial 的条目可读（404 = requestId 不在环，环为进程内态重启即清；409 = 状态不可读，message 携带 bodyState/bodyReason）。offset/limit 以 UTF-16 code unit 计量且不劈代理对，响应含 totalLength/returned/truncated；body 落环前已脱敏（敏感字段值/Bearer/k=v → [redacted]）"
+    )]
+    async fn get_network_body(
+        &self,
+        Parameters(a): Parameters<NetworkBodyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run_sync(|| {
+            self.state
+                .diagnostics
+                .network_body(&a.instance_id, &a.request_id, a.offset, a.limit)
         })
     }
 

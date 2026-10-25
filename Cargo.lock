@@ -645,6 +645,7 @@ name = "chrome-host"
 version = "0.5.1"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "libc",

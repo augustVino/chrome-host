@@ -206,6 +206,28 @@ pub async fn network(
     Ok(Json(view))
 }
 
+#[derive(Deserialize)]
+pub struct NetworkBodyQuery {
+    /// 窗口起点（UTF-16 code unit；缺省 0）
+    pub offset: Option<usize>,
+    /// 窗口长度（UTF-16 code unit；缺省 8192，上限 65536）
+    pub limit: Option<usize>,
+}
+
+/// GET /api/v1/instances/{id}/network/{requestId}/body：分页读响应体（脱敏后）。
+/// 404 NETWORK_BODY_NOT_FOUND = requestId 不在环；409 NETWORK_BODY_UNAVAILABLE =
+/// 条目在但 bodyState 不可读（mime/timeout/...，message 携带归因）
+pub async fn network_body(
+    State(state): State<ApiState>,
+    Path((id, request_id)): Path<(String, String)>,
+    Query(q): Query<NetworkBodyQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let view = state
+        .diagnostics
+        .network_body(&id, &request_id, q.offset, q.limit)?;
+    Ok(Json(view))
+}
+
 /// GET /api/v1/instances/{id}/screenshot：当前页面 png 截图（base64，
 /// 复用常驻诊断连接；实例未运行/连接未就绪/无 http 页 → 409）
 pub async fn screenshot(

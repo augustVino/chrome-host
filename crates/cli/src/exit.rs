@@ -205,6 +205,17 @@ mod tests {
                 api(409, "INSTANCE_NOT_RUNNING"),
                 ExitCode::RUNTIME,
             ),
+            // —— 常驻诊断 body 面（v0.6+）：状态码既有分支，码表同步义务 ——
+            (
+                "404 NETWORK_BODY_NOT_FOUND（requestId 不在环）",
+                api(404, "NETWORK_BODY_NOT_FOUND"),
+                ExitCode::NOT_FOUND,
+            ),
+            (
+                "409 NETWORK_BODY_UNAVAILABLE（bodyState 不可读）",
+                api(409, "NETWORK_BODY_UNAVAILABLE"),
+                ExitCode::RUNTIME,
+            ),
             (
                 "409 PROFILE_IN_USE",
                 api(409, "PROFILE_IN_USE"),

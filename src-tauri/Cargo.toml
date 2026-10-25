@@ -49,6 +49,8 @@ tauri-plugin-updater = "2.11.0"
 tauri-plugin-process = "2.3.1"
 
 uuid = { version = "1", features = ["v4"] }
+# body 拉取的 base64 解码（Network.getResponseBody base64Encoded 形态）与 HAR 编码
+base64 = "0.22"
 # CDP 会话代理（方案 §4/§7.2）：axum ws(server) + tokio-tungstenite(client) 帧级桥
 tokio-tungstenite = "0.26"
 futures-util = "0.3"

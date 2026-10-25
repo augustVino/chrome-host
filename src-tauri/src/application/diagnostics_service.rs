@@ -10,7 +10,7 @@
 //! Page.captureScreenshot），与 agent 自建的 CDP 会话天然互不干扰。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +18,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::domain::diagnostics::{
-    ApplyOutcome, DiagBuffer, QueryResult, RingStats, NETWORK_SCOPE_COMPLETED,
+    ApplyOutcome, BodyPayload, BodyState, DiagBuffer, NetworkBodyView, QueryResult, RingStats,
+    NETWORK_SCOPE_COMPLETED, REASON_NO_DATA, REASON_TIMEOUT,
 };
 use crate::domain::instance::InstanceStatus;
 use crate::error::AppError;
@@ -31,6 +32,16 @@ const BACKOFF_MAX: Duration = Duration::from_secs(15);
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
+/// body 拉取预算：并发 in-flight ≤4（CdpConnection::send 支持 &self 并发，
+/// 常驻事件流不被拉取堵死）；排队上限（溢出即诚实归因 no-data，不堆积）；
+/// 单条超时 ~2.5s（远低于命令通道 15s，防慢拉取占住并发槽）
+const BODY_FETCH_CONCURRENCY: usize = 4;
+const BODY_BACKLOG_CAP: usize = 64;
+const BODY_FETCH_TIMEOUT: Duration = Duration::from_millis(2500);
+/// body 分页读：offset/limit 以 UTF-16 code unit 计量（JS String 同构）
+const BODY_READ_DEFAULT_LIMIT: usize = 8192;
+const BODY_READ_MAX_LIMIT: usize = 65536;
+
 fn unavailable(message: impl Into<String>) -> AppError {
     AppError::conflict("DIAGNOSTICS_UNAVAILABLE", message)
 }
@@ -40,6 +51,10 @@ struct Watched {
     /// 当前代连接（断线置 None，重连整体替换）；截图查询复用它发命令。
     /// send 已 &self 并发化（P2-F 根治），裸 Arc 直发、无锁包裹。
     conn: Mutex<Option<Arc<CdpConnection>>>,
+    /// body 拉取并发闸门（≤4 in-flight；排队 = acquire 等待）
+    body_gate: Arc<tokio::sync::Semaphore>,
+    /// body 拉取排队计数（含 in-flight；超上限溢出即归因 no-data）
+    body_backlog: Arc<AtomicUsize>,
     /// 代际守卫：restart 产生新一代后旧代自行退出（防双 watcher 双缓冲）
     current: AtomicBool,
     /// 本代 watcher 挂载时刻（epoch ms）：响应 meta.since 的数据源——早于该
@@ -52,6 +67,8 @@ impl Watched {
         Watched {
             buffer: Arc::new(Mutex::new(DiagBuffer::default())),
             conn: Mutex::new(None),
+            body_gate: Arc::new(tokio::sync::Semaphore::new(BODY_FETCH_CONCURRENCY)),
+            body_backlog: Arc::new(AtomicUsize::new(0)),
             current: AtomicBool::new(true),
             since_ms: now_ms(),
         }
@@ -215,9 +232,60 @@ impl DiagnosticsService {
                 "request/response 的 headersSize、bodySize = -1：未采集（HAR 规范 not available 语义）",
                 "timings 的 send/wait/dns/connect/ssl = -1：仅记录总时长（receive），分阶段耗时未采集",
                 "headers/queryString/cookies = 空数组：未采集，非确认为空",
+                "request body 未采集：仅捕获响应体（文本类 mime 的 response.content.text，脱敏后嵌入）",
+                "response.content.text：仅 bodyState available/partial 的条目携带（partial = 超 256KiB 截断；含非 ASCII 时 base64 + encoding）；evicted/unavailable 条目无 text——bodyState/bodyReason 见 network 查询",
             ],
         });
         Ok(har)
+    }
+
+    /// GET network/{requestId}/body?offset=&limit=：分页读响应体（UTF-16
+    /// code unit 计量，不劈代理对）。仅环内 available/partial 条目可读；
+    /// requestId 不在环 → 404 NETWORK_BODY_NOT_FOUND（环为进程内态，重启即清）；
+    /// 状态不可读 → 409 NETWORK_BODY_UNAVAILABLE（message 携带 bodyState/bodyReason）。
+    pub fn network_body(
+        &self,
+        ins_id: &str,
+        request_id: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<Value, AppError> {
+        let offset = offset.unwrap_or(0);
+        let limit = limit.unwrap_or(BODY_READ_DEFAULT_LIMIT).min(BODY_READ_MAX_LIMIT);
+        let Some(watched) = self.require(ins_id)? else {
+            return Err(AppError::not_found(
+                "NETWORK_BODY_NOT_FOUND",
+                format!("请求 {request_id} 不在诊断环内（常驻诊断未就绪：实例刚启动或已重启，环内无数据）"),
+            ));
+        };
+        let view = {
+            let buf = watched.buffer.lock().unwrap();
+            buf.network_body(request_id, offset, limit)
+        };
+        let Some(view) = view else {
+            return Err(AppError::not_found(
+                "NETWORK_BODY_NOT_FOUND",
+                format!(
+                    "请求 {request_id} 不在诊断环内（可能已被环容量挤出，或实例/应用重启；\
+                     requestId 以 network 查询为准）"
+                ),
+            ));
+        };
+        if !matches!(view.state, BodyState::Available | BodyState::Partial) {
+            let reason = view
+                .reason
+                .map(|r| format!("，bodyReason: {r}"))
+                .unwrap_or_default();
+            return Err(AppError::conflict(
+                "NETWORK_BODY_UNAVAILABLE",
+                format!(
+                    "请求 {request_id} 的 body 不可读（bodyState: {}{}）",
+                    view.state.as_str(),
+                    reason
+                ),
+            ));
+        }
+        Ok(body_response(ins_id, request_id, offset, limit, &view))
     }
 
     /// GET screenshot：复用常驻连接对第一个 http(s) 页面 session 截图（png base64）。
@@ -256,6 +324,102 @@ impl DiagnosticsService {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// body 响应组装：truncated = 窗口未覆盖全文（offset+returned < total），
+/// 分页继续读用 offset += returned。bodyReason 仅 unavailable 态携带。
+fn body_response(
+    ins_id: &str,
+    request_id: &str,
+    offset: usize,
+    limit: usize,
+    view: &NetworkBodyView,
+) -> Value {
+    let mut resp = json!({
+        "instanceId": ins_id,
+        "requestId": request_id,
+        "bodyState": view.state,
+        "body": view.slice.text,
+        "offset": offset,
+        "limit": limit,
+        "returned": view.slice.returned,
+        "totalLength": view.slice.total,
+        "bodyBytes": view.stored_bytes,
+        "truncated": offset + view.slice.returned < view.slice.total,
+    });
+    if let Some(reason) = view.reason {
+        resp["bodyReason"] = json!(reason);
+    }
+    resp
+}
+
+/// body 拉取调度：排队预算（防事件洪峰堆积；溢出即诚实归因 no-data）→
+/// 并发闸门（≤4 in-flight）。连接断开（重连窗口）同样归因 no-data，
+/// 条目不停畆在悬挂态。
+fn dispatch_body_fetch(watched: &Arc<Watched>, session_id: String, request_id: String) {
+    if watched.body_backlog.load(Ordering::Relaxed) >= BODY_BACKLOG_CAP {
+        watched.buffer.lock().unwrap().store_body(
+            &request_id,
+            BodyPayload::Unavailable {
+                reason: REASON_NO_DATA,
+            },
+        );
+        return;
+    }
+    watched.body_backlog.fetch_add(1, Ordering::Relaxed);
+    let gate = Arc::clone(&watched.body_gate);
+    let backlog = Arc::clone(&watched.body_backlog);
+    let buffer = Arc::clone(&watched.buffer);
+    let conn = watched.conn.lock().unwrap().clone();
+    // 拉取完全异步：事件泵只登记不等待（诊断连接是常驻事件流，不能被 body 拉取堵死）
+    tauri::async_runtime::spawn(async move {
+        // 排队等待 permit（≤4 并发）；拿到 permit 即退出排队计数
+        let _permit = gate.acquire().await;
+        backlog.fetch_sub(1, Ordering::Relaxed);
+        let payload = match conn {
+            Some(conn) => fetch_response_body(&conn, &session_id, &request_id, BODY_FETCH_TIMEOUT).await,
+            None => BodyPayload::Unavailable {
+                reason: REASON_NO_DATA,
+            },
+        };
+        buffer.lock().unwrap().store_body(&request_id, payload);
+    });
+}
+
+/// 单条拉取：getResponseBody（per-session）+ 2.5s 超时预算 → 归因映射。
+/// timeout 参数化仅为单测提速（生产恒为 [`BODY_FETCH_TIMEOUT`]）。
+async fn fetch_response_body(
+    conn: &CdpConnection,
+    session_id: &str,
+    request_id: &str,
+    timeout: Duration,
+) -> BodyPayload {
+    let fut = conn.send::<Value>(
+        "Network.getResponseBody",
+        json!({ "requestId": request_id }),
+        Some(session_id),
+    );
+    match tokio::time::timeout(timeout, fut).await {
+        Err(_elapsed) => BodyPayload::Unavailable {
+            reason: REASON_TIMEOUT,
+        },
+        Ok(Err(_cdp)) => BodyPayload::Unavailable {
+            // CDP 拒绝（如 No resource with given identifier）/连接中断：无数据
+            reason: REASON_NO_DATA,
+        },
+        Ok(Ok(v)) => match v.get("body").and_then(Value::as_str) {
+            None | Some("") => BodyPayload::Unavailable {
+                reason: REASON_NO_DATA,
+            },
+            Some(body) => BodyPayload::Raw {
+                body: body.to_string(),
+                base64_encoded: v
+                    .get("base64Encoded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+        },
+    }
 }
 
 /// watcher 未就绪时的空投影（空环过滤任意 tab 结果仍为空，无需降级标注）
@@ -322,8 +486,12 @@ async fn watch_loop(
                         break;
                     }
                     let outcome = watched.buffer.lock().unwrap().apply(&event, now_ms());
-                    if let ApplyOutcome::Attach(sid) = outcome {
-                        enable_session(&watched, &sid).await;
+                    match outcome {
+                        ApplyOutcome::Attach(sid) => enable_session(&watched, &sid).await,
+                        ApplyOutcome::BodyFetch { session_id, request_id } => {
+                            dispatch_body_fetch(&watched, session_id, request_id)
+                        }
+                        ApplyOutcome::Detach(_) | ApplyOutcome::None => {}
                     }
                 }
                 // 通道关闭 = reader 结束 = 连接已死；清空连接引用后进入退避重连
@@ -559,5 +727,224 @@ mod tests {
             .unwrap()
             .iter()
             .any(|s| s.as_str().unwrap_or("").contains("timings")));
+    }
+
+    // ---------- body 读取端点与拉取编排 ----------
+
+    /// 事件喂入工具：完整走完一个请求（指定 mime）并返回 requestId
+    fn finish_request(buf: &mut std::sync::MutexGuard<'_, DiagBuffer>, rid: &str, mime: &str) {
+        buf.apply(
+            &json!({ "method": "Network.requestWillBeSent", "sessionId": "s1",
+                "params": { "requestId": rid, "wallTime": 1.0, "timestamp": 1.0,
+                    "request": { "method": "GET", "url": format!("https://a/{rid}") } } }),
+            0,
+        );
+        buf.apply(
+            &json!({ "method": "Network.responseReceived", "sessionId": "s1",
+                "params": { "requestId": rid, "response": { "status": 200, "mimeType": mime } } }),
+            0,
+        );
+        buf.apply(
+            &json!({ "method": "Network.loadingFinished", "sessionId": "s1",
+                "params": { "requestId": rid, "timestamp": 1.0 } }),
+            0,
+        );
+    }
+
+    /// body 端点语义与契约字段：available 可读（分页 + truncated）、
+    /// 不可读状态 → 409 NETWORK_BODY_UNAVAILABLE、不在环 → 404、
+    /// network 列表条目携带 bodyState/bodyReason（meta 契约不变）
+    #[test]
+    fn network_body_endpoint_semantics() {
+        let (repo, ins) = setup();
+        let svc = DiagnosticsService::new(Arc::clone(&repo), "0.6.0".into());
+        let watched = Arc::new(Watched::new());
+        svc.registry
+            .lock()
+            .unwrap()
+            .insert(ins.id.clone(), Arc::clone(&watched));
+        watched.buffer.lock().unwrap().apply(
+            &json!({ "method": "Target.attachedToTarget",
+                "params": { "sessionId": "s1", "targetInfo": { "targetId": "tab-1", "type": "page", "url": "https://a/" } } }),
+            0,
+        );
+        {
+            let mut buf = watched.buffer.lock().unwrap();
+            finish_request(&mut buf, "r1", "application/json");
+            finish_request(&mut buf, "r2", "image/png");
+            finish_request(&mut buf, "r3", "application/json");
+            buf.store_body(
+                "r1",
+                BodyPayload::Raw { body: "{\"token\":\"x\",\"data\":[1,2,3]}".into(), base64_encoded: false },
+            );
+            // r3 超时终态
+            buf.store_body("r3", BodyPayload::Unavailable { reason: crate::domain::diagnostics::REASON_TIMEOUT });
+        }
+
+        // 列表契约：条目携带 bodyState/bodyReason；meta 结构不变（无新增键语义）
+        let list = svc.network(&ins.id, false, None, None).unwrap();
+        let e0 = &list["entries"][0];
+        assert_eq!(e0["bodyState"], "available");
+        assert!(e0.get("bodyReason").is_none(), "非 unavailable 无 bodyReason");
+        assert_eq!(list["entries"][1]["bodyState"], "unavailable");
+        assert_eq!(list["entries"][1]["bodyReason"], "mime");
+        assert_eq!(list["meta"]["scope"], "completed");
+
+        // 可读：全文一次返回
+        let body = svc.network_body(&ins.id, "r1", None, None).unwrap();
+        assert_eq!(body["bodyState"], "available");
+        assert_eq!(body["body"], "{\"token\":\"[redacted]\",\"data\":[1,2,3]}");
+        assert_eq!(body["returned"], 37);
+        assert_eq!(body["totalLength"], 37);
+        assert_eq!(body["bodyBytes"], 37);
+        assert_eq!(body["truncated"], false);
+
+        // 分页：limit=10 → 前半 + truncated=true；续读 offset=10
+        let page = svc.network_body(&ins.id, "r1", Some(0), Some(10)).unwrap();
+        assert_eq!(page["returned"], 10);
+        assert_eq!(page["truncated"], true);
+        assert_eq!(page["offset"], 0);
+        let next = svc.network_body(&ins.id, "r1", Some(10), Some(10)).unwrap();
+        assert_eq!(next["offset"], 10);
+
+        // 不可读（mime）→ 409 NETWORK_BODY_UNAVAILABLE，message 携带归因
+        let err = svc.network_body(&ins.id, "r2", None, None).unwrap_err();
+        assert_eq!((err.status(), err.code()), (409, "NETWORK_BODY_UNAVAILABLE"));
+        assert!(err.to_string().contains("mime"));
+        let err = svc.network_body(&ins.id, "r3", None, None).unwrap_err();
+        assert!(err.to_string().contains("timeout"));
+
+        // 不在环 → 404 NETWORK_BODY_NOT_FOUND
+        let err = svc.network_body(&ins.id, "ghost", None, None).unwrap_err();
+        assert_eq!((err.status(), err.code()), (404, "NETWORK_BODY_NOT_FOUND"));
+
+        // 实例停止 → 409 DIAGNOSTICS_UNAVAILABLE（与 network 查询同门卫）
+        repo.update_runtime(
+            &ins.id,
+            crate::domain::instance::RuntimeUpdate {
+                status: Some(InstanceStatus::Stopped),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = svc.network_body(&ins.id, "r1", None, None).unwrap_err();
+        assert_eq!(err.code(), "DIAGNOSTICS_UNAVAILABLE");
+    }
+
+    /// 排队溢出：backlog 打满时新拉取同步归因 no-data（不停畆在 not-finished）
+    #[test]
+    fn body_fetch_dispatch_sheds_when_backlog_full() {
+        let watched = Arc::new(Watched::new());
+        watched
+            .buffer
+            .lock()
+            .unwrap()
+            .apply(
+                &json!({ "method": "Target.attachedToTarget",
+                    "params": { "sessionId": "s1", "targetInfo": { "targetId": "t", "type": "page", "url": "https://a/" } } }),
+                0,
+            );
+        let mut buf = watched.buffer.lock().unwrap();
+        finish_request(&mut buf, "r1", "application/json");
+        drop(buf);
+        watched
+            .body_backlog
+            .store(BODY_BACKLOG_CAP, Ordering::Relaxed);
+        dispatch_body_fetch(&watched, "s1".into(), "r1".into()); // 同步溢出路径，不 spawn
+        let e = &watched
+            .buffer
+            .lock()
+            .unwrap()
+            .network_entries(false, None, 10)
+            .entries[0];
+        assert_eq!(
+            (e.body_state, e.body_reason),
+            (BodyState::Unavailable, Some(crate::domain::diagnostics::REASON_NO_DATA))
+        );
+    }
+
+    /// 拉取路径（FakeCdp）：mock ws server 脚本化 getResponseBody 三种应答——
+    /// 正常文本（base64 与否）、CDP 拒绝、悬挂（超时）。事件驱动链路的 IO 段
+    /// 在此验证；mock 形态与 infrastructure/cdp/ws.rs 测试同源。
+    #[tokio::test]
+    async fn fetch_response_body_against_mock_cdp() {
+        use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+        use axum::response::Response;
+        use axum::routing::get;
+        use axum::Router;
+
+        async fn mock_socket(mut socket: WebSocket) {
+            while let Some(Ok(msg)) = socket.recv().await {
+                let Message::Text(text) = msg else { continue };
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let Some(id) = v.get("id").and_then(|x| x.as_u64()) else { continue };
+                let reply = match v["params"]["requestId"].as_str() {
+                    Some("r-ok") => serde_json::json!({
+                        "id": id,
+                        "result": { "body": "Bearer sec.ret", "base64Encoded": false }
+                    }),
+                    Some("r-b64") => serde_json::json!({
+                        "id": id,
+                        "result": {
+                            "body": base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD, "plain text"),
+                            "base64Encoded": true
+                        }
+                    }),
+                    Some("r-deny") => serde_json::json!({
+                        "id": id,
+                        "error": { "code": -32000, "message": "No resource with given identifier" }
+                    }),
+                    Some("r-hang") => continue, // 不应答：超时路径
+                    _ => continue,
+                };
+                let _ = socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await;
+            }
+        }
+        let app = Router::new().route(
+            "/ws",
+            get(|ws: WebSocketUpgrade| async move { ws.on_upgrade(mock_socket) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = CdpConnection::connect_ws(
+            &format!("ws://127.0.0.1:{}/ws", addr.port()),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        // 正常：文本（脱敏在域层，此处只验取回）
+        match fetch_response_body(&conn, "sess", "r-ok", Duration::from_secs(2)).await {
+            BodyPayload::Raw { body, base64_encoded } => {
+                assert_eq!(body, "Bearer sec.ret");
+                assert!(!base64_encoded);
+            }
+            other => panic!("应为 Raw: {other:?}"),
+        }
+        // base64 形态透传（解码在域层 store_body）
+        match fetch_response_body(&conn, "sess", "r-b64", Duration::from_secs(2)).await {
+            BodyPayload::Raw { body: _, base64_encoded } => assert!(base64_encoded),
+            other => panic!("应为 Raw: {other:?}"),
+        }
+        // CDP 拒绝 → no-data
+        match fetch_response_body(&conn, "sess", "r-deny", Duration::from_secs(2)).await {
+            BodyPayload::Unavailable { reason } => {
+                assert_eq!(reason, crate::domain::diagnostics::REASON_NO_DATA)
+            }
+            other => panic!("应为 Unavailable: {other:?}"),
+        }
+        // 悬挂 → 超时（预算 300ms，验证不等待命令通道 15s）
+        let start = std::time::Instant::now();
+        match fetch_response_body(&conn, "sess", "r-hang", Duration::from_millis(300)).await {
+            BodyPayload::Unavailable { reason } => {
+                assert_eq!(reason, crate::domain::diagnostics::REASON_TIMEOUT)
+            }
+            other => panic!("应为 Unavailable: {other:?}"),
+        }
+        assert!(start.elapsed() < Duration::from_secs(2), "超时预算生效，非命令通道 15s");
     }
 }

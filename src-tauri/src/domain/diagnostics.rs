@@ -13,18 +13,76 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use base64::Engine;
 use serde::Serialize;
 use serde_json::{json, Value};
+
+use crate::domain::redact;
 
 /// 环形容量（交接契约：console 500 / network 1000）
 const CONSOLE_RING: usize = 500;
 const NETWORK_RING: usize = 1000;
+/// 单条 body 上限（字节）：超限截断 → bodyState "partial"（保留实际字节数）
+pub const BODY_ITEM_MAX_BYTES: usize = 256 * 1024;
+/// 环级 body 总预算（字节）：超预算从最旧条目驱逐 body（元数据永不驱逐）
+pub const BODY_TOTAL_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// network 环的采集范围声明（console/network 查询与 HAR `_meta` 的常量值）：
 /// 条目在请求完成/失败时入环，**进行中的请求不可见**——响应显式声明而非留白
 pub const NETWORK_SCOPE_COMPLETED: &str = "completed";
 /// in-flight 悬挂保护：未完成请求的 pending 表上限。超限整体清空——泄漏防护
 /// 优先于完整性（无序 HashMap 无从挑选最旧；被清掉的请求完成事件将无处归档）
 const PENDING_CAP: usize = 500;
+
+// ---------- bodyState 状态机（冻结契约，从第一天就多态） ----------
+
+/// bodyReason 的契约取值（unavailable 时必填；其余状态为 None）
+pub const REASON_MIME: &str = "mime";
+pub const REASON_TIMEOUT: &str = "timeout";
+pub const REASON_NOT_TEXT: &str = "not-text";
+pub const REASON_NO_DATA: &str = "no-data";
+/// 请求未完成（loadingFailed）或 body 拉取尚未结算（事件驱动，最终一致）
+pub const REASON_NOT_FINISHED: &str = "not-finished";
+pub const REASON_REDACT_FAILED: &str = "redact-failed";
+
+/// 响应体可用性状态（冻结契约：available | partial | evicted | unavailable）。
+/// 多态从第一天就存在——不先做「有/无」再补状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BodyState {
+    /// 全量可用（预算内未截断）
+    Available,
+    /// 超单条上限被截断（保留实际字节数；分页读可读已保留部分）
+    Partial,
+    /// 环级总预算驱逐（元数据保留，body 已回收）
+    Evicted,
+    /// 不可用（bodyReason 必填：mime/timeout/not-text/no-data/not-finished/redact-failed）
+    Unavailable,
+}
+
+impl BodyState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BodyState::Available => "available",
+            BodyState::Partial => "partial",
+            BodyState::Evicted => "evicted",
+            BodyState::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// store_body 的输入（app 层拉取结果 → 域层结算终态）
+#[derive(Debug)]
+pub enum BodyPayload {
+    /// getResponseBody 原始返回（base64 与否由 CDP 响应告知；解码/校验/脱敏/
+    /// 截断均在域层 store_body 内完成——单一冲口保证「落环前脱敏」）
+    Raw {
+        body: String,
+        base64_encoded: bool,
+    },
+    /// 拉取失败（timeout = 2.5s 预算耗尽；no-data = 排队溢出/连接断/CDP 拒绝/
+    /// 空响应；not-text = 解码后非 UTF-8 文本——具体归因在 app 层，域层只存）
+    Unavailable { reason: &'static str },
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +107,7 @@ pub struct NetworkEntry {
     pub ts: i64,
     pub request_id: String,
     pub method: String,
+    /// **脱敏后**的 URL（query 敏感参数值已替换；原始 URL 不落进程内存）
     pub url: String,
     pub status: Option<i64>,
     pub mime_type: Option<String>,
@@ -59,6 +118,14 @@ pub struct NetworkEntry {
     pub target_url: String,
     /// 归属 tab 的 targetId（requestWillBeSent 有 session 门卫，必有归属）
     pub target_id: Option<String>,
+    /// 响应体可用性（冻结契约，见 [`BodyState`]）
+    pub body_state: BodyState,
+    /// unavailable 时的原因（其余状态 None，不序列化）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_reason: Option<&'static str>,
+    /// 已保留的脱敏 body（不随条目序列化——list 响应只出状态，内容走 body 端点）
+    #[serde(skip)]
+    pub body: Option<String>,
 }
 
 /// 环的证据边界（查询响应/HAR `_meta` 的数据源）：固定容量 + 累计溢出丢弃数。
@@ -92,12 +159,65 @@ pub struct QueryResult<T> {
     pub meta: Option<TabFilterMeta>,
 }
 
-/// attach/detach 的信号（应用层据此发送 per-session enable 命令）
+/// body 分页读取投影（service 层据此组装响应）
+#[derive(Debug)]
+pub struct NetworkBodyView {
+    pub state: BodyState,
+    pub reason: Option<&'static str>,
+    pub slice: Utf16Slice,
+    /// 环内已保留字节数（partial = 截断后实际保留量）
+    pub stored_bytes: usize,
+}
+
+/// UTF-16 code unit 计量的切片结果（不劈代理对：边界落入代理对时向外取整，
+/// 返回量可能比请求 limit 多 1 个 unit）
+#[derive(Debug, Default)]
+pub struct Utf16Slice {
+    pub text: String,
+    /// 实际返回的 UTF-16 单位数
+    pub returned: usize,
+    /// 全文 UTF-16 单位总长
+    pub total: usize,
+}
+
+impl Utf16Slice {
+    fn empty() -> Self {
+        Utf16Slice { text: String::new(), returned: 0, total: 0 }
+    }
+}
+
+/// UTF-16 窗口切片：取与 [offset, offset+limit) **有交集**的字符（区间重叠
+/// 规则 = 起止边界同时向外取整，代理对永不劈开；limit=0 或 offset 出界 → 空）
+pub fn slice_utf16(text: &str, offset: usize, limit: usize) -> Utf16Slice {
+    let mut total = 0usize;
+    let mut out = String::new();
+    let mut returned = 0usize;
+    let mut pos = 0usize;
+    for c in text.chars() {
+        let len = c.len_utf16();
+        let end = pos + len;
+        // 字符的 [pos, end) 与窗口 [offset, offset+limit) 有交集则包含
+        if limit > 0 && pos < offset + limit && end > offset {
+            out.push(c);
+            returned += len;
+        }
+        pos = end;
+        total += len;
+    }
+    Utf16Slice { text: out, returned, total }
+}
+
+/// attach/detach 的信号（应用层据此发送 per-session enable 命令）；
+/// BodyFetch = 该请求应拉响应体（文本 mime 且成功完成，并发/超时预算在应用层）
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
     None,
     Attach(String),
     Detach(String),
+    BodyFetch {
+        session_id: String,
+        request_id: String,
+    },
 }
 
 /// attach 登记的 session 归属：tab 的 targetId + attach 时的页面 URL
@@ -118,6 +238,8 @@ pub struct DiagBuffer {
     sessions: HashMap<String, SessionInfo>,
     /// (session_id, request_id) → 进行中的请求；完成/失败时结算入环
     pending: HashMap<(String, String), PendingRequest>,
+    /// 环内已保留 body 的字节总量（分层驱逐的预算账本）
+    body_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -279,11 +401,14 @@ impl DiagBuffer {
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
-                            url: request
-                                .get("url")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
+                            // 落环前脱敏：原始 URL 不进进程内存（常驻环会被
+                            // 查询/HAR 反复外泄，单向脱敏让查得到的一定安全）
+                            url: redact::redact_url(
+                                request
+                                    .get("url")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            ),
                             status: None,
                             mime_type: None,
                             failed: false,
@@ -291,6 +416,9 @@ impl DiagBuffer {
                             duration_ms: None,
                             target_url: session.map(|s| s.target_url.clone()).unwrap_or_default(),
                             target_id: session.map(|s| s.target_id.clone()),
+                            body_state: BodyState::Unavailable,
+                            body_reason: Some(REASON_NOT_FINISHED),
+                            body: None,
                         },
                         mono_start: params
                             .get("timestamp")
@@ -322,9 +450,35 @@ impl DiagBuffer {
                         .unwrap_or(0.0);
                     req.entry.duration_ms =
                         Some(((end - req.mono_start).max(0.0) * 1000.0).round() as i64);
+                    // 初始 bodyState：文本 mime → not-finished（事件驱动拉取中，
+                    // 最终一致）；非文本/未知 mime → mime（永不拉取）。多态从
+                    // 第一天就存在——查询看到的就是这四个状态之一
+                    let text_mime = req
+                        .entry
+                        .mime_type
+                        .as_deref()
+                        .map(redact::is_text_mime)
+                        .unwrap_or(false);
+                    if text_mime {
+                        req.entry.body_state = BodyState::Unavailable;
+                        req.entry.body_reason = Some(REASON_NOT_FINISHED);
+                    } else {
+                        req.entry.body_state = BodyState::Unavailable;
+                        req.entry.body_reason = Some(REASON_MIME);
+                    }
+                    let outcome = if text_mime {
+                        ApplyOutcome::BodyFetch {
+                            session_id: session_id.clone(),
+                            request_id: req.entry.request_id.clone(),
+                        }
+                    } else {
+                        ApplyOutcome::None
+                    };
                     self.settle(req.entry);
+                    outcome
+                } else {
+                    ApplyOutcome::None
                 }
-                ApplyOutcome::None
             }
             "Network.loadingFailed" => {
                 if let Some(mut req) = self.take_pending(&session_id, &params) {
@@ -339,6 +493,9 @@ impl DiagBuffer {
                         .unwrap_or(0.0);
                     req.entry.duration_ms =
                         Some(((end - req.mono_start).max(0.0) * 1000.0).round() as i64);
+                    // 请求未完成：响应体永不可得
+                    req.entry.body_state = BodyState::Unavailable;
+                    req.entry.body_reason = Some(REASON_NOT_FINISHED);
                     self.settle(req.entry);
                 }
                 ApplyOutcome::None
@@ -355,10 +512,133 @@ impl DiagBuffer {
 
     fn settle(&mut self, entry: NetworkEntry) {
         self.network.push_back(entry);
-        if self.network.len() > NETWORK_RING {
-            self.network.pop_front();
-            self.network_dropped += 1;
+        while self.network.len() > NETWORK_RING {
+            if let Some(dropped) = self.network.pop_front() {
+                if let Some(body) = &dropped.body {
+                    self.body_bytes = self.body_bytes.saturating_sub(body.len());
+                }
+                self.network_dropped += 1;
+            }
         }
+    }
+
+    /// body 拉取结果结算（单一冲口：解码 → 校验 → 脱敏 → 截断 → 入账）。
+    /// 目标条目 = 环内最新一个该 requestId 且仍处 not-finished 待结算态的条目
+    /// （requestId 理论上可跨 session 碰撞，先到先结算；已被环溢出挤出的条目
+    /// 找不到则丢弃——诚实丢弃，无处可写）。
+    pub fn store_body(&mut self, request_id: &str, payload: BodyPayload) {
+        let Some(entry) = self.network.iter_mut().rev().find(|e| {
+            e.request_id == request_id
+                && e.body_state == BodyState::Unavailable
+                && e.body_reason == Some(REASON_NOT_FINISHED)
+        }) else {
+            return;
+        };
+        match payload {
+            BodyPayload::Unavailable { reason } => {
+                entry.body_reason = Some(reason);
+            }
+            BodyPayload::Raw { body, base64_encoded } => {
+                let bytes = if base64_encoded {
+                    match base64::engine::general_purpose::STANDARD.decode(body.as_bytes()) {
+                        Ok(b) => b,
+                        // base64 非法：CDP 回了不可解码的字节序列，按二进制伪装归 not-text
+                        Err(_) => {
+                            entry.body_reason = Some(REASON_NOT_TEXT);
+                            return;
+                        }
+                    }
+                } else {
+                    body.into_bytes()
+                };
+                if bytes.is_empty() {
+                    entry.body_reason = Some(REASON_NO_DATA);
+                    return;
+                }
+                let Ok(text) = String::from_utf8(bytes) else {
+                    entry.body_reason = Some(REASON_NOT_TEXT);
+                    return;
+                };
+                let redacted = match redact::redact_body(entry.mime_type.as_deref(), &text) {
+                    Ok(r) => r,
+                    Err(reject) => {
+                        // 拒绝语义优先于部分保留（宁少证据不漏密钥）；
+                        // 具体拒绝型（Unparseable/TooDeep/Uncertain）统一落
+                        // redact-failed，诊断而分钟级排障足够
+                        let _ = reject;
+                        entry.body_reason = Some(REASON_REDACT_FAILED);
+                        return;
+                    }
+                };
+                if redacted.len() > BODY_ITEM_MAX_BYTES {
+                    // 字符边界截断（不跨 UTF-8 序列）；保留实际字节数入账
+                    let mut cut = BODY_ITEM_MAX_BYTES;
+                    while !redacted.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    let stored = redacted[..cut].to_string();
+                    self.body_bytes += stored.len();
+                    entry.body = Some(stored);
+                    entry.body_state = BodyState::Partial;
+                    entry.body_reason = None;
+                } else {
+                    self.body_bytes += redacted.len();
+                    entry.body = Some(redacted);
+                    entry.body_state = BodyState::Available;
+                    entry.body_reason = None;
+                }
+                self.enforce_body_budget();
+            }
+        }
+    }
+
+    /// 分层驱逐：body 总预算超限时从**最旧**条目开始回收 body（元数据永不
+    /// 驱逐，bodyState → evicted）。与环容量驱逐并行起作用：环驱条目，
+    /// 预算驱 body——结构证据完整，重的 body 可回收。
+    fn enforce_body_budget(&mut self) {
+        while self.body_bytes > BODY_TOTAL_MAX_BYTES {
+            let (idx, len) = match self.network.iter().enumerate().find(|(_, e)| e.body.is_some())
+            {
+                Some((i, e)) => (i, e.body.as_ref().map_or(0, |b| b.len())),
+                // body_bytes 超限却无 body 可驱：账本与环不一致（不可达——
+                // 入账与回收同锁同点），归零防御防死循环
+                None => {
+                    self.body_bytes = 0;
+                    return;
+                }
+            };
+            let e = &mut self.network[idx];
+            e.body = None;
+            e.body_state = BodyState::Evicted;
+            e.body_reason = None;
+            self.body_bytes = self.body_bytes.saturating_sub(len);
+        }
+    }
+
+    /// body 读取投影：requestId 最新命中条目（跨 session 同名 id 时取最新，
+    /// 诚实语义已在 AGENT-API 声明）。返回 None = requestId 不在环内。
+    pub fn network_body(
+        &self,
+        request_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Option<NetworkBodyView> {
+        let entry = self
+            .network
+            .iter()
+            .rev()
+            .find(|e| e.request_id == request_id)?;
+        let stored_bytes = entry.body.as_ref().map_or(0, |b| b.len());
+        let slice = match &entry.body {
+            Some(text) => slice_utf16(text, offset, limit),
+            None => Utf16Slice::empty(),
+        };
+        Some(NetworkBodyView {
+            state: entry.body_state,
+            reason: entry.body_reason,
+            slice,
+            stored_bytes,
+        })
     }
 
     /// console 环的证据边界（响应 meta 数据源）
@@ -421,12 +701,29 @@ impl DiagBuffer {
     }
 
     /// HAR 1.2（har-recorder 的正式落地点）。未捕获的字段按规范以 -1/空集占位；
-    /// `_targetUrl` 为自定义字段标注条目归属的页面目标（CDP session 归属）。
+    /// `_targetUrl` 为自定义字段标注条目归属的页面目标（CDP session 归属）；
+    /// body 可用（available/partial）时 `response.content.text` 填**脱敏后**
+    /// 内容（含非 ASCII → base64 + encoding，HAR 惯例），否则不填 text（HAR
+    /// 兼容占位，bodyState 语义见 network 查询）。
     pub fn to_har(&self, creator_version: &str) -> Value {
         let entries: Vec<Value> = self
             .network
             .iter()
             .map(|e| {
+                let mut content = json!({
+                    "size": e.body.as_ref().map_or(0, |b| b.len()),
+                    "mimeType": e.mime_type.clone().unwrap_or_default(),
+                });
+                if let Some(body) = &e.body {
+                    if body.is_ascii() {
+                        content["text"] = json!(body);
+                    } else {
+                        content["text"] = json!(
+                            base64::engine::general_purpose::STANDARD.encode(body.as_bytes())
+                        );
+                        content["encoding"] = json!("base64");
+                    }
+                }
                 json!({
                     "startedDateTime": iso_ms(e.ts),
                     "time": e.duration_ms.unwrap_or(0),
@@ -445,7 +742,7 @@ impl DiagBuffer {
                         "statusText": if e.failed { e.error.clone().unwrap_or_default() } else { String::new() },
                         "httpVersion": "unknown",
                         "headers": [],
-                        "content": { "size": 0, "mimeType": e.mime_type.clone().unwrap_or_default() },
+                        "content": content,
                         "redirectURL": "",
                         "headersSize": -1,
                         "bodySize": -1,
@@ -863,5 +1160,289 @@ mod tests {
             !result.meta.unwrap().tab_filter_unavailable,
             "network 环全归属，不降级"
         );
+    }
+
+    // ---------- body 捕获与 bodyState 状态机 ----------
+
+    /// 全链路事件喂入：文本 mime 完成 → BodyFetch 信号 + not-finished 初态；
+    /// 非文本 mime / 失败请求 → 无信号 + mime/not-finished 终态（永不拉取）
+    #[test]
+    fn body_fetch_signal_and_initial_states() {
+        let mut buf = DiagBuffer::default();
+        buf.apply(&attached("https://a/"), 0);
+
+        // json mime：完成 → 信号
+        buf.apply(&req("r1", "https://a/api"), 0);
+        buf.apply(
+            &json!({ "method": "Network.responseReceived", "sessionId": SESS,
+                "params": { "requestId": "r1", "response": { "status": 200, "mimeType": "application/json" } } }),
+            0,
+        );
+        assert_eq!(
+            buf.apply(
+                &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                    "params": { "requestId": "r1", "timestamp": 1.0 } }),
+                0,
+            ),
+            ApplyOutcome::BodyFetch { session_id: SESS.into(), request_id: "r1".into() }
+        );
+        let e = &buf.network_entries(false, None, 10).entries[0];
+        assert_eq!((e.body_state, e.body_reason), (BodyState::Unavailable, Some(REASON_NOT_FINISHED)));
+
+        // 非文本 mime：无信号 + mime 终态
+        buf.apply(&req("r2", "https://a/img"), 0);
+        buf.apply(
+            &json!({ "method": "Network.responseReceived", "sessionId": SESS,
+                "params": { "requestId": "r2", "response": { "status": 200, "mimeType": "image/png" } } }),
+            0,
+        );
+        assert_eq!(
+            buf.apply(
+                &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                    "params": { "requestId": "r2", "timestamp": 1.0 } }),
+                0,
+            ),
+            ApplyOutcome::None
+        );
+        let e = &buf.network_entries(false, None, 10).entries[1];
+        assert_eq!((e.body_state, e.body_reason), (BodyState::Unavailable, Some(REASON_MIME)));
+
+        // 失败请求：无信号 + not-finished 终态
+        buf.apply(&req("r3", "https://a/dead"), 0);
+        assert_eq!(
+            buf.apply(
+                &json!({ "method": "Network.loadingFailed", "sessionId": SESS,
+                    "params": { "requestId": "r3", "errorText": "net::ERR", "timestamp": 1.0 } }),
+                0,
+            ),
+            ApplyOutcome::None
+        );
+        let e = &buf.network_entries(false, None, 10).entries[2];
+        assert_eq!((e.body_state, e.body_reason), (BodyState::Unavailable, Some(REASON_NOT_FINISHED)));
+        assert!(e.failed);
+    }
+
+    /// store_body 结算管线：成功 → available（脱敏后落环）；CDP 失败归因 →
+    /// unavailable+reason；redact 拒绝 → redact-failed；未知 requestId → no-op
+    #[test]
+    fn store_body_settles_states_and_redacts() {
+        let mut buf = DiagBuffer::default();
+        buf.apply(&attached("https://a/"), 0);
+        for (rid, mime) in [("r1", "application/json"), ("r2", "application/json"), ("r3", "text/plain")] {
+            buf.apply(&req(rid, &format!("https://a/{rid}?token=secret1")), 0);
+            buf.apply(
+                &json!({ "method": "Network.responseReceived", "sessionId": SESS,
+                    "params": { "requestId": rid, "response": { "status": 200, "mimeType": mime } } }),
+                0,
+            );
+            buf.apply(
+                &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                    "params": { "requestId": rid, "timestamp": 1.0 } }),
+                0,
+            );
+        }
+
+        // 入环 URL 已脱敏（原始 URL 不落进程内存）
+        let e = &buf.network_entries(false, None, 10).entries[0];
+        assert_eq!(e.url, "https://a/r1?token=[redacted]");
+
+        // 成功：body 脱敏后 available
+        buf.store_body(
+            "r1",
+            BodyPayload::Raw { body: r#"{"token":"abc","ok":true}"#.into(), base64_encoded: false },
+        );
+        let e = &buf.network_entries(false, None, 10).entries[0];
+        assert_eq!((e.body_state, e.body_reason), (BodyState::Available, None));
+        assert_eq!(e.body.as_deref(), Some(r#"{"token":"[redacted]","ok":true}"#));
+
+        // 超时归因
+        buf.store_body("r2", BodyPayload::Unavailable { reason: REASON_TIMEOUT });
+        let e = &buf.network_entries(false, None, 10).entries[1];
+        assert_eq!((e.body_state, e.body_reason), (BodyState::Unavailable, Some(REASON_TIMEOUT)));
+
+        // redact 拒绝（text mime + JSON 形态 → Uncertain → redact-failed）
+        buf.store_body("r3", BodyPayload::Raw { body: "{broken".into(), base64_encoded: false });
+        let e = &buf.network_entries(false, None, 10).entries[2];
+        assert_eq!((e.body_state, e.body_reason), (BodyState::Unavailable, Some(REASON_REDACT_FAILED)));
+
+        // 未知 requestId：诚实丢弃（无处理写）
+        buf.store_body("ghost", BodyPayload::Raw { body: "x".into(), base64_encoded: false });
+        assert_eq!(buf.network_entries(false, None, 10).entries.len(), 3);
+    }
+
+    /// base64 形态与 not-text / no-data / 重复结算（已结算条目不再被后续同名
+    /// store 命中——not-finished 待结算态匹配）
+    #[test]
+    fn store_body_handles_base64_and_terminal_reasons() {
+        let mut buf = DiagBuffer::default();
+        buf.apply(&attached("https://a/"), 0);
+        for rid in ["rb", "rn", "rd"] {
+            buf.apply(&req(rid, "https://a/x"), 0);
+            buf.apply(
+                &json!({ "method": "Network.responseReceived", "sessionId": SESS,
+                    "params": { "requestId": rid, "response": { "status": 200, "mimeType": "text/plain" } } }),
+                0,
+            );
+            buf.apply(
+                &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                    "params": { "requestId": rid, "timestamp": 1.0 } }),
+                0,
+            );
+        }
+        // base64："Bearer abc" 的 base64 → 解码后脱敏
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "Bearer abc");
+        buf.store_body("rb", BodyPayload::Raw { body: b64, base64_encoded: true });
+        let e = &buf.network_entries(false, None, 10).entries[0];
+        assert_eq!(e.body.as_deref(), Some("Bearer [redacted]"));
+
+        // base64 非法（二进制伪装）→ not-text；空 body → no-data
+        buf.store_body("rn", BodyPayload::Raw { body: "!!!not-base64".into(), base64_encoded: true });
+        buf.store_body("rd", BodyPayload::Unavailable { reason: REASON_NO_DATA });
+        let es = buf.network_entries(false, None, 10).entries;
+        assert_eq!(es[1].body_reason, Some(REASON_NOT_TEXT));
+        assert_eq!(es[2].body_reason, Some(REASON_NO_DATA));
+
+        // 已结算（available）的条目不再被同名 store 命中
+        buf.store_body("rb", BodyPayload::Unavailable { reason: REASON_TIMEOUT });
+        let e = &buf.network_entries(false, None, 10).entries[0];
+        assert_eq!(e.body_state, BodyState::Available, "终态不可被覆盖");
+    }
+
+    /// 单条 256 KiB 截断 → partial（字符边界，保留实际字节数入账）
+    #[test]
+    fn store_body_truncates_to_item_max() {
+        let mut buf = DiagBuffer::default();
+        buf.apply(&attached("https://a/"), 0);
+        buf.apply(&req("r1", "https://a/big"), 0);
+        buf.apply(
+            &json!({ "method": "Network.responseReceived", "sessionId": SESS,
+                "params": { "requestId": "r1", "response": { "status": 200, "mimeType": "text/plain" } } }),
+            0,
+        );
+        buf.apply(
+            &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                "params": { "requestId": "r1", "timestamp": 1.0 } }),
+            0,
+        );
+        // 多字节字符混合：截断不得跨 UTF-8 序列
+        let mut big = "密钥无关正文".repeat(60_000); // ≈ 480KB
+        big.push_str(&"a".repeat(BODY_ITEM_MAX_BYTES));
+        buf.store_body("r1", BodyPayload::Raw { body: big, base64_encoded: false });
+        let e = &buf.network_entries(false, None, 10).entries[0];
+        assert_eq!(e.body_state, BodyState::Partial);
+        let stored_len = e.body.as_ref().unwrap().len();
+        assert!(stored_len <= BODY_ITEM_MAX_BYTES, "不超单条上限: {stored_len}");
+        assert!(stored_len >= BODY_ITEM_MAX_BYTES - 3, "贴着上限截（字符边界最多回退 3B）");
+        assert_eq!(e.body_reason, None);
+    }
+
+    /// 环级 8 MiB 总预算：从最旧条目驱逐 body，元数据保留（分层驱逐）。
+    /// 33 × 256KiB = 8.25MiB > 8MiB → 驱逐最旧 1 条；条目本身仍在环内。
+    #[test]
+    fn body_budget_evicts_oldest_bodies_keeps_metadata() {
+        let mut buf = DiagBuffer::default();
+        buf.apply(&attached("https://a/"), 0);
+        let n = BODY_TOTAL_MAX_BYTES / BODY_ITEM_MAX_BYTES + 1; // 33
+        for i in 0..n {
+            let rid = format!("r{i}");
+            buf.apply(&req(&rid, &format!("https://a/{i}")), 0);
+            buf.apply(
+                &json!({ "method": "Network.responseReceived", "sessionId": SESS,
+                    "params": { "requestId": rid.clone(), "response": { "status": 200, "mimeType": "text/plain" } } }),
+                0,
+            );
+            buf.apply(
+                &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                    "params": { "requestId": rid, "timestamp": 1.0 } }),
+                0,
+            );
+            let item = "x".repeat(BODY_ITEM_MAX_BYTES);
+            buf.store_body(&format!("r{i}"), BodyPayload::Raw { body: item, base64_encoded: false });
+        }
+        let es = buf.network_entries(false, None, 100).entries;
+        assert_eq!(es.len(), n, "条目（元数据）永不驱逐");
+        assert_eq!(es[0].body_state, BodyState::Evicted, "最旧 body 被预算驱逐");
+        assert_eq!(es[0].body_reason, None);
+        assert_eq!(es[0].status, Some(200), "元数据完整保留");
+        for e in &es[1..] {
+            assert_eq!(e.body_state, BodyState::Available);
+        }
+        // 账本收敛：驱到 ≤ 8MiB 为止
+        let kept: usize = es[1..].iter().map(|e| e.body.as_ref().map_or(0, |b| b.len())).sum();
+        assert!(kept <= BODY_TOTAL_MAX_BYTES);
+    }
+
+    /// body 分页读：UTF-16 code unit 计量、代理对不劈、出界与 limit=0、
+    /// evicted/unavailable 条目无内容但有总长语义（空切片）
+    #[test]
+    fn network_body_slices_utf16_without_splitting_pairs() {
+        let mut buf = DiagBuffer::default();
+        buf.apply(&attached("https://a/"), 0);
+        buf.apply(&req("r1", "https://a/t"), 0);
+        buf.apply(
+            &json!({ "method": "Network.responseReceived", "sessionId": SESS,
+                "params": { "requestId": "r1", "response": { "status": 200, "mimeType": "text/plain" } } }),
+            0,
+        );
+        buf.apply(
+            &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                "params": { "requestId": "r1", "timestamp": 1.0 } }),
+            0,
+        );
+        // 4 字符：A(1u) 𝕏(2u 代理对) B(1u) C(1u) → total 5 units
+        buf.store_body("r1", BodyPayload::Raw { body: "A𝕏BC".into(), base64_encoded: false });
+
+        let v = buf.network_body("r1", 0, 5).unwrap();
+        assert_eq!((v.slice.returned, v.slice.total), (5, 5));
+        assert_eq!(v.slice.text, "A𝕏BC");
+        assert_eq!(v.state, BodyState::Available);
+        assert_eq!(v.stored_bytes, 7); // A=1B 𝕏=4B B/C 各 1B
+
+        // offset=2 落在代理对中间 → 向外取整（含 𝕏 整字符）
+        let v = buf.network_body("r1", 2, 2).unwrap();
+        assert_eq!(v.slice.text, "𝕏B");
+        assert_eq!(v.slice.returned, 3, "代理对整体保留（2+1 units）");
+        // limit 落在代理对中间同理向外
+        let v = buf.network_body("r1", 0, 2).unwrap();
+        assert_eq!(v.slice.text, "A𝕏");
+        // 出界 / limit=0
+        assert_eq!(buf.network_body("r1", 99, 5).unwrap().slice.text, "");
+        assert_eq!(buf.network_body("r1", 0, 0).unwrap().slice.returned, 0);
+        // 不存在的 requestId → None（service 层转 404）
+        assert!(buf.network_body("ghost", 0, 5).is_none());
+    }
+
+    /// HAR：body 可用条目填脱敏 text（ASCII 原样 / 非 ASCII base64+encoding），
+    /// 不可用条目不填 text（HAR 兼容占位）
+    #[test]
+    fn har_embeds_redacted_body_text() {
+        let mut buf = DiagBuffer::default();
+        buf.apply(&attached("https://a/"), 0);
+        for (rid, mime) in [("r1", "application/json"), ("r2", "image/png")] {
+            buf.apply(&req(rid, "https://a/x"), 0);
+            buf.apply(
+                &json!({ "method": "Network.responseReceived", "sessionId": SESS,
+                    "params": { "requestId": rid, "response": { "status": 200, "mimeType": mime } } }),
+                0,
+            );
+            buf.apply(
+                &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                    "params": { "requestId": rid, "timestamp": 1.0 } }),
+                0,
+            );
+        }
+        buf.store_body("r1", BodyPayload::Raw { body: "{\"msg\":\"中文\"}".into(), base64_encoded: false });
+        let har = buf.to_har("0.6.0");
+        let e0 = &har["log"]["entries"][0];
+        assert_eq!(e0["response"]["content"]["encoding"], "base64", "非 ASCII → base64");
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            e0["response"]["content"]["text"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "{\"msg\":\"中文\"}");
+        assert_eq!(e0["response"]["content"]["size"], 16); // {"msg":"中文"} 字节数（中文各 3B）
+        let e1 = &har["log"]["entries"][1];
+        assert!(e1["response"]["content"].get("text").is_none(), "不可用条目无 text");
     }
 }

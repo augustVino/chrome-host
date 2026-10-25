@@ -120,8 +120,14 @@ export const API_CATALOG: CatalogGroup[] = [
       {
         method: 'GET',
         path: '/instances/:id/network',
-        desc: '请求环（?failedOnly=&limit=&tab=）',
-        note: '常驻订阅，请求完成/失败时入环（1000 条）；failedOnly = 失败或 HTTP≥400；meta 另带 scope:"completed"（进行中的请求不可见）',
+        desc: '请求环（?failedOnly=&limit=&tab=），条目含 bodyState',
+        note: '常驻订阅，请求完成/失败时入环（1000 条）；failedOnly = 失败或 HTTP≥400；meta 另带 scope:"completed"；条目携带 bodyState/bodyReason（available/partial/evicted/unavailable，响应体证据边界）',
+      },
+      {
+        method: 'GET',
+        path: '/instances/:id/network/:requestId/body',
+        desc: '分页读响应体（脱敏后）',
+        note: '?offset=&limit= 以 UTF-16 code unit 计量（缺省 8192/上限 65536，不劈代理对）；仅 bodyState available/partial 可读（404 不在环 / 409 不可读）；body 落环前已脱敏',
       },
       {
         method: 'GET',

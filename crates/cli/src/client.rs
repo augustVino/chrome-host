@@ -616,6 +616,29 @@ impl AgentClient {
         ))
     }
 
+    /// GET /api/v1/instances/{id}/network/{requestId}/body —— 分页读响应体
+    /// （UTF-16 unit 计量；404 NETWORK_BODY_NOT_FOUND → exit 3，
+    /// 409 NETWORK_BODY_UNAVAILABLE → exit 5，均状态码既有映射，无新码）
+    pub fn instance_network_body(
+        &self,
+        id: &str,
+        request_id: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, CliError> {
+        let query = join_query([
+            offset.map(|n| format!("offset={n}")),
+            limit.map(|n| format!("limit={n}")),
+            None,
+        ]);
+        Self::decode(self.send(
+            Method::GET,
+            &format!("/api/v1/instances/{id}/network/{request_id}/body{query}"),
+            None,
+            false,
+        ))
+    }
+
     /// GET /api/v1/instances/{id}/screenshot —— png base64（复用常驻诊断连接）
     pub fn instance_screenshot(&self, id: &str) -> Result<serde_json::Value, CliError> {
         Self::decode(self.send(

@@ -435,9 +435,41 @@ fn fixture_router() -> Router {
         .route(
             "/api/v1/instances/ins_x/network",
             get(|| async {
-                Json(json!({ "instanceId": "ins_x", "entries": [
-                    { "ts": 1, "requestId": "r1", "method": "GET", "url": "https://a/404", "status": 404, "failed": false, "targetUrl": "https://a/" }
+                Json(json!({ "instanceId": "ins_x", "meta": { "dropped": 0, "capacity": 1000, "since": null, "live": true, "scope": "completed" }, "entries": [
+                    { "ts": 1, "requestId": "r1", "method": "GET", "url": "https://a/404", "status": 404, "failed": false, "targetUrl": "https://a/", "bodyState": "available" },
+                    { "ts": 2, "requestId": "r2", "method": "GET", "url": "https://a/img", "status": 200, "failed": false, "targetUrl": "https://a/", "bodyState": "unavailable", "bodyReason": "mime" }
                 ] }))
+            }),
+        )
+        // body 分页读：query（offset/limit）echo 进 meta，验证 client 拼参形状
+        .route(
+            "/api/v1/instances/ins_x/network/r1/body",
+            get(|Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                Json(json!({
+                    "instanceId": "ins_x",
+                    "requestId": "r1",
+                    "bodyState": "partial",
+                    "body": "{\"data\":[1,2]}",
+                    "offset": q.get("offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0),
+                    "limit": q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(8192),
+                    "returned": 14,
+                    "totalLength": 4096,
+                    "bodyBytes": 262144,
+                    "truncated": true
+                }))
+            }),
+        )
+        // body 错误样本：404 不在环 / 409 状态不可读（message 携带归因）
+        .route(
+            "/api/v1/instances/ins_x/network/r_gone/body",
+            get(|| async {
+                (StatusCode::NOT_FOUND, Json(error_body("NETWORK_BODY_NOT_FOUND")))
+            }),
+        )
+        .route(
+            "/api/v1/instances/ins_x/network/r_mime/body",
+            get(|| async {
+                (StatusCode::CONFLICT, Json(error_body("NETWORK_BODY_UNAVAILABLE")))
             }),
         )
         // tab 过滤透传验证：echo 收到的 query 为 meta（同 extension config 的 echo 先例）
@@ -1027,6 +1059,59 @@ fn instance_diagnostics_passthrough_and_unavailable() {
         5,
         "409 → RUNTIME exit 5"
     );
+}
+
+/// network 面：bodyState/bodyReason 字段解码（v0.6+ 契约）+ body 分页读端点
+/// （query 透传 echo）+ 两类错误码的 exit 映射（404→3 / 409→5）
+#[test]
+fn network_body_state_and_paged_read_contract() {
+    let client = test_client();
+
+    // 环条目携带 bodyState；unavailable 必带 bodyReason，available 无该键
+    let resp = client
+        .instance_network("ins_x", false, None, None)
+        .expect("network 应成功");
+    let entries = resp["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["bodyState"], "available");
+    assert!(entries[0].get("bodyReason").is_none());
+    assert_eq!(entries[1]["bodyState"], "unavailable");
+    assert_eq!(entries[1]["bodyReason"], "mime");
+    assert_eq!(resp["meta"]["scope"], "completed", "meta 契约不变");
+
+    // 分页读：offset/limit 透传（echo 验证），响应形状解码
+    let body = client
+        .instance_network_body("ins_x", "r1", Some(7), Some(14))
+        .expect("body 读应成功");
+    assert_eq!(body["bodyState"], "partial");
+    assert_eq!(body["body"], "{\"data\":[1,2]}");
+    assert_eq!(body["offset"], 7, "offset 透传");
+    assert_eq!(body["limit"], 14, "limit 透传");
+    assert_eq!(body["totalLength"], 4096);
+    assert_eq!(body["truncated"], true);
+
+    // 404：requestId 不在环 → exit 3
+    let err = client
+        .instance_network_body("ins_x", "r_gone", None, None)
+        .unwrap_err();
+    match &err {
+        CliError::Api { status, code, .. } => {
+            assert_eq!((*status, code.as_str()), (404, "NETWORK_BODY_NOT_FOUND"));
+        }
+        other => panic!("应为 Api 变体: {other:?}"),
+    }
+    assert_eq!(exit::from_cli_error(&err).as_u8(), 3);
+
+    // 409：bodyState 不可读 → exit 5
+    let err = client
+        .instance_network_body("ins_x", "r_mime", None, None)
+        .unwrap_err();
+    match &err {
+        CliError::Api { status, code, .. } => {
+            assert_eq!((*status, code.as_str()), (409, "NETWORK_BODY_UNAVAILABLE"));
+        }
+        other => panic!("应为 Api 变体: {other:?}"),
+    }
+    assert_eq!(exit::from_cli_error(&err).as_u8(), 5);
 }
 
 /// 常驻诊断（M6）四方法面：console/network 环解包（含 query 透传）、
