@@ -421,9 +421,39 @@ struct PageNavigateArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct PageScreenshotArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "截图目标：@eN 引用（上次 page_snap 产生）或 CSS 选择器；省略 = 当前视口整幅。元素路径先滚动入视口再截其包围盒（跨行元素取并集）"
+    )]
+    target: Option<String>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct PageNavHistoryArgs {
     #[schemars(description = "实例 id（ins_ 前缀）")]
     instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PagePdfArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = "横向打印；缺省 false（纵向）")]
+    landscape: Option<bool>,
+    #[schemars(description = "打印背景色/背景图；缺省 true")]
+    print_background: Option<bool>,
+    #[schemars(description = "纸宽（英寸）；缺省 8.5（Letter）")]
+    paper_width: Option<f64>,
+    #[schemars(description = "纸高（英寸）；缺省 11（Letter）")]
+    paper_height: Option<f64>,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
 }
@@ -435,6 +465,38 @@ struct PageReloadArgs {
     instance_id: String,
     #[schemars(description = "true = 跳过缓存；缺省 false")]
     ignore_cache: Option<bool>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageEmulateViewport {
+    #[schemars(description = "视口宽（CSS 像素，正整数）")]
+    width: i64,
+    #[schemars(description = "视口高（CSS 像素，正整数）")]
+    height: i64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageEmulateArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "预设名：iphone-14 / iphone-se / pixel-7 / galaxy-s23 / ipad-air / desktop-1080p；未知 → 422 PAGE_EMULATE_UNKNOWN_PRESET"
+    )]
+    preset: Option<String>,
+    #[schemars(description = "自定义视口（与 preset 互斥；mobile/touch 缺省 false）")]
+    viewport: Option<PageEmulateViewport>,
+    #[schemars(description = "覆盖 UA（仅 viewport 形态可配；预设自带真实 UA）")]
+    user_agent: Option<String>,
+    #[schemars(description = "mobile 语义；viewport 形态缺省 false")]
+    mobile: Option<bool>,
+    #[schemars(description = "触摸仿真；viewport 形态缺省 false")]
+    touch: Option<bool>,
+    #[schemars(description = "true = 清除全部仿真（viewport / UA / touch），与其他字段互斥")]
+    off: Option<bool>,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
 }
@@ -1078,6 +1140,23 @@ impl ChromeHostMcp {
     }
 
     #[tool(
+        description = "png 截图：target 省略 = 当前视口整幅；target 为 @eN 引用或 CSS 选择器时截该元素（与 page_click 同定位链，先滚动入视口，clip 取元素包围盒）。响应 data 为 base64 png；未命中 → 404 PAGE_ELEMENT_NOT_FOUND，几何退化 → 409 PAGE_TARGET_MOVED"
+    )]
+    async fn page_screenshot(
+        &self,
+        Parameters(a): Parameters<PageScreenshotArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.screenshot(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.target.as_deref(),
+            )
+        })
+        .await
+    }
+
+    #[tool(
         description = "导航历史后退一步（Page.getNavigationHistory 偏移 + navigateToHistoryEntry）：已在最早条目 → 409 PAGE_NAV_NO_HISTORY。新文档条目等 load 事件；同文档（SPA pushState）条目以历史索引提交 + readyState 为完成信号"
     )]
     async fn page_back(
@@ -1114,6 +1193,49 @@ impl ChromeHostMcp {
             )
         })
         .await
+    }
+
+    #[tool(
+        description = "整页 PDF（Page.printToPDF）：landscape 缺省纵向、printBackground 缺省 true、纸张缺省 Letter 8.5×11 英寸（paperWidth/paperHeight 可调，如 A4 = 8.27×11.69）。响应 data 为 base64 pdf"
+    )]
+    async fn page_pdf(
+        &self,
+        Parameters(a): Parameters<PagePdfArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.pdf(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.landscape,
+                a.print_background,
+                a.paper_width,
+                a.paper_height,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "设备仿真：preset（iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p，自带真实 UA 与 mobile/touch）或 viewport+可选 userAgent/mobile/touch；off=true 恢复。只作用于该 tab 的 page session（与实例级无关）；同一 tab 重复 emulate = 覆盖（未给字段恢复默认）；连接重建/实例重启自然清除。仿真后 viewport 截图尺寸随之变化；page_pdf 输出也按仿真视口排页"
+    )]
+    async fn page_emulate(
+        &self,
+        Parameters(a): Parameters<PageEmulateArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let req = crate::domain::emulate::EmulateRequest {
+            preset: a.preset,
+            viewport: a
+                .viewport
+                .map(|v| crate::domain::emulate::Viewport {
+                    width: v.width,
+                    height: v.height,
+                }),
+            user_agent: a.user_agent,
+            mobile: a.mobile,
+            touch: a.touch,
+            off: a.off.unwrap_or(false),
+        };
+        run(|| self.state.page.emulate(&a.instance_id, a.tab.as_deref().unwrap_or(""), req)).await
     }
 }
 

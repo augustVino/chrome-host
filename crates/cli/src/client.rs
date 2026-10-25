@@ -1047,4 +1047,53 @@ impl AgentClient {
             ),
         )
     }
+
+    /// POST /api/v1/instances/{id}/page/screenshot —— body `{target?, tab?}`
+    /// （target 缺省 = 当前视口；响应 data 为 base64 png）
+    pub fn page_screenshot(
+        &self,
+        id: &str,
+        target: Option<&str>,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "screenshot"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/pdf —— body `{tab?, landscape?, printBackground?,
+    /// paperWidth?, paperHeight?}`（纸张单位英寸；缺省 Letter 纵向带背景）
+    pub fn page_pdf(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+        landscape: bool,
+        print_background: bool,
+        paper_width: Option<f64>,
+        paper_height: Option<f64>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({
+            "tab": tab,
+            "landscape": landscape,
+            "printBackground": print_background,
+            "paperWidth": paper_width,
+            "paperHeight": paper_height,
+        });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "pdf"), Some(body), true))
+    }
+
+    /// POST /api/v1/instances/{id}/page/emulate —— body 三形态：
+    /// `{preset}` / `{viewport:{width,height}, userAgent?, mobile?, touch?}` /
+    /// `{off:true}`（CLI 侧已归一为枚举，未知预设由服务端 422）
+    pub fn page_emulate(
+        &self,
+        id: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, CliError> {
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "emulate"), Some(body), true))
+    }
 }
