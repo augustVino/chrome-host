@@ -8,7 +8,7 @@
 
 - [连接配置](#连接配置)
 - [通用行为约定](#通用行为约定)
-- [工具总览（56 个）](#工具总览39-个)
+- [工具总览（57 个）](#工具总览57-个)
 - [内核](#内核)
 - [环境](#环境)
 - [实例](#实例)
@@ -64,11 +64,9 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 2. **字段 camelCase**，与 REST 完全一致；`id` 前缀约定：环境 `env_`、实例 `ins_`、扩展 `ext_`。
 3. **时间戳**为 Unix epoch 毫秒。
 4. **内核未装时 `create_instance` 会阻塞于首次下载**（约 150MB）——复杂任务先调 `kernel_status` 预判。
-5. 扩展启停只影响**之后启动的实例**；实例创建非幂等（每次新增一个）。
+5. 扩展启停只影响**之后启动的实例**；实例创建非幂等（每次新增一个）。可选 `name` 在同环境内唯一——重名创建会得到 409，可先 `list_instances` 查名再建。
 
-## 工具总览（56 个）
-
-> 计数与分组 = 服务端 tool_router 实际暴露面（此前总览消后于实际，本表已对齐；逐工具详参各分组章节与 AGENT-API 同源语义）。
+- [工具总览（57 个）](#工具总览57-个)
 
 | 分组 | 工具 |
 |---|---|
@@ -77,7 +75,8 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | 实例（9） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
 | 常驻诊断（6） | `get_diagnostics` · `get_console` · `get_network` · `get_network_body` · `get_screenshot` · `get_har` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
-| 页面控制（22） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_wait` · `page_dialogs` · `page_eval` · `page_raw` · `page_html` · `page_clickxy` · `page_loadall` · `page_type` · `page_navigate` · `page_back` · `page_forward` · `page_reload` · `page_screenshot` · `page_pdf` · `page_emulate` · `page_download_wait` · `page_downloads` · `page_upload` |
+- [工具总览（57 个）](#工具总览57-个)
+| 页面控制（23） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_wait` · `page_dialogs` · `page_eval` · `page_raw` · `page_html` · `page_clickxy` · `page_loadall` · `page_type` · `page_navigate` · `page_back` · `page_forward` · `page_reload` · `page_screenshot` · `page_pdf` · `page_emulate` · `page_extract` · `page_download_wait` · `page_downloads` · `page_upload` |
 | 登录态（2） | `login_profile`（action: get / capture / reset） · `session_status` |
 | 扩展（7） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` · `get_extension_config` · `set_extension_config` |
 
@@ -105,19 +104,20 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 
 | 工具 | 输入 | 说明 |
 |---|---|---|
-| `create_instance` | `environmentId` | 创建并启动完全隔离的 Chrome 实例（独立 profile + hosts 注入 + 登录态克隆）。**首次可能阻塞于内核下载**；出错先查 `kernel_status` |
-| `list_instances` | `environmentId` | 环境下全部实例（状态/端口/pid） |
-| `get_instance` | `instanceId` | 单实例详情（状态/pid/CDP 端口/profile 目录） |
+| `create_instance` | `environmentId`；可选 `name`（1-64 字符、非纯空白；同环境唯一，重名 → 409 `INSTANCE_NAME_CONFLICT`） | 创建并启动完全隔离的 Chrome 实例（独立 profile + hosts 注入 + 登录态克隆）。**首次可能阻塞于内核下载**；出错先查 `kernel_status`。多任务并行时建议命名，便于按任务锚定（返回体与 list 均携带 name） |
+| `list_instances` | `environmentId` | 环境下全部实例（name/状态/端口/pid） |
+| `get_instance` | `instanceId` | 单实例详情（name/状态/pid/CDP 端口/profile 目录） |
 | `start_instance` | `instanceId` | 启动已停止实例（重复 start → 409 INSTANCE_ALREADY_RUNNING） |
 | `stop_instance` | `instanceId` | 优雅终止 Chrome 进程 |
 | `restart_instance` | `instanceId` | stop + start，hosts 重新拉取 |
 | `delete_instance` | `instanceId` | 删除实例（运行中 → 409，须先停止） |
 | `create_cdp_session` | `instanceId` | 发放 CDP 会话（远程/代理访问用，30 分钟有效）→ `{ sessionId, baseUrl, expiresAt }`。远程客户端以 baseUrl 代理访问 CDP（`/json/version` 与 `/devtools/*` WS，webSocketDebuggerUrl 已改写）；本地直连场景优先 `get_cdp` |
 | `get_cdp` | `instanceId` | CDP endpoint（含 WebSocket URL，可直接连 Chrome DevTools Protocol 做页面自动化） |
-| `get_console` | `instanceId`；可选 `level`、`limit` | 常驻 console 环（500 条，进程内态重启即清）：console API + 页面日志 |
-| `get_network` | `instanceId`；可选 `failedOnly`、`limit` | 常驻请求环（1000 条，完成/失败时入环）。完整时序用 `get_har` |
+| `get_console` | `instanceId`；可选 `level`、`limit` | 常驻 console 环（500 条，进程内态重启即清）：console API + 页面日志。响应 meta 带证据边界（dropped/capacity/since/live） |
+| `get_network` | `instanceId`；可选 `failedOnly`、`limit` | 常驻请求环（1000 条，完成/失败时入环，进行中不可见——meta `scope:"completed"`）。完整时序用 `get_har` |
+| `get_network_body` | `instanceId`, `requestId`；可选 `offset`、`limit` | 分页读响应体（脱敏后；UTF-16 单位计量不劈代理对，limit 缺省 8192/上限 65536，truncated=true 时 offset+=returned 续读）。仅 bodyState available/partial 可读：404 = requestId 不在环（进程内态重启即清）；409 = 状态不可读（message 携带 bodyState/bodyReason，如 mime/timeout/no-data/not-text/not-finished/redact-failed/evicted） |
 | `get_screenshot` | `instanceId` | 当前页面 png 截图（base64，复用常驻连接；未运行/未就绪/无 http 页 → 409） |
-| `get_har` | `instanceId` | 请求环生成 HAR 1.2 文档（`_targetUrl` 标注归属页面；未采集字段按规范占位） |
+| `get_har` | `instanceId` | 请求环生成 HAR 1.2 文档（`_targetUrl` 标注归属页面；未采集字段按规范占位，语义见顶层 `_meta.uncollected`） |
 | `get_diagnostics` | `instanceId` | 当前页面诊断快照（JS 错误/失败资源各环形 100 条 + LCP/FCP；对第一个 http(s) 页面短连接求值页面扩展）。未运行或无 http 页 → 409 `DIAGNOSTICS_UNAVAILABLE`；`diagnostics: null` = 页面未注入 |
 
 ## 标签页
@@ -126,7 +126,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 |---|---|---|
 | `list_tabs` | `instanceId` | 全部页面标签（id/url/title，仅 page 类型） |
 | `open_tab` | `instanceId`, `url`（须含协议） | 新开标签页并导航 |
-| `navigate` | `instanceId`, `tabId`, `url` | 导航既有标签页（new+close 组合近似：丢失旧页历史） |
+| `navigate` | `instanceId`, `tabId`, `url` | 导航既有标签页（new+close 组合近似：丢失旧页历史；**推荐改用 `page_navigate`**——同 tab 内导航保留历史，本工具保留给兼容） |
 
 > MCP 读页面内容优先 `page_snap`（AX 文本树 + @eN 引用）；页内求值/读 HTML
 > 已内建为 `page_eval` / `page_html`（实例级常驻连接，无需自建 WS）；需要完全
@@ -138,16 +138,24 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 实例级常驻连接上的页面操作面（与 CLI `page` 命令族、REST `/instances/{id}/page/*`
 同源）。操作循环：`page_snap` 拿 @eN 引用 → `page_click`/`page_fill`/`page_press`
 用引用操作 → 页面变化后重新 `page_snap`（导航后引用整表失效 → 409 `PAGE_REF_STALE`，
-重 snap 而非对旧引用重试）。对话框（alert/confirm/prompt/beforeunload）自动
+重 snap 而非对旧引用重试）。**跨域 iframe（OOPIF）**：snap 的 `[frame]` 段内嵌
+iframe 内可交互元素（@eN 跨 frame 连续编号），click 走坐标投影、fill/press 走
+帧会话——帧内 @eN 直接可用；单帧导航/移除只失效该帧内引用（主 frame 引用
+不受影响）；CSS 选择器仍只查主 frame；帧内 hover 标记不适用（迭代边界）。
+对话框（alert/confirm/prompt/beforeunload）自动
 accept，命令期间新弹的附在成功响应 `dialogs_seen`，历史查 `page_dialogs`。
 `page_eval`/`page_html`/`page_clickxy`/`page_loadall`/`page_type` 为 cdp.mjs
 退役补齐的兑底五件：eval 是高权限原语（可执行任意 JS，与退役前 cdp.mjs 同
-权限——仅在 page 原语不够用时使用）；跨域 iframe 内元素是全部 selector 基
-工具的盲区，兜底路径 = `page_clickxy` 点入获得焦点 → `page_type` 输入。
+权限——仅在 page 原语不够用时使用）；跨域 iframe（OOPIF）内元素已支持：snap 以 `[frame]` 段内嵌帧内容、@eN 跨 frame 连续编号，click（坐标投影）/fill/press（帧会话）对帧内 @eN 直接可用；CSS 选择器仍只查主 frame，帧内坐标级兜底仍可用（`page_clickxy` 点入获得焦点 → `page_type` 输入）。
+`page_navigate`/`page_back`/`page_forward`/`page_reload` 为导航四件套：同一
+标签的 page session 内导航/历史回退/重载，**保留历史**（实例级 `navigate` 的
+new+close 组合近似会丢历史）；等待 load 至多 25s，未证实 → 响应 `loaded:false`
+（已开始而非失败，用 `page_snap`/`page_wait` 观察）。SPA 路由切换（pushState）
+不触发 load，同文档历史条目以历史索引 + readyState 为完成信号。
 
 | 工具 | 输入 | 说明 |
 |---|---|---|
-| `page_snap` | `instanceId`；可选 `tab` | AX 树快照：精简文本树（@e1..@eN 内联）+ `refs_count` + `generation` |
+| `page_snap` | `instanceId`；可选 `tab` | AX 树快照：精简文本树（@e1..@eN 内联）+ `refs_count` + `generation` + hover 感知（行内 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化；meta `hoverScan`：ok/truncated(预算截断 32 表/2MiB/256 规则)/skipped(无 hover 规则)/error） |
 | `page_click` | `instanceId`, `target`；可选 `tab` | 原生输入点击；target 支持 @eN 引用（导航后失效需重新 snap）与 CSS 选择器 |
 | `page_fill` | `instanceId`, `target`, `value`；可选 `tab` | 聚焦→清空→输入→回读校验；空 value = 仅清空 |
 | `page_press` | `instanceId`, `key`；可选 `target`, `tab` | 三段键盘事件（组合键如 Control+A）；target 先聚焦 |
@@ -158,10 +166,12 @@ accept，命令期间新弹的附在成功响应 `dialogs_seen`，历史查 `pag
 | `page_html` | `instanceId`；可选 `selector`, `tab` | 读 outerHTML（selector 缺省 = 整文档；未命中 → 404）；大页面响应很大，优先 snap 定位后缩小范围 |
 | `page_clickxy` | `instanceId`, `x`, `y`；可选 `tab` | 视口坐标点击（CSS 像素；无定位/遮挡校验，坐标即意图）；跨域 iframe 元素兜底 |
 | `page_loadall` | `instanceId`, `selector`；可选 `interval`, `maxClicks`, `tab` | 循环点击直到消失（interval 缺省 `"1500ms"`，maxClicks 缺省 200）；达上限仍未消失时结果明示 still present |
-| `page_type` | `instanceId`, `text`；可选 `tab` | 向当前焦点元素直接输入（无定位无校验）；跨域 iframe 输入唯一路径（先 `page_clickxy` 点入）；空文本 → 400 |
+| `page_type` | `instanceId`, `text`；可选 `tab` | 向当前焦点元素直接输入（无定位无校验）；跨域 iframe 内坐标级兜底（@eN 已支持帧直达，selector 不可达帧内时先 `page_clickxy` 点入）；空文本 → 400 |
+- [工具总览（57 个）](#工具总览57-个)
 | `page_download_wait` | `instanceId`；可选 `timeoutMs`（缺省 30000）、`tab` | 等待**下一次**下载完成（命令式：先调本工具再另行 `page_click` 触发；等待期不阻塞其他命令）。返回 filePath/fileName/bytes（落盘在实例 profile 的 downloads/）；失败/取消 → 500 PAGE_DOWNLOAD_FAILED；超时 → 409 PAGE_DOWNLOAD_TIMEOUT |
 | `page_downloads` | `instanceId`；可选 `tab` | 下载终态记录环（最近 20 条，含已消费——matched 区分；并发下载未被等待者拿走的在此可查） |
 | `page_upload` | `instanceId`, `target`, `filePath`；可选 `tab` | 主机文件设入 input[type=file]（触发原生 change；React 受控表单同常收到）。filePath 绝对路径且拒符号链接（422，macOS /tmp 类软链拒绝）、不存在 → 404、超 100MB → 422；非 file input → 422 PAGE_TARGET_NOT_FILE_INPUT |
+| `page_extract` | `instanceId`；可选 `target`（@eN / CSS，缺省 = 最大表格自动发现）、`tab` | 表格 → 结构化 JSON：columns（name/path/source）/rows（null = 被合并覆盖，"" = 真实空单元格）/meta（spans 锚点）/coverage（datasetComplete 只有 unknown/incomplete，永不装作取全）。非表格目标 → 422 PAGE_EXTRACT_NOT_A_TABLE |
 
 `tab` = targetId 或唯一前缀（`list_tabs` 获得）；省略 = 唯一页面标签自动选中，
 多标签 409 并在 message 列出全部 targetId。错误处置看 code 分支：`PAGE_REF_STALE`/

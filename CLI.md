@@ -61,6 +61,8 @@ chrome-host env create staging --hosts-source-url https://example.com/hosts.txt
 
 # 2. 创建并启动一个完全隔离的 Chrome 实例（独立 profile + hosts 注入 + 登录态克隆）
 chrome-host instance create <env_id> --quiet        # 输出实例 id；创建即启动
+chrome-host instance create <env_id> --name e2e-checkout --quiet   # 可选命名：同环境唯一，
+#    之后命令可用 name 代替 id（如 instance stop e2e-checkout）
 #    ⚠ 首次运行会阻塞于内核下载（Chrome for Testing ~150MB），属正常现象
 
 # 3. 拿到 CDP 端点，即可用任意 CDP 客户端做页面自动化
@@ -123,7 +125,7 @@ env_d4285b49-...
 | 2 | 参数错误 | clap 解析失败、`--json --quiet` 互斥、非 TTY 危险操作缺 `--yes`、本地校验失败（如 `instance open` 的 URL 缺协议） |
 | 3 | 资源不存在 | `ENVIRONMENT_NOT_FOUND` / `INSTANCE_NOT_FOUND` / `EXTENSION_NOT_FOUND` 等 404 族（含 page 族 `PAGE_TAB_NOT_FOUND` / `PAGE_REF_NOT_FOUND` / `PAGE_ELEMENT_NOT_FOUND`） |
 | 4 | 资源已存在 | 预留（服务端当前无此码，映射规则先行） |
-| 5 | 运行时状态冲突 / 运行时错误 | 409 族（`INSTANCE_ALREADY_RUNNING`、`INSTANCE_NOT_RUNNING`、`PROFILE_IN_USE`、`ENVIRONMENT_HAS_RUNNING_INSTANCES`、page 族 `PAGE_REF_STALE` / `PAGE_TAB_AMBIGUOUS` / `PAGE_WAIT_TIMEOUT` 等）+ 500/504 运行时族（`KERNEL_NOT_READY`、`INSTANCE_START_FAILED`、`CDP_PORT_UNAVAILABLE`、`CDP_CONNECTION_FAILED`、`HOSTS_FETCH_FAILED`、`PAGE_DISPATCH_FAILED`、`PAGE_TOOL_TIMEOUT`） |
+| 5 | 运行时状态冲突 / 运行时错误 | 409 族（`INSTANCE_ALREADY_RUNNING`、`INSTANCE_NOT_RUNNING`、`PROFILE_IN_USE`、`ENVIRONMENT_HAS_RUNNING_INSTANCES`、page 族 `PAGE_REF_STALE` / `PAGE_TAB_AMBIGUOUS` / `PAGE_WAIT_TIMEOUT` / `PAGE_NAV_NO_HISTORY` 等）+ 500/504 运行时族（`KERNEL_NOT_READY`、`INSTANCE_START_FAILED`、`CDP_PORT_UNAVAILABLE`、`CDP_CONNECTION_FAILED`、`HOSTS_FETCH_FAILED`、`PAGE_DISPATCH_FAILED`、`PAGE_TOOL_TIMEOUT`、`PAGE_NAV_FAILED`） |
 | 6 | 权限拒绝 | `EXTENSION_SYSTEM_LOCKED`（内置扩展锁定） |
 | 7 | 请求校验失败 | 400 族（`INVALID_REQUEST`、`HOSTS_SOURCE_INVALID` 等）与 422 族（page 族 `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_TARGET_NOT_FILLABLE`） |
 | 8 | 服务不可达 | Agent API 连接拒绝 / 连接超时（桌面应用未运行） |
@@ -180,26 +182,29 @@ chrome-host env delete <id> --yes
 
 实例 = 独立 profile + 独立 CDP 端口的 Chrome for Testing 进程。**`create` 是「创建即启动」的复合语义**（无独立的"创建不启动"模式），首次调用可能阻塞于内核下载。
 
+实例可命名（`create --name`，1-64 字符、同环境唯一，重名 → 409 exit 5）；**ID 参数支持 name 引用**：`ins_` 前缀按 id 直达；否则拉全量列表按 name 精确匹配——唯一命中即解析，零命中 → 404 exit 3，同名存在于多个环境 → exit 2 列出候选（改用 id 消歧）。未命名实例 name 为 null（表格显示 `-`）。
+
 | 命令 | 说明 |
 |---|---|
-| `instance list [--env <ENV_ID>]` | 实例列表。缺省全量（含 `environmentName` 列，需 v0.1.5+ 应用）；`--env` 只看指定环境 |
-| `instance get <ID>` | 实例详情（status/pid/cdpPort/browserVersion/profileDir） |
-| `instance status <ID>` | 轻量轮询视图（id/status/pid/cdpPort/browserVersion）；全量详情（含 profileDir）用 `get` |
-| `instance diagnostics <ID>` | 页面诊断快照摘要（targetUrl / errors / badResources / lcp / fcp；`--json` 完整透传）。未运行或无 http 页 → 409 exit 5 |
-| `instance console <ID> [--level error] [--limit 50]` | 常驻 console 环（500 条，进程内态）；table 列 LEVEL/SOURCE/TEXT |
-| `instance network <ID> [--failed-only] [--limit 50]` | 常驻请求环（1000 条）；`--failed-only` 只看失败/HTTP≥400 |
-| `instance screenshot <ID> [--out <path>]` | 当前页面 png（base64 解码 + PNG 魔数校验后写文件，缺省 `<id>.png`；`--json` 输出响应原样） |
-| `instance har <ID> [--out <path>]` | 请求环生成 HAR 1.2（缺省写 `<id>.har`；`--json` 输出文档原样） |
-| `instance create <ENV_ID>` | 创建并启动。读操作族用 30s 超时，本命令**无总超时**（容忍内核下载） |
-| `instance start <ID>` / `instance stop <ID>` | 启动已停止实例 / 优雅停止。`start`/`restart` 同样无总超时 |
-| `instance restart <ID>` | 停止再启动（hosts 重新拉取最新） |
-| `instance open <ID> <URL>` | 新开标签页导航到 URL。**仅 http/https**，缺协议在本地即拒绝（exit 2，不发请求） |
-| `instance tabs <ID>` | 当前标签页列表（每项 id/type/title/url，tabId 供 navigate 使用） |
-| `instance navigate <ID> <TAB_ID> <URL>` | 将 `tabs` 中的指定标签页导航到新 URL（实现为新开页并关闭旧页，返回新页 target；仅 http/https） |
-| `instance focus <ID>` | 聚焦实例窗口 |
-| `instance cdp <ID>` | 输出 CDP 端点（host/port/httpUrl/webSocketUrl），可直接接入 Playwright / Puppeteer / puppeteer-core |
-| `instance cdp-session <ID>` | 发放 CDP 会话（远程/代理访问用，30 分钟有效）。`--quiet` 输出**完整代理 URL**（新契约，供 `CDP_BASE=$(...)` 直接捕获）；`--json` 含 sessionId/baseUrl/expiresAt/fullUrl。远程调用需 `CHROME_HOST_TOKEN` |
-| `instance delete <ID> [--yes]` | 删除实例（含 profile 数据）。运行中实例：`--yes` 自动 stop → delete；stop 失败则原样报错 |
+| `instance list [--env <ENV_ID>]` | 实例列表。缺省全量（含 `environmentName` 列，需 v0.1.5+ 应用）；`--env` 只看指定环境。列：ID NAME ENVIRONMENT STATUS PID CDP（NAME 列需 v0.6+ 应用，未命名显示 `-`） |
+| `instance get <ID\|NAME>` | 实例详情（name/status/pid/cdpPort/browserVersion/profileDir） |
+| `instance status <ID\|NAME>` | 轻量轮询视图（id/status/pid/cdpPort/browserVersion）；全量详情（含 profileDir）用 `get` |
+| `instance diagnostics <ID\|NAME>` | 页面诊断快照摘要（targetUrl / errors / badResources / lcp / fcp；`--json` 完整透传）。未运行或无 http 页 → 409 exit 5 |
+| `instance console <ID\|NAME> [--level error] [--limit 50]` | 常驻 console 环（500 条，进程内态）；table 列 LEVEL/SOURCE/TEXT。`--json` 含 meta 证据边界（dropped/capacity/since/live） |
+| `instance network <ID\|NAME> [--failed-only] [--limit 50]` | 常驻请求环（1000 条，完成/失败才入环，进行中不可见）；`--failed-only` 只看失败/HTTP≥400；`--json` 含 meta（另含 `scope:"completed"`）。table 列 METHOD/STATUS/URL/BODY（BODY = bodyState，unavailable 附归因）；`--quiet` 每行 `status\turl\trequestId`（requestId 供 network-body） |
+| `instance network-body <ID\|NAME> <REQUEST_ID> [--offset N] [--limit N]` | 分页读响应体（脱敏后；UTF-16 单位计量，不劈代理对；缺省 8192/上限 65536）。仅 bodyState available/partial 可读：404（不在环）exit 3、409（不可读，message 含 bodyState/bodyReason）exit 5；`--quiet` 输出 body 原文；`truncated=true` 时续读 `--offset += returned` |
+| `instance screenshot <ID\|NAME> [--out <path>]` | 当前页面 png（base64 解码 + PNG 魔数校验后写文件，缺省 `<id>.png`；`--json` 输出响应原样） |
+| `instance har <ID\|NAME> [--out <path>]` | 请求环生成 HAR 1.2（缺省写 `<id>.har`；`--json` 输出文档原样） |
+| `instance create <ENV_ID> [--name <NAME>]` | 创建并启动；`--name` 可选（1-64 字符，同环境唯一，重名 → 409 exit 5）。读操作族用 30s 超时，本命令**无总超时**（容忍内核下载） |
+| `instance start <ID\|NAME>` / `instance stop <ID\|NAME>` | 启动已停止实例 / 优雅停止。`start`/`restart` 同样无总超时 |
+| `instance restart <ID\|NAME>` | 停止再启动（hosts 重新拉取最新） |
+| `instance open <ID\|NAME> <URL>` | 新开标签页导航到 URL。**仅 http/https**，缺协议在本地即拒绝（exit 2，不发请求） |
+| `instance tabs <ID\|NAME>` | 当前标签页列表（每项 id/type/title/url，tabId 供 navigate 使用） |
+| `instance navigate <ID\|NAME> <TAB_ID> <URL>` | 将 `tabs` 中的指定标签页导航到新 URL（实现为新开页并关闭旧页，返回新页 target；仅 http/https） |
+| `instance focus <ID\|NAME>` | 聚焦实例窗口 |
+| `instance cdp <ID\|NAME>` | 输出 CDP 端点（host/port/httpUrl/webSocketUrl），可直接接入 Playwright / Puppeteer / puppeteer-core |
+| `instance cdp-session <ID\|NAME>` | 发放 CDP 会话（远程/代理访问用，30 分钟有效）。`--quiet` 输出**完整代理 URL**（新契约，供 `CDP_BASE=$(...)` 直接捕获）；`--json` 含 sessionId/baseUrl/expiresAt/fullUrl。远程调用需 `CHROME_HOST_TOKEN` |
+| `instance delete <ID\|NAME> [--yes]` | 删除实例（含 profile 数据）。运行中实例：`--yes` 自动 stop → delete；stop 失败则原样报错 |
 
 实例状态机：`starting → running → stopped`，异常路径 `error / crashed`。读路径全部经过对账（以真实进程为准，不轻信数据库）。
 
@@ -210,11 +215,14 @@ chrome-host env delete <id> --yes
 （导航后引用整表失效，报 `PAGE_REF_STALE` / `PAGE_REF_NOT_FOUND` → **重 snap，
 不要对旧引用重试**）。对话框（alert/confirm/prompt/beforeunload）会被自动
 accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示行，历史用
-`page dialogs` 查。
+`page dialogs` 查。导航四件套（navigate/back/forward/reload）在同一标签内
+导航并**保留历史**（`instance navigate` 的 new+close 组合近似会丢历史，保留
+给 GUI）；等待 load 至多 25s，未证实 → 结果行 `loaded:false`（已开始而非
+失败，用 snap/wait 观察）。
 
 | 命令 | 说明 |
 |---|---|
-| `page snap <ID> [TAB_ID]` | AX 树文本快照（可交互节点内联 @e1..@eN 引用）+ 元信息行（targetId/refs/generation）；`--quiet` 输出 targetId |
+| `page snap <ID\|NAME> [TAB_ID]` | AX 树文本快照（可交互节点内联 @e1..@eN 引用）+ 元信息行（targetId/refs/generation）；行内 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化（meta `hoverScan`：ok/truncated/skipped/error，预算 32 表/2MiB/256 规则）；跨域 iframe 内容以 `[frame]` 段内嵌，@eN 跨 frame 连续编号（v0.7+；click/fill/press 对帧内 @eN 直接可用，CSS 选择器仍只查主 frame）；`--quiet` 输出 targetId |
 | `page click <ID> <sel\|@eN> [--tab T]` | 原生输入点击（三段鼠标事件，非 el.click()）；selector 路径带可见性/遮挡校验 |
 | `page fill <ID> <sel\|@eN> <value> [--tab T]` | 聚焦→全选清空→输入→回读校验；空 value = 仅清空；不可编辑 → 422 exit 7 |
 | `page press <ID> <key> [--target <sel\|@eN>] [--tab T]` | 三段键盘事件；key 支持 Enter/Tab/单字符/组合键（`Control+A`）；`--target` 先聚焦 |
@@ -225,7 +233,15 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 | `page html <ID> [selector] [--tab T]` | 读 outerHTML（缺省 = 整文档；未命中 → 404 exit 3）；html 原样到 stdout，`--json` 包 `html` 字段 |
 | `page clickxy <ID> <x> <y> [--tab T]` | 视口坐标点击（CSS 像素；无定位/遮挡校验，坐标即意图） |
 | `page loadall <ID> <selector> [--interval 1500ms] [--max-clicks 200] [--tab T]` | 循环点击「加载更多」直到消失；达上限仍未消失时结果明示 still present |
-| `page type <ID> <text> [--tab T]` | 向当前焦点元素输入文本（跨域 iframe 唯一输入路径；先 clickxy 点入）；空文本 → 400 exit 7 |
+| `page type <ID> <text> [--tab T]` | 向当前焦点元素输入文本（跨域 iframe 内坐标级兑底：@eN 已支持帧直达，selector 不可达帧内时先 clickxy 点入）；空文本 → 400 exit 7 |
+| `page screenshot <ID> [sel\|@eN] [--full] [--tab T] [--out F]` | png 截图三形态：目标缺省 = 视口；@eN/选择器 = 元素；--full = 全页（截发起时刻整文档，懒加载未加载内容不在图；上限 16384 设备像素 ÷ DPR）；--full 缺省 `<id>-full.png`；与 target 互斥 exit 2 |
+| `page pdf <ID> [--landscape] [--no-print-background] [--paper-width 8.5] [--paper-height 11] [--tab T] [--out F]` | 整页 PDF（缺省 Letter 纵向带背景；缺省 `<id>.pdf`） |
+| `page emulate <ID> --preset P \| --viewport WxH [--user-agent UA] [--mobile] [--touch] \| --off [--tab T]` | 设备仿真（仅作用该 tab；重复 = 覆盖，--off 恢复；预设：iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p） |
+| `page navigate <ID> <url> [--tab T]` | 页内导航（page session 上 Page.navigate，保留历史）；等 load 至多 25s，未证实 → loaded:false；导航失败（net::ERR_*）→ 500 exit 5；URL 非法 → 400 exit 7 |
+| `page back <ID> [--tab T]` | 历史后退一步；无更早条目 → 409 `PAGE_NAV_NO_HISTORY` exit 5 |
+| `page forward <ID> [--tab T]` | 历史前进一步；无更晚条目 → 409 `PAGE_NAV_NO_HISTORY` exit 5 |
+| `page reload <ID> [--ignore-cache] [--tab T]` | 重载当前页（--ignore-cache 跳过缓存）；等待语义同 navigate |
+| `page extract <ID> [sel\|@eN] [--tab T] [--out f.json]` | 表格结构化提取 → `{ columns, rows, coverage, meta }`（缺省目标 = 主文档最大表格自动发现；仅 table/[role=table\|grid\|treegrid]，非表格 → 422 exit 7；未命中 → 404 exit 3）。单元格 `null` = 被合并覆盖/空位、`""` = 真实空单元格；缺省模式摘要行 + 数据表（∅ 表 null），`--json` 全量 payload，`--out` 写 JSON 文件（quiet = 行数或文件路径）；CSV 未做（后续迭代） |
 | `page download-wait <ID> [--timeout-ms 30000] [--tab T]` | 等待下一次下载完成（命令式：先调本命令，再另行 click 触发下载）；落盘在实例 profile 的 downloads/；失败 → exit 5，超时 → exit 5（message 区分） |
 | `page downloads <ID> [--tab T]` | 下载终态记录环（最近 20 条，含已消费；STATE/FILE/BYTES/MATCHED 表） |
 | `page upload <ID> <sel\|@eN> <主机绝对路径> [--tab T]` | 主机文件设入 input[type=file]（触发原生 change）；路径拒符号链接（422 exit 7，macOS /tmp→/private/tmp 类软链拒绝——改传物理路径）；不存在 → 404 exit 3；超 100MB → 422 exit 7 |
@@ -261,10 +277,10 @@ chrome-host page clickxy ins_xxx 320 240
 chrome-host page type ins_xxx 'hello iframe'
 chrome-host page eval ins_xxx 'document.title'   # 高权限，最后手段
 
-# 文件传输（W-file）：命令式等待下载 → click 触发 → 落盘路径/大小；上传
-chrome-host page download-wait ins_xxx --timeout-ms 60000   # 挂住等下载（另终端 click）
-chrome-host page downloads ins_xxx                          # 终态记录环（含失败与已消费）
-chrome-host page upload ins_xxx 'input[type=file]' /private/tmp/avatar.png
+# 表格提取（QA：订单列表/查询结果 → JSON）
+chrome-host page extract ins_xxx                     # 主文档最大表格自动发现
+chrome-host page extract ins_xxx '#orders' --json | jq '.rows'
+chrome-host page extract ins_xxx @e3 --out orders.json   # 全量 payload 落文件
 ```
 
 ### extension — 扩展管理

@@ -28,6 +28,25 @@
 | 编码 | 请求/响应均为 `application/json`；字段 camelCase |
 | 时间戳 | 均为 Unix epoch **毫秒**（`i64`） |
 | 鉴权 | 17890 无鉴权（本机回环即信任边界）；17891 全路由要求 `Authorization: Bearer <token>`（`/cdp/` 会话路径除外——会话 key 即凭证） |
+
+## 证据边界契约（Evidence Bounds）
+
+任何观察类端点（console/network/screenshot/har/diagnostics/dialogs 等）在数据缺失、截断、超限、降级时，**必须以显式字段或 meta 标注，不允许静默**——宁可报 `unknown/partial/overflowed`，不编造成功、不静默截断。新端点设计的验收问题：**「数据缺失/截断/超限/迟到时返回什么？」**
+
+现有范式：`effect_state`（none=未发出可重试 / unknown=禁盲目重试）、`tab_filter_unavailable`（禁止臆造归属时显式降级标注）、console/network 响应的 `meta`（见下）。
+
+### console / network / har 响应 meta 字段（冻结契约）
+
+| 字段 | 类型 | 出现于 | 语义 |
+|---|---|---|---|
+| `meta.dropped` | number（u64） | console / network 查询、HAR `_meta` | 环溢出累计丢弃条数，自本代 watcher 挂载起算，只增不清零；≠0 即历史证据不完整 |
+| `meta.capacity` | number | 同上 | 环固定容量（console 500 / network 1000） |
+| `meta.since` | number \| null | 同上 | 本代 watcher 挂载时刻（epoch ms）；早于该时刻的数据从未被采集；未挂载时 null |
+| `meta.live` | boolean | 同上 | true=常驻采集进行中；false=watcher 未挂载（entries 是空投影，≠ 无日志） |
+| `meta.scope` | string 常量 | network 查询、HAR `_meta` | 恒 `"completed"`：完成/失败才入环，进行中请求不可见 |
+| `_meta.uncollected` | string[] | 仅 HAR | -1/空集占位语义简述（headersSize/bodySize=-1、timings 分阶段=-1 仅 receive=总时长、空数组=未采集非确认为空） |
+| `meta.filteredByTab` / `meta.tabFilterUnavailable` / `meta.before` / `meta.after` | — | console / network（仅请求 tab 过滤时） | tab 过滤执行情况；`tabFilterUnavailable: true` = 存在无归属条目，已降级为全量 |
+| `meta.dropped` / `meta.capacity`（dialogs） | number | page/dialogs | 对话框 FIFO 逐出累计 / 容量（32）；幸存首条 sequence > since+1 ⇒ 中间有逐出 |
 | 幂等性 | `POST .../instances` 与 `POST .../open` **非幂等**——每次调用新增一个实例 |
 | 版本要求 | `GET /api/v1/instances` 与 `GET /api/v1/health` 为 v0.1.5+ 新增；其余端点历史版本可用 |
 
@@ -110,7 +129,7 @@
 
 ### `POST /api/v1/environments/{id}/open` — 快捷创建
 
-`create` 的别名（历史快捷端点）：同样**创建并启动一个新实例**，非"打开某 URL"。
+`create` 的别名（历史快捷端点）：同样**创建并启动一个新实例**，非"打开某 URL"；可选 body 同 create（`{ "name": ... }`）。
 
 ### `POST /api/v1/environments/{id}/stop-all` — 停止全部运行中实例
 
@@ -146,7 +165,7 @@
 
 | 端点 | 说明 |
 |---|---|
-| `POST /api/v1/environments/{envId}/instances` | **创建并启动**（非幂等）。流程：分配 CDP 端口 → 克隆登录态 → hosts 拉取注入 → spawn → 等 CDP 就绪（≤10s）。首次运行可能阻塞于内核下载。`201` 返回实例 |
+| `POST /api/v1/environments/{envId}/instances` | **创建并启动**（非幂等）。流程：校验 name（可选）→ 分配 CDP 端口 → 克隆登录态 → hosts 拉取注入 → spawn → 等 CDP 就绪（≤10s）。首次运行可能阻塞于内核下载。`201` 返回实例。可选 body `{ "name": "..." }`（1-64 字符、同环境唯一，重名 → `409 INSTANCE_NAME_CONFLICT`；NULL 不参与唯一约束） |
 | `POST /api/v1/environments/{envId}/instances` + `GET` | 同路径 GET = 按环境列实例 |
 | `GET /api/v1/instances` | **全量实例列表**（v0.1.5+）：`Instance` 平铺 + `environmentName` |
 | `GET /api/v1/instances/{id}` | 详情 |
@@ -156,15 +175,29 @@
 | `POST /api/v1/instances/{id}/focus` | 唤出窗口（CDP 激活优先，回退平台 API；未运行 → 409） |
 | `DELETE /api/v1/instances/{id}` | 删除（运行中 → `409 INSTANCE_ALREADY_RUNNING`，须先 stop；清理 profile 目录） |
 
+创建可选 body（无 body / 空 / `name: null` = 不命名）：
+
+```json
+// 请求
+{ "name": "checkout-e2e" }
+```
+
+`name`（可选实例名）：trim 后 1-64 字符（按字符计）、不允许纯空白与控制字符，
+否则 `400 INVALID_REQUEST`；**同环境内唯一**（可空的 NULL 不参与唯一约束），
+重名 → `409 INSTANCE_NAME_CONFLICT`（先查后插 + DB 唯一索引兑底，并发安全）。
+多任务并行时建议命名，便于按任务锚定实例（CLI 支持按 name 引用）。
+
 实例对象：
 
 ```json
-{ "id": "ins_9b198afd-...", "environmentId": "env_...", "loginProfileId": null,
+{ "id": "ins_9b198afd-...", "name": "checkout-e2e", "environmentId": "env_...", "loginProfileId": null,
   "profileDir": "~/Library/.../instances/ins_...", "pid": 18231, "cdpPort": 9333,
   "status": "running", "hostRules": "...", "browserVersion": "131.0.6778.204",
   "startedAt": 1789298923396, "stoppedAt": null,
   "createdAt": 1789298923396, "updatedAt": 1789298923396 }
 ```
+
+（未命名实例 `name` 为 `null`；列表/详情响应均携带该字段。）
 
 `GET /instances/{id}/status` 返回精简视图：`{ "id", "status", "pid", "cdpPort", "browserVersion" }`。
 
@@ -174,13 +207,14 @@
 |---|---|
 | `GET /api/v1/instances/{id}/cdp` | CDP 端点。CDP 仅绑定 `127.0.0.1` |
 | `GET /api/v1/instances/{id}/diagnostics` | 页面诊断快照（透传）：对第一个 http(s) 页面短连接求值 page-diagnostics 扩展挂载的 `window.__chromeHostDiagnostics`。未运行或无 http 页 → `409 DIAGNOSTICS_UNAVAILABLE` |
-| `GET /api/v1/instances/{id}/console?level=&limit=` | 常驻订阅 console 环（500 条）：console API + 页面日志。level 精确匹配，limit 缺省 100 |
-| `GET /api/v1/instances/{id}/network?failedOnly=&limit=` | 常驻订阅请求环（1000 条，请求完成/失败时入环）。failedOnly = 失败或 HTTP≥400 |
+| `GET /api/v1/instances/{id}/console?level=&limit=` | 常驻订阅 console 环（500 条）：console API + 页面日志。level 精确匹配，limit 缺省 100。响应 meta 恒带证据边界（见[证据边界契约](#证据边界契约evidence-bounds)） |
+| `GET /api/v1/instances/{id}/network?failedOnly=&limit=&tab=` | 常驻订阅请求环（1000 条，请求完成/失败时入环，进行中不可见——meta `scope:"completed"` 声明）。failedOnly = 失败或 HTTP≥400；条目携带 `bodyState`/`bodyReason`（见[证据边界契约](#证据边界契约evidence-bounds)） |
+| `GET /api/v1/instances/{id}/network/{requestId}/body?offset=&limit=` | **分页读响应体**（脱敏后；UTF-16 code unit 计量）。仅 `bodyState` available/partial 可读；404 `NETWORK_BODY_NOT_FOUND` = requestId 不在环；409 `NETWORK_BODY_UNAVAILABLE` = 状态不可读（message 携带归因） |
 | `GET /api/v1/instances/{id}/screenshot` | 当前页面 png 截图（base64，复用常驻连接）。未运行/连接未就绪/无 http 页 → 409 |
-| `GET /api/v1/instances/{id}/har` | 请求环生成 HAR 1.2 文档（未采集字段按规范 -1/空集占位；`_targetUrl` 标注归属页面） |
+| `GET /api/v1/instances/{id}/har` | 请求环生成 HAR 1.2 文档（未采集字段按规范 -1/空集占位，语义见顶层 `_meta.uncollected`；`_targetUrl` 标注归属页面；body 可用条目的 `response.content.text` 嵫脱敏后内容，含非 ASCII 时 base64+encoding） |
 | `GET /api/v1/instances/{id}/tabs` | 页面标签列表（仅 `type: "page"`） |
 | `POST /api/v1/instances/{id}/tabs` | 新开标签页并导航。请求体 `{ "url": "https://…" }`（须含协议） |
-| `POST /api/v1/instances/{id}/navigate` | 导航既有标签页。请求体 `{ "tabId": "...", "url": "..." }`（new+close 组合近似，旧页历史丢失） |
+| `POST /api/v1/instances/{id}/navigate` | 导航既有标签页。请求体 `{ "tabId": "...", "url": "..." }`（new+close 组合近似，旧页历史丢失；**推荐改用 `page/navigate`**——同 tab 内导航保留历史，本端点保留给 GUI） |
 | `POST /api/v1/instances/{id}/cdp/sessions` | **发放 CDP 会话**（远程/代理访问用，`201`）：`{ sessionId, baseUrl, expiresAt }`，30 分钟有效。实例须运行中（否则 409）。经 17891 访问需 Bearer token |
 
 ```json
@@ -210,6 +244,51 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 即清空**；请求在完成/失败时入环（in-flight 不可见）。截图取第一个 http(s) 页面 session
 （隐藏页面可能拍到空白帧，与浏览器行为一致）。
 
+### 证据边界契约（常驻诊断）
+
+观察数据**永远显式声明边界**——缺失/截断/驱逐可见，而非静默少数据：
+
+**响应 meta 恒在**（console/network 查询与 HAR 顶层 `_meta`）：
+
+| 字段 | 语义 |
+|---|---|
+| `dropped` | 环溢出累计丢弃条数（只增不清零；结构证据被挤出的唯一信号） |
+| `capacity` | 环容量（console 500 / network 1000） |
+| `since` | watcher 挂载时刻（epoch ms）；早于此的数据**从未被采集**（非「无数据」）。`null` = watcher 未运行 |
+| `live` | 是否活采集（false = 实例运行中但 watcher 尚未就绪/已断） |
+| `scope` | network/HAR 恒为 `"completed"`：进行中请求不可见 |
+
+**响应体捕获与 `bodyState`**（network 条目字段；多态从第一天就存在）：
+
+| bodyState | 语义 |
+|---|---|
+| `available` | 全量可用（脱敏后；单条 ≤256 KiB） |
+| `partial` | 超单条 256 KiB 上限被截断（`bodyBytes` = 实际保留量；分页读可读已保留部分） |
+| `evicted` | 环级 body 总预算（8 MiB）超限，**最旧**条目的 body 被回收——元数据永不驱逐（分层驱逐：结构证据完整，重的 body 可回收） |
+| `unavailable` | 不可读；`bodyReason` 必填：`mime`（非文本类 mime，不拉取）/ `timeout`（拉取超 2.5s 预算）/ `no-data`（CDP 无资源/排队溢出/连接断/空响应）/ `not-text`（非 UTF-8 文本或 base64 非法）/ `not-finished`（请求失败或拉取尚未结算——事件驱动，最终一致）/ `redact-failed`（无法安全定界敏感内容，整体拒绝保留） |
+
+拉取预算：并发 in-flight ≤4、排队上限 64（溢出归因 `no-data`）、单条超时 ~2.5s——常驻
+事件流不被 body 拉取堵死。URL 与 body **落环前脱敏**（原始内容不进进程内存）：query
+敏感参数值与敏感字段名（token/key/secret/password/auth/signature/session 等类别词，
+camelCase/复数/HTML 实体归一匹配）的字符串值 → `[redacted]`；JSON 走源码区间替换
+（64 位大数、空白、键序字节级原样）；超 2048 字符的 URL 截断并标记。
+
+**body 分页读**：`offset`/`limit` 以 **UTF-16 code unit** 计量（JS String 同构；边界落入
+代理对时向外取整，不劈开）；`limit` 缺省 8192、上限 65536。响应：
+
+```json
+{ "instanceId": "ins_...", "requestId": "1000123456.7",
+  "bodyState": "partial", "body": "{\"data\":[1,2]}",
+  "offset": 0, "limit": 8192, "returned": 14, "totalLength": 4096,
+  "bodyBytes": 262144, "truncated": true }
+```
+
+`truncated = offset + returned < totalLength`（窗口未覆盖全文；续读 `offset += returned`）。
+requestId 以 network 查询为准；跨 tab 同名 requestId 时读最新命中条目。
+
+**HAR**：`response.content.text` 仅 available/partial 条目携带（脱敏后；含非 ASCII 时
+base64 + `encoding: "base64"`，HAR 惯例）；`_meta.uncollected` 逐行声明未采集面。
+
 拿到 `webSocketUrl` 后可直接接入 Playwright（`connectOverCDP`）/ Puppeteer / chrome-remote-interface。
 
 ### 页面控制（Page Control）
@@ -217,12 +296,15 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 实例级常驻 CDP 连接上的页面操作面：`snap` 产生 @eN 引用，`click`/`fill`/
 `press` 消费引用或 CSS 选择器，`wait` 轮询等待，`dialogs` 读自动应答的对话框
 日志；`eval`/`html`/`clickxy`/`loadall`/`type` 为 cdp.mjs 退役补齐的兑底五件
-（行为规格同源 TS 工具）。连接惰性建立（实例首次 page 命令时），与常驻诊断
-连接互不干扰；仅对运行中实例可用（否则 `409 PAGE_SERVICE_UNAVAILABLE`）。
+（行为规格同源 TS 工具）；`navigate`/`back`/`forward`/`reload` 为导航四件套
+（page session 内导航/历史回退/重载，保留历史——实例级 `navigate` 的
+new+close 组合近似会丢历史，保留给 GUI）。连接惰性建立（实例首次 page
+命令时），与常驻诊断连接互不干扰；仅对运行中实例可用（否则 `409
+PAGE_SERVICE_UNAVAILABLE`）。
 
 | 端点 | 说明 |
 |---|---|
-| `POST /api/v1/instances/{id}/page/snap` | AX 树快照 + @eN ref 整表替换。body `{ "tab?": ... }` |
+| `POST /api/v1/instances/{id}/page/snap` | AX 树快照 + @eN ref 整表替换 + hover 感知标记（行内 `[hover]` / `[hover-reveal]`，meta `hoverScan`）。body `{ "tab?": ... }`；跨域 iframe 内容以 `[frame]` 段内嵌（@eN 跨 frame 连续编号，v0.7+） |
 | `POST /api/v1/instances/{id}/page/click` | 原生输入点击（三段鼠标事件，非 `el.click()`）。body `{ "target", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/fill` | 聚焦→全选清空→insertText→回读校验。body `{ "target", "value", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/press` | 键盘三段序列。body `{ "key", "target?", "tab?" }` |
@@ -234,8 +316,18 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 | `POST /api/v1/instances/{id}/page/clickxy` | 视口坐标点击（CSS 像素，无定位/遮挡校验）。body `{ "x", "y", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/loadall` | 循环点击直到选择器消失。body `{ "selector", "interval?", "maxClicks?", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/type` | 向当前焦点元素输入文本（跨域 iframe 唯一输入路径）。body `{ "text", "tab?" }` |
-| `POST /api/v1/instances/{id}/page/download-wait` | 等待**下一次**下载完成（W-file；命令式等待：先调本端点再触发点击）。body `{ "timeoutMs?"（缺省 30000）, "tab?" }` |
+| `POST /api/v1/instances/{id}/page/navigate` | 页内导航（page session 上 `Page.navigate`，保留历史；区别于实例级 navigate 的 new+close 近似）。body `{ "url", "tab?" }`；等 load 至多 25s，未证实 → `loaded:false`（非失败） |
+| `POST /api/v1/instances/{id}/page/back` | 导航历史后退一步（无更早条目 → `409 PAGE_NAV_NO_HISTORY`）。body `{ "tab?" }` |
+| `POST /api/v1/instances/{id}/page/forward` | 导航历史前进一步（无更晚条目 → `409 PAGE_NAV_NO_HISTORY`）。body `{ "tab?" }` |
+| `POST /api/v1/instances/{id}/page/reload` | 重载当前页（等待语义同 navigate）。body `{ "ignoreCache?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/intercept` | **Fetch 会话层拦截**：规则集整表替换（空 `rules` = 清空 + `Fetch.disable`）。body `{ "rules": [...], "tab?" }`，规则模型见下 |
+| `GET /api/v1/instances/{id}/page/intercept?tab=` | 拦截状态：各规则命中计数/剩余/活跃 + 干预记录环（最近 200 条，url 已脱敏）+ `liveSince` |
+| `POST /api/v1/instances/{id}/page/screenshot` | 元素/视口/全页 png 截图（base64）。body `{ "target?", "full?", "tab?" }`；full 与 target 互斥 |
+| `POST /api/v1/instances/{id}/page/pdf` | 整页 PDF（base64）。body `{ "landscape?", "printBackground?", "paperWidth?", "paperHeight?", "tab?" }`（英寸，缺省 Letter 8.5×11） |
+| `POST /api/v1/instances/{id}/page/emulate` | 设备仿真（preset / viewport / off 三形态互斥）。body `{ "preset?" \| "viewport"+"userAgent?"+"mobile?"+"touch?" \| "off", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/extract` | 表格结构化提取 → `{ columns, rows, coverage, meta }`。body `{ "target?", "tab?" }`（target 缺省 = 主文档最大表格自动发现；详见下文「表格提取」） |
 | `GET /api/v1/instances/{id}/page/downloads` | 下载终态记录环（最近 20 条，含已消费——matched 字段区分） |
+| `POST /api/v1/instances/{id}/page/download-wait` | 等待**下一次**下载完成（W-file；命令式等待：先调本端点再触发点击）。body `{ "timeoutMs?"（缺省 30000）, "tab?" }` |
 | `POST /api/v1/instances/{id}/page/upload` | 主机文件设入页面 file input。body `{ "target", "filePath", "tab?" }` |
 
 参数语义：
@@ -244,8 +336,26 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
   标签时自动选中，多标签 → `409 PAGE_TAB_AMBIGUOUS`（message 列出全部
   targetId 供显式指定——不猜活跃 tab，避免取错页面）；显式前缀未命中
   → `404 PAGE_TAB_NOT_FOUND`。
+- **`hoverScan`**（snap 响应字段）+ 行内 `[hover]` / `[hover-reveal]` 标记（snap
+  hover 感知）：被动扫描页面 CSS 规则中的 `:hover` 选择器并静态标记——
+  `[hover]` = 该元素是 hover 触发器（hover 它会有效果，菜单类页面优先关注）；
+  `[hover-reveal]` = 该元素是 hover 后才显示/变化的可见目标。状态：
+  `ok`（完整扫描）/ `truncated`（预算截断：样式表 >32 张、单表 >2MiB、
+  提取规则 >256 条、单选择器命中 >1000——部分标记，宁可不完整不静默）/
+  `skipped`（无 hover 规则或无样式表）/ `error`（标记桥接等基础设施故障，
+  snap 主体不受影响）。已知边界：OOPIF 内样式表不在扫描范围；
+  `display:none` 隐藏的 reveal 目标不在 AX 树（hover 后出现，重新 snap 可见）；
+  CSS 解析为启发式（`@keyframes`/注释/`:not(:hover)` 已排除，误报由 DOM
+  求值兜底——查不到元素的选择器自然无标记）。
 - **`target`**：`@eN` 引用（上次 snap 产生；导航/文档替换后整表失效 → `PAGE_REF_STALE`，
   需重新 snap 而非对旧引用重试）或 CSS 选择器两种形态。
+- **跨域 iframe（OOPIF）**：snap 的 AX 树包含跨域 iframe 内的可交互元素
+  （挂接点下 `[frame]` 段，@eN 连续编号）；@eN 指向帧内元素时 click 走
+  坐标投影（帧内 quad → owner iframe 元素 quad 逐级上投 → 根视口，
+  Input 派发发根 target），fill/press 的 DOM/Runtime 命令路由到帧会话。
+  **CSS 选择器仍只查主 frame**（与 BrowserSkill 一致）；帧内导航/移除只
+  使该帧的 ref 失效（`PAGE_REF_STALE`，主 frame ref 不受影响）；帧内 hover
+  标记不适用（后续迭代边界）。同源 iframe 内容本就在主树中，无需特殊处理。
 - **`state`**：`visible`（缺省）/ `hidden` / `attached` / `detached`；非法 → `400 INVALID_REQUEST`。
 - **`timeout`**：时长字符串（`"10s"` / `"250ms"`，裸数字 = 毫秒），缺省 10s；工具级
   预算 = timeout + 5s。
@@ -261,37 +371,70 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
   点击上限（缺省 200；预算 = interval × maxClicks + 30s）。达上限仍未消失时
   result 明示 `still present`，由调用方决定是否继续。
 - **`text`**（type）：非空文本，直接输入到当前焦点元素（无定位、无校验）——
-  跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达跨域 frame，先用
-  clickxy 点入获得焦点）；空串 → `400`。
-- **`timeoutMs`**（download-wait）：等待窗口毫秒数，缺省 30000。语义 =
-  **命令式等待**：调用即登记等待者，等待**下一次**下载终态（从调用时刻起算
-  ——不是轮询历史）；典型用法 = 先调本端点，再另行 click 触发下载（等待
-  期间不占实例串行锁，click 可立即执行）。返回最早到达的终态：完成 →
-  记录（`filePath/fileName/bytes/mimeType`，另含 `state/url/tab/startedAt/`
-  `completedAt/verified/matched`；`bytes` 优先取落盘实测大小，取不到时用
-  事件值且 `verified:false`）；取消/中断 → `500 PAGE_DOWNLOAD_FAILED`；
-  窗口耗尽 → `409 PAGE_DOWNLOAD_TIMEOUT`（无终态证据——若有下载在进行
-  中会在 message 披露，与「下载了但失败」严格区分）。落盘目录 = 实例
-  profile 下 `downloads/` 子目录（每实例隔离，实例删除随 profile 清理）；
-  文件名净化：suggestedFilename 含路径分隔符时拒绝拼路径（record 附 note，
-  等待者收 PAGE_DOWNLOAD_FAILED）。并发下载：多等待者按终态到达序先到
-  先得；未被等待者拿走的终态留在记录环（GET downloads 查询）。
-- **`target`**（upload）：file input 目标，`@eN` 引用或 CSS 选择器；非
-  input 或非 `type="file"` → `422 PAGE_TARGET_NOT_FILE_INPUT`（先于任何
-  写入校验）。
-- **`filePath`**（upload）：**主机本地绝对路径**（远程接入场景 = API 侧
-  主机路径）。安全边界：非绝对路径/路径任一组件是符号链接/非普通文件 →
-  `422 PAGE_UPLOAD_PATH_INVALID`（message 附物理路径提示——macOS 的
-  /tmp、/var 本身是软链，请传 /private/... 物理路径）；不存在 → `404
-  PAGE_UPLOAD_FILE_NOT_FOUND`；大于 100MB → `422 PAGE_UPLOAD_FILE_TOO_LARGE`。
-  不拷贝文件：CDP `DOM.setFileInputFiles` 直接引用主机路径，并触发页面
-  原生 change 事件（React 受控表单同常收到）；drop 拖拽上传不支持。
+
+#### Fetch 会话层拦截（intercept）
+
+agent 任务内动态规则（与 net-rules 扩展的 DNR 持久层互补：net-rules 管跨任务
+block/redirect/headers，intercept 管任务内 mock/改头/按需 block）。**一次性
+整表下发、应用本地决策**（requestPaused 事件流内匹配并回应，不逐请求往返
+调用方）。规则模型：
 
 ```json
-// POST .../page/snap 响应（蛇形键对齐 TS wire 字段）
+{ "rules": [
+  { "id": "r1", "match": { "urlPattern": "https://api.foo.com/v1/*", "resourceTypes": ["xhr","fetch"] },
+    "action": { "type": "mock", "status": 200, "headers": {"Content-Type":"application/json"},
+                "body": "{\"ok\":true}", "delayMs": 0 }, "times": 1 },
+  { "id": "r2", "match": { "urlPattern": "*://*.foo.com/*" },
+    "action": { "type": "setHeaders", "headers": {"X-Debug-Uid":"42"} } },
+  { "id": "r3", "match": { "urlPattern": "https://ads.example.com/*" },
+    "action": { "type": "block" } }
+] }
+```
+
+- **`urlPattern`**：glob（`*` 通配，与 net-rules 同语义）；须含 scheme
+  （`https://…` 或 `*://…`）。透传 CDP `Fetch.enable` patterns 并在应用层
+  同 pattern 二次匹配。
+- **`action.type`**：`mock`（不发出真实请求，本地回任意 status/headers/body/
+  delay）、`setHeaders`（改写请求头：原头全保留 + 规则头同名覆盖）、
+  `block`（`Fetch.failRequest` BlockedByClient，页面表现为网络错误）。
+- **校验**（`400 INVALID_REQUEST`，message 带规则路径）：`status` 限 2xx ∪
+  4xx-599（3xx 重定向/304 不允许——mock 是终态响应）；`delayMs` 0-10000；
+  headers 黑名单（cookie/authorization/origin/content-length/host/`sec-*`/
+  `proxy-*`——防规则窃取凭据/破坏连接语义）；`resourceTypes` 白名单见下；
+  规则 ≤32、展开 patterns ≤64；`body`（UTF-8 文本）或 `bodyBase64`（二进制）
+  二选一。
+- **`resourceTypes` 枚举（真机实测口径，务必注意）**：合法值
+  `Document / Stylesheet / Image / Media / Font / Script / XHR / Fetch /
+  Ping / Other`（输入**大小写不敏感**，内部规范化为 CDP 形态后下发——
+  CDP 校验大小写敏感，直接传小写会被 `Fetch.enable` 拒 -32602）。**XHR 与
+  Fetch 是合法值且行为级实测可拦 fetch/XHR API 请求**（拦全部请求类型则
+  省略 `resourceTypes`）。**勿用 `WebSocket`/`Manifest`/`EventSource`/
+  `CSPReport`/`Preflight`/`SignedExchange`**：这些在协议文档的枚举里存在，
+  但 CfT 131 的 `Fetch.enable` 真机拒绝（-32602 Unknown resource type），
+  domain 校验直接 400 并在 message 列合法集。
+- **`times`**：命中次数上限，默认 1；`0` = 不限。耗尽后规则失效但可查询
+  （GET 披露 hits/remaining/active）。
+- **生命周期**：绑定 page 控制连接——实例重启/断连重连后规则**自动失效**
+  （`Fetch.enable` 是 session 级），GET 返回空表 + `liveSince: null` + 提示；
+  需要时重新 POST 下发。无规则时零开销（不 `Fetch.enable`，清空即 disable）。
+- **决策路径与放行保证**：requestPaused 在事件流内本地决策（不占命令串行
+  锁，与 in-flight page 命令并发）；**未命中/耗尽的请求一律 continueRequest
+  放行，决策命令失败也裸放行兜底**——启用拦截绝不悬挂页面请求。
+- **mock 实现披露**：mock 经本地 loopback 上游改写（`Fetch.continueRequest`
+  → `http://127.0.0.1:<port>/m/<token>`，上游注入 CORS 头使跨源可读）——
+  页面 JS 读到的 `response.url` 是 mock 上游 URL 而非原 URL；CfT 131 的
+  `Fetch.fulfillRequest` 存在响应体不交付缺陷（spike 实测），故不走该路径。
+- **干预记录**（GET `journal`）：被 pause 的每个请求一条——`requestId`、
+  `url`（脱敏）、`rule`、`outcome`（`mocked` / `headers-set` / `blocked` /
+  `passed` / `failed-then-passed` / `stranded`）、`detail`、`ts`；环 200 条。
+| `POST /api/v1/instances/{id}/page/intercept` | **Fetch 会话层拦截**：规则集整表替换（空 `rules` = 清空 + `Fetch.disable`）。body `{ "rules": [...], "tab?" }`，规则模型见下 |
+| `GET /api/v1/instances/{id}/page/intercept?tab=` | 拦截状态：各规则命中计数/剩余/活跃 + 干预记录环（最近 200 条，url 已脱敏）+ `liveSince` |
+
+```json
+// POST .../page/snap 响应（蛇形键对齐 TS wire 字段；hoverScan 见下）
 { "instanceId": "ins_...", "targetId": "ABC123",
-  "text": "[WebArea] Example Domain\n  @e1 [link] More information...",
-  "refs_count": 1, "generation": 1 }
+  "text": "[WebArea] Example Domain\n  @e1 [link] [hover] More information...",
+  "refs_count": 1, "generation": 1, "hoverScan": "ok" }
 
 // POST .../page/click 响应（fill/press/wait 同为 result 单行形态）
 { "result": "Clicked <BUTTON> \"Save\" (native input @150,130)",
@@ -318,24 +461,34 @@ CDP 连接（`Target.setAutoAttach` flatten），**只订阅不操作**，与外
 { "result": "Clicked \".load-more\" 3 time(s) until it disappeared", ... }
 { "result": "Typed 12 characters", ... }
 
-// POST .../page/download-wait 响应（终态记录平铺；本例落盘已核证）
-{ "guid": "g-1", "state": "completed", "fileName": "report.csv",
-  "filePath": "~/Library/.../instances/ins_.../downloads/report.csv",
-  "bytes": 1024, "mimeType": null, "url": "https://dl.example.com/f",
-  "tab": "ABC123", "startedAt": 1710000000000, "completedAt": 1710000002100,
-  "verified": true, "matched": true,
-  "instanceId": "ins_...", "targetId": "ABC123" }
-
-// GET .../page/downloads 响应（环形记录，旧→新；含已消费与失败终态）
-{ "downloads": [ { "guid": "g-1", "state": "completed", "fileName": "report.csv",
-    "filePath": "...", "bytes": 1024, "mimeType": null, "url": "...", "tab": "ABC123",
-    "startedAt": ..., "completedAt": ..., "verified": true, "matched": true } ],
-  "capacity": 20, "instanceId": "ins_...", "targetId": "ABC123" }
-
-// POST .../page/upload 响应
-{ "result": "Set file \"a.png\" (3 bytes) on #upload", "fileName": "a.png", "bytes": 3,
+| `POST /api/v1/instances/{id}/page/navigate` | 页内导航（page session 上 `Page.navigate`，保留历史；区别于实例级 navigate 的 new+close 近似）。body `{ "url", "tab?" }`；等 load 至多 25s，未证实 → `loaded:false`（非失败） |
+| `POST /api/v1/instances/{id}/page/back` | 导航历史后退一步（无更早条目 → `409 PAGE_NAV_NO_HISTORY`）。body `{ "tab?" }` |
+| `POST /api/v1/instances/{id}/page/forward` | 导航历史前进一步（无更晚条目 → `409 PAGE_NAV_NO_HISTORY`）。body `{ "tab?" }` |
+| `POST /api/v1/instances/{id}/page/reload` | 重载当前页（等待语义同 navigate）。body `{ "ignoreCache?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/intercept` | **Fetch 会话层拦截**：规则集整表替换（空 `rules` = 清空 + `Fetch.disable`）。body `{ "rules": [...], "tab?" }`，规则模型见下 |
+| `GET /api/v1/instances/{id}/page/intercept?tab=` | 拦截状态：各规则命中计数/剩余/活跃 + 干预记录环（最近 200 条，url 已脱敏）+ `liveSince` |
   "instanceId": "ins_...", "targetId": "ABC123" }
 ```
+
+#### 表格提取（extract）的语义契约
+
+- **null ≠ 空串**：`rows` 单元格为 `null` = 该逻辑位无值（被 rowspan/colspan
+  合并覆盖，或 aria-colindex 稀疏网格的空位）；`""` = 真实空单元格。
+  合并锚点（原始 rowspan/colspan 位置，输出坐标）记录在 `meta.spans`。
+- **列名解析**：thead th 优先 → 无 thead 时首行全 th 提升为表头（source=
+  `first-row`）→ 生成 `col_N`（source=`generated`）；跨行 thead 产出
+  `headerPath`（`path` 字段，如 `["基本信息", "姓名"]`，colspan 组标签继承到
+  被覆盖列，rowspan 续行不重复）。
+- **coverage 诚实证据**：`datasetComplete` **永不为 true**——`unknown`（无 aria
+  行列声明，完整性不可判定）| `incomplete`（aria-rowcount/colcount 超出实际、
+  单元格预算 10000 超限整行截断、空 tbody/无数据行——不装作空表，reasons
+  给出归因）。`hiddenRowsOmitted` = display:none 被跳过的行数（单独披露，
+  不改变 datasetComplete 判定）。
+- **aria 表格**：role=table/grid/treegrid 的行按 aria-rowindex 逻辑序输出
+ （全部行都声明 rowindex 才排序，部分声明保持 DOM 序）；单元格按
+  aria-colindex 放置，缺失列不编造（仅披露 aria-colcount 差值）。
+- **嵌套表格**：单元格文本取 textContent（嵌套内表文本会并入外层单元格，
+  不再展开内表结构）；CSS 选择器可显式指定内层表格提取。
 
 对话框接管：alert/confirm/prompt/beforeunload 一律自动 `accept: true`（prompt 提交
 默认文本，beforeunload = 放行离开）；应答成功才入档，缓冲按 tab 隔离、上限 32 条
@@ -514,9 +667,12 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 403 | `EXTENSION_SYSTEM_LOCKED` | 内置扩展不可启停/移除 |
 | 404 | `ENVIRONMENT_NOT_FOUND` / `INSTANCE_NOT_FOUND` / `EXTENSION_NOT_FOUND` / `LOGIN_PROFILE_NOT_FOUND` | 资源不存在 |
 | 409 | `ENVIRONMENT_HAS_RUNNING_INSTANCES` | 删环境前须 stop-all |
+| 409 | `INSTANCE_NAME_CONFLICT` | 创建实例时 `name` 与同环境既有实例重名（NULL 不参与唯一约束） |
 | 409 | `INSTANCE_ALREADY_RUNNING` | 重复 start；删除运行中实例 |
 | 409 | `INSTANCE_NOT_RUNNING` | 对停止实例 open/stop/焦点操作 |
 | 409 | `DIAGNOSTICS_UNAVAILABLE` | 诊断查询（快照/console/network/screenshot/har）：实例未运行、常驻连接未就绪，或无 http(s) 页面目标 |
+| 404 | `NETWORK_BODY_NOT_FOUND` | body 分页读：requestId 不在诊断环内（可能被环容量挤出，或实例/应用重启；环为进程内态） |
+| 409 | `NETWORK_BODY_UNAVAILABLE` | body 分页读：条目在环内但 bodyState 不可读（mime/timeout/no-data/not-text/not-finished/redact-failed/evicted） |
 | 409 | `PROFILE_IN_USE` | 快照操作进行中，或遗留登录浏览器（旧版本 launch 遗留）运行中 |
 | 409 | `SESSION_CAPTURE_FAILED` | 从实例捕获登录态失败（实例目录无导出文件，或导出 Cookie 为空） |
 | 404 | `SESSION_GENERATION_NOT_FOUND` | session/restore 目标历史代不存在 |
@@ -525,14 +681,17 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `PAGE_TAB_AMBIGUOUS` / `PAGE_SERVICE_UNAVAILABLE` | page 族：tab 前缀多匹配，或省略 tab 且存在多个页面标签（message 列出全部 targetId）/ 实例未运行或无 CDP 端口 |
 | 409 | `PAGE_REF_STALE` / `PAGE_TARGET_MOVED` | @eN 引用已因导航/文档替换失效（重 snap）/ 引用节点不再可解析 |
 | 409 | `PAGE_ELEMENT_BLOCKED` / `PAGE_FILL_VALUE_MISMATCH` / `PAGE_WAIT_TIMEOUT` | 点击点被遮挡 / fill 回读不一致（写入可能已部分生效，先观察再决定）/ 等待超时 |
+| 409 | `PAGE_NAV_NO_HISTORY` | page back/forward 已在导航历史边界（无更早/更晚条目） |
 | 409 | `PAGE_FOCUS_FAILED` / `PAGE_FILL_FOCUS_LOST` | page press/fill 焦点失败 / 页面在 fill 过程中抢走焦点 |
 | 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / fill 目标不可编辑 |
+| 422 | `PAGE_EMULATE_UNKNOWN_PRESET` / `PAGE_EXTRACT_NOT_A_TABLE` | 未知仿真预设 / extract 目标非表格（仅接受 table/[role=table\|grid\|treegrid]） |
 | 422 | `PAGE_TARGET_NOT_FILE_INPUT` / `PAGE_UPLOAD_PATH_INVALID` / `PAGE_UPLOAD_FILE_TOO_LARGE` | upload 目标非 input[type=file] / filePath 非绝对路径或经符号链接或非普通文件 / 超 100MB 上限（W-file） |
 | 404 | `PAGE_UPLOAD_FILE_NOT_FOUND` | upload 的主机文件不存在（W-file） |
 | 409 | `PAGE_DOWNLOAD_TIMEOUT` | download-wait 窗口耗尽且无终态证据（有下载在进行中会在 message 披露；与失败严格区分，W-file） |
 | 500 | `PAGE_DOWNLOAD_FAILED` | 下载终态 = interrupted/canceled（或文件名不安全被拒）——下载了但失败（W-file） |
 | 500 | `PAGE_DISPATCH_FAILED` | Input 派发失败（message 附 effect_state：`none`=未发出可重试 / `unknown`=已发出禁盲目重试） |
 | 500 | `PAGE_EVAL_FAILED` / `CDP_COMMAND_FAILED` | page 工具页内 eval 失败 / CDP 发送失败 |
+| 500 | `PAGE_NAV_FAILED` | page navigate 导航失败（`Page.navigate` 响应 errorText，`net::ERR_*` 族——与 `loaded:false`「已开始未证实」严格区分） |
 | 504 | `PAGE_TOOL_TIMEOUT` | page 工具超出预算（常规 30s；wait = 用户 timeout + 5s） |
 | 409 | `CDP_PORT_UNAVAILABLE` | 实例 start 时 CDP 端口被外部进程占用 |
 | 500 | `CDP_PORT_UNAVAILABLE` | 创建实例时端口窗口耗尽（9222–9421 全部不可用） |
