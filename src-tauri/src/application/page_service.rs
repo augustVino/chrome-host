@@ -2401,9 +2401,10 @@ async fn pdf_tool(
 }
 
 /// emulate 工具：无条件发 set/clear（CDP 幂等），零状态实现覆盖语义——
-/// 应用时 UA 未给则清旧 override、touch 未给则关闭（未给 = 恢复默认，非
-/// 保持旧值）；off 清全部三域。仿真只作用于本 tab 的 page session
-///（CDP session 级），与实例级无关。
+/// 应用时 UA 未给则恢复默认（空串 setUserAgentOverride：CfT 131 无
+/// clearUserAgentOverride，真机实测）、touch 未给则关闭（未给 = 恢复默认，
+/// 非保持旧值）；off 清全部三域（metrics clear + UA 空串 + touch 关）。
+/// 仿真只作用于本 tab 的 page session（CDP session 级），与实例级无关。
 async fn emulate_tool(
     watched: &Watched,
     sid: &str,
@@ -2436,11 +2437,13 @@ async fn emulate_tool(
                     .await?;
                 }
                 None => {
-                    // 覆盖语义：本次不带 UA = 不仿真 UA，清掉上一次的
+                    // 覆盖语义：本次不带 UA = 不仿真 UA，恢复默认。CfT 131
+                    // 无 Emulation.clearUserAgentOverride（-32601，真机实测），
+                    // 改发空串 UA——真机验证可恢复默认 UA
                     cdp_send(
                         &conn,
-                        "Emulation.clearUserAgentOverride",
-                        json!({}),
+                        "Emulation.setUserAgentOverride",
+                        json!({ "userAgent": "" }),
                         Some(sid),
                     )
                     .await?;
@@ -2470,12 +2473,23 @@ async fn emulate_tool(
             }))
         }
         EmulateAction::Off => {
-            for method in [
+            // clearDeviceMetricsOverride 存在且有效（真机验证）；UA 恢复用
+            // 空串 setUserAgentOverride（CfT 131 无 clearUserAgentOverride，
+            // 真机实测 -32601；空串已验证恢复默认 UA）
+            cdp_send(
+                &conn,
                 "Emulation.clearDeviceMetricsOverride",
-                "Emulation.clearUserAgentOverride",
-            ] {
-                cdp_send(&conn, method, json!({}), Some(sid)).await?;
-            }
+                json!({}),
+                Some(sid),
+            )
+            .await?;
+            cdp_send(
+                &conn,
+                "Emulation.setUserAgentOverride",
+                json!({ "userAgent": "" }),
+                Some(sid),
+            )
+            .await?;
             cdp_send(
                 &conn,
                 "Emulation.setTouchEmulationEnabled",
@@ -4924,7 +4938,8 @@ mod tests {
         }
     }
 
-    /// 覆盖语义：第二次 viewport 形态未给 UA → clearUserAgentOverride（未给 =
+    /// 覆盖语义：第二次 viewport 形态未给 UA → setUserAgentOverride 空串恢复
+    /// 默认（CfT 131 无 clearUserAgentOverride，真机实测 -32601；未给 =
     /// 恢复默认，非保持旧值）；touch 未给 → 关闭。
     #[tokio::test]
     async fn emulate_reapplies_overwrite_semantics() {
@@ -4945,9 +4960,14 @@ mod tests {
         assert_eq!(metrics.len(), 2);
         assert_eq!(metrics[1].param("width"), json!(200));
         let ua = calls_of(&calls, "Emulation.setUserAgentOverride");
-        assert_eq!(ua.len(), 1, "仅第一次设 UA");
-        let clear = calls_of(&calls, "Emulation.clearUserAgentOverride");
-        assert_eq!(clear.len(), 1, "第二次未给 UA 必须清掉旧 override");
+        assert_eq!(ua.len(), 2, "两次都发 setUserAgentOverride（第二次为空串恢复）");
+        assert_eq!(ua[0].param("userAgent"), json!("Bot/1.0"));
+        assert_eq!(
+            ua[1].param("userAgent"),
+            json!(""),
+            "第二次未给 UA 必须恢复默认（空串，非 clear 命令）"
+        );
+        assert_eq!(calls_of(&calls, "Emulation.clearUserAgentOverride").len(), 0);
         let touch = calls_of(&calls, "Emulation.setTouchEmulationEnabled");
         assert_eq!(touch[1].param("enabled"), json!(false));
     }
@@ -4971,7 +4991,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(calls_of(&calls, "Emulation.clearDeviceMetricsOverride").len(), 1);
-        assert_eq!(calls_of(&calls, "Emulation.clearUserAgentOverride").len(), 1);
+        let ua = calls_of(&calls, "Emulation.setUserAgentOverride");
+        assert_eq!(
+            (ua.len(), ua[0].param("userAgent")),
+            (1, json!("")),
+            "UA 恢复 = 空串 setUserAgentOverride（CfT 131 无 clear 命令）"
+        );
+        assert_eq!(calls_of(&calls, "Emulation.clearUserAgentOverride").len(), 0);
         let touch = calls_of(&calls, "Emulation.setTouchEmulationEnabled");
         assert_eq!((touch.len(), touch[0].param("enabled")), (1, json!(false)));
         assert_eq!(calls_of(&calls, "Emulation.setDeviceMetricsOverride").len(), 0);
