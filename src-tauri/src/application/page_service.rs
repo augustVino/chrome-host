@@ -63,6 +63,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::oneshot;
 
 use crate::domain::instance::InstanceStatus;
+use crate::domain::fetch_rules::{cdp_patterns, compile_rules, first_live_match, Action, InterceptRule};
 use crate::domain::page_control::{
     dialog_accept_params, fill_fillable_check_expr, hit_test_expr, largest_quad_centroid,
     locate_expr, normalize_ref, observed_matches_state, parse_dialog_opening, parse_duration,
@@ -74,6 +75,8 @@ use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::{connect_page, SharedPageConn};
 use crate::infrastructure::cdp::ws::EventSink;
 use crate::infrastructure::db::repositories::instance_repository::InstanceRepository;
+
+use super::fetch_mock::{MockSpec, MockUpstream};
 
 /// 工具级总超时：单条 CDP send 已有内建 15s（ws.rs），这里兜住多命令链与
 /// 无响应页面（wait 例外：用户 timeout + 5s）。
@@ -244,6 +247,12 @@ struct Watched {
     /// HOVER_SETTLE_WINDOW 内生效（styleSheetAdded 回放可能仍在途）；窗口过后
     /// 登记仍空 = 真无表，后续 snap 即时返回（不为无表页付每快照等待）。
     css_since: Mutex<HashMap<String, Instant>>,
+    /// per-tab Fetch 拦截运行态（会话生命周期：establish 整清 = 连接重建
+    /// 自动失效，GET 披露 liveSince=null；规则由 intercept_set 重新下发）。
+    /// **决策在事件流内进行**（on_request_paused，watch_loop 路径，不碰
+    /// cmd_lock）；拦截响应命令走 conn 的并发 send（&self），与 in-flight
+    /// 工具命令互不阻塞。
+    intercept: Mutex<HashMap<String, InterceptState>>,
     /// 代际计数：每次建连 +1。旧代 watch_loop 在清理点核对代际，新一代已
     /// 接管时不动登记表/连接槽（防僵尸 loop 误删新代状态）。
     generation: AtomicU64,
@@ -260,6 +269,7 @@ impl Watched {
             load_waiters: Mutex::new(HashMap::new()),
             sheets: Mutex::new(HashMap::new()),
             css_since: Mutex::new(HashMap::new()),
+            intercept: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
         }
     }
@@ -353,6 +363,9 @@ impl PageService {
         watched.load_waiters.lock().unwrap().clear();
         watched.sheets.lock().unwrap().clear();
         watched.css_since.lock().unwrap().clear();
+        // Fetch 拦截随死会话失效（Fetch.enable 是 session 级，新连接需重新
+        // 下发规则——契约：连接重建即失效，GET intercept 返回空 + liveSince null）
+        watched.intercept.lock().unwrap().clear();
         *watched.conn.lock().unwrap() = Some(Arc::clone(&conn));
         tauri::async_runtime::spawn(watch_loop(
             ins_id.to_string(),
@@ -811,6 +824,120 @@ impl PageService {
         .await
     }
 
+    /// POST intercept：规则集整表替换（空 rules = 清空 + Fetch.disable）。
+    /// 编译/校验在串行锁外快速失败；enable 成功才落状态（失败不动旧规则）。
+    /// wire：`{"rules": [...], "tab?": ...}`（rules 数组必填；空数组 = 清空）。
+    pub async fn intercept_set(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        body: &Value,
+    ) -> Result<Value, AppError> {
+        let rules_json = body
+            .get("rules")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                AppError::invalid_request("body.rules 必须是数组（空数组 = 清空拦截）")
+            })?;
+        let rules = compile_rules(rules_json)?;
+        let patterns = cdp_patterns(&rules)?;
+        self.command(
+            TOOL_TIMEOUT,
+            "intercept-set",
+            ins_id,
+            tab,
+            move |w, tid, sid| async move {
+                let conn = require_conn(&w)?;
+                if rules.is_empty() {
+                    // 清空：先 Fetch.disable（失败也继续清状态——残留的 enable
+                    // 随连接重建自然失效，状态与查询面必须一致）
+                    let _ = cdp_send(&conn, "Fetch.disable", json!({}), Some(&sid)).await;
+                    w.intercept.lock().unwrap().remove(&tid);
+                    return Ok(json!({
+                        "result": "intercept cleared",
+                        "rules": 0,
+                        "instanceId": "", "targetId": "",
+                    }));
+                }
+                cdp_send(
+                    &conn,
+                    "Fetch.enable",
+                    json!({ "patterns": patterns }),
+                    Some(&sid),
+                )
+                .await?;
+                let n = rules.len();
+                w.intercept
+                    .lock()
+                    .unwrap()
+                    .insert(tid.clone(), InterceptState::new(rules));
+                // 披露 mock 上游（mock 命中的请求会被改写到该 loopback 源，
+                // 页面侧 response.url 随之变化——诚实披露机制）
+                let upstream = MockUpstream::shared()
+                    .await
+                    .map(|u| json!(format!("http://127.0.0.1:{}", u.port())))
+                    .unwrap_or(serde_json::Value::Null);
+                Ok(json!({
+                    "result": "intercept active",
+                    "rules": n,
+                    "patterns": patterns.len(),
+                    "mockUpstream": upstream,
+                }))
+            },
+        )
+        .await
+    }
+
+    /// GET intercept：规则状态（命中/剩余/活跃）+ 干预记录环 + liveSince。
+    /// 无状态（未下发或连接重建失效）→ 空表 + liveSince null + 提示。
+    pub async fn intercept_get(&self, ins_id: &str, tab: &str) -> Result<Value, AppError> {
+        self.command(
+            TOOL_TIMEOUT,
+            "intercept-get",
+            ins_id,
+            tab,
+            |w, tid, _sid| async move {
+                let guard = w.intercept.lock().unwrap();
+                let Some(st) = guard.get(&tid) else {
+                    return Ok(json!({
+                        "rules": [],
+                        "journal": [],
+                        "liveSince": null,
+                        "note": "无活跃拦截（未下发，或连接重建后自动失效——重新 POST 下发）",
+                    }));
+                };
+                let rules: Vec<Value> = st
+                    .rules
+                    .iter()
+                    .map(|r| {
+                        let hits = st.used.get(&r.id).copied().unwrap_or(0);
+                        let exhausted = r.times > 0 && hits >= u64::from(r.times);
+                        json!({
+                            "id": r.id,
+                            "urlPattern": r.url_pattern,
+                            "action": match &r.action {
+                                Action::Mock { status, delay_ms, .. } =>
+                                    json!({"type": "mock", "status": status, "delayMs": delay_ms}),
+                                Action::SetHeaders { .. } => json!({"type": "setHeaders"}),
+                                Action::Block => json!({"type": "block"}),
+                            },
+                            "times": r.times,
+                            "hits": hits,
+                            "remaining": if r.times == 0 { Value::Null } else { json!(r.times.saturating_sub(hits as u32)) },
+                            "active": !exhausted,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "rules": rules,
+                    "journal": st.journal.iter().cloned().collect::<Vec<_>>(),
+                    "liveSince": st.live_since_ms,
+                }))
+            },
+        )
+        .await
+    }
+
     /// emulate <tab>：设备仿真（W-cap）。preset / viewport / off 三形态，
     /// 解析（含 422 未知预设）在 domain::emulate 完成——建连前即可拒绝。
     /// 语义：同一 tab 重复 emulate = 覆盖（未给字段恢复默认，非合并）；
@@ -978,6 +1105,15 @@ async fn handle_event(watched: &Watched, event: &Value) {
                 }
             }
         }
+        // Fetch 拦截决策（任务红线 ①）：requestPaused 在**事件流内**决策并回——
+        // on_request_paused 不碰 per-instance 命令串行锁（watch_loop 天然不持
+        // 锁），拦截响应命令走 conn 并发 send，与 in-flight 工具命令互不阻塞；
+        // 否则规则拦截会堵死全部 page 命令。
+        "Fetch.requestPaused" => {
+            if let Some(sid) = event.get("sessionId").and_then(Value::as_str) {
+                on_request_paused(watched, sid, &params).await;
+            }
+        }
         // 仅根 frame（parentId 为空）才失效：子 frame 导航不换文档（§3.6）
         "Page.frameNavigated" => {
             if let Some(tid) = tab_of_session(watched, event) {
@@ -1116,6 +1252,7 @@ fn drop_tab(watched: &Watched, tid: &str) {
     watched.load_waiters.lock().unwrap().remove(tid);
     watched.sheets.lock().unwrap().remove(tid);
     watched.css_since.lock().unwrap().remove(tid);
+    watched.intercept.lock().unwrap().remove(tid);
 }
 
 fn on_detached(watched: &Watched, params: &Value) {
@@ -1147,6 +1284,229 @@ fn tab_of_session(watched: &Watched, event: &Value) -> Option<String> {
         .unwrap()
         .target_of_session(sid)
         .map(str::to_string)
+}
+
+// ============================================================================
+// 3b. Fetch 拦截：事件流内决策（红线：不碰串行锁；任何错误必放行）
+// ============================================================================
+
+/// per-tab 拦截运行态（Fetch.enable 生效期间存在；establish/drop_tab 清除）。
+/// 规则本体不可变（下发时编译），times 耗尽由 used 计数判定。
+struct InterceptState {
+    rules: Vec<InterceptRule>,
+    /// id → 已命中次数
+    used: HashMap<String, u64>,
+    /// 干预记录环（含命中与放行，每条已脱敏；容量 domain::fetch_rules::JOURNAL_CAPACITY）
+    journal: std::collections::VecDeque<Value>,
+    /// 规则集下发时刻（epoch ms；GET 披露）
+    live_since_ms: i64,
+}
+
+impl InterceptState {
+    fn new(rules: Vec<InterceptRule>) -> Self {
+        InterceptState {
+            rules,
+            used: HashMap::new(),
+            journal: std::collections::VecDeque::with_capacity(4),
+            live_since_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// 干预记录入环（超容量滚出旧条）。
+    fn journal_push(&mut self, mut entry: Value) {
+        if self.journal.len() >= crate::domain::fetch_rules::JOURNAL_CAPACITY {
+            self.journal.pop_front();
+        }
+        entry["ts"] = json!(chrono::Utc::now().timestamp_millis());
+        self.journal.push_back(entry);
+    }
+}
+
+/// 干预记录条目（诚实证据第一公民：命中与放行都留痕，url 脱敏）。
+fn journal_entry(request_id: &str, url: &str, outcome: &str, rule: Option<&str>, detail: &str) -> Value {
+    json!({
+        "requestId": request_id,
+        "url": crate::domain::redact::redact_url(url),
+        "rule": rule,
+        "outcome": outcome,   // mocked | headers-set | blocked | passed | failed-then-passed | stranded
+        "detail": detail,
+    })
+}
+
+/// 请求头合并：pause 事件的原始头（对象形态）∪ 规则头（数组形态，同名覆盖）
+/// → CDP continueRequest 要的 [{name, value}] 数组（替换语义下原头全部保留
+/// ——包括页面自身的 cookie：黑名单拦的是**规则**设凭据，不动页面原生行为）。
+fn merge_request_headers(original: Option<&Value>, overrides: &[(String, String)]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let upsert = |out: &mut Vec<Value>, k: &str, v: &str| {
+        if let Some(pos) = out
+            .iter()
+            .position(|h| h["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(k)))
+        {
+            out[pos] = json!({ "name": k, "value": v });
+        } else {
+            out.push(json!({ "name": k, "value": v }));
+        }
+    };
+    if let Some(Value::Object(map)) = original {
+        for (k, v) in map {
+            upsert(&mut out, k, v.as_str().unwrap_or_default());
+        }
+    }
+    for (k, v) in overrides {
+        upsert(&mut out, k, v);
+    }
+    out
+}
+
+/// requestPaused 事件流内决策（红线 ①不碰串行锁；红线 ②任何错误必放行）。
+/// 无规则/未命中/耗尽 → continueRequest 裸放行；决策命令失败 → 裸 continue
+/// 兑底（requestPaused 不回应 = 页面挂死，spike 实测）；兑底也失败（连接
+/// 已死）→ journal 记 stranded（请求随连接死亡，无从挽救）。
+async fn on_request_paused(watched: &Watched, session_id: &str, params: &Value) {
+    let Some(conn) = watched.conn.lock().unwrap().clone() else {
+        return; // 无连接：请求随连接死亡（与 watch_loop 同生命周期，理论不可达）
+    };
+    let Some(tid) = watched
+        .tabs
+        .lock()
+        .unwrap()
+        .target_of_session(session_id)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+        return;
+    };
+    let request_id = request_id.to_string();
+    let url = params
+        .pointer("/request/url")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let resource_type = params
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .unwrap_or("Other");
+
+    // 决策（短锁：匹配 + 计数 + journal；无状态/未命中/耗尽 → None = 放行）
+    let decision: Option<(String, Action)> = {
+        let mut guard = watched.intercept.lock().unwrap();
+        let state = guard.get_mut(&tid);
+        state.and_then(|st| {
+            let matched = first_live_match(&st.rules, &st.used, url, resource_type);
+            matched.map(|rule| {
+                *st.used.entry(rule.id.clone()).or_insert(0) += 1;
+                (rule.id.clone(), rule.action.clone())
+            })
+        })
+    };
+
+    // 未命中放行（常态路径：patterns 命中但 resourceTypes/times 不满足）
+    let Some((rule_id, action)) = decision else {
+        let entry = journal_entry(&request_id, url, "passed", None, "no live rule matched");
+        watched
+            .intercept
+            .lock()
+            .unwrap()
+            .get_mut(&tid)
+            .map(|st| st.journal_push(entry));
+        let _ = cdp_send(
+            &conn,
+            "Fetch.continueRequest",
+            json!({ "requestId": request_id }),
+            Some(session_id),
+        )
+        .await;
+        return;
+    };
+
+    // 执行决策（锁外；命令走 conn 并发 send）
+    let outcome: &str;
+    let executed: Result<Value, AppError> = match &action {
+        Action::Mock {
+            status,
+            headers,
+            body,
+            delay_ms,
+        } => {
+            outcome = "mocked";
+            match MockUpstream::shared().await {
+                Ok(upstream) => {
+                    let mock_url = upstream.register(MockSpec {
+                        status: *status,
+                        headers: headers.clone(),
+                        body: body.clone(),
+                        delay_ms: *delay_ms,
+                    });
+                    cdp_send(
+                        &conn,
+                        "Fetch.continueRequest",
+                        json!({ "requestId": request_id, "url": mock_url }),
+                        Some(session_id),
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Action::SetHeaders { headers } => {
+            outcome = "headers-set";
+            let merged = merge_request_headers(params.pointer("/request/headers"), headers);
+            cdp_send(
+                &conn,
+                "Fetch.continueRequest",
+                json!({ "requestId": request_id, "headers": merged }),
+                Some(session_id),
+            )
+            .await
+        }
+        Action::Block => {
+            outcome = "blocked";
+            cdp_send(
+                &conn,
+                "Fetch.failRequest",
+                json!({ "requestId": request_id, "errorReason": "BlockedByClient" }),
+                Some(session_id),
+            )
+            .await
+        }
+    };
+
+    match executed {
+        Ok(_) => {
+            let entry = journal_entry(&request_id, url, outcome, Some(&rule_id), "");
+            watched
+                .intercept
+                .lock()
+                .unwrap()
+                .get_mut(&tid)
+                .map(|st| st.journal_push(entry));
+        }
+        Err(e) => {
+            // 红线 ②：决策失败必放行（裸 continue，不改写任何东西）；
+            // 兑底也失败 = 连接已死，journal 记 stranded（诚实披露）
+            let fallback = cdp_send(
+                &conn,
+                "Fetch.continueRequest",
+                json!({ "requestId": request_id }),
+                Some(session_id),
+            )
+            .await;
+            let (outcome_fb, detail) = if fallback.is_ok() {
+                ("failed-then-passed", format!("decision failed: {e}"))
+            } else {
+                ("stranded", format!("decision failed: {e}; fallback also failed"))
+            };
+            let entry = journal_entry(&request_id, url, outcome_fb, Some(&rule_id), &detail);
+            watched
+                .intercept
+                .lock()
+                .unwrap()
+                .get_mut(&tid)
+                .map(|st| st.journal_push(entry));
+        }
+    }
 }
 
 fn invalidate_refs(watched: &Watched, tid: &str, reason: &str) {
@@ -6336,5 +6696,365 @@ mod tests {
             .filter(|c| c.method.starts_with("Emulation."))
             .count();
         assert_eq!(emulate_calls, 0);
+    }
+
+    // ---------------- 工具：Fetch 拦截（W-fetch）---------------------------
+
+    /// Fetch.requestPaused 事件（flatten 模式：sessionId 顶层）
+    fn pause_event(sid: &str, rid: &str, url: &str, rt: &str, headers: Value) -> Value {
+        json!({
+            "method": "Fetch.requestPaused", "sessionId": sid,
+            "params": {
+                "requestId": rid, "resourceType": rt,
+                "request": { "url": url, "method": "GET", "headers": headers }
+            }
+        })
+    }
+
+    const MOCK_RULES: &str = r#"{ "rules": [
+        { "id": "m1", "match": { "urlPattern": "*://127.0.0.1:18799/api/*", "resourceTypes": ["xhr","fetch"] },
+          "action": { "type": "mock", "status": 200, "headers": {"Content-Type":"application/json"}, "body": "{\"ok\":true}" } },
+        { "id": "h1", "match": { "urlPattern": "*://127.0.0.1:18799/hdr/*" },
+          "action": { "type": "setHeaders", "headers": {"X-Debug-Uid":"42"} } },
+        { "id": "b1", "match": { "urlPattern": "*://ads.example.com/*" },
+          "action": { "type": "block" } }
+    ] }"#;
+
+    /// 下发 + enable 形态：patterns 展开（resourceTypes 逐条 + requestStage）。
+    #[tokio::test]
+    async fn intercept_set_enables_fetch_with_expanded_patterns() {
+        let (svc, _w, calls, _s) = armed();
+        let resp = svc
+            .intercept_set(INS, "T1", &serde_json::from_str(MOCK_RULES).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp["rules"], json!(3));
+        assert_eq!(resp["patterns"], json!(4), "m1 两类型 + h1 + b1");
+        let enable = calls_of(&calls, "Fetch.enable");
+        assert_eq!(enable.len(), 1);
+        let pats = enable[0].param("patterns");
+        assert_eq!(pats.as_array().unwrap().len(), 4);
+        assert_eq!(pats[0]["urlPattern"], json!("*://127.0.0.1:18799/api/*"));
+        assert_eq!(pats[0]["requestStage"], json!("Request"));
+        assert_eq!(pats[0]["resourceType"], json!("xhr"));
+        assert!(pats[2].get("resourceType").is_none(), "缺省类型不带 resourceType");
+    }
+
+    /// mock 命中：continueRequest 改写到 mock 上游 URL；GET 披露 hits/journal/
+    /// liveSince；journal 的 url 已脱敏。
+    #[tokio::test]
+    async fn intercept_mock_rewrites_to_upstream_and_journals() {
+        let (svc, watched, calls, _s) = armed();
+        svc.intercept_set(INS, "T1", &serde_json::from_str(MOCK_RULES).unwrap())
+            .await
+            .unwrap();
+        handle_event(
+            &watched,
+            &pause_event("S1", "job-1", "http://127.0.0.1:18799/api/data?n=1&t=2", "XHR", json!({"X-Spike":"yes"})),
+        )
+        .await;
+        eventually("continueRequest 已发出", || {
+            calls_of(&calls, "Fetch.continueRequest").len() == 1
+        })
+        .await;
+        let cr = calls_of(&calls, "Fetch.continueRequest")[0].clone();
+        let url = cr.param("url").as_str().unwrap().to_string();
+        assert!(
+            url.starts_with("http://127.0.0.1:") && url.contains("/m/"),
+            "改写到 mock 上游: {url}"
+        );
+        assert_eq!(cr.session.as_deref(), Some("S1"));
+
+        let status = svc.intercept_get(INS, "T1").await.unwrap();
+        assert_eq!(status["liveSince"].is_number(), true);
+        let r0 = &status["rules"][0];
+        // m1 默认 times=1：命中 1 次即耗尽（active=false，剩余 0）——耗尽
+        // 后规则失效但可查询（GET 仍完整披露）
+        assert_eq!((r0["id"].as_str(), r0["hits"].as_u64(), r0["active"].as_bool()), (Some("m1"), Some(1), Some(false)));
+        let j0 = &status["journal"][0];
+        assert_eq!(j0["outcome"], json!("mocked"));
+        assert_eq!(j0["rule"], json!("m1"));
+        assert_eq!(j0["requestId"], json!("job-1"));
+        let jurl = j0["url"].as_str().unwrap();
+        assert!(jurl.contains("127.0.0.1:18799"), "url 保留: {jurl}");
+    }
+
+    /// setHeaders 命中：原始头全保留 + 规则头覆盖/追加（替换语义下的合并）。
+    #[tokio::test]
+    async fn intercept_set_headers_merges_originals() {
+        let (svc, watched, calls, _s) = armed();
+        svc.intercept_set(INS, "T1", &serde_json::from_str(MOCK_RULES).unwrap())
+            .await
+            .unwrap();
+        handle_event(
+            &watched,
+            &pause_event("S1", "job-2", "http://127.0.0.1:18799/hdr/x", "Document", json!({"X-Spike":"yes", "X-Debug-Uid":"old"})),
+        )
+        .await;
+        eventually("continueRequest 已发出", || {
+            calls_of(&calls, "Fetch.continueRequest").len() == 1
+        })
+        .await;
+        let headers = calls_of(&calls, "Fetch.continueRequest")[0].param("headers");
+        let by_name = |k: &str| -> String {
+            headers
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["name"].as_str().unwrap().eq_ignore_ascii_case(k))
+                .and_then(|h| h["value"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(by_name("X-Spike"), "yes", "原头保留");
+        assert_eq!(by_name("X-Debug-Uid"), "42", "规则头覆盖同名列");
+        let status = svc.intercept_get(INS, "T1").await.unwrap();
+        assert_eq!(status["journal"][0]["outcome"], json!("headers-set"));
+        assert_eq!(status["journal"][0]["rule"], json!("h1"));
+    }
+
+    /// block 命中：failRequest BlockedByClient。
+    #[tokio::test]
+    async fn intercept_block_fails_request() {
+        let (svc, watched, calls, _s) = armed();
+        svc.intercept_set(INS, "T1", &serde_json::from_str(MOCK_RULES).unwrap())
+            .await
+            .unwrap();
+        handle_event(
+            &watched,
+            &pause_event("S1", "job-3", "https://ads.example.com/pixel?x=1", "Image", json!({})),
+        )
+        .await;
+        eventually("failRequest 已发出", || calls_of(&calls, "Fetch.failRequest").len() == 1).await;
+        let fr = calls_of(&calls, "Fetch.failRequest")[0].clone();
+        assert_eq!(fr.param("requestId"), json!("job-3"));
+        assert_eq!(fr.param("errorReason"), json!("BlockedByClient"));
+        let status = svc.intercept_get(INS, "T1").await.unwrap();
+        assert_eq!(status["journal"][0]["outcome"], json!("blocked"));
+    }
+
+    /// 红线②常态面：不匹配的 url / resourceType 不满足 → 裸 continueRequest
+    /// 放行 + journal passed（绝不能悬挂页面）。
+    #[tokio::test]
+    async fn intercept_no_match_passes_through() {
+        let (svc, watched, calls, _s) = armed();
+        svc.intercept_set(INS, "T1", &serde_json::from_str(MOCK_RULES).unwrap())
+            .await
+            .unwrap();
+        // url 不匹配任何规则
+        handle_event(
+            &watched,
+            &pause_event("S1", "job-4", "https://other.example.com/x", "XHR", json!({})),
+        )
+        .await;
+        // resourceType 不匹配 m1（Script 而非 xhr/fetch；url 匹配 m1 的 pattern）
+        handle_event(
+            &watched,
+            &pause_event("S1", "job-5", "http://127.0.0.1:18799/api/data", "Script", json!({})),
+        )
+        .await;
+        eventually("两次裸放行", || {
+            calls_of(&calls, "Fetch.continueRequest")
+                .iter()
+                .filter(|c| c.params.as_object().is_some_and(|m| m.len() == 1))
+                .count()
+                == 2
+        })
+        .await;
+        let status = svc.intercept_get(INS, "T1").await.unwrap();
+        let outcomes: Vec<&str> = status["journal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(outcomes, vec!["passed", "passed"], "未命中都留痕");
+        // hits 不动（未命中不计）
+        assert_eq!(status["rules"][0]["hits"], json!(0));
+    }
+
+    /// times 耗尽后放行（默认 times=1：第二次命中同 url → passed）。
+    #[tokio::test]
+    async fn intercept_times_exhausted_passes() {
+        let (svc, watched, calls, _s) = armed();
+        svc.intercept_set(INS, "T1", &serde_json::from_str(MOCK_RULES).unwrap())
+            .await
+            .unwrap();
+        for i in 0..2 {
+            handle_event(
+                &watched,
+                &pause_event("S1", &format!("job-{i}"), "https://ads.example.com/x", "Image", json!({})),
+            )
+            .await;
+        }
+        eventually("block 一次 + 裸放行一次", || {
+            calls_of(&calls, "Fetch.failRequest").len() == 1
+                && calls_of(&calls, "Fetch.continueRequest").len() == 1
+        })
+        .await;
+        let status = svc.intercept_get(INS, "T1").await.unwrap();
+        let b1 = status["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == json!("b1"))
+            .unwrap()
+            .clone();
+        assert_eq!((b1["hits"].as_u64(), b1["remaining"].as_u64(), b1["active"].as_bool()), (Some(1), Some(0), Some(false)));
+    }
+
+    /// 红线②错误路径：决策命令失败 → 裸 continueRequest 兑底放行 + journal
+    /// failed-then-passed（页面绝不悬挂）。
+    #[tokio::test]
+    async fn intercept_decision_failure_falls_back_to_bare_continue() {
+        let (svc, watched, calls, script) = armed();
+        // 第一次 continueRequest（带 url 的 mock 决策）失败；兑底的第二次调用
+        // 落到队列耗尽后的 Ok(Null) → 成功
+        given(&script, "Fetch.continueRequest", vec![Err("connection reset".into())]);
+        svc.intercept_set(INS, "T1", &serde_json::from_str(MOCK_RULES).unwrap())
+            .await
+            .unwrap();
+        handle_event(
+            &watched,
+            &pause_event("S1", "job-6", "http://127.0.0.1:18799/api/data", "XHR", json!({})),
+        )
+        .await;
+        eventually("决策 + 兑底两次 continueRequest", || {
+            calls_of(&calls, "Fetch.continueRequest").len() == 2
+        })
+        .await;
+        let all = calls_of(&calls, "Fetch.continueRequest");
+        assert!(all[0].param("url").is_string(), "首次是决策（带 url）");
+        assert_eq!(all[1].params.as_object().unwrap().len(), 1, "兑底是裸放行（仅 requestId）");
+        let status = svc.intercept_get(INS, "T1").await.unwrap();
+        assert_eq!(status["journal"][0]["outcome"], json!("failed-then-passed"));
+        assert!(status["journal"][0]["detail"].as_str().unwrap().contains("connection reset"));
+    }
+
+    /// 红线①：拦截决策 in-flight（continueRequest 被闸门挂住）不阻塞同实例的
+    /// 其它 page 命令（决策不碰串行锁 + 连接并发 send）。组装方式对齐
+    /// dialog_handle_completes_while_command_in_flight（Script/Gates 分离）。
+    #[tokio::test]
+    async fn intercept_decision_does_not_block_page_commands() {
+        let calls: Calls = Arc::default();
+        let script: Script = Arc::default();
+        let gates: Gates = Arc::default();
+        given(
+            &script,
+            "Accessibility.getFullAXTree",
+            vec![Ok(json!({ "nodes": [] })), Ok(json!({ "nodes": [] }))],
+        );
+        // 闸门挂住决策的 continueRequest（send 记录后停在闸门）
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        gates
+            .lock()
+            .unwrap()
+            .insert("Fetch.continueRequest".into(), std::collections::VecDeque::from([held]));
+
+        let watched = Arc::new(Watched::new());
+        *watched.conn.lock().unwrap() = Some(fake_conn(&calls, &script, None, &gates));
+        watched.tabs.lock().unwrap().attach("T1", "S1");
+        // 拦截状态直接武装（决策路径只依赖 intercept 状态 + conn，不经 command 骨架）
+        let rules: Value = serde_json::from_str(MOCK_RULES).unwrap();
+        watched.intercept.lock().unwrap().insert(
+            "T1".to_string(),
+            InterceptState::new(compile_rules(rules["rules"].as_array().unwrap()).unwrap()),
+        );
+        // snap 走完整 service 路径：watched 登记 + Running 实例
+        let (svc, _c2, _s2, _t2) = fake_service();
+        {
+            let mut map = svc.watched.lock().unwrap();
+            map.insert(INS.to_string(), Arc::clone(&watched));
+        }
+        // 已有连接槽位（不触发 ensure 重建，走命令骨架 + 串行锁）
+        // —— watched.conn 已置位；ensure 只查实例状态与端口（armed 同款）
+
+        // 决策任务：pause → failRequest？不——block 规则走 failRequest；
+        // 用 mock 规则（continueRequest 被闸门挂住）体现并发
+        let w2 = Arc::clone(&watched);
+        let decision = tokio::spawn(async move {
+            handle_event(
+                &w2,
+                &pause_event("S1", "job-7", "http://127.0.0.1:18799/api/data", "XHR", json!({})),
+            )
+            .await;
+        });
+        eventually("决策停在闸门", || {
+            calls_of(&calls, "Fetch.continueRequest").len() == 1
+        })
+        .await;
+        // 同实例 snap：不得被 in-flight 决策阻塞（决策不持串行锁、send 并发）
+        let snap_ok = tokio::time::timeout(Duration::from_secs(3), svc.snap(INS, "T1"))
+            .await
+            .is_ok_and(|r| r.is_ok());
+        assert!(snap_ok, "snap 不得被拦截决策阻塞");
+        release.send(()).unwrap();
+        decision.await.unwrap();
+    }
+
+    /// 清空：空 rules → Fetch.disable + 状态移除；GET 空 + liveSince null。
+    #[tokio::test]
+    async fn intercept_clear_disables_and_gets_empty() {
+        let (svc, _w, calls, _s) = armed();
+        svc.intercept_set(INS, "T1", &serde_json::from_str(MOCK_RULES).unwrap())
+            .await
+            .unwrap();
+        let resp = svc
+            .intercept_set(INS, "T1", &json!({ "rules": [] }))
+            .await
+            .unwrap();
+        assert_eq!(resp["result"], json!("intercept cleared"));
+        assert_eq!(calls_of(&calls, "Fetch.disable").len(), 1);
+        let status = svc.intercept_get(INS, "T1").await.unwrap();
+        assert_eq!(status["rules"].as_array().unwrap().len(), 0);
+        assert_eq!(status["journal"].as_array().unwrap().len(), 0);
+        assert_eq!(status["liveSince"], Value::Null);
+        assert!(status["note"].as_str().unwrap().contains("失效"));
+    }
+
+    /// 非法规则在进串行锁前 400（黑名单头 / 缺 rules 键）。
+    #[tokio::test]
+    async fn intercept_invalid_rules_rejected_400() {
+        let (svc, _w, calls, _s) = armed();
+        let e = svc
+            .intercept_set(
+                INS,
+                "T1",
+                &json!({ "rules": [ { "id": "x", "match": { "urlPattern": "*://a/*" },
+                    "action": { "type": "setHeaders", "headers": { "Authorization": "Bearer x" } } } ] }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
+        assert!(e.to_string().contains("黑名单"));
+        let e2 = svc
+            .intercept_set(INS, "T1", &json!({ "noRules": [] }))
+            .await
+            .unwrap_err();
+        assert_eq!(e2.code(), "INVALID_REQUEST");
+        assert_eq!(calls_of(&calls, "Fetch.enable").len(), 0, "非法不入连接");
+    }
+
+    /// 生命周期红线：连接重建（establish）→ 拦截状态整清（Fetch.enable 是
+    /// session 级，新会话需要重新下发）。
+    #[tokio::test]
+    async fn intercept_state_lost_on_reconnect() {
+        let (svc, _calls, _script, _tap) = fake_service();
+        let rules: Value = serde_json::from_str(MOCK_RULES).unwrap();
+        let (w1, _g1) = svc.ensure(INS).await.unwrap();
+        svc.intercept_set(INS, "", &rules).await.unwrap_err(); // 无 tab：409（仅证明建连）
+        // 直接构造状态（绕过 tab 路由）：手动放入 T1 模拟已生效
+        w1.intercept
+            .lock()
+            .unwrap()
+            .insert("T1".to_string(), InterceptState::new(compile_rules(rules["rules"].as_array().unwrap()).unwrap()));
+        drop(_g1);
+        // 模拟断连：连接槽置空 → 下一条命令重建（establish 整清 intercept）
+        *w1.conn.lock().unwrap() = None;
+        let (w2, g2) = svc.ensure(INS).await.unwrap();
+        assert!(Arc::ptr_eq(&w1, &w2), "同 Watched 重建");
+        drop(g2);
+        let guard = w2.intercept.lock().unwrap();
+        assert!(guard.get("T1").is_none(), "重建后拦截状态已清（自动失效）");
     }
 }

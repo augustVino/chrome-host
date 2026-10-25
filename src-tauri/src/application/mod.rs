@@ -2,6 +2,7 @@ pub mod activity;
 pub mod cdp_session;
 pub mod diagnostics_service;
 pub mod environment_service;
+pub mod fetch_mock;
 pub mod extension_service;
 pub mod health_service;
 pub mod instance_service;
