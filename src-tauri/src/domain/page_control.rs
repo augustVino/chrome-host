@@ -827,6 +827,314 @@ pub fn validate_http_url(url: &str) -> Result<(), AppError> {
 }
 
 // ============================================================================
+// 5c. hover 规则扫描（snap hover 感知，domain 纯函数）
+// ============================================================================
+
+/// hover 扫描预算（任务书口径）：样式表数 / 单表字节 / 提取规则数。任一
+/// 超限即停止采集并把 truncated 置位（诚实证据：宁可不完整不静默）。
+pub const MAX_HOVER_SHEETS: usize = 32;
+pub const MAX_HOVER_SHEET_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_HOVER_RULES: usize = 256;
+
+/// CSS 文本扫描产物：可直接交给 DOM.querySelectorAll 的查询选择器集。
+/// - triggers：hover 触发器（规则里含 :hover 的复合段，去 :hover、保留
+///   前缀上下文）——命中元素标 [hover]（hover 它会有效果）；
+/// - reveals：hover-reveal 目标（:hover 段之后还有复合段的后代/子代目标，
+///   完整选择器去 :hover）——命中元素标 [hover-reveal]（hover 后才显示/
+///   变化，常为 display:none，DOM 查询不受可见性影响仍可命中）。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HoverRules {
+    pub triggers: Vec<String>,
+    pub reveals: Vec<String>,
+    /// 预算内是否完整（false = 有截断，快照 meta 报 truncated）
+    pub truncated: bool,
+}
+
+/// 扫描一批样式表文本（app 层已按 origin=regular 过滤并取文本）。
+/// sheet_total = 实际 regular 表总数（可能大于 texts 长度：app 只取前
+/// MAX_HOVER_SHEETS 张，超出部分在这里如实计入截断）。
+pub fn scan_hover_rules(texts: &[&str], sheet_total: usize) -> HoverRules {
+    let mut out = HoverRules::default();
+    if sheet_total > MAX_HOVER_SHEETS {
+        out.truncated = true;
+    }
+    let mut rules_seen = 0usize;
+    'sheets: for (idx, text) in texts.iter().enumerate() {
+        if idx >= MAX_HOVER_SHEETS {
+            break;
+        }
+        if text.len() > MAX_HOVER_SHEET_BYTES {
+            out.truncated = true; // 单表超限：整表跳过（不载入不解析）
+            continue;
+        }
+        let cleaned = strip_css_comments(text);
+        for sel in style_rule_selectors(&cleaned) {
+            if rules_seen >= MAX_HOVER_RULES {
+                out.truncated = true;
+                break 'sheets;
+            }
+            rules_seen += 1;
+            absorb_hover_selector(&sel, &mut out);
+        }
+    }
+    out
+}
+
+/// 剔除 /* ... */ 注释（CSS 注释不可嵌套；替换为空串——`a/**/:hover` 在
+/// 合法 CSS 里等价 `a:hover`，替换为空格会变成后代选择器失真）。
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let chars: Vec<char> = css.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < chars.len() {
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 括号/引号感知的顶层切分：按 seps 中任一字符切，深度非 0 处不切（()
+/// [] 内、引号内的分隔符不是分隔符）。返回 (前置分隔符, 段)——保留 > + ~
+/// 等组合子原样，拼接回去时不失真。首段的分隔符为 '\0'。
+fn split_top_level(s: &str, seps: &[char]) -> Vec<(char, String)> {
+    let mut parts: Vec<(char, String)> = Vec::new();
+    let mut cur = String::new();
+    let mut sep = '\0';
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut prev = '\0';
+    for c in s.chars() {
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == q && prev != '\\' {
+                quote = None;
+            }
+        } else {
+            match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    cur.push(c);
+                }
+                '(' | '[' => {
+                    depth += 1;
+                    cur.push(c);
+                }
+                ')' | ']' => {
+                    depth -= 1;
+                    cur.push(c);
+                }
+                _ if depth == 0 && seps.contains(&c) => {
+                    let trimmed = cur.trim().to_string();
+                    if !trimmed.is_empty() {
+                        parts.push((sep, trimmed));
+                        cur.clear();
+                        sep = c;
+                    } else if !c.is_whitespace() {
+                        // cur 为空：组合子（> + ~）覆盖前导空白；后随空白不
+                        // 覆盖已记录的组合子（`a > b` 的 '>' 不被其后的空格冲掉）
+                        sep = c;
+                    }
+                }
+                _ => cur.push(c),
+            }
+        }
+        prev = c;
+    }
+    let trimmed = cur.trim().to_string();
+    if !trimmed.is_empty() {
+        parts.push((sep, trimmed));
+    }
+    parts
+}
+
+/// 花括号走读：提取所有样式规则的选择器文本（@media/@supports/@layer/
+/// @container/@scope 组块内层展开；@keyframes/@font-face/@page 等非条件
+/// 组块整体跳过；@import/@charset 等顶层语句按 ';' 忽略）。不追求完美
+/// CSS 解析（CSS 嵌套的内层规则以「最近 ';' 后的段」近似提取，丢失外层
+/// & 上下文——扫描是启发式增强，不是规则引擎；误报由 querySelectorAll
+/// 求值兑底：查不到元素的选择器自然无命中）。
+fn style_rule_selectors(css: &str) -> Vec<String> {
+    #[derive(PartialEq)]
+    enum Block {
+        Style,
+        AtGroup,
+        AtSkip,
+    }
+    let mut selectors = Vec::new();
+    let mut stack: Vec<Block> = Vec::new();
+    let mut buf = String::new();
+    for c in css.chars() {
+        match c {
+            '{' => {
+                // 取最后一个顶层 ';' 之后的段（@import 等语句丢弃）
+                let head = split_top_level(&buf, &[';'])
+                    .last()
+                    .map(|(_, s)| s.trim().to_string())
+                    .unwrap_or_default();
+                let head_lower = head.to_lowercase();
+                let kind = if head_lower.starts_with('@') {
+                    let name = head_lower
+                        .split(|ch: char| ch == '(' || ch.is_whitespace())
+                        .next()
+                        .unwrap_or("");
+                    match name {
+                        "@media" | "@supports" | "@layer" | "@container" | "@scope" => {
+                            Block::AtGroup
+                        }
+                        _ => Block::AtSkip, // @keyframes/@font-face/@page/@property…
+                    }
+                } else if head.is_empty() {
+                    Block::Style // 畸形 CSS：空选择器，内容忽略
+                } else {
+                    selectors.push(head);
+                    Block::Style
+                };
+                stack.push(kind);
+                buf.clear();
+            }
+            '}' => {
+                stack.pop();
+                buf.clear();
+            }
+            ';' => buf.clear(),
+            _ if stack.last().is_some_and(|b| *b == Block::AtSkip) => {}
+            _ => buf.push(c),
+        }
+    }
+    selectors
+}
+
+/// 单条选择器（已逗号拆分前的原始段）→ 触发器/reveal 查询串，吸收进 out。
+/// 先逗号拆分（每组独立），再复合段拆分（空格/>/+/~）；首个含裸 :hover
+/// 的段 i：trigger = 段 0..=i（段 i 去 :hover）；i 后还有段 → reveal =
+/// 全段去 :hover（保留组合子）。`:not(:hover)` 语义反转：:hover 在括号
+/// 内不是裸 :hover，该段不触发提取（整条若无其他裸 :hover 段则跳过）。
+fn absorb_hover_selector(sel: &str, out: &mut HoverRules) {
+    for (_, group) in split_top_level(sel, &[',']) {
+        let segments = split_top_level(&group, &[' ', '>', '+', '~']);
+        if segments.is_empty() {
+            continue;
+        }
+        let Some(i) = segments
+            .iter()
+            .position(|(_, seg)| has_bare_hover(seg))
+        else {
+            continue;
+        };
+        if let Some(t) = join_stripped(&segments[..=i]) {
+            push_dedup(&mut out.triggers, t);
+        }
+        if i + 1 < segments.len() {
+            if let Some(r) = join_stripped(&segments) {
+                push_dedup(&mut out.reveals, r);
+            }
+        }
+    }
+}
+
+/// 段列表去裸 :hover 后按原分隔符拼接；任一段去后为空（如裸 ":hover"）
+/// → None（该角色放弃，不产出无效查询串）。
+fn join_stripped(segments: &[(char, String)]) -> Option<String> {
+    let mut out = String::new();
+    for (sep, seg) in segments {
+        let stripped = strip_bare_hover(seg);
+        if stripped.is_empty() {
+            return None;
+        }
+        match sep {
+            ' ' | '\0' => {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+            }
+            op => {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push(*op);
+                out.push(' ');
+            }
+        }
+        out.push_str(&stripped);
+    }
+    Some(out)
+}
+
+/// 裸 :hover 判定：剥离后与原串不同即命中（括号/引号内的 :hover 不剥）。
+fn has_bare_hover(seg: &str) -> bool {
+    strip_bare_hover(seg) != seg
+}
+
+/// 剥离裸 :hover token：仅深度 0（括号外）、引号外、且后随字符非标识符
+/// 字符（`:hovered` 之类的伪类名不误伤）。非 ASCII 段安全（chars 边界）。
+fn strip_bare_hover(seg: &str) -> String {
+    const TOKEN: &str = ":hover";
+    let mut out = String::with_capacity(seg.len());
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut chars = seg.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            '(' | '[' => {
+                depth += 1;
+                out.push(c);
+            }
+            ')' | ']' => {
+                depth -= 1;
+                out.push(c);
+            }
+            ':' if depth == 0 => {
+                // lookahead：先取 token 余部（不含开头的 ':'），再取 token 后随
+                // 字符判边界（读首字符是错的——那是 token 自身）
+                let mut lookahead = chars.clone();
+                let token_rest: String = (&mut lookahead).take(TOKEN.len() - 1).collect();
+                if token_rest == TOKEN[1..]
+                    && lookahead
+                        .next()
+                        .is_none_or(|nx| !(nx.is_alphanumeric() || nx == '-' || nx == '_'))
+                {
+                    for _ in 1..TOKEN.len() {
+                        chars.next(); // 消耗 token 余下字符（不输出 = 剥除）
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn push_dedup(list: &mut Vec<String>, item: String) {
+    if !list.contains(&item) {
+        list.push(item);
+    }
+}
+
+// ============================================================================
 // 6. eval 表达式生成器（TS 内嵌 JS → Rust 字符串生成，语义逐字移植）
 // ============================================================================
 
@@ -1149,6 +1457,101 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("URL 不合法"));
+    }
+
+    // ---------------- hover 规则扫描（5c）---------------------------------------
+
+    /// 提取矩阵：触发器/reveal 派生、注释剔除、@media 展开、@keyframes 跳过、
+    /// :not(:hover) 排除、逗号分组独立、组合子保留、去重。
+    #[test]
+    fn hover_scan_extracts_triggers_and_reveals() {
+        let css = r#"
+            /* comment with .fake:hover inside */
+            .menu-item:hover { background: yellow; }
+            .menu-item:hover .dropdown { display: block; }
+            .dropdown { display: none; }
+            .plain-rule { color: red; }
+            .menu-item:hover > .child-panel { opacity: 1; }
+            a:hover { text-decoration: underline; }
+            .deep .ctx:hover .target { color: blue; }
+            @media (min-width: 100px) {
+                .media-hover:hover { color: green; }
+                .media-hover:hover .media-drop { display: block; }
+            }
+            @keyframes spin { from { transform: rotate(0); } to { transform: rotate(9deg); } }
+            .input:not(:hover) { border-color: gray; }
+            .combo-a:hover, .combo-b:hover { outline: 1px solid; }
+            a:hovered { color: pink; }
+        "#;
+        let r = scan_hover_rules(&[css], 1);
+        assert_eq!(
+            r.triggers,
+            vec![
+                ".menu-item", "a", ".deep .ctx", ".media-hover", ".combo-a", ".combo-b",
+            ],
+            "触发器 = 首个含 :hover 段去 :hover、保留前缀；@media 内展开；注释/.plain/@keyframes/:not(:hover)/:hovered 不产生；逗号分组独立；同串去重（同选择器只查一次）"
+        );
+        assert_eq!(
+            r.reveals,
+            vec![
+                ".menu-item .dropdown",
+                ".menu-item > .child-panel",
+                ".deep .ctx .target",
+                ".media-hover .media-drop",
+            ],
+            "reveal = hover 段之后还有段才派生；组合子原样保留"
+        );
+        assert!(!r.triggers.contains(&".input:not(:hover)".to_string()));
+        assert!(!r.truncated, "预算内完整");
+    }
+
+    /// 顶层语句（@import/@charset）不污染后续选择器提取。
+    #[test]
+    fn hover_scan_ignores_import_and_charset_statements() {
+        let css = "@charset \"utf-8\";\n@import url('x.css');\n.btn:hover { color: red; }\n";
+        let r = scan_hover_rules(&[css], 1);
+        assert_eq!(r.triggers, vec![".btn"]);
+        assert!(r.reveals.is_empty());
+    }
+
+    /// 预算三档：规则数 256（第 257 条起丢弃并置 truncated）、单表 2MiB
+    /// （整表跳过置 truncated）、表数 32（sheet_total 超出置 truncated）。
+    #[test]
+    fn hover_scan_budgets_truncate_honestly() {
+        // 规则预算：257 条 hover 规则 → 截断，且 256 条在表
+        let css_many = (0..300)
+            .map(|i| format!(".c{i}:hover {{ color: red; }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = scan_hover_rules(&[&css_many], 1);
+        assert!(r.truncated);
+        assert_eq!(r.triggers.len(), MAX_HOVER_RULES, "恰好取满预算后停");
+
+        // 单表超 2MiB：跳过 + 截断（一个占位符表填充超限文本）
+        let huge = format!(".x:hover {{}}\n{}", "a".repeat(MAX_HOVER_SHEET_BYTES));
+        let r2 = scan_hover_rules(&[huge.as_str()], 1);
+        assert!(r2.truncated && r2.triggers.is_empty());
+
+        // 表数超出 32：sheet_total 如实上报 → 截断（文本仅 1 张也可判）
+        let r3 = scan_hover_rules(&[".y:hover {}"], MAX_HOVER_SHEETS + 1);
+        assert!(r3.truncated);
+        assert_eq!(r3.triggers, vec![".y"], "表内规则仍提取");
+
+        // 预算内不误报
+        let r4 = scan_hover_rules(&[".z:hover {}"], 1);
+        assert!(!r4.truncated);
+    }
+
+    /// 属性选择器内逗号/括号与伪函数参数不干扰顶层切分。
+    #[test]
+    fn hover_scan_handles_nesting_inside_brackets_and_parens() {
+        let css = r#"
+            [data-list="a,b"]:hover { color: red; }
+            .w :is(.p, .q):hover { color: blue; }
+        "#;
+        let r = scan_hover_rules(&[css], 1);
+        assert_eq!(r.triggers, vec!["[data-list=\"a,b\"]", ".w :is(.p, .q)"],
+            "括号/引号内的分隔符不切分；:is() 参数保留");
     }
 
     // ---------------- RefStore / normalize_ref（tests/ref-store.test.mjs）------
