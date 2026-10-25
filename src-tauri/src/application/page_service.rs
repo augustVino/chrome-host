@@ -934,6 +934,9 @@ async fn handle_event(watched: &Watched, event: &Value) {
         }
         // hover 扫描的样式表登记：CSS.enable（on_attached）后 Chrome 回放/增量
         // 推送 styleSheetAdded；Removed 按表撤销。读取侧才过滤 origin/disabled。
+        // 扩展注入表（sourceURL 以 chrome-extension:// 开头）登记即排除：对
+        // 页面 hover 语义无贡献，且取文本不稳定（真机复测：混入 regular 扫描
+        // 会恒触发 truncated，狼来了效应压死 skipped）。
         "CSS.styleSheetAdded" => {
             if let Some(tid) = tab_of_session(watched, event) {
                 let Some(header) = params.get("header") else { return };
@@ -943,6 +946,16 @@ async fn handle_event(watched: &Watched, event: &Value) {
                 ) else {
                     return;
                 };
+                let source_url = header
+                    .get("sourceURL")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if source_url.starts_with("chrome-extension://") {
+                    tracing::debug!(
+                        "[page] tab {tid} 跳过扩展样式表 {id}（sourceURL={source_url}，origin={origin}）"
+                    );
+                    return;
+                }
                 let disabled = header
                     .get("disabled")
                     .and_then(Value::as_bool)
@@ -4378,10 +4391,84 @@ mod tests {
 
     /// styleSheetAdded 事件登记（含 origin/disabled 元数据，读取侧才过滤）
     fn sheet_added_event(sid: &str, sheet_id: &str, origin: &str, disabled: bool) -> Value {
+        sheet_added_event_with_url(sid, sheet_id, origin, disabled, "")
+    }
+
+    /// 带 sourceURL 的登记事件（外部表/扩展表的真机形态：inline 表空串、
+    /// 扩展表 chrome-extension://…）
+    fn sheet_added_event_with_url(
+        sid: &str,
+        sheet_id: &str,
+        origin: &str,
+        disabled: bool,
+        source_url: &str,
+    ) -> Value {
         json!({
             "method": "CSS.styleSheetAdded", "sessionId": sid,
-            "params": { "header": { "styleSheetId": sheet_id, "origin": origin, "disabled": disabled } }
+            "params": { "header": { "styleSheetId": sheet_id, "origin": origin, "disabled": disabled, "sourceURL": source_url } }
         })
+    }
+
+    /// 扩展注入表（sourceURL = chrome-extension://…，origin 可能仍报 regular）
+    /// 登记即排除：真机复测它们取文本不稳定（Err → 恒触发 truncated 的狼来
+    /// 了效应）且对页面 hover 语义无贡献——无 hover 规则页必须回到 skipped。
+    #[tokio::test]
+    async fn extension_style_sheets_are_excluded_from_registry() {
+        let (_svc, watched, _calls, _script) = armed();
+        // 扩展表（带 chrome-extension:// sourceURL）不登记
+        handle_event(
+            &watched,
+            &sheet_added_event_with_url(
+                "S1",
+                "ext-1",
+                "regular",
+                false,
+                "chrome-extension://abcdef/navbar.css",
+            ),
+        )
+        .await;
+        // 普通外部表（http sourceURL）与 inline 表（空 sourceURL）照常登记
+        handle_event(
+            &watched,
+            &sheet_added_event_with_url("S1", "site-1", "regular", false, "https://a/style.css"),
+        )
+        .await;
+        handle_event(&watched, &sheet_added_event("S1", "inline-1", "regular", false)).await;
+        {
+            let sheets = watched.sheets.lock().unwrap();
+            let t1 = sheets.get("T1").unwrap();
+            assert!(!t1.contains_key("ext-1"), "扩展表不得入登记表");
+            assert!(t1.contains_key("site-1") && t1.contains_key("inline-1"));
+            assert_eq!(t1.len(), 2);
+        }
+        // 排除发生在登记侧：hover_scan 的 total 不再被扩展表灌水（>32 预算
+        // 误报的根因）——30 张扩展表 + 0 张页面表 → 空登记 → skipped
+        let (svc2, watched2, _c2, script2) = armed();
+        for i in 0..40 {
+            handle_event(
+                &watched2,
+                &sheet_added_event_with_url(
+                    "S1",
+                    &format!("ext-{i}"),
+                    "regular",
+                    false,
+                    "chrome-extension://abcdef/injected.css",
+                ),
+            )
+            .await;
+        }
+        given(
+            &script2,
+            "Accessibility.getFullAXTree",
+            vec![Ok(json!({ "nodes": [] }))],
+        );
+        let resp = svc2.snap(INS, "T1").await.unwrap();
+        assert_eq!(
+            resp["hoverScan"],
+            json!("skipped"),
+            "全部为扩展表 → 登记空 → skipped（而非 truncated）"
+        );
+        assert_eq!(calls_of(&_c2, "CSS.getStyleSheetText").len(), 0);
     }
 
     /// 端到端：登记表 → 取文本 → domain 提取 → querySelectorAll 逐选择器 →
