@@ -8796,8 +8796,7 @@ mod tests {
         let set = calls_of(&calls, "DOM.setFileInputFiles");
         assert_eq!(set.len(), 1);
         assert_eq!(set[0].param("backendNodeId"), 42, "ref 路径直用 backendNodeId");
-        assert!(!set[0].params.is_object() && set[0].params.get("nodeId").is_none()
-            || set[0].param("nodeId").is_null(), "不带 nodeId");
+        assert!(set[0].params.get("nodeId").is_none(), "ref 路径不带 nodeId");
         assert_eq!(set[0].session.as_deref(), Some("S1"), "主文档 ref 走主会话");
     }
 
