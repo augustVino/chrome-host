@@ -17,7 +17,9 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::domain::diagnostics::{ApplyOutcome, DiagBuffer, QueryResult};
+use crate::domain::diagnostics::{
+    ApplyOutcome, DiagBuffer, QueryResult, RingStats, NETWORK_SCOPE_COMPLETED,
+};
 use crate::domain::instance::InstanceStatus;
 use crate::error::AppError;
 use crate::infrastructure::cdp::ws::CdpConnection;
@@ -40,6 +42,9 @@ struct Watched {
     conn: Mutex<Option<Arc<CdpConnection>>>,
     /// 代际守卫：restart 产生新一代后旧代自行退出（防双 watcher 双缓冲）
     current: AtomicBool,
+    /// 本代 watcher 挂载时刻（epoch ms）：响应 meta.since 的数据源——早于该
+    /// 时刻的数据从未被采集（诚实声明窗口边界，而非留白让调用方误判为「无数据」）
+    since_ms: i64,
 }
 
 impl Watched {
@@ -48,6 +53,7 @@ impl Watched {
             buffer: Arc::new(Mutex::new(DiagBuffer::default())),
             conn: Mutex::new(None),
             current: AtomicBool::new(true),
+            since_ms: now_ms(),
         }
     }
 }
@@ -107,7 +113,8 @@ impl DiagnosticsService {
     }
 
     /// GET console?level=&limit=&tab=：level 精确匹配（error/warning/info/debug/log）；
-    /// tab 按 targetId 归属过滤（环中存在无归属条目时降级全量，meta 标注）
+    /// tab 按 targetId 归属过滤（环中存在无归属条目时降级全量，meta 标注）。
+    /// 响应 meta 恒带证据边界（dropped/capacity/since/live，见 query_response）
     pub fn console(
         &self,
         ins_id: &str,
@@ -117,14 +124,30 @@ impl DiagnosticsService {
     ) -> Result<Value, AppError> {
         let watched = self.require(ins_id)?;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-        let result = watched
-            .map(|w| w.buffer.lock().unwrap().console_entries(level, tab, limit))
-            .unwrap_or_else(empty_result);
-        Ok(query_response(ins_id, result))
+        let (result, stats, since, live) = match watched {
+            Some(w) => {
+                let buf = w.buffer.lock().unwrap();
+                (
+                    buf.console_entries(level, tab, limit),
+                    buf.console_stats(),
+                    Some(w.since_ms),
+                    true,
+                )
+            }
+            // 无 watcher = 空投影，但 meta 必须如实声明（since:null + live:false）
+            None => (
+                empty_result(),
+                DiagBuffer::default().console_stats(),
+                None,
+                false,
+            ),
+        };
+        Ok(query_response(ins_id, result, &stats, since, live, None))
     }
 
     /// GET network?failedOnly=&limit=&tab=：failedOnly = 失败请求或 HTTP ≥400；
-    /// tab 按 targetId 归属过滤（同上）
+    /// tab 按 targetId 归属过滤（同上）。meta 另带 scope:"completed"——
+    /// 进行中的请求不可见（完成/失败时才入环）
     pub fn network(
         &self,
         ins_id: &str,
@@ -134,23 +157,66 @@ impl DiagnosticsService {
     ) -> Result<Value, AppError> {
         let watched = self.require(ins_id)?;
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-        let result = watched
-            .map(|w| {
-                w.buffer
-                    .lock()
-                    .unwrap()
-                    .network_entries(failed_only, tab, limit)
-            })
-            .unwrap_or_else(empty_result);
-        Ok(query_response(ins_id, result))
+        let (result, stats, since, live) = match watched {
+            Some(w) => {
+                let buf = w.buffer.lock().unwrap();
+                (
+                    buf.network_entries(failed_only, tab, limit),
+                    buf.network_stats(),
+                    Some(w.since_ms),
+                    true,
+                )
+            }
+            None => (
+                empty_result(),
+                DiagBuffer::default().network_stats(),
+                None,
+                false,
+            ),
+        };
+        Ok(query_response(
+            ins_id,
+            result,
+            &stats,
+            since,
+            live,
+            Some(NETWORK_SCOPE_COMPLETED),
+        ))
     }
 
-    /// GET har：network 环生成 HAR 1.2 文档原样返回（har-recorder 落地点）
+    /// GET har：network 环生成 HAR 1.2 文档原样返回（har-recorder 落地点）。
+    /// 证据边界走 HAR 顶层 `_meta` 扩展键（HAR 规范允许 `_` 前缀自定义字段；
+    /// 不用 {har, meta} 包裹——会破坏「API 返回 HAR 文档原样」的既有消费方）
     pub fn har(&self, ins_id: &str) -> Result<Value, AppError> {
         let watched = self.require(ins_id)?;
-        let har = watched
-            .map(|w| w.buffer.lock().unwrap().to_har(&self.version))
-            .unwrap_or_else(|| DiagBuffer::default().to_har(&self.version));
+        let (mut har, stats, since, live) = match watched {
+            Some(w) => {
+                let buf = w.buffer.lock().unwrap();
+                (
+                    buf.to_har(&self.version),
+                    buf.network_stats(),
+                    Some(w.since_ms),
+                    true,
+                )
+            }
+            None => {
+                let buf = DiagBuffer::default();
+                (buf.to_har(&self.version), buf.network_stats(), None, false)
+            }
+        };
+        har["_meta"] = json!({
+            "since": since,
+            "live": live,
+            "dropped": stats.dropped,
+            "capacity": stats.capacity,
+            "scope": NETWORK_SCOPE_COMPLETED,
+            // 未采集字段的占位语义（HAR 1.2：-1 = not available；空集 = 未采集非确认为空）
+            "uncollected": [
+                "request/response 的 headersSize、bodySize = -1：未采集（HAR 规范 not available 语义）",
+                "timings 的 send/wait/dns/connect/ssl = -1：仅记录总时长（receive），分阶段耗时未采集",
+                "headers/queryString/cookies = 空数组：未采集，非确认为空",
+            ],
+        });
         Ok(har)
     }
 
@@ -200,14 +266,35 @@ fn empty_result<T>() -> QueryResult<T> {
     }
 }
 
-/// 查询响应组装：meta 仅在请求了 tab 过滤时出现（未过滤查询形状不变）
-fn query_response<T: Serialize>(ins_id: &str, result: QueryResult<T>) -> Value {
+/// 查询响应组装：meta 恒在（证据边界契约）——dropped/capacity/since/live 必有，
+/// network 另有 scope；请求了 tab 过滤时 TabFilterMeta 字段并入同一对象
+fn query_response<T: Serialize>(
+    ins_id: &str,
+    result: QueryResult<T>,
+    stats: &RingStats,
+    since: Option<i64>,
+    live: bool,
+    scope: Option<&str>,
+) -> Value {
     let QueryResult { entries, meta } = result;
-    let mut resp = json!({ "instanceId": ins_id, "entries": entries });
-    if let Some(m) = meta {
-        resp["meta"] = json!(m);
+    let mut m = json!({
+        "dropped": stats.dropped,
+        "capacity": stats.capacity,
+        "since": since,
+        "live": live,
+    });
+    if let Some(scope) = scope {
+        m["scope"] = json!(scope);
     }
-    resp
+    if let Some(tf) = meta {
+        // TabFilterMeta 为纯数据结构，序列化不会失败
+        if let Value::Object(fields) = serde_json::to_value(tf).unwrap_or(Value::Null) {
+            for (k, v) in fields {
+                m[k] = v;
+            }
+        }
+    }
+    json!({ "instanceId": ins_id, "entries": entries, "meta": m })
 }
 
 /// watcher 主循环：连接 → 泵事件 → 死亡后退避重连；退出条件（代际失效或实例
@@ -354,8 +441,18 @@ mod tests {
             0,
             "无 watcher = 空数据"
         );
+        assert_eq!(console["meta"]["since"], Value::Null, "无 watcher 无窗口起点");
+        assert_eq!(console["meta"]["live"], false, "无 watcher 必须声明非活采集");
+        assert_eq!(console["meta"]["dropped"], 0);
+        assert_eq!(console["meta"]["capacity"], 500);
+        let network = svc.network(&ins.id, false, None, None).unwrap();
+        assert_eq!(network["meta"]["scope"], "completed");
         let har = svc.har(&ins.id).unwrap();
         assert_eq!(har["log"]["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(har["_meta"]["since"], Value::Null);
+        assert_eq!(har["_meta"]["live"], false);
+        assert_eq!(har["_meta"]["scope"], "completed");
+        assert!(har["_meta"]["uncollected"].as_array().unwrap().len() >= 3);
 
         repo.update_runtime(
             &ins.id,
@@ -389,7 +486,8 @@ mod tests {
     }
 
     /// tab 过滤透传：直接登记 Watched 并喂事件（绕过 spawn 的网络路径），
-    /// 验证 service 层的 tab 参数透传与 meta 组装（filteredByTab/tabFilterUnavailable）
+    /// 验证 service 层的 tab 参数透传与 meta 组装（证据边界恒在 +
+    /// filteredByTab/tabFilterUnavailable 并入同一 meta 对象）
     #[test]
     fn console_network_tab_filter_meta_surfaced() {
         let (repo, ins) = setup();
@@ -428,15 +526,37 @@ mod tests {
         assert_eq!(resp["meta"]["tabFilterUnavailable"], true);
         assert_eq!(resp["meta"]["before"], 2);
         assert_eq!(resp["meta"]["after"], 2);
+        // 证据边界与 tab 过滤字段同层：tab 过滤信息不得挤掉窗口/溢出声明
+        assert_eq!(resp["meta"]["dropped"], 0);
+        assert_eq!(resp["meta"]["capacity"], 500);
+        assert!(resp["meta"]["since"].as_i64().is_some(), "watcher 在 = 有窗口起点");
+        assert_eq!(resp["meta"]["live"], true);
+        assert!(resp["meta"].get("scope").is_none(), "console 无 scope 语义");
 
-        // network 透传：空环 + tab 过滤 → 空 entries，meta 正常（不降级）
+        // network 透传：空环 + tab 过滤 → 空 entries，meta 正常（不降级）+ scope 声明
         let resp = svc.network(&ins.id, false, Some("tab-1"), None).unwrap();
         assert_eq!(resp["entries"].as_array().unwrap().len(), 0);
         assert_eq!(resp["meta"]["tabFilterUnavailable"], false);
+        assert_eq!(resp["meta"]["scope"], "completed");
+        assert_eq!(resp["meta"]["capacity"], 1000);
 
-        // 未请求 tab：响应形状与 M6 一致（无 meta 键）
+        // 未请求 tab：meta 恒在（证据边界契约），只是无 tab 过滤字段
         let resp = svc.console(&ins.id, None, None, None).unwrap();
         assert_eq!(resp["entries"].as_array().unwrap().len(), 2);
-        assert!(resp.get("meta").is_none());
+        assert_eq!(resp["meta"]["capacity"], 500);
+        assert!(resp["meta"].get("filteredByTab").is_none());
+
+        // har：HAR 本体不动，顶层 _meta 带同一套证据边界 + uncollected 占位语义
+        let har = svc.har(&ins.id).unwrap();
+        assert!(har["_meta"]["since"].as_i64().is_some());
+        assert_eq!(har["_meta"]["live"], true);
+        assert_eq!(har["_meta"]["dropped"], 0);
+        assert_eq!(har["_meta"]["capacity"], 1000);
+        assert_eq!(har["_meta"]["scope"], "completed");
+        assert!(har["_meta"]["uncollected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("timings")));
     }
 }

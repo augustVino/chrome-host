@@ -947,6 +947,9 @@ pub struct DialogBuffer {
     tab_id: String,
     entries: VecDeque<DialogEntry>,
     sequence: u64,
+    /// FIFO 逐出累计数（dialogs 响应 meta 透出——游标早于缓冲起点时调用方
+    /// 至少能知道丢了多少，而非静默只见幸存者）
+    dropped: u64,
 }
 
 impl DialogBuffer {
@@ -955,6 +958,7 @@ impl DialogBuffer {
             tab_id: tab_id.into(),
             entries: VecDeque::new(),
             sequence: 0,
+            dropped: 0,
         }
     }
 
@@ -979,12 +983,19 @@ impl DialogBuffer {
         self.entries.push_back(entry.clone());
         while self.entries.len() > MAX_DIALOG_BUFFER {
             self.entries.pop_front();
+            self.dropped += 1;
         }
         entry
     }
 
-    /// sequence 严格大于 cursor 的条目（§1.6）。游标早于缓冲起点时只见幸存者，
-    /// 不补"N 条被逐出"标记。
+    /// 累计逐出条数（缓冲创建起算，只增不清零；响应 meta 证据标记）
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// sequence 严格大于 cursor 的条目（§1.6）。游标早于缓冲起点时只见幸存者；
+    /// 被逐出的总数由 meta.dropped 累计透出，逐出与查询间的关系可由
+    /// entries[0].sequence 与 cursor 的差值推断。
     pub fn since(&self, cursor: u64) -> Vec<&DialogEntry> {
         self.entries
             .iter()
@@ -1696,21 +1707,29 @@ mod tests {
         assert_eq!(buf.cursor(), 2);
     }
 
-    /// TS "tracker: buffer holds at most 32 entries, FIFO drops the oldest without a loss marker"
+    /// TS "tracker: buffer holds at most 32 entries, FIFO drops the oldest"；
+    /// 逐出不再静默：dropped 累计计数随 dialogs 响应 meta 透出（证据边界契约）
     #[test]
-    fn dialog_buffer_fifo_cap_drops_oldest_silently() {
+    fn dialog_buffer_fifo_cap_counts_dropped() {
         let mut buf = DialogBuffer::new("T");
+        assert_eq!(buf.dropped(), 0);
         for i in 0..MAX_DIALOG_BUFFER + 8 {
             buf.record(parse_dialog_opening(
                 &json!({ "type": "alert", "message": format!("m{}", i + 1) }),
             ));
         }
         assert_eq!(buf.len(), MAX_DIALOG_BUFFER);
-        // 幸存者是最新 32 条；since(0) 静默错过被逐出的 8 条（无丢失标记）
+        // 幸存者是最新 32 条；since(0) 错过被逐出的 8 条——但 dropped 声明了丢失量
         let seen = buf.since(0);
         assert_eq!(seen.len(), MAX_DIALOG_BUFFER);
         assert_eq!(seen[0].sequence, 9);
         assert_eq!(seen[0].message, "m9");
+        assert_eq!(buf.dropped(), 8, "40 条入 32 环，累计逐出 8");
+        // 追加两条再逐出两条：计数只增不清零（调用方拿差值可推知区间丢失）
+        buf.record(parse_dialog_opening(&json!({ "type": "alert", "message": "m41" })));
+        buf.record(parse_dialog_opening(&json!({ "type": "alert", "message": "m42" })));
+        assert_eq!(buf.dropped(), 10);
+        assert_eq!(buf.since(0)[0].sequence, 11, "游标推断：幸存者起点后移");
     }
 
     /// TS "tracker: since() is strictly greater-than"

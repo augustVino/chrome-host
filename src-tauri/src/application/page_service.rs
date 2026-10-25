@@ -60,7 +60,7 @@ use crate::domain::page_control::{
     dialog_accept_params, fill_fillable_check_expr, hit_test_expr, largest_quad_centroid,
     locate_expr, normalize_ref, observed_matches_state, parse_dialog_opening, parse_duration,
     parse_key, wait_observe_expr, DialogBuffer, DialogInfo, ObservedState, PageControlError, Point,
-    RefStore, WaitState,
+    RefStore, WaitState, MAX_DIALOG_BUFFER,
 };
 use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::{connect_page, SharedPageConn};
@@ -444,6 +444,7 @@ impl PageService {
     }
 
     /// dialogs <tab> [--since N]：读 per-tab 对话框缓冲（§1.6 游标语义）。
+    /// 响应 meta 带证据边界（dropped/capacity）：缓冲 FIFO 逐出对调用方可见。
     pub async fn dialogs(
         &self,
         ins_id: &str,
@@ -456,20 +457,25 @@ impl PageService {
             ins_id,
             tab,
             |w, tid, _sid| async move {
-                let (cursor, entries): (u64, Vec<Value>) = {
+                let (cursor, dropped, entries): (u64, u64, Vec<Value>) = {
                     let dialogs = w.dialogs.lock().unwrap();
                     match dialogs.get(&tid) {
                         Some(b) => (
                             b.cursor(),
+                            b.dropped(),
                             b.since(since.unwrap_or(0))
                                 .iter()
                                 .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
                                 .collect(),
                         ),
-                        None => (0, Vec::new()),
+                        None => (0, 0, Vec::new()),
                     }
                 };
-                Ok(json!({ "cursor": cursor, "entries": entries }))
+                Ok(json!({
+                    "cursor": cursor,
+                    "entries": entries,
+                    "meta": { "dropped": dropped, "capacity": MAX_DIALOG_BUFFER },
+                }))
             },
         )
         .await

@@ -108,14 +108,14 @@ export const API_CATALOG: CatalogGroup[] = [
       {
         method: 'GET',
         path: '/instances/:id/console',
-        desc: 'console 环（?level=&limit=）',
-        note: '常驻订阅的环形缓冲（500 条，重启即清），非 Chrome 查询接口；level 精确匹配',
+        desc: 'console 环（?level=&limit=&tab=）',
+        note: '常驻订阅的环形缓冲（500 条，重启即清），非 Chrome 查询接口；level 精确匹配，tab 按 targetId 归属过滤；响应 meta 恒带 dropped/capacity/since/live（证据边界契约：溢出与采集窗口显式可见）',
       },
       {
         method: 'GET',
         path: '/instances/:id/network',
-        desc: '请求环（?failedOnly=&limit=）',
-        note: '常驻订阅，请求完成/失败时入环（1000 条）；failedOnly = 失败或 HTTP≥400',
+        desc: '请求环（?failedOnly=&limit=&tab=）',
+        note: '常驻订阅，请求完成/失败时入环（1000 条）；failedOnly = 失败或 HTTP≥400；meta 另带 scope:"completed"（进行中的请求不可见）',
       },
       {
         method: 'GET',
@@ -127,7 +127,7 @@ export const API_CATALOG: CatalogGroup[] = [
         method: 'GET',
         path: '/instances/:id/har',
         desc: '请求环生成 HAR 1.2',
-        note: '未采集字段按规范 -1/空集占位（无请求/响应头、分阶段耗时）；_targetUrl 标注归属页面',
+        note: '未采集字段按规范 -1/空集占位（无请求/响应头、分阶段耗时）；_targetUrl 标注归属页面；顶层 _meta 扩展键声明占位语义与证据边界（dropped/capacity/since/live/scope）',
       },
     ],
   },
@@ -169,6 +169,7 @@ export const API_CATALOG: CatalogGroup[] = [
         method: 'GET',
         path: '/instances/:id/page/dialogs',
         desc: '自动接管的弹窗历史（近 32 条；?tab=&since= 增量）',
+        note: '缓冲 FIFO 逐出累计于 meta.dropped（诚实证据）；since 游标增量拉取，幸存首条 sequence > since+1 即中间有逐出',
       },
       {
         method: 'POST',

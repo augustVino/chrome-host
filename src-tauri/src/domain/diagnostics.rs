@@ -2,9 +2,11 @@
 //! 纯逻辑无 IO（事件 JSON 由应用层喂入），全部可单测；IO 与重连编排在
 //! application/diagnostics_service.rs。
 //!
-//! 语义（AGENT-API.md 同步披露）：
+//! 语义（AGENT-API.md 同步披露，见「证据边界契约」）：
 //! - console 环 500 条 / network 环 1000 条，进程内态——应用或实例重启即清；
-//! - network 条目在请求**完成/失败时**入环（in-flight 不可见）；requestId 按
+//!   溢出丢最旧并累计 dropped 计数（查询/HAR 响应 meta 透出，绝不静默截断）；
+//! - network 条目在请求**完成/失败时**入环（in-flight 不可见，响应 meta 以
+//!   `scope: "completed"` 声明）；requestId 按
 //!   session 维度去重（多 tab 各自计数，不互相覆盖）；
 //! - 事件应用返回 [`ApplyOutcome`]，attach 的 per-session enable 命令由应用层执行
 //!   （域层不产 IO）。
@@ -17,6 +19,9 @@ use serde_json::{json, Value};
 /// 环形容量（交接契约：console 500 / network 1000）
 const CONSOLE_RING: usize = 500;
 const NETWORK_RING: usize = 1000;
+/// network 环的采集范围声明（console/network 查询与 HAR `_meta` 的常量值）：
+/// 条目在请求完成/失败时入环，**进行中的请求不可见**——响应显式声明而非留白
+pub const NETWORK_SCOPE_COMPLETED: &str = "completed";
 /// in-flight 悬挂保护：未完成请求的 pending 表上限。超限整体清空——泄漏防护
 /// 优先于完整性（无序 HashMap 无从挑选最旧；被清掉的请求完成事件将无处归档）
 const PENDING_CAP: usize = 500;
@@ -54,6 +59,17 @@ pub struct NetworkEntry {
     pub target_url: String,
     /// 归属 tab 的 targetId（requestWillBeSent 有 session 门卫，必有归属）
     pub target_id: Option<String>,
+}
+
+/// 环的证据边界（查询响应/HAR `_meta` 的数据源）：固定容量 + 累计溢出丢弃数。
+/// 「诚实证据」契约的一环——调用方必须能看见截断，而非静默少数据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RingStats {
+    /// 环固定容量
+    pub capacity: usize,
+    /// 自缓冲创建以来因溢出被丢弃的条目总数（只增不清零）
+    pub dropped: u64,
 }
 
 /// tab 过滤的执行情况（查询响应 meta 的来源；仅请求了 tab 过滤时出现）
@@ -95,6 +111,9 @@ struct SessionInfo {
 pub struct DiagBuffer {
     console: VecDeque<ConsoleEntry>,
     network: VecDeque<NetworkEntry>,
+    /// 环溢出累计丢弃数（锁内累加；查询时随 meta 透出）
+    console_dropped: u64,
+    network_dropped: u64,
     /// session_id → 归属信息（attach 时登记，detach 移除；条目留档）
     sessions: HashMap<String, SessionInfo>,
     /// (session_id, request_id) → 进行中的请求；完成/失败时结算入环
@@ -133,6 +152,7 @@ impl DiagBuffer {
         self.console.push_back(entry);
         if self.console.len() > CONSOLE_RING {
             self.console.pop_front();
+            self.console_dropped += 1;
         }
     }
 
@@ -337,6 +357,23 @@ impl DiagBuffer {
         self.network.push_back(entry);
         if self.network.len() > NETWORK_RING {
             self.network.pop_front();
+            self.network_dropped += 1;
+        }
+    }
+
+    /// console 环的证据边界（响应 meta 数据源）
+    pub fn console_stats(&self) -> RingStats {
+        RingStats {
+            capacity: CONSOLE_RING,
+            dropped: self.console_dropped,
+        }
+    }
+
+    /// network 环的证据边界（响应 meta / HAR `_meta` 数据源）
+    pub fn network_stats(&self) -> RingStats {
+        RingStats {
+            capacity: NETWORK_RING,
+            dropped: self.network_dropped,
         }
     }
 
@@ -676,10 +713,15 @@ mod tests {
         );
     }
 
-    /// 环形上限：console 500 / network 1000，超限丢最旧
+    /// 环形上限：console 500 / network 1000，超限丢最旧；溢出计数随 meta 透出
     #[test]
     fn rings_are_bounded() {
         let mut buf = DiagBuffer::default();
+        assert_eq!(
+            buf.console_stats(),
+            RingStats { capacity: 500, dropped: 0 },
+            "新缓冲无丢弃"
+        );
         buf.apply(&attached("https://a/"), 0);
         for i in 0..600 {
             buf.apply(
@@ -693,6 +735,10 @@ mod tests {
             .text
             .clone();
         assert_eq!(oldest, "m100", "最旧被挤出的正是环形起点: {oldest}");
+        assert_eq!(
+            buf.console_stats().dropped, 100,
+            "600 条入 500 环，累计丢弃 100"
+        );
 
         for i in 0..1100 {
             buf.apply(&req(&format!("r{i}"), &format!("https://a/{i}")), 0);
@@ -703,8 +749,17 @@ mod tests {
             );
         }
         assert_eq!(buf.network_entries(false, None, 2000).entries.len(), 1000);
+        assert_eq!(
+            buf.network_stats(),
+            RingStats { capacity: 1000, dropped: 100 },
+            "1100 条入 1000 环，累计丢弃 100"
+        );
         // limit 投影：尾部 N 条
         assert_eq!(buf.console_entries(None, None, 7).entries.len(), 7);
+        // 丢弃计数不影响存活条目语义：最旧存活请求正是被挤出后的环形起点
+        assert!(buf.network_entries(false, None, 1).entries[0]
+            .url
+            .ends_with("a/1099"));
     }
 
     /// tab 级过滤：多 tab 各自 attach，条目按 targetId 精确过滤，meta 带 before/after
