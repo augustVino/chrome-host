@@ -74,14 +74,91 @@ impl BodyState {
 #[derive(Debug)]
 pub enum BodyPayload {
     /// getResponseBody 原始返回（base64 与否由 CDP 响应告知；解码/校验/脱敏/
-    /// 截断均在域层 store_body 内完成——单一冲口保证「落环前脱敏」）
-    Raw {
-        body: String,
-        base64_encoded: bool,
-    },
+    /// 截断在域层 [`settle_body`] 完成——app 层在 DiagBuffer Mutex **之外**执行后
+    /// 以 [`SettledBody`] 提交。「落环前脱敏」单一冲口不变：未脱敏内容
+    /// 不出现在提交路径）
+    Raw { body: String, base64_encoded: bool },
     /// 拉取失败（timeout = 2.5s 预算耗尽；no-data = 排队溢出/连接断/CDP 拒绝/
     /// 空响应；not-text = 解码后非 UTF-8 文本——具体归因在 app 层，域层只存）
     Unavailable { reason: &'static str },
+}
+
+/// [`settle_body`] 的产物：锁外重活管线完成后的终态。app 层两段式结算 =
+/// 锁内 mime 快照（[`DiagBuffer::pending_body_mime`]）→ 锁外 [`settle_body`]
+/// → 锁内提交（[`DiagBuffer::store_body`]）。
+#[derive(Debug)]
+pub enum SettledBody {
+    /// 已脱敏、已按单条上限截断的最终文本。partial = 触发过
+    /// [`BODY_ITEM_MAX_BYTES`] 截断（→ bodyState "partial"）
+    Text { body: String, partial: bool },
+    /// 终态归因（timeout/no-data/not-text/redact-failed）
+    Unavailable { reason: &'static str },
+}
+
+/// body 结算重活管线（纯函数：无 `&mut self`、无锁，可在任意线程执行）：
+/// base64 解码 → UTF-8 校验 → 脱敏 → 单条上限截断。mime 取目标条目快照
+/// （决定 JSON tokenizer / 文本模式）。此前整条管线内联在 [`DiagBuffer::store_body`]
+/// 的 Mutex 临界区内——大 body 的解码/脱敏会串行卡死事件泵 `apply()` 与
+/// console/network/har 全部查询（W-fix2 外移；锁内只剩提交入账与预算驱逐）。
+pub fn settle_body(mime: Option<&str>, payload: BodyPayload) -> SettledBody {
+    match payload {
+        BodyPayload::Unavailable { reason } => SettledBody::Unavailable { reason },
+        BodyPayload::Raw {
+            body,
+            base64_encoded,
+        } => {
+            let bytes = if base64_encoded {
+                match base64::engine::general_purpose::STANDARD.decode(body.as_bytes()) {
+                    Ok(b) => b,
+                    // base64 非法：CDP 回了不可解码的字节序列，按二进制伪装归 not-text
+                    Err(_) => {
+                        return SettledBody::Unavailable {
+                            reason: REASON_NOT_TEXT,
+                        }
+                    }
+                }
+            } else {
+                body.into_bytes()
+            };
+            if bytes.is_empty() {
+                return SettledBody::Unavailable {
+                    reason: REASON_NO_DATA,
+                };
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                return SettledBody::Unavailable {
+                    reason: REASON_NOT_TEXT,
+                };
+            };
+            let redacted = match redact::redact_body(mime, &text) {
+                Ok(r) => r,
+                Err(_reject) => {
+                    // 拒绝语义优先于部分保留（宁少证据不漏密钥）；具体拒绝型
+                    // （Unparseable/TooDeep/Uncertain）统一落 redact-failed，
+                    // 诊断级分钟级排障足够
+                    return SettledBody::Unavailable {
+                        reason: REASON_REDACT_FAILED,
+                    };
+                }
+            };
+            if redacted.len() > BODY_ITEM_MAX_BYTES {
+                // 字符边界截断（不跨 UTF-8 序列）；保留实际字节数入账
+                let mut cut = BODY_ITEM_MAX_BYTES;
+                while !redacted.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                SettledBody::Text {
+                    body: redacted[..cut].to_string(),
+                    partial: true,
+                }
+            } else {
+                SettledBody::Text {
+                    body: redacted,
+                    partial: false,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -182,7 +259,11 @@ pub struct Utf16Slice {
 
 impl Utf16Slice {
     fn empty() -> Self {
-        Utf16Slice { text: String::new(), returned: 0, total: 0 }
+        Utf16Slice {
+            text: String::new(),
+            returned: 0,
+            total: 0,
+        }
     }
 }
 
@@ -204,7 +285,11 @@ pub fn slice_utf16(text: &str, offset: usize, limit: usize) -> Utf16Slice {
         pos = end;
         total += len;
     }
-    Utf16Slice { text: out, returned, total }
+    Utf16Slice {
+        text: out,
+        returned,
+        total,
+    }
 }
 
 /// attach/detach 的信号（应用层据此发送 per-session enable 命令）；
@@ -522,11 +607,30 @@ impl DiagBuffer {
         }
     }
 
-    /// body 拉取结果结算（单一冲口：解码 → 校验 → 脱敏 → 截断 → 入账）。
-    /// 目标条目 = 环内最新一个该 requestId 且仍处 not-finished 待结算态的条目
+    /// 锁外结算的前置快照：目标条目（最新 not-finished 同名 requestId，与
+    /// [`store_body`] 同一定位规则）的 mime。外层 None = 无待结算条目（已
+    /// 结算/被环溢出挤出），调用方跳过重活与提交。mime 决定脱敏走 JSON
+    /// tokenizer 还是文本模式。注：跨 session requestId 碰撞的极小窗口内
+    /// 快照与提交目标可能错位（先到先结算本身即任意序），按快照 mime 结算。
+    pub fn pending_body_mime(&self, request_id: &str) -> Option<Option<String>> {
+        self.network
+            .iter()
+            .rev()
+            .find(|e| {
+                e.request_id == request_id
+                    && e.body_state == BodyState::Unavailable
+                    && e.body_reason == Some(REASON_NOT_FINISHED)
+            })
+            .map(|e| e.mime_type.clone())
+    }
+
+    /// body 结算提交（锁内轻活，与锁外 [`settle_body`] 两段式）：定位目标
+    /// 条目 = 环内最新一个该 requestId 且仍处 not-finished 待结算态
     /// （requestId 理论上可跨 session 碰撞，先到先结算；已被环溢出挤出的条目
-    /// 找不到则丢弃——诚实丢弃，无处可写）。
-    pub fn store_body(&mut self, request_id: &str, payload: BodyPayload) {
+    /// 找不到则丢弃——诚实丢弃，无处可写）→ 终态写入 → 字节入账 → 预算
+    /// 驱逐。驱逐决策基于锁内最新 body_bytes 重验（快照-计算-回锁提交期间
+    /// 账本可能被并发结算推进），最旧先驱语义不变。
+    pub fn store_body(&mut self, request_id: &str, settled: SettledBody) {
         let Some(entry) = self.network.iter_mut().rev().find(|e| {
             e.request_id == request_id
                 && e.body_state == BodyState::Unavailable
@@ -534,59 +638,19 @@ impl DiagBuffer {
         }) else {
             return;
         };
-        match payload {
-            BodyPayload::Unavailable { reason } => {
+        match settled {
+            SettledBody::Unavailable { reason } => {
                 entry.body_reason = Some(reason);
             }
-            BodyPayload::Raw { body, base64_encoded } => {
-                let bytes = if base64_encoded {
-                    match base64::engine::general_purpose::STANDARD.decode(body.as_bytes()) {
-                        Ok(b) => b,
-                        // base64 非法：CDP 回了不可解码的字节序列，按二进制伪装归 not-text
-                        Err(_) => {
-                            entry.body_reason = Some(REASON_NOT_TEXT);
-                            return;
-                        }
-                    }
+            SettledBody::Text { body, partial } => {
+                self.body_bytes += body.len();
+                entry.body = Some(body);
+                entry.body_state = if partial {
+                    BodyState::Partial
                 } else {
-                    body.into_bytes()
+                    BodyState::Available
                 };
-                if bytes.is_empty() {
-                    entry.body_reason = Some(REASON_NO_DATA);
-                    return;
-                }
-                let Ok(text) = String::from_utf8(bytes) else {
-                    entry.body_reason = Some(REASON_NOT_TEXT);
-                    return;
-                };
-                let redacted = match redact::redact_body(entry.mime_type.as_deref(), &text) {
-                    Ok(r) => r,
-                    Err(reject) => {
-                        // 拒绝语义优先于部分保留（宁少证据不漏密钥）；
-                        // 具体拒绝型（Unparseable/TooDeep/Uncertain）统一落
-                        // redact-failed，诊断而分钟级排障足够
-                        let _ = reject;
-                        entry.body_reason = Some(REASON_REDACT_FAILED);
-                        return;
-                    }
-                };
-                if redacted.len() > BODY_ITEM_MAX_BYTES {
-                    // 字符边界截断（不跨 UTF-8 序列）；保留实际字节数入账
-                    let mut cut = BODY_ITEM_MAX_BYTES;
-                    while !redacted.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    let stored = redacted[..cut].to_string();
-                    self.body_bytes += stored.len();
-                    entry.body = Some(stored);
-                    entry.body_state = BodyState::Partial;
-                    entry.body_reason = None;
-                } else {
-                    self.body_bytes += redacted.len();
-                    entry.body = Some(redacted);
-                    entry.body_state = BodyState::Available;
-                    entry.body_reason = None;
-                }
+                entry.body_reason = None;
                 self.enforce_body_budget();
             }
         }
@@ -597,7 +661,11 @@ impl DiagBuffer {
     /// 预算驱 body——结构证据完整，重的 body 可回收。
     fn enforce_body_budget(&mut self) {
         while self.body_bytes > BODY_TOTAL_MAX_BYTES {
-            let (idx, len) = match self.network.iter().enumerate().find(|(_, e)| e.body.is_some())
+            let (idx, len) = match self
+                .network
+                .iter()
+                .enumerate()
+                .find(|(_, e)| e.body.is_some())
             {
                 Some((i, e)) => (i, e.body.as_ref().map_or(0, |b| b.len())),
                 // body_bytes 超限却无 body 可驱：账本与环不一致（不可达——
@@ -700,72 +768,80 @@ impl DiagBuffer {
         project(matched, tab, limit, |e| e.target_id.as_deref())
     }
 
-    /// HAR 1.2（har-recorder 的正式落地点）。未捕获的字段按规范以 -1/空集占位；
-    /// `_targetUrl` 为自定义字段标注条目归属的页面目标（CDP session 归属）；
-    /// body 可用（available/partial）时 `response.content.text` 填**脱敏后**
-    /// 内容（含非 ASCII → base64 + encoding，HAR 惯例），否则不填 text（HAR
-    /// 兼容占位，bodyState 语义见 network 查询）。
-    pub fn to_har(&self, creator_version: &str) -> Value {
-        let entries: Vec<Value> = self
-            .network
-            .iter()
-            .map(|e| {
-                let mut content = json!({
-                    "size": e.body.as_ref().map_or(0, |b| b.len()),
-                    "mimeType": e.mime_type.clone().unwrap_or_default(),
-                });
-                if let Some(body) = &e.body {
-                    if body.is_ascii() {
-                        content["text"] = json!(body);
-                    } else {
-                        content["text"] = json!(
-                            base64::engine::general_purpose::STANDARD.encode(body.as_bytes())
-                        );
-                        content["encoding"] = json!("base64");
-                    }
-                }
-                json!({
-                    "startedDateTime": iso_ms(e.ts),
-                    "time": e.duration_ms.unwrap_or(0),
-                    "request": {
-                        "method": e.method,
-                        "url": e.url,
-                        "httpVersion": "unknown",
-                        "headers": [],
-                        "queryString": [],
-                        "cookies": [],
-                        "headersSize": -1,
-                        "bodySize": -1,
-                    },
-                    "response": {
-                        "status": e.status.unwrap_or(0),
-                        "statusText": if e.failed { e.error.clone().unwrap_or_default() } else { String::new() },
-                        "httpVersion": "unknown",
-                        "headers": [],
-                        "content": content,
-                        "redirectURL": "",
-                        "headersSize": -1,
-                        "bodySize": -1,
-                    },
-                    "cache": {},
-                    "timings": {
-                        "send": -1, "wait": -1, "receive": e.duration_ms.unwrap_or(-1),
-                        "dns": -1, "connect": -1, "ssl": -1,
-                        "comment": "chrome-host 常驻订阅仅记录总时长，分阶段耗时未采集",
-                    },
-                    "_targetUrl": e.target_url,
-                })
-            })
-            .collect();
-        json!({
-            "log": {
-                "version": "1.2",
-                "creator": { "name": "chrome-host", "version": creator_version },
-                "pages": [],
-                "entries": entries,
-            }
-        })
+    /// HAR 构建的锁内快照（轻：条目克隆即返回）。HAR 组装与 base64 编码由
+    /// 调用方持快照在锁外经 [`build_har`] 完成——与 body 结算同纪律：重活
+    /// 不进 DiagBuffer Mutex（事件泵与查询不被 HAR 生成阻塞）。快照与
+    /// [`Self::network_stats`] 同锁获取即为一致的点时视图（此后到达的结算
+    /// 不出现在本次 HAR 中）。
+    pub fn har_snapshot(&self) -> Vec<NetworkEntry> {
+        self.network.iter().cloned().collect()
     }
+}
+
+/// HAR 1.2 组装（纯函数，锁外执行；har-recorder 的正式落地点）。未捕获的
+/// 字段按规范以 -1/空集占位；`_targetUrl` 为自定义字段标注条目归属的页面
+/// 目标（CDP session 归属）；body 可用（available/partial）时
+/// `response.content.text` 填**脱敏后**内容（含非 ASCII → base64 + encoding，
+/// HAR 惯例），否则不填 text（HAR 兼容占位，bodyState 语义见 network 查询）。
+pub fn build_har(entries: &[NetworkEntry], creator_version: &str) -> Value {
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            let mut content = json!({
+                "size": e.body.as_ref().map_or(0, |b| b.len()),
+                "mimeType": e.mime_type.clone().unwrap_or_default(),
+            });
+            if let Some(body) = &e.body {
+                if body.is_ascii() {
+                    content["text"] = json!(body);
+                } else {
+                    content["text"] = json!(
+                        base64::engine::general_purpose::STANDARD.encode(body.as_bytes())
+                    );
+                    content["encoding"] = json!("base64");
+                }
+            }
+            json!({
+                "startedDateTime": iso_ms(e.ts),
+                "time": e.duration_ms.unwrap_or(0),
+                "request": {
+                    "method": e.method,
+                    "url": e.url,
+                    "httpVersion": "unknown",
+                    "headers": [],
+                    "queryString": [],
+                    "cookies": [],
+                    "headersSize": -1,
+                    "bodySize": -1,
+                },
+                "response": {
+                    "status": e.status.unwrap_or(0),
+                    "statusText": if e.failed { e.error.clone().unwrap_or_default() } else { String::new() },
+                    "httpVersion": "unknown",
+                    "headers": [],
+                    "content": content,
+                    "redirectURL": "",
+                    "headersSize": -1,
+                    "bodySize": -1,
+                },
+                "cache": {},
+                "timings": {
+                    "send": -1, "wait": -1, "receive": e.duration_ms.unwrap_or(-1),
+                    "dns": -1, "connect": -1, "ssl": -1,
+                    "comment": "chrome-host 常驻订阅仅记录总时长，分阶段耗时未采集",
+                },
+                "_targetUrl": e.target_url,
+            })
+        })
+        .collect();
+    json!({
+        "log": {
+            "version": "1.2",
+            "creator": { "name": "chrome-host", "version": creator_version },
+            "pages": [],
+            "entries": entries,
+        }
+    })
 }
 
 /// tab 过滤投影的公共尾部：归属完整 → 精确过滤；环中存在无归属条目 → 降级
@@ -972,7 +1048,7 @@ mod tests {
         );
 
         // HAR：版本/creator/条目映射/未知量占位
-        let har = buf.to_har("0.2.3");
+        let har = build_har(&buf.har_snapshot(), "0.2.3");
         assert_eq!(har["log"]["version"], "1.2");
         assert_eq!(har["log"]["creator"]["name"], "chrome-host");
         assert_eq!(har["log"]["entries"].as_array().unwrap().len(), 3);
@@ -1016,7 +1092,10 @@ mod tests {
         let mut buf = DiagBuffer::default();
         assert_eq!(
             buf.console_stats(),
-            RingStats { capacity: 500, dropped: 0 },
+            RingStats {
+                capacity: 500,
+                dropped: 0
+            },
             "新缓冲无丢弃"
         );
         buf.apply(&attached("https://a/"), 0);
@@ -1033,7 +1112,8 @@ mod tests {
             .clone();
         assert_eq!(oldest, "m100", "最旧被挤出的正是环形起点: {oldest}");
         assert_eq!(
-            buf.console_stats().dropped, 100,
+            buf.console_stats().dropped,
+            100,
             "600 条入 500 环，累计丢弃 100"
         );
 
@@ -1048,7 +1128,10 @@ mod tests {
         assert_eq!(buf.network_entries(false, None, 2000).entries.len(), 1000);
         assert_eq!(
             buf.network_stats(),
-            RingStats { capacity: 1000, dropped: 100 },
+            RingStats {
+                capacity: 1000,
+                dropped: 100
+            },
             "1100 条入 1000 环，累计丢弃 100"
         );
         // limit 投影：尾部 N 条
@@ -1164,6 +1247,12 @@ mod tests {
 
     // ---------- body 捕获与 bodyState 状态机 ----------
 
+    /// 两段式结算帮手（生产路径同构）：锁内 mime 快照 → 锁外结算 → 锁内提交
+    fn settle_and_store(buf: &mut DiagBuffer, rid: &str, payload: BodyPayload) {
+        let mime = buf.pending_body_mime(rid).expect("条目应处待结算态");
+        buf.store_body(rid, settle_body(mime.as_deref(), payload));
+    }
+
     /// 全链路事件喂入：文本 mime 完成 → BodyFetch 信号 + not-finished 初态；
     /// 非文本 mime / 失败请求 → 无信号 + mime/not-finished 终态（永不拉取）
     #[test]
@@ -1184,10 +1273,16 @@ mod tests {
                     "params": { "requestId": "r1", "timestamp": 1.0 } }),
                 0,
             ),
-            ApplyOutcome::BodyFetch { session_id: SESS.into(), request_id: "r1".into() }
+            ApplyOutcome::BodyFetch {
+                session_id: SESS.into(),
+                request_id: "r1".into()
+            }
         );
         let e = &buf.network_entries(false, None, 10).entries[0];
-        assert_eq!((e.body_state, e.body_reason), (BodyState::Unavailable, Some(REASON_NOT_FINISHED)));
+        assert_eq!(
+            (e.body_state, e.body_reason),
+            (BodyState::Unavailable, Some(REASON_NOT_FINISHED))
+        );
 
         // 非文本 mime：无信号 + mime 终态
         buf.apply(&req("r2", "https://a/img"), 0);
@@ -1205,7 +1300,10 @@ mod tests {
             ApplyOutcome::None
         );
         let e = &buf.network_entries(false, None, 10).entries[1];
-        assert_eq!((e.body_state, e.body_reason), (BodyState::Unavailable, Some(REASON_MIME)));
+        assert_eq!(
+            (e.body_state, e.body_reason),
+            (BodyState::Unavailable, Some(REASON_MIME))
+        );
 
         // 失败请求：无信号 + not-finished 终态
         buf.apply(&req("r3", "https://a/dead"), 0);
@@ -1218,7 +1316,10 @@ mod tests {
             ApplyOutcome::None
         );
         let e = &buf.network_entries(false, None, 10).entries[2];
-        assert_eq!((e.body_state, e.body_reason), (BodyState::Unavailable, Some(REASON_NOT_FINISHED)));
+        assert_eq!(
+            (e.body_state, e.body_reason),
+            (BodyState::Unavailable, Some(REASON_NOT_FINISHED))
+        );
         assert!(e.failed);
     }
 
@@ -1228,7 +1329,11 @@ mod tests {
     fn store_body_settles_states_and_redacts() {
         let mut buf = DiagBuffer::default();
         buf.apply(&attached("https://a/"), 0);
-        for (rid, mime) in [("r1", "application/json"), ("r2", "application/json"), ("r3", "text/plain")] {
+        for (rid, mime) in [
+            ("r1", "application/json"),
+            ("r2", "application/json"),
+            ("r3", "text/plain"),
+        ] {
             buf.apply(&req(rid, &format!("https://a/{rid}?token=secret1")), 0);
             buf.apply(
                 &json!({ "method": "Network.responseReceived", "sessionId": SESS,
@@ -1246,27 +1351,62 @@ mod tests {
         let e = &buf.network_entries(false, None, 10).entries[0];
         assert_eq!(e.url, "https://a/r1?token=[redacted]");
 
-        // 成功：body 脱敏后 available
-        buf.store_body(
+        // 成功：body 脱敏后 available（两段式：快照 → 锁外结算 → 提交）
+        settle_and_store(
+            &mut buf,
             "r1",
-            BodyPayload::Raw { body: r#"{"token":"abc","ok":true}"#.into(), base64_encoded: false },
+            BodyPayload::Raw {
+                body: r#"{"token":"abc","ok":true}"#.into(),
+                base64_encoded: false,
+            },
         );
         let e = &buf.network_entries(false, None, 10).entries[0];
         assert_eq!((e.body_state, e.body_reason), (BodyState::Available, None));
-        assert_eq!(e.body.as_deref(), Some(r#"{"token":"[redacted]","ok":true}"#));
+        assert_eq!(
+            e.body.as_deref(),
+            Some(r#"{"token":"[redacted]","ok":true}"#)
+        );
 
         // 超时归因
-        buf.store_body("r2", BodyPayload::Unavailable { reason: REASON_TIMEOUT });
+        settle_and_store(
+            &mut buf,
+            "r2",
+            BodyPayload::Unavailable {
+                reason: REASON_TIMEOUT,
+            },
+        );
         let e = &buf.network_entries(false, None, 10).entries[1];
-        assert_eq!((e.body_state, e.body_reason), (BodyState::Unavailable, Some(REASON_TIMEOUT)));
+        assert_eq!(
+            (e.body_state, e.body_reason),
+            (BodyState::Unavailable, Some(REASON_TIMEOUT))
+        );
 
         // redact 拒绝（text mime + JSON 形态 → Uncertain → redact-failed）
-        buf.store_body("r3", BodyPayload::Raw { body: "{broken".into(), base64_encoded: false });
+        settle_and_store(
+            &mut buf,
+            "r3",
+            BodyPayload::Raw {
+                body: "{broken".into(),
+                base64_encoded: false,
+            },
+        );
         let e = &buf.network_entries(false, None, 10).entries[2];
-        assert_eq!((e.body_state, e.body_reason), (BodyState::Unavailable, Some(REASON_REDACT_FAILED)));
+        assert_eq!(
+            (e.body_state, e.body_reason),
+            (BodyState::Unavailable, Some(REASON_REDACT_FAILED))
+        );
 
-        // 未知 requestId：诚实丢弃（无处理写）
-        buf.store_body("ghost", BodyPayload::Raw { body: "x".into(), base64_encoded: false });
+        // 未知 requestId：诚实丢弃（无处理写）——直接提交无快照路径
+        buf.store_body(
+            "ghost",
+            settle_body(
+                None,
+                BodyPayload::Raw {
+                    body: "x".into(),
+                    base64_encoded: false,
+                },
+            ),
+        );
         assert_eq!(buf.network_entries(false, None, 10).entries.len(), 3);
     }
 
@@ -1291,19 +1431,44 @@ mod tests {
         }
         // base64："Bearer abc" 的 base64 → 解码后脱敏
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "Bearer abc");
-        buf.store_body("rb", BodyPayload::Raw { body: b64, base64_encoded: true });
+        settle_and_store(
+            &mut buf,
+            "rb",
+            BodyPayload::Raw {
+                body: b64,
+                base64_encoded: true,
+            },
+        );
         let e = &buf.network_entries(false, None, 10).entries[0];
         assert_eq!(e.body.as_deref(), Some("Bearer [redacted]"));
 
         // base64 非法（二进制伪装）→ not-text；空 body → no-data
-        buf.store_body("rn", BodyPayload::Raw { body: "!!!not-base64".into(), base64_encoded: true });
-        buf.store_body("rd", BodyPayload::Unavailable { reason: REASON_NO_DATA });
+        settle_and_store(
+            &mut buf,
+            "rn",
+            BodyPayload::Raw {
+                body: "!!!not-base64".into(),
+                base64_encoded: true,
+            },
+        );
+        settle_and_store(
+            &mut buf,
+            "rd",
+            BodyPayload::Unavailable {
+                reason: REASON_NO_DATA,
+            },
+        );
         let es = buf.network_entries(false, None, 10).entries;
         assert_eq!(es[1].body_reason, Some(REASON_NOT_TEXT));
         assert_eq!(es[2].body_reason, Some(REASON_NO_DATA));
 
         // 已结算（available）的条目不再被同名 store 命中
-        buf.store_body("rb", BodyPayload::Unavailable { reason: REASON_TIMEOUT });
+        buf.store_body(
+            "rb",
+            SettledBody::Unavailable {
+                reason: REASON_TIMEOUT,
+            },
+        );
         let e = &buf.network_entries(false, None, 10).entries[0];
         assert_eq!(e.body_state, BodyState::Available, "终态不可被覆盖");
     }
@@ -1327,12 +1492,25 @@ mod tests {
         // 多字节字符混合：截断不得跨 UTF-8 序列
         let mut big = "密钥无关正文".repeat(60_000); // ≈ 480KB
         big.push_str(&"a".repeat(BODY_ITEM_MAX_BYTES));
-        buf.store_body("r1", BodyPayload::Raw { body: big, base64_encoded: false });
+        settle_and_store(
+            &mut buf,
+            "r1",
+            BodyPayload::Raw {
+                body: big,
+                base64_encoded: false,
+            },
+        );
         let e = &buf.network_entries(false, None, 10).entries[0];
         assert_eq!(e.body_state, BodyState::Partial);
         let stored_len = e.body.as_ref().unwrap().len();
-        assert!(stored_len <= BODY_ITEM_MAX_BYTES, "不超单条上限: {stored_len}");
-        assert!(stored_len >= BODY_ITEM_MAX_BYTES - 3, "贴着上限截（字符边界最多回退 3B）");
+        assert!(
+            stored_len <= BODY_ITEM_MAX_BYTES,
+            "不超单条上限: {stored_len}"
+        );
+        assert!(
+            stored_len >= BODY_ITEM_MAX_BYTES - 3,
+            "贴着上限截（字符边界最多回退 3B）"
+        );
         assert_eq!(e.body_reason, None);
     }
 
@@ -1357,7 +1535,14 @@ mod tests {
                 0,
             );
             let item = "x".repeat(BODY_ITEM_MAX_BYTES);
-            buf.store_body(&format!("r{i}"), BodyPayload::Raw { body: item, base64_encoded: false });
+            settle_and_store(
+                &mut buf,
+                &format!("r{i}"),
+                BodyPayload::Raw {
+                    body: item,
+                    base64_encoded: false,
+                },
+            );
         }
         let es = buf.network_entries(false, None, 100).entries;
         assert_eq!(es.len(), n, "条目（元数据）永不驱逐");
@@ -1368,8 +1553,154 @@ mod tests {
             assert_eq!(e.body_state, BodyState::Available);
         }
         // 账本收敛：驱到 ≤ 8MiB 为止
-        let kept: usize = es[1..].iter().map(|e| e.body.as_ref().map_or(0, |b| b.len())).sum();
+        let kept: usize = es[1..]
+            .iter()
+            .map(|e| e.body.as_ref().map_or(0, |b| b.len()))
+            .sum();
         assert!(kept <= BODY_TOTAL_MAX_BYTES);
+    }
+
+    /// 锁外结算管线（纯函数 settle_body）与前置快照（pending_body_mime）：
+    /// 归因透传、脱敏/截断标记 partial、非 UTF-8 → not-text；快照定位与提交
+    /// 定位同规则（最新 not-finished），终态后不再命中
+    #[test]
+    fn settle_body_pipeline_and_mime_snapshot() {
+        // Unavailable 透传
+        assert!(matches!(
+            settle_body(
+                None,
+                BodyPayload::Unavailable {
+                    reason: REASON_TIMEOUT
+                }
+            ),
+            SettledBody::Unavailable {
+                reason: REASON_TIMEOUT
+            }
+        ));
+        // 正常文本：脱敏 + partial=false
+        let SettledBody::Text { body, partial } = settle_body(
+            Some("text/plain"),
+            BodyPayload::Raw {
+                body: "Bearer xyz".into(),
+                base64_encoded: false,
+            },
+        ) else {
+            panic!("应为 Text");
+        };
+        assert_eq!(body, "Bearer [redacted]");
+        assert!(!partial);
+        // 超 256KiB 截断 → partial=true（纯 ASCII 贴着字节上限）
+        let SettledBody::Text { body, partial } = settle_body(
+            Some("text/plain"),
+            BodyPayload::Raw {
+                body: "a".repeat(BODY_ITEM_MAX_BYTES + 1),
+                base64_encoded: false,
+            },
+        ) else {
+            panic!("应为 Text");
+        };
+        assert_eq!(body.len(), BODY_ITEM_MAX_BYTES);
+        assert!(partial);
+        // 非 UTF-8（base64 形态）→ not-text
+        let bad = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            [0xffu8, 0xfe, 0xfd, 0xfc],
+        );
+        assert!(matches!(
+            settle_body(
+                None,
+                BodyPayload::Raw {
+                    body: bad,
+                    base64_encoded: true
+                }
+            ),
+            SettledBody::Unavailable {
+                reason: REASON_NOT_TEXT
+            }
+        ));
+
+        // 快照定位：最新 not-finished 同名条目的 mime；结算后不再命中
+        let mut buf = DiagBuffer::default();
+        buf.apply(&attached("https://a/"), 0);
+        buf.apply(&req("r1", "https://a/x"), 0);
+        buf.apply(
+            &json!({ "method": "Network.responseReceived", "sessionId": SESS,
+                "params": { "requestId": "r1", "response": { "status": 200, "mimeType": "application/json" } } }),
+            0,
+        );
+        buf.apply(
+            &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                "params": { "requestId": "r1", "timestamp": 1.0 } }),
+            0,
+        );
+        assert_eq!(
+            buf.pending_body_mime("r1"),
+            Some(Some("application/json".into()))
+        );
+        settle_and_store(
+            &mut buf,
+            "r1",
+            BodyPayload::Raw {
+                body: "{}".into(),
+                base64_encoded: false,
+            },
+        );
+        assert_eq!(buf.pending_body_mime("r1"), None, "终态不再被同名快照命中");
+        // 未知 requestId：快照即无目标
+        assert_eq!(buf.pending_body_mime("ghost"), None);
+    }
+
+    /// 两段式竞态下的预算语义：锁外算好的终态在提交时才入账——提交序（而非
+    /// 计算序）驱动账本，驱逐仍最旧先驱且基于锁内最新 body_bytes 重验
+    /// （快照-计算-回锁提交的核心保证：B 批全部算完才提交，仍驱最旧的 A 批）
+    #[test]
+    fn settled_commits_account_in_commit_order_oldest_first_eviction() {
+        let mut buf = DiagBuffer::default();
+        buf.apply(&attached("https://a/"), 0);
+        let mut stashed_b: Vec<(String, SettledBody)> = Vec::new();
+        for batch in ["a", "b"] {
+            for i in 0..17 {
+                let rid = format!("{batch}{i}");
+                buf.apply(&req(&rid, &format!("https://a/{rid}")), 0);
+                buf.apply(
+                    &json!({ "method": "Network.responseReceived", "sessionId": SESS,
+                        "params": { "requestId": rid.clone(), "response": { "status": 200, "mimeType": "text/plain" } } }),
+                    0,
+                );
+                buf.apply(
+                    &json!({ "method": "Network.loadingFinished", "sessionId": SESS,
+                        "params": { "requestId": rid.clone(), "timestamp": 1.0 } }),
+                    0,
+                );
+                // 锁外计算（每条恰 256KiB，不触发单条截断）
+                let settled = settle_body(
+                    Some("text/plain"),
+                    BodyPayload::Raw {
+                        body: "x".repeat(BODY_ITEM_MAX_BYTES),
+                        base64_encoded: false,
+                    },
+                );
+                if batch == "a" {
+                    buf.store_body(&rid, settled); // A 批：即算即提交
+                } else {
+                    stashed_b.push((rid, settled)); // B 批：全部算完后才提交
+                }
+            }
+        }
+        for (rid, settled) in stashed_b {
+            buf.store_body(&rid, settled);
+        }
+        let es = buf.network_entries(false, None, 100).entries;
+        assert_eq!(es.len(), 34, "元数据永不驱逐");
+        // 34 × 256KiB = 8.5MiB > 8MiB → 驱逐最旧 2 条（a0/a1），与提交序无关
+        assert_eq!(es[0].body_state, BodyState::Evicted, "最旧 a0 被预算驱逐");
+        assert_eq!(es[1].body_state, BodyState::Evicted, "次旧 a1 被预算驱逐");
+        assert!(es[2..].iter().all(|e| e.body_state == BodyState::Available));
+        let kept: usize = es
+            .iter()
+            .map(|e| e.body.as_ref().map_or(0, |b| b.len()))
+            .sum();
+        assert!(kept <= BODY_TOTAL_MAX_BYTES, "账本收敛 ≤ 8MiB: {kept}");
     }
 
     /// body 分页读：UTF-16 code unit 计量、代理对不劈、出界与 limit=0、
@@ -1390,7 +1721,14 @@ mod tests {
             0,
         );
         // 4 字符：A(1u) 𝕏(2u 代理对) B(1u) C(1u) → total 5 units
-        buf.store_body("r1", BodyPayload::Raw { body: "A𝕏BC".into(), base64_encoded: false });
+        settle_and_store(
+            &mut buf,
+            "r1",
+            BodyPayload::Raw {
+                body: "A𝕏BC".into(),
+                base64_encoded: false,
+            },
+        );
 
         let v = buf.network_body("r1", 0, 5).unwrap();
         assert_eq!((v.slice.returned, v.slice.total), (5, 5));
@@ -1431,10 +1769,20 @@ mod tests {
                 0,
             );
         }
-        buf.store_body("r1", BodyPayload::Raw { body: "{\"msg\":\"中文\"}".into(), base64_encoded: false });
-        let har = buf.to_har("0.6.0");
+        settle_and_store(
+            &mut buf,
+            "r1",
+            BodyPayload::Raw {
+                body: "{\"msg\":\"中文\"}".into(),
+                base64_encoded: false,
+            },
+        );
+        let har = build_har(&buf.har_snapshot(), "0.6.0");
         let e0 = &har["log"]["entries"][0];
-        assert_eq!(e0["response"]["content"]["encoding"], "base64", "非 ASCII → base64");
+        assert_eq!(
+            e0["response"]["content"]["encoding"], "base64",
+            "非 ASCII → base64"
+        );
         let decoded = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             e0["response"]["content"]["text"].as_str().unwrap(),
@@ -1443,6 +1791,9 @@ mod tests {
         assert_eq!(String::from_utf8(decoded).unwrap(), "{\"msg\":\"中文\"}");
         assert_eq!(e0["response"]["content"]["size"], 16); // {"msg":"中文"} 字节数（中文各 3B）
         let e1 = &har["log"]["entries"][1];
-        assert!(e1["response"]["content"].get("text").is_none(), "不可用条目无 text");
+        assert!(
+            e1["response"]["content"].get("text").is_none(),
+            "不可用条目无 text"
+        );
     }
 }
