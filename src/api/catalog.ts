@@ -46,6 +46,19 @@ export const API_CATALOG: CatalogGroup[] = [
         body: '{ "name": "checkout-e2e" }',
         note: 'body 可选：无 body / name=null = 不命名；name 1-64 字符、非纯空白，同环境内唯一，重名 → 409 INSTANCE_NAME_CONFLICT',
       },
+      {
+        method: 'GET',
+        path: '/environments/:id/instances',
+        desc: '该环境的实例列表（含运行摘要）',
+        note: '与 GET /instances（全量平铺）相对；环境视角列表页用',
+      },
+      {
+        method: 'POST',
+        path: '/environments/:id/open',
+        desc: '快捷创建实例（create 的别名端点）',
+        body: '{ "name": "checkout-e2e" }',
+        note: '⚠ 历史端点：语义是「创建并启动新实例」，不是「打开某 URL」；body 同 create（可选 name）',
+      },
       { method: 'POST', path: '/environments/:id/stop-all', desc: '停止该环境全部实例' },
       {
         method: 'GET',
@@ -60,6 +73,12 @@ export const API_CATALOG: CatalogGroup[] = [
         note: 'body 可选；fromInstanceId 从指定已停止实例捕获（实例即登录源，推荐路径）',
       },
       { method: 'POST', path: '/environments/:id/login-profile/reset', desc: '重置快照' },
+      {
+        method: 'GET',
+        path: '/login-profiles',
+        desc: '全部登录态快照列表（含环境名）',
+        note: '跨环境汇总视图（供列表页）；单环境视图用 GET /environments/:id/login-profile',
+      },
       {
         method: 'GET',
         path: '/environments/:id/session',
@@ -78,6 +97,12 @@ export const API_CATALOG: CatalogGroup[] = [
   {
     group: 'Instances',
     items: [
+      {
+        method: 'GET',
+        path: '/instances',
+        desc: '全量实例列表（跨环境平铺）',
+        note: 'Instance 平铺 + environmentName；环境视角用 GET /environments/:id/instances',
+      },
       { method: 'GET', path: '/instances/:id', desc: '实例详情' },
       { method: 'DELETE', path: '/instances/:id', desc: '删除实例（运行中 → 409）' },
       { method: 'GET', path: '/instances/:id/status', desc: '状态摘要' },
@@ -86,6 +111,12 @@ export const API_CATALOG: CatalogGroup[] = [
       { method: 'POST', path: '/instances/:id/restart', desc: '重启（stop + start）' },
       { method: 'POST', path: '/instances/:id/focus', desc: '唤出窗口' },
       { method: 'GET', path: '/instances/:id/cdp', desc: 'CDP endpoint（含 WebSocket URL）' },
+      {
+        method: 'POST',
+        path: '/instances/:id/cdp/sessions',
+        desc: '发放 CDP 会话（远程/代理访问用，201）',
+        note: '返回 { sessionId, baseUrl, expiresAt }，30 分钟有效；实例须运行中（否则 409）；经 17891 隧道访问需 Bearer token',
+      },
       {
         method: 'GET',
         path: '/instances/:id/tabs',
@@ -245,6 +276,9 @@ export const API_CATALOG: CatalogGroup[] = [
         desc: '重载当前页（ignoreCache 跳过缓存）',
         body: '{ "ignoreCache": true, "tab": null }',
         note: '等待语义同 page/navigate（等 load 至多 25s，未证实 → loaded:false）',
+      },
+      {
+        method: 'POST',
         path: '/instances/:id/page/screenshot',
         desc: '元素/视口 png 截图：target = @eN 或 CSS 选择器（缺省 = 当前视口）；返回 base64 png',
         body: '{ "target": "@e1", "tab": null }',
@@ -263,6 +297,23 @@ export const API_CATALOG: CatalogGroup[] = [
         desc: '设备仿真：preset（iphone-14 等 6 款，自带真实 UA）或 viewport+可选 userAgent/mobile/touch；off=true 恢复',
         body: '{ "preset": "iphone-14", "tab": null }',
         note: '仅作用该 tab 的 page session；重复 emulate = 覆盖；未知预设 → 422 PAGE_EMULATE_UNKNOWN_PRESET',
+      },
+    ],
+  },
+  {
+    group: 'Remote Access（远程接入）',
+    items: [
+      {
+        method: 'GET',
+        path: '/remote-access/status',
+        desc: '隧道实时状态',
+        note: '{ enabled, target, state: disabled/connecting/connected/reconnecting, lastError, since, pid, restarts }',
+      },
+      {
+        method: 'POST',
+        path: '/remote-access/token',
+        desc: '轮换访问令牌',
+        note: '旧令牌立即失效，同时清空全部活跃 CDP 会话；返回 { token }（settings 中 remoteAccessToken 只读呈现）',
       },
     ],
   },

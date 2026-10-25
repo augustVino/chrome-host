@@ -12,7 +12,8 @@
     "tauri": "tauri",
     "docs:dev": "node scripts/sync-docs.mjs && vitepress dev docs",
     "docs:build": "node scripts/sync-docs.mjs && vitepress build docs",
-    "docs:preview": "vitepress preview docs"
+    "docs:preview": "vitepress preview docs",
+    "check:api": "node scripts/check-api-catalog.mjs"
   },
   "dependencies": {
     "@fontsource-variable/jetbrains-mono": "^5.3.0",
