@@ -368,6 +368,25 @@ kbd {
     padding: 0 8px;
     font-size: 10.5px;
     color: rgb(var(--ink-3));
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .side-foot-gh {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px;
+    border: 0;
+    background: none;
+    color: rgb(var(--ink-3));
+    cursor: pointer;
+    border-radius: 6px;
+    transition: color 0.15s ease, background 0.15s ease;
+  }
+  .side-foot-gh:hover {
+    color: rgb(var(--ink));
+    background: rgb(var(--brand) / 0.1);
   }
 
   /* ───────── 内容区 / 页头 ───────── */

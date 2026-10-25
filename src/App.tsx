@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as RPointerEvent } from 'react';
 import { HashRouter, NavLink, Route, Routes, useLocation } from 'react-router-dom';
 import { getVersion } from '@tauri-apps/api/app';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { useStore } from './store';
 import { startFeed } from './feed';
 import { ConfirmDialog } from './components/confirm';
@@ -107,7 +108,18 @@ function Sidebar() {
       </nav>
       <div className="side-bottom">
         <SideHello />
-        <div className="side-foot mono">{version ? `v${version}` : ''}</div>
+        <div className="side-foot mono">
+          <span>{version ? `v${version}` : ''}</span>
+          <button
+            type="button"
+            className="side-foot-gh"
+            title="GitHub 仓库"
+            aria-label="GitHub 仓库"
+            onClick={() => void openUrl('https://github.com/augustVino/chrome-host')}
+          >
+            <Icon name="github" width={13} height={13} />
+          </button>
+        </div>
       </div>
     </aside>
   );
