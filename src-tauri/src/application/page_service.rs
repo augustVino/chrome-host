@@ -987,6 +987,12 @@ async fn handle_event(watched: &Watched, event: &Value) {
                     .is_some_and(|p| !p.is_empty());
                 if !child_frame {
                     invalidate_refs(watched, &tid, "navigation");
+                    // 换文档 = 旧表全部失效：Chrome 在文档销毁时不保证逐张发
+                    // styleSheetRemoved（真机实测：导航后登记表残留死表，
+                    // getStyleSheetText 报 No style sheet with given id found →
+                    // hoverScan 恒 truncated）。新文档的表由 styleSheetAdded
+                    // 重新登记（CSS 域 session 级持续有效，不依赖 Removed 语义）。
+                    watched.sheets.lock().unwrap().remove(&tid);
                 }
             }
         }
@@ -4638,6 +4644,83 @@ mod tests {
         assert_eq!(resp["hoverScan"], json!("error"));
         let text = resp["text"].as_str().unwrap();
         assert!(text.contains("@e1 [button] Menu") && !text.contains("[hover"), "{text}");
+    }
+
+    /// 根 frame 导航 = 换文档：登记表整清（Chrome 不保证逐张 Removed，死表
+    /// 残留会让 getStyleSheetText 恒 Err → 假 truncated，真机实测 total=4
+    /// texts=1）；子 frame 导航不清。新表由 styleSheetAdded 重新登记后 snap 恢复 ok。
+    #[tokio::test]
+    async fn navigation_clears_sheet_registry_root_frame_only() {
+        let (svc, watched, _calls, script) = armed();
+        // 预置 ref 表（invalidate_refs 只对已存在的 store 起效，与 sheets
+        // 清理同一事件分支触发——钉住两条链路不回归）
+        watched
+            .refs
+            .lock()
+            .unwrap()
+            .entry("T1".into())
+            .or_default()
+            .replace(&json!([{ "ref": "e1", "backendNodeId": 1 }]));
+        handle_event(&watched, &sheet_added_event("S1", "a-1", "regular", false)).await;
+        handle_event(&watched, &sheet_added_event("S1", "a-2", "regular", false)).await;
+        assert_eq!(watched.sheets.lock().unwrap()["T1"].len(), 2);
+
+        // 子 frame 导航：不清（子 frame 不换主文档）
+        handle_event(
+            &watched,
+            &json!({
+                "method": "Page.frameNavigated", "sessionId": "S1",
+                "params": { "frame": { "id": "f1", "parentId": "root" } }
+            }),
+        )
+        .await;
+        assert_eq!(watched.sheets.lock().unwrap()["T1"].len(), 2, "子 frame 导航不清登记");
+
+        // 根 frame 导航：整清
+        handle_event(
+            &watched,
+            &json!({
+                "method": "Page.frameNavigated", "sessionId": "S1",
+                "params": { "frame": { "id": "root" } }
+            }),
+        )
+        .await;
+        assert!(watched.sheets.lock().unwrap().get("T1").is_none(), "根 frame 导航整清登记");
+        // refs 失效链路与 sheets 清理同一事件分支触发（既有语义不回归；
+        // 须在 snap 前断言——snap 的 replace 会清 stale 与 reason）
+        assert_eq!(
+            watched.refs.lock().unwrap().get("T1").unwrap().last_invalid_reason(),
+            Some("navigation")
+        );
+
+        // 新文档的表重新登记 → snap ok（死表已不存在，无 Err 无假 truncated）
+        handle_event(&watched, &sheet_added_event("S1", "b-1", "regular", false)).await;
+        given(
+            &script,
+            "CSS.getStyleSheetText",
+            vec![Ok(json!({ "text": ".btn:hover { color: red; }" }))],
+        );
+        given(
+            &script,
+            "Accessibility.getFullAXTree",
+            vec![Ok(json!({ "nodes": [
+                { "nodeId": "1", "role": { "value": "button" }, "name": { "value": "B" }, "backendDOMNodeId": 9 },
+            ]}))],
+        );
+        given(&script, "DOM.getDocument", vec![Ok(json!({ "root": { "nodeId": 1 } }))]);
+        given(
+            &script,
+            "DOM.querySelectorAll",
+            vec![Ok(json!({ "nodeIds": [3] }))],
+        );
+        given(
+            &script,
+            "DOM.pushNodesByBackendIdsToFrontend",
+            vec![Ok(json!({ "nodeIds": [3] }))],
+        );
+        let resp = svc.snap(INS, "T1").await.unwrap();
+        assert_eq!(resp["hoverScan"], json!("ok"));
+        assert!(resp["text"].as_str().unwrap().contains("[hover]"));
     }
 
     /// styleSheetAdded/Removed 事件维护登记表；drop_tab 随 per-tab 状态清理。
