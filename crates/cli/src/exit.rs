@@ -295,6 +295,11 @@ mod tests {
                 api(422, "PAGE_TARGET_NOT_FILLABLE"),
                 ExitCode::VALIDATION,
             ),
+            (
+                "422 PAGE_EMULATE_UNKNOWN_PRESET（未知仿真预设）",
+                api(422, "PAGE_EMULATE_UNKNOWN_PRESET"),
+                ExitCode::VALIDATION,
+            ),
             // —— page 控制族：5xx 运行时码表（非 GENERAL 兑底）——
             (
                 "500 PAGE_DISPATCH_FAILED（Input 派发失败，附 effect_state）",

@@ -241,6 +241,19 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/type",
             post(crate::api::pages::r#type),
         )
+        // page 控制命令族（W-cap）：元素截图 / PDF / 设备仿真——仍为薄透传
+        .route(
+            "/api/v1/instances/{id}/page/screenshot",
+            post(crate::api::pages::screenshot),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/pdf",
+            post(crate::api::pages::pdf),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/emulate",
+            post(crate::api::pages::emulate),
+        )
         .route(
             "/api/v1/login-profiles",
             get(crate::api::login_profiles::list),

@@ -381,6 +381,71 @@ pub fn largest_quad_centroid(quads: &[Vec<f64>]) -> Option<Point> {
 }
 
 // ============================================================================
+// 3b. 元素截图几何（W-cap：clip 是区域不是点，与点击几何并列）
+// ============================================================================
+
+/// 视口 CSS 像素矩形（Page.captureScreenshot 的 clip 源）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// 全部有效 quad 的联合包围盒（getBoundingClientRect 语义）。与
+/// [`largest_quad_centroid`] 取「最大 quad」不同：截图 clip 要覆盖元素**全部**
+/// 可见部分——跨行 inline 元素有多个 quad，点击点必须落在实体上（取最大），
+/// 而 clip 取并集才不截丢内容。零面积包围盒视为无几何（None，走 rect 回退），
+/// 与点击链对退化元素的处理一致。
+pub fn quads_bbox(quads: &[Vec<f64>]) -> Option<Rect> {
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for q in quads {
+        if q.len() != 8 || q.iter().any(|n| !n.is_finite()) {
+            continue;
+        }
+        for i in 0..4 {
+            let (x, y) = (q[i * 2], q[i * 2 + 1]);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    if !min_x.is_finite() || !min_y.is_finite() {
+        return None;
+    }
+    let (width, height) = (max_x - min_x, max_y - min_y);
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    Some(Rect {
+        x: min_x,
+        y: min_y,
+        width,
+        height,
+    })
+}
+
+/// bbox → 整数化 clip：外扩取整（floor 左上 / ceil 右下）保证完全覆盖元素，
+/// 最小 1×1。CDP clip 接受浮点，但亚像素 clip 在缩放链路上产生边缘半截像素；
+/// Playwright 同样取整。宽度/高度不允许为 0（空 clip 会报错，不如给 1px
+/// 让元素「不可截图」的语义由定位链错误负责）。
+pub fn rounded_clip(r: &Rect) -> Rect {
+    let x = r.x.floor();
+    let y = r.y.floor();
+    let width = ((r.x + r.width).ceil() - x).max(1.0);
+    let height = ((r.y + r.height).ceil() - y).max(1.0);
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+// ============================================================================
 // 4. press 键系统（TS lib/tools/press.mjs + tests/press.test.mjs，SPEC §4.2）
 // ============================================================================
 
@@ -1174,6 +1239,53 @@ mod tests {
             largest_quad_centroid(&quads),
             Some(Point { x: 5.0, y: 5.0 })
         );
+    }
+
+    /// quads_bbox 取全部 quad 的并集（与点击取最大 quad 的差异是刻意的）：
+    /// 跨行 inline 元素两个 quad，clip 必须覆盖两行——取最大 quad 会截丢另一行。
+    #[test]
+    fn quads_bbox_unions_all_valid_quads() {
+        let quads = vec![
+            vec![10.0, 20.0, 110.0, 20.0, 110.0, 70.0, 10.0, 70.0],   // 第一行
+            vec![10.0, 90.0, 60.0, 90.0, 60.0, 140.0, 10.0, 140.0],  // 第二行
+        ];
+        assert_eq!(
+            quads_bbox(&quads),
+            Some(Rect { x: 10.0, y: 20.0, width: 100.0, height: 120.0 })
+        );
+        // 非法 quad（长度 ≠ 8 / 非有限数）不参与并集
+        let junk = vec![
+            vec![0.0, 0.0, 5.0],                                   // 长度 ≠ 8
+            vec![f64::NAN, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0],  // 非有限数
+            vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0],       // 唯一合法
+        ];
+        assert_eq!(
+            quads_bbox(&junk),
+            Some(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 })
+        );
+    }
+
+    /// 全退化（空表 / 零面积包围盒）→ None：元素无可截图几何，由调用方走
+    /// rect 回退链或报 PAGE_TARGET_MOVED（与点击链同语义）。
+    #[test]
+    fn quads_bbox_none_for_empty_or_degenerate() {
+        assert_eq!(quads_bbox(&[]), None);
+        let zero_width = vec![vec![5.0, 5.0, 5.0, 5.0, 5.0, 25.0, 5.0, 25.0]];
+        assert_eq!(quads_bbox(&zero_width), None, "零宽包围盒 = 无几何");
+    }
+
+    /// rounded_clip 外扩取整：floor 左上 / ceil 右下保证覆盖，最小 1×1。
+    /// 亚像素元素（如 10.2..110.8）整数化后不丢边缘。
+    #[test]
+    fn rounded_clip_expands_outward_to_integers() {
+        let sub_pixel = Rect { x: 10.2, y: 20.7, width: 100.6, height: 50.1 };
+        assert_eq!(
+            rounded_clip(&sub_pixel),
+            Rect { x: 10.0, y: 20.0, width: 101.0, height: 51.0 }
+        );
+        // 已是整数的矩形不动（ceil-floor 恰好还原）
+        let exact = Rect { x: 10.0, y: 20.0, width: 100.0, height: 50.0 };
+        assert_eq!(rounded_clip(&exact), exact);
     }
 
     /// TS largestQuadCentroid 的 continue 守卫：长度 ≠ 8 / 非有限数跳过

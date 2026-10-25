@@ -1,5 +1,6 @@
-//! page 命令组 —— 页面控制（P2-C/P2-G）：snap / click / fill / press / wait /
-//! dialogs / eval / html / clickxy / loadall / type。
+//! page 命令组 —— 页面控制（P2-C/P2-G/W-cap）：snap / click / fill / press /
+//! wait / dialogs / eval / html / clickxy / loadall / type / screenshot / pdf /
+//! emulate。
 //!
 //! 行为语义全部在服务层 page_service（P2-B）：本组只做参数透传 + 渲染。
 //! 核心循环（对齐 SKILL.md 教学）：`snap` 拿 @eN 引用 → `click`/`fill`/
@@ -14,6 +15,8 @@
 //! - html：主产物在 `html` 字段（可能很大），text/quiet 原样到 stdout（与
 //!   cdp.mjs 一致，不加元信息——dialogs_seen 只在 --json 里可见）；
 //! - dialogs：SEQ TYPE MESSAGE 表 + cursor 行（增量拉取的 --since 值）；
+//! - screenshot/pdf：解码 base64 落盘（--out，缺省 <实例id>.png/.pdf），quiet
+//!   输出路径（与 instance screenshot/har 同先例）；emulate：一行 result。
 //! - 三态：`--json` 响应原样透传（P2-F F3 修复：snap 与 result 型命令的
 //!   shell 此前缺 --json 分支，文本树直接打到 stdout，管道侧拿不到合法
 //!   JSON；分流收敛在 [`snap_out`]/[`result_out`] 纯函数）；`--quiet` 输出
@@ -211,6 +214,83 @@ pub enum PageCommands {
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
     },
+
+    /// 元素/视口 png 截图（W-cap）
+    #[command(
+        about = "png 截图：[sel|@eN] 缺省 = 当前视口；--out 写文件（缺省 <实例id>.png），quiet 输出路径"
+    )]
+    Screenshot {
+        /// 实例 id
+        id: String,
+        /// 截图目标：@eN 引用（上次 snap 产生）或 CSS 选择器；缺省 = 当前视口整幅
+        target: Option<String>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+        /// 输出文件路径
+        #[arg(long = "out")]
+        out: Option<String>,
+    },
+
+    /// 整页 PDF（W-cap）
+    #[command(
+        about = "整页 PDF：--out 写文件（缺省 <实例id>.pdf）；--landscape 横向；--no-print-background 去背景；--paper-width/--paper-height 英寸（缺省 Letter 8.5×11）"
+    )]
+    Pdf {
+        /// 实例 id
+        id: String,
+        /// 横向打印（缺省纵向）
+        #[arg(long)]
+        landscape: bool,
+        /// 不打印背景色/背景图（缺省打印）
+        #[arg(long = "no-print-background")]
+        no_print_background: bool,
+        /// 纸宽（英寸；缺省 8.5）
+        #[arg(long)]
+        paper_width: Option<f64>,
+        /// 纸高（英寸；缺省 11）
+        #[arg(long)]
+        paper_height: Option<f64>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+        /// 输出文件路径
+        #[arg(long = "out")]
+        out: Option<String>,
+    },
+
+    /// 设备仿真（W-cap）
+    #[command(
+        about = "设备仿真：--preset 预设（iphone-14 等）| --viewport WxH [--user-agent UA] [--mobile] [--touch] | --off 恢复；仅作用该 tab"
+    )]
+    Emulate {
+        /// 实例 id
+        id: String,
+        /// 预设名：iphone-14 / iphone-se / pixel-7 / galaxy-s23 / ipad-air / desktop-1080p
+        #[arg(
+            long,
+            conflicts_with_all = ["viewport", "user_agent", "mobile", "touch", "off"]
+        )]
+        preset: Option<String>,
+        /// 自定义视口，如 390x844（CSS 像素）
+        #[arg(long, value_name = "WxH", conflicts_with_all = ["off"])]
+        viewport: Option<String>,
+        /// 覆盖 UA（仅 viewport 形态）
+        #[arg(long)]
+        user_agent: Option<String>,
+        /// mobile 语义（viewport 形态缺省关闭）
+        #[arg(long)]
+        mobile: bool,
+        /// 触摸仿真（viewport 形态缺省关闭）
+        #[arg(long)]
+        touch: bool,
+        /// 清除全部仿真（viewport / UA / touch）
+        #[arg(long)]
+        off: bool,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
 }
 
 /// page 组分发入口（main.rs dispatch 的唯一调用点）。
@@ -292,6 +372,52 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             tab.as_deref(),
         ),
         PageCommands::Type { id, text, tab } => r#type(globals, client, id, text, tab.as_deref()),
+        PageCommands::Screenshot {
+            id,
+            target,
+            tab,
+            out,
+        } => screenshot(globals, client, id, target.as_deref(), tab.as_deref(), out.as_deref()),
+        PageCommands::Pdf {
+            id,
+            landscape,
+            no_print_background,
+            paper_width,
+            paper_height,
+            tab,
+            out,
+        } => pdf(
+            globals,
+            client,
+            id,
+            *landscape,
+            !*no_print_background,
+            *paper_width,
+            *paper_height,
+            tab.as_deref(),
+            out.as_deref(),
+        ),
+        PageCommands::Emulate {
+            id,
+            preset,
+            viewport,
+            user_agent,
+            mobile,
+            touch,
+            off,
+            tab,
+        } => emulate(
+            globals,
+            client,
+            id,
+            preset.as_deref(),
+            viewport.as_deref(),
+            user_agent.as_deref(),
+            *mobile,
+            *touch,
+            *off,
+            tab.as_deref(),
+        ),
     }
 }
 
@@ -462,6 +588,156 @@ fn r#type(
     let resp = client.page_type(id, text, tab)?;
     render_result(&OutputCtx::from(globals), &resp);
     Ok(())
+}
+
+/// `page screenshot <ID> [sel|@eN] [--tab T] [--out F]`：解码 base64 写 png
+/// （与 instance screenshot 同模式：缺省 <实例id>.png，quiet 输出路径，json
+/// 模式响应原样不落盘）。魔数校验失败显式报错，不写坏文件。
+fn screenshot(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: Option<&str>,
+    tab: Option<&str>,
+    out_path: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.page_screenshot(id, target, tab)?;
+    let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    let bytes = decode_base64(data, PNG_MAGIC, "截图")?;
+    if !out.json {
+        let path = out_path
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{id}.png"));
+        std::fs::write(&path, &bytes)
+            .map_err(|e| CliError::Local(format!("写截图文件失败 {path}: {e}")))?;
+        if out.quiet {
+            out.print_id(&path);
+        } else {
+            out.render_kv(
+                &[
+                    ("file".into(), path.clone()),
+                    ("bytes".into(), bytes.len().to_string()),
+                ],
+                serde_json::json!({ "file": path, "bytes": bytes.len(), "format": "png" }),
+            );
+        }
+    } else {
+        out.render_kv(&[], resp);
+    }
+    Ok(())
+}
+
+/// `page pdf <ID> [--tab T] [--out F] [--landscape] [--no-print-background]
+/// [--paper-width W] [--paper-height H]`：解码 base64 写 pdf（缺省
+/// <实例id>.pdf）。--landscape / --no-print-background 为开关形态，发送前
+/// 归一为服务端语义（缺省纵向 + 打印背景）。
+fn pdf(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    landscape: bool,
+    print_background: bool,
+    paper_width: Option<f64>,
+    paper_height: Option<f64>,
+    tab: Option<&str>,
+    out_path: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.page_pdf(id, tab, landscape, print_background, paper_width, paper_height)?;
+    let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    let bytes = decode_base64(data, PDF_MAGIC, "PDF")?;
+    if !out.json {
+        let path = out_path
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{id}.pdf"));
+        std::fs::write(&path, &bytes)
+            .map_err(|e| CliError::Local(format!("写 PDF 文件失败 {path}: {e}")))?;
+        if out.quiet {
+            out.print_id(&path);
+        } else {
+            out.render_kv(
+                &[
+                    ("file".into(), path.clone()),
+                    ("bytes".into(), bytes.len().to_string()),
+                ],
+                serde_json::json!({ "file": path, "bytes": bytes.len(), "format": "pdf" }),
+            );
+        }
+    } else {
+        out.render_kv(&[], resp);
+    }
+    Ok(())
+}
+
+/// `page emulate <ID> (--preset P | --viewport WxH [--user-agent UA] [--mobile]
+/// [--touch] | --off) [--tab T]`：三形态互斥在 clap 层拦（preset 冲突
+/// viewport/UA/mobile/touch/off；viewport 冲突 off），服务端仍独立校验。
+/// 开关型 flag（mobile/touch）只在置位时随 body 发送，未置位走服务端缺省
+/// （viewport 形态两者缺省 false）。
+fn emulate(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    preset: Option<&str>,
+    viewport: Option<&str>,
+    user_agent: Option<&str>,
+    mobile: bool,
+    touch: bool,
+    off: bool,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let body = if off {
+        serde_json::json!({ "off": true, "tab": tab })
+    } else if let Some(p) = preset {
+        serde_json::json!({ "preset": p, "tab": tab })
+    } else {
+        let Some(v) = viewport else {
+            return Err(CliError::Local(
+                "需要 --preset、--viewport WxH 或 --off 之一（clap 冲突检查应已拦住此路径）".into(),
+            ));
+        };
+        let (w, h) = parse_viewport(v)?;
+        serde_json::json!({
+            "viewport": { "width": w, "height": h },
+            "userAgent": user_agent,
+            "mobile": mobile.then_some(true),
+            "touch": touch.then_some(true),
+            "tab": tab,
+        })
+    };
+    let resp = client.page_emulate(id, body)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// "390x844"（x/X 均可）→ (390, 844)；格式/正整数校验本地拦（exit 2）。
+fn parse_viewport(s: &str) -> Result<(i64, i64), CliError> {
+    let bad = || CliError::Local(format!("--viewport 格式为 WxH（如 390x844），got \"{s}\""));
+    let (w, h) = s.split_once(['x', 'X']).ok_or_else(bad)?;
+    let w: i64 = w.parse().map_err(|_| bad())?;
+    let h: i64 = h.parse().map_err(|_| bad())?;
+    if w <= 0 || h <= 0 {
+        return Err(bad());
+    }
+    Ok((w, h))
+}
+
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+const PDF_MAGIC: &[u8] = b"%PDF-";
+
+/// base64 解码 + 魔数校验（png/pdf 共用）：数据非预期格式显式报协议错
+/// （exit 1），不静默写坏文件。与 instance.rs 的 decode_base64_png 同策略，
+/// 因 pdf 需不同魔数在此参数化（不顺手重构 instance 侧）。
+fn decode_base64(data: &str, magic: &[u8], label: &str) -> Result<Vec<u8>, CliError> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| CliError::Local(format!("{label} base64 解码失败: {e}")))?;
+    if !bytes.starts_with(magic) {
+        return Err(CliError::Protocol(format!("{label} 数据格式不符（魔数校验失败）")));
+    }
+    Ok(bytes)
 }
 
 /// `page dialogs <ID> [--tab T] [--since N]`：SEQ TYPE MESSAGE 表；
@@ -906,5 +1182,31 @@ mod tests {
             PageOut::Text(t) => assert_eq!(t, ""),
             other => panic!("缺字段防御路径: {other:?}"),
         }
+    }
+
+    /// --viewport 解析：x/X 分隔均可；非 WxH / 非正整数 → 本地参数错（exit 2）
+    /// 而非等服务端 400——格式错误在 CLI 层就拦住。
+    #[test]
+    fn parse_viewport_accepts_wxh_forms() {
+        assert_eq!(parse_viewport("390x844").unwrap(), (390, 844));
+        assert_eq!(parse_viewport("1920X1080").unwrap(), (1920, 1080));
+        for bad in ["390", "ax844", "390x", "0x844", "390x-1", "390*844"] {
+            assert!(parse_viewport(bad).is_err(), "应拒绝 {bad}");
+        }
+    }
+
+    /// base64 + 魔数校验：合法 png/pdf 通过；魔数不符 → 协议错（exit 1，
+    /// 不写坏文件）；非法 base64 → 本地错。魔数区分是 pdf 与 png 共用一条
+    /// 解码路径的全部差异。
+    #[test]
+    fn decode_base64_checks_magic_per_format() {
+        use base64::Engine;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let png = decode_base64(&b64(PNG_MAGIC), PNG_MAGIC, "截图").unwrap();
+        assert_eq!(png, PNG_MAGIC);
+        let pdf = decode_base64(&b64(b"%PDF-1.7 rest"), PDF_MAGIC, "PDF").unwrap();
+        assert!(pdf.starts_with(b"%PDF-1.7"));
+        assert!(decode_base64(&b64(b"%PDF-not-png"), PNG_MAGIC, "截图").is_err());
+        assert!(decode_base64("!!not-base64!!", PNG_MAGIC, "截图").is_err());
     }
 }

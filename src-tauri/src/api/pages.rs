@@ -1,4 +1,4 @@
-//! page 控制端点（P2-C）：`/api/v1/instances/{id}/page/*`。
+//! page 控制端点（P2-C + W-cap）：`/api/v1/instances/{id}/page/*`。
 //!
 //! handler 只做参数解包与透传——tab 路由（targetId / 唯一前缀）、错误分类、
 //! 对话框游标、超时预算全部在 [`crate::application::page_service::PageService`]
@@ -116,6 +116,59 @@ pub struct LoadallBody {
 pub struct TypeBody {
     /// 非空文本（空串 → 400）
     pub text: String,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/screenshot —— 元素/视口 png 截图（W-cap）。
+#[derive(Deserialize)]
+pub struct ScreenshotBody {
+    /// 截图目标：@eN ref（上次 snap 产生）或 CSS 选择器；缺省 = 当前视口整幅。
+    /// 元素路径与 click 同定位链（scrollIntoView + quads），clip 取联合包围盒
+    pub target: Option<String>,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/pdf —— 整页 PDF（W-cap）。
+/// 蛇形纸张参数（paperWidth/paperHeight 英寸），缺省 Letter 8.5×11。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfBody {
+    pub tab: Option<String>,
+    /// 横向打印；缺省 false
+    pub landscape: Option<bool>,
+    /// 打印背景；缺省 true
+    pub print_background: Option<bool>,
+    /// 纸宽英寸；缺省 8.5
+    pub paper_width: Option<f64>,
+    /// 纸高英寸；缺省 11
+    pub paper_height: Option<f64>,
+}
+
+/// POST /api/v1/instances/{id}/page/emulate 的 viewport 子对象。
+#[derive(Deserialize)]
+pub struct ViewportBody {
+    /// 视口宽（CSS 像素，正整数）
+    pub width: i64,
+    /// 视口高（CSS 像素，正整数）
+    pub height: i64,
+}
+
+/// POST /api/v1/instances/{id}/page/emulate —— 设备仿真（W-cap）。
+/// 三形态互斥：preset（预设名，未知 → 422 PAGE_EMULATE_UNKNOWN_PRESET）/
+/// viewport+可选 userAgent/mobile/touch / off=true 清除。仿真只作用于
+/// 指定 tab 的 page session（与实例级无关）；重复 emulate = 覆盖。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmulateBody {
+    pub preset: Option<String>,
+    pub viewport: Option<ViewportBody>,
+    pub user_agent: Option<String>,
+    /// 自定义视口缺省 false（预设形态自带表值）
+    pub mobile: Option<bool>,
+    pub touch: Option<bool>,
+    /// true = 清除全部仿真（viewport / UA / touch）
+    #[serde(default)]
+    pub off: bool,
     pub tab: Option<String>,
 }
 
@@ -306,6 +359,62 @@ pub async fn r#type(
     let resp = state
         .page
         .r#type(&id, body.tab.as_deref().unwrap_or(""), &body.text)
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn screenshot(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ScreenshotBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .screenshot(&id, body.tab.as_deref().unwrap_or(""), body.target.as_deref())
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn pdf(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<PdfBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .pdf(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            body.landscape,
+            body.print_background,
+            body.paper_width,
+            body.paper_height,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn emulate(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<EmulateBody>,
+) -> Result<Json<Value>, AppError> {
+    let req = crate::domain::emulate::EmulateRequest {
+        preset: body.preset,
+        viewport: body
+            .viewport
+            .map(|v| crate::domain::emulate::Viewport {
+                width: v.width,
+                height: v.height,
+            }),
+        user_agent: body.user_agent,
+        mobile: body.mobile,
+        touch: body.touch,
+        off: body.off,
+    };
+    let resp = state
+        .page
+        .emulate(&id, body.tab.as_deref().unwrap_or(""), req)
         .await?;
     Ok(Json(resp))
 }

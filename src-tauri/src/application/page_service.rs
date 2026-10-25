@@ -59,8 +59,8 @@ use crate::domain::instance::InstanceStatus;
 use crate::domain::page_control::{
     dialog_accept_params, fill_fillable_check_expr, hit_test_expr, largest_quad_centroid,
     locate_expr, normalize_ref, observed_matches_state, parse_dialog_opening, parse_duration,
-    parse_key, wait_observe_expr, DialogBuffer, DialogInfo, ObservedState, PageControlError, Point,
-    RefStore, WaitState,
+    parse_key, quads_bbox, rounded_clip, wait_observe_expr, DialogBuffer, DialogInfo, ObservedState,
+    PageControlError, Point, RefStore, WaitState,
 };
 use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::{connect_page, SharedPageConn};
@@ -600,6 +600,95 @@ impl PageService {
             ins_id,
             tab,
             |w, _tid, sid| async move { type_tool(&w, &sid, text).await },
+        )
+        .await
+    }
+
+    /// screenshot <tab> [--target]：元素级（@eN / CSS 选择器，复用定位链）或
+    /// 整视口 png 截图（W-cap）。target 缺省 = 当前视口；元素路径：
+    /// scrollIntoView best-effort → quads 联合 bbox → 回退 getBoundingClientRect
+    /// → Page.captureScreenshot { clip }（与 click 的几何链同源，clip 是区域
+    /// 取并集，点击是点取最大 quad）。
+    pub async fn screenshot(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        target: Option<&str>,
+    ) -> Result<Value, AppError> {
+        if target == Some("") {
+            return Err(AppError::invalid_request(
+                "target must be an @eN ref or CSS selector (omit it to capture the viewport)",
+            ));
+        }
+        self.command(
+            TOOL_TIMEOUT,
+            "screenshot",
+            ins_id,
+            tab,
+            |w, tid, sid| async move { screenshot_tool(&w, &tid, &sid, target).await },
+        )
+        .await
+    }
+
+    /// pdf <tab>：Page.printToPDF 整页 PDF（W-cap）。landscape 缺省 false、
+    /// printBackground 缺省 true、纸张缺省 Letter 8.5×11 英寸。前置
+    /// Page.enable 已由 on_attached 在 session 建立时统一补启（与对话框事件
+    /// 共用同一域启用集，无需命令内按需 enable——见任务报告决策 2）。
+    pub async fn pdf(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        landscape: Option<bool>,
+        print_background: Option<bool>,
+        paper_width: Option<f64>,
+        paper_height: Option<f64>,
+    ) -> Result<Value, AppError> {
+        for (label, v) in [("paperWidth", paper_width), ("paperHeight", paper_height)] {
+            if let Some(v) = v {
+                if !v.is_finite() || v <= 0.0 {
+                    return Err(AppError::invalid_request(format!(
+                        "pdf: {label} 必须为正数英寸（got {v}）"
+                    )));
+                }
+            }
+        }
+        self.command(
+            TOOL_TIMEOUT,
+            "pdf",
+            ins_id,
+            tab,
+            |w, _tid, sid| async move {
+                pdf_tool(
+                    &w,
+                    &sid,
+                    landscape.unwrap_or(false),
+                    print_background.unwrap_or(true),
+                    paper_width.unwrap_or(8.5),
+                    paper_height.unwrap_or(11.0),
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    /// emulate <tab>：设备仿真（W-cap）。preset / viewport / off 三形态，
+    /// 解析（含 422 未知预设）在 domain::emulate 完成——建连前即可拒绝。
+    /// 语义：同一 tab 重复 emulate = 覆盖（未给字段恢复默认，非合并）；
+    /// off 清全部；override 绑定 page session，连接重建/实例重启自然清除。
+    pub async fn emulate(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        req: crate::domain::emulate::EmulateRequest,
+    ) -> Result<Value, AppError> {
+        let action = crate::domain::emulate::resolve(&req)?;
+        self.command(
+            TOOL_TIMEOUT,
+            "emulate",
+            ins_id,
+            tab,
+            move |w, _tid, sid| async move { emulate_tool(&w, &sid, action).await },
         )
         .await
     }
@@ -2131,6 +2220,272 @@ async fn type_tool(watched: &Watched, sid: &str, text: &str) -> Result<Value, Ap
     Ok(json!({
         "result": format!("Typed {} characters", text.chars().count())
     }))
+}
+
+// ============================================================================
+// 6b. 截图 / PDF / 仿真（W-cap）
+// ============================================================================
+
+/// DOM 节点句柄：ref 路径拿到 backendNodeId，selector 路径（getDocument →
+/// querySelector）拿到 nodeId——scrollIntoViewIfNeeded / getContentQuads /
+/// resolveNode 三个命令同时接受两者，统一透传不换算。
+#[derive(Clone, Copy)]
+enum NodeHandle {
+    BackendNode(i64),
+    Node(i64),
+}
+
+impl NodeHandle {
+    /// CDP 参数键值对（json! 里展开：{ key: value }）
+    fn param(&self) -> (&'static str, i64) {
+        match self {
+            NodeHandle::BackendNode(id) => ("backendNodeId", *id),
+            NodeHandle::Node(id) => ("nodeId", *id),
+        }
+    }
+}
+
+/// 元素在视口中的可截图矩形：与 click 的 resolve_ref_point 同链（scroll
+/// best-effort → quads → rect 回退），差异仅在产出——点 → 联合包围盒，
+/// 且退化几何统一报 PAGE_TARGET_MOVED（与点击链同语义，不另造码）。
+async fn resolve_clip_rect(
+    conn: &SharedPageConn,
+    sid: &str,
+    handle: NodeHandle,
+) -> Result<crate::domain::page_control::Rect, AppError> {
+    let (key, id) = handle.param();
+    let _ = cdp_send(
+        conn,
+        "DOM.scrollIntoViewIfNeeded",
+        json!({ key: id }),
+        Some(sid),
+    )
+    .await;
+    if let Ok(resp) = cdp_send(
+        conn,
+        "DOM.getContentQuads",
+        json!({ key: id }),
+        Some(sid),
+    )
+    .await
+    {
+        let quads: Vec<Vec<f64>> = resp
+            .get("quads")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .flat_map(|q| {
+                        q.as_array()
+                            .map(|nums| nums.iter().filter_map(Value::as_f64).collect::<Vec<f64>>())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(r) = quads_bbox(&quads) {
+            return Ok(r);
+        }
+    }
+    // 回退：resolveNode → getBoundingClientRect（与 resolve_ref_point 同源）
+    let resp = cdp_send(conn, "DOM.resolveNode", json!({ key: id }), Some(sid)).await
+        .map_err(|e| PageControlError::target_moved(&e.to_string()))?;
+    let object_id = resp
+        .pointer("/object/objectId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| PageControlError::target_moved("no objectId"))?;
+    let resp = cdp_send(
+        conn,
+        "Runtime.callFunctionOn",
+        json!({ "objectId": object_id, "functionDeclaration": RECT_CENTER_FN, "returnByValue": true }),
+        Some(sid),
+    )
+    .await
+    .map_err(|e| PageControlError::target_moved(&e.to_string()))?;
+    let rect = resp.pointer("/result/value").cloned().unwrap_or(Value::Null);
+    let (x, y, w, h) = (
+        rect.get("x").and_then(Value::as_f64),
+        rect.get("y").and_then(Value::as_f64),
+        rect.get("w").and_then(Value::as_f64),
+        rect.get("h").and_then(Value::as_f64),
+    );
+    match (x, y, w, h) {
+        (Some(x), Some(y), Some(w), Some(h)) if w > 0.0 && h > 0.0 => {
+            Ok(crate::domain::page_control::Rect { x, y, width: w, height: h })
+        }
+        _ => Err(PageControlError::target_moved("empty rect").into()),
+    }
+}
+
+/// screenshot 工具：无 target = 整视口；有 target = ref / selector 定位链 →
+/// clip（整数化、scale 1）→ Page.captureScreenshot。响应与诊断面 screenshot
+/// 同形状（format/data），command() 补 instanceId/targetId。
+async fn screenshot_tool(
+    watched: &Watched,
+    tid: &str,
+    sid: &str,
+    target: Option<&str>,
+) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    let params = match target {
+        None => json!({ "format": "png" }),
+        Some(t) => {
+            let handle = if is_ref_target(t) {
+                let entry = resolve_ref_entry(watched, tid, t)?;
+                NodeHandle::BackendNode(entry.backend_node_id)
+            } else {
+                // selector 路径：与 fill 同链（getDocument → querySelector），
+                // nodeId 0 = 未命中（同码 PAGE_ELEMENT_NOT_FOUND）
+                let doc = cdp_send(&conn, "DOM.getDocument", json!({}), Some(sid)).await?;
+                let root = doc
+                    .pointer("/root/nodeId")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let q = cdp_send(
+                    &conn,
+                    "DOM.querySelector",
+                    json!({ "nodeId": root, "selector": t }),
+                    Some(sid),
+                )
+                .await?;
+                let node_id = q.get("nodeId").and_then(Value::as_i64).unwrap_or(0);
+                if node_id == 0 {
+                    return Err(PageControlError::element_not_found(t).into());
+                }
+                NodeHandle::Node(node_id)
+            };
+            let rect = resolve_clip_rect(&conn, sid, handle).await?;
+            let clip = rounded_clip(&rect);
+            json!({
+                "format": "png",
+                "clip": { "x": clip.x, "y": clip.y, "width": clip.width, "height": clip.height, "scale": 1 }
+            })
+        }
+    };
+    let resp = cdp_send(&conn, "Page.captureScreenshot", params, Some(sid)).await?;
+    let data = resp
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::internal("截图响应缺少 data 字段"))?
+        .to_string();
+    Ok(json!({ "format": "png", "data": data }))
+}
+
+/// pdf 工具：参数透传（默认值已在 service 入口归一）。缺 data = 显式报错，
+/// 不静默降级（如被 page preview 拦截等异常路径）。
+async fn pdf_tool(
+    watched: &Watched,
+    sid: &str,
+    landscape: bool,
+    print_background: bool,
+    paper_width: f64,
+    paper_height: f64,
+) -> Result<Value, AppError> {
+    let conn = require_conn(watched)?;
+    let resp = cdp_send(
+        &conn,
+        "Page.printToPDF",
+        json!({
+            "landscape": landscape,
+            "printBackground": print_background,
+            "paperWidth": paper_width,
+            "paperHeight": paper_height,
+        }),
+        Some(sid),
+    )
+    .await?;
+    let data = resp
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::internal("PDF 响应缺少 data 字段"))?
+        .to_string();
+    Ok(json!({ "format": "pdf", "data": data }))
+}
+
+/// emulate 工具：无条件发 set/clear（CDP 幂等），零状态实现覆盖语义——
+/// 应用时 UA 未给则清旧 override、touch 未给则关闭（未给 = 恢复默认，非
+/// 保持旧值）；off 清全部三域。仿真只作用于本 tab 的 page session
+///（CDP session 级），与实例级无关。
+async fn emulate_tool(
+    watched: &Watched,
+    sid: &str,
+    action: crate::domain::emulate::EmulateAction,
+) -> Result<Value, AppError> {
+    use crate::domain::emulate::{EmulateAction, EmulateOrigin};
+    let conn = require_conn(watched)?;
+    match action {
+        EmulateAction::Apply(spec) => {
+            cdp_send(
+                &conn,
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": spec.width,
+                    "height": spec.height,
+                    "deviceScaleFactor": 0,
+                    "mobile": spec.mobile,
+                }),
+                Some(sid),
+            )
+            .await?;
+            match &spec.user_agent {
+                Some(ua) => {
+                    cdp_send(
+                        &conn,
+                        "Emulation.setUserAgentOverride",
+                        json!({ "userAgent": ua }),
+                        Some(sid),
+                    )
+                    .await?;
+                }
+                None => {
+                    // 覆盖语义：本次不带 UA = 不仿真 UA，清掉上一次的
+                    cdp_send(
+                        &conn,
+                        "Emulation.clearUserAgentOverride",
+                        json!({}),
+                        Some(sid),
+                    )
+                    .await?;
+                }
+            }
+            cdp_send(
+                &conn,
+                "Emulation.setTouchEmulationEnabled",
+                json!({ "enabled": spec.touch }),
+                Some(sid),
+            )
+            .await?;
+            let origin = match spec.origin {
+                EmulateOrigin::Preset(name) => format!("preset {name}"),
+                EmulateOrigin::Custom => "custom viewport".to_string(),
+            };
+            let ua_note = if spec.user_agent.is_some() {
+                ", UA overridden"
+            } else {
+                ""
+            };
+            Ok(json!({
+                "result": format!(
+                    "Emulated {} ({}×{}, mobile={}, touch={}{ua_note})",
+                    origin, spec.width, spec.height, spec.mobile, spec.touch
+                )
+            }))
+        }
+        EmulateAction::Off => {
+            for method in [
+                "Emulation.clearDeviceMetricsOverride",
+                "Emulation.clearUserAgentOverride",
+            ] {
+                cdp_send(&conn, method, json!({}), Some(sid)).await?;
+            }
+            cdp_send(
+                &conn,
+                "Emulation.setTouchEmulationEnabled",
+                json!({ "enabled": false }),
+                Some(sid),
+            )
+            .await?;
+            Ok(json!({ "result": "Cleared device emulation (viewport / UA / touch restored)" }))
+        }
+    }
 }
 
 /// 存在性探针（TS loadAllStr 的 `!!document.querySelector(sel)`）：eval
@@ -4294,5 +4649,362 @@ mod tests {
         let e2 = svc.loadall(INS, "T1", "", None, None).await.unwrap_err();
         assert_eq!(e2.code(), "INVALID_REQUEST");
         assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 0);
+    }
+
+    // ---------------- 工具：screenshot（W-cap）-----------------------------
+
+    /// 无 target = 整视口：captureScreenshot 无 clip、png 格式、响应形状与
+    /// 诊断面 screenshot 一致（format/data + command 补的 instanceId/targetId）。
+    #[tokio::test]
+    async fn screenshot_viewport_captures_without_clip() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Page.captureScreenshot",
+            vec![Ok(json!({ "data": "aGVsbG8=" }))],
+        );
+        let resp = svc.screenshot(INS, "T1", None).await.unwrap();
+        assert_eq!(resp["format"], json!("png"));
+        assert_eq!(resp["data"], json!("aGVsbG8="));
+        assert_eq!(resp["instanceId"], json!(INS));
+        assert_eq!(resp["targetId"], json!("T1"));
+        let cap = calls_of(&calls, "Page.captureScreenshot");
+        assert_eq!(cap.len(), 1);
+        assert_eq!(cap[0].param("format"), json!("png"));
+        assert!(cap[0].params.get("clip").is_none(), "无 target 不带 clip");
+        assert_eq!(cap[0].session.as_deref(), Some("S1"));
+    }
+
+    /// ref 路径：scrollIntoView + quads（backendNodeId）→ 联合 bbox 外扩取整
+    /// → clip {scale:1}。两个跨行 quad 的并集必须完整进 clip（取最大 quad
+    /// 会截丢另一行——这是 clip 与点击质心的语义差异）。
+    #[tokio::test]
+    async fn screenshot_ref_clips_union_bbox_rounded_outward() {
+        let (svc, watched, calls, script) = armed();
+        watched
+            .refs
+            .lock()
+            .unwrap()
+            .entry("T1".into())
+            .or_default()
+            .replace(&json!([{ "ref": "e1", "backendNodeId": 101, "name": "OK" }]));
+        given(
+            &script,
+            "DOM.getContentQuads",
+            vec![Ok(json!({ "quads": [
+                [10.2, 20.7, 110.2, 20.7, 110.2, 70.7, 10.2, 70.7],
+                [10.2, 90.5, 60.2, 90.5, 60.2, 140.5, 10.2, 140.5]
+            ] }))],
+        );
+        given(
+            &script,
+            "Page.captureScreenshot",
+            vec![Ok(json!({ "data": "aGVsbG8=" }))],
+        );
+        let resp = svc.screenshot(INS, "T1", Some("@e1")).await.unwrap();
+        assert_eq!(resp["data"], json!("aGVsbG8="));
+        let scroll = calls_of(&calls, "DOM.scrollIntoViewIfNeeded");
+        assert_eq!(scroll[0].param("backendNodeId"), json!(101));
+        assert_eq!(
+            calls_of(&calls, "DOM.getContentQuads")[0].param("backendNodeId"),
+            json!(101)
+        );
+        let cap = calls_of(&calls, "Page.captureScreenshot");
+        // 并集 bbox (10.2,20.7)→(110.2,140.5)，外扩取整 → (10,20) 101×121
+        // （右/下界 ceil：ceil(110.2)=111 − floor(10.2)=10 → 101）
+        assert_eq!(
+            cap[0].params.get("clip"),
+            Some(&json!({ "x": 10.0, "y": 20.0, "width": 101.0, "height": 121.0, "scale": 1 }))
+        );
+    }
+
+    /// selector 路径：getDocument → querySelector（nodeId 链，与 fill 同源）；
+    /// 未命中（nodeId 0）→ 404 PAGE_ELEMENT_NOT_FOUND（与 click/fill 同码）。
+    #[tokio::test]
+    async fn screenshot_selector_uses_node_id_and_reports_not_found() {
+        let (svc, _w, calls, script) = armed();
+        given(&script, "DOM.getDocument", vec![Ok(json!({ "root": { "nodeId": 3 } }))]);
+        given(
+            &script,
+            "DOM.querySelector",
+            vec![Ok(json!({ "nodeId": 7 }))],
+        );
+        given(
+            &script,
+            "DOM.getContentQuads",
+            vec![Ok(json!({ "quads": [[0.0, 0.0, 50.0, 0.0, 50.0, 50.0, 0.0, 50.0]] }))],
+        );
+        given(
+            &script,
+            "Page.captureScreenshot",
+            vec![Ok(json!({ "data": "aGVsbG8=" }))],
+        );
+        svc.screenshot(INS, "T1", Some("#hero")).await.unwrap();
+        let q = calls_of(&calls, "DOM.querySelector");
+        assert_eq!(q[0].param("selector"), json!("#hero"));
+        assert_eq!(q[0].param("nodeId"), json!(3));
+        let scroll = calls_of(&calls, "DOM.scrollIntoViewIfNeeded");
+        assert_eq!(scroll[0].param("nodeId"), json!(7), "selector 路径走 nodeId 句柄");
+        let cap = calls_of(&calls, "Page.captureScreenshot");
+        assert_eq!(
+            cap[0].params.get("clip"),
+            Some(&json!({ "x": 0.0, "y": 0.0, "width": 50.0, "height": 50.0, "scale": 1 }))
+        );
+
+        // 未命中 → 404，且不截屏
+        let (svc2, _w2, _c2, script2) = armed();
+        given(&script2, "DOM.getDocument", vec![Ok(json!({ "root": { "nodeId": 3 } }))]);
+        given(&script2, "DOM.querySelector", vec![Ok(json!({ "nodeId": 0 }))]);
+        let e = svc2.screenshot(INS, "T1", Some(".missing")).await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
+    }
+
+    /// quads 退化 → resolveNode + getBoundingClientRect 回退（与点击链同源），
+    /// 回退也退化 → 409 PAGE_TARGET_MOVED（不发明新码）。
+    #[tokio::test]
+    async fn screenshot_falls_back_to_rect_and_reports_moved() {
+        let (svc, watched, calls, script) = armed();
+        watched
+            .refs
+            .lock()
+            .unwrap()
+            .entry("T1".into())
+            .or_default()
+            .replace(&json!([{ "ref": "e1", "backendNodeId": 9, "name": "OK" }]));
+        given(&script, "DOM.getContentQuads", vec![Ok(json!({ "quads": [] }))]);
+        given(
+            &script,
+            "DOM.resolveNode",
+            vec![Ok(json!({ "object": { "objectId": "obj9" } }))],
+        );
+        given(
+            &script,
+            "Runtime.callFunctionOn",
+            vec![Ok(
+                json!({ "result": { "value": { "x": 5.1, "y": 6.2, "w": 100.4, "h": 40.9 } } })
+            )],
+        );
+        given(
+            &script,
+            "Page.captureScreenshot",
+            vec![Ok(json!({ "data": "aGVsbG8=" }))],
+        );
+        svc.screenshot(INS, "T1", Some("e1")).await.unwrap();
+        let cap = calls_of(&calls, "Page.captureScreenshot");
+        // 外扩取整：floor(5.1)=5 / ceil(105.5)=106 → 101；floor(6.2)=6 / ceil(47.1)=48 → 42
+        assert_eq!(
+            cap[0].params.get("clip"),
+            Some(&json!({ "x": 5.0, "y": 6.0, "width": 101.0, "height": 42.0, "scale": 1 }))
+        );
+
+        // 回退 rect 也退化（零高）→ PAGE_TARGET_MOVED
+        let (svc2, watched2, _c2, script2) = armed();
+        watched2
+            .refs
+            .lock()
+            .unwrap()
+            .entry("T1".into())
+            .or_default()
+            .replace(&json!([{ "ref": "e1", "backendNodeId": 9, "name": "OK" }]));
+        given(&script2, "DOM.getContentQuads", vec![Ok(json!({ "quads": [] }))]);
+        given(
+            &script2,
+            "DOM.resolveNode",
+            vec![Ok(json!({ "object": { "objectId": "obj9" } }))],
+        );
+        given(
+            &script2,
+            "Runtime.callFunctionOn",
+            vec![Ok(json!({ "result": { "value": { "x": 5.0, "y": 6.0, "w": 100.0, "h": 0.0 } } }))],
+        );
+        let e = svc2.screenshot(INS, "T1", Some("e1")).await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("PAGE_TARGET_MOVED", 409));
+    }
+
+    /// 响应缺 data 字段：显式 500 INTERNAL_ERROR，不装作成功（诊断面同款）。
+    #[tokio::test]
+    async fn screenshot_missing_data_is_explicit_internal_error() {
+        let (svc, _w, _calls, script) = armed();
+        given(&script, "Page.captureScreenshot", vec![Ok(json!({}))]);
+        let e = svc.screenshot(INS, "T1", None).await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("INTERNAL_ERROR", 500));
+        assert!(e.to_string().contains("data"));
+    }
+
+    /// 空字符串 target：与 click 的空 selector 同门（400），缺省视口应传 None。
+    #[tokio::test]
+    async fn screenshot_empty_target_is_rejected() {
+        let (svc, _w, calls, _script) = armed();
+        let e = svc.screenshot(INS, "T1", Some("")).await.unwrap_err();
+        assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
+        assert_eq!(calls_of(&calls, "Page.captureScreenshot").len(), 0);
+    }
+
+    // ---------------- 工具：pdf（W-cap）------------------------------------
+
+    /// 参数透传 + 缺省归一：landscape=false / printBackground=true /
+    /// 8.5×11；显式给值时原样透传；响应 format=pdf + data。
+    #[tokio::test]
+    async fn pdf_passes_params_and_applies_defaults() {
+        let (svc, _w, calls, script) = armed();
+        given(
+            &script,
+            "Page.printToPDF",
+            vec![Ok(json!({ "data": "JVBER" })), Ok(json!({ "data": "JVBER" }))],
+        );
+        let resp = svc
+            .pdf(INS, "T1", None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!((resp["format"].as_str().unwrap(), resp["data"].as_str().unwrap()), ("pdf", "JVBER"));
+        let p = calls_of(&calls, "Page.printToPDF");
+        assert_eq!(p[0].param("landscape"), json!(false));
+        assert_eq!(p[0].param("printBackground"), json!(true));
+        assert_eq!(p[0].param("paperWidth"), json!(8.5));
+        assert_eq!(p[0].param("paperHeight"), json!(11.0));
+
+        svc.pdf(INS, "T1", Some(true), Some(false), Some(8.27), Some(11.69))
+            .await
+            .unwrap();
+        let p2 = &calls_of(&calls, "Page.printToPDF")[1];
+        assert_eq!(p2.param("landscape"), json!(true));
+        assert_eq!(p2.param("printBackground"), json!(false));
+        assert_eq!(p2.param("paperWidth"), json!(8.27));
+        assert_eq!(p2.param("paperHeight"), json!(11.69));
+        // pdf 走 page session（printToPDF 的域前置）
+        assert_eq!(p2.session.as_deref(), Some("S1"));
+    }
+
+    /// 非法纸张（0/负/NaN）→ 400，且不发 printToPDF。
+    #[tokio::test]
+    async fn pdf_rejects_non_positive_paper() {
+        let (svc, _w, calls, _script) = armed();
+        for (w, h) in [(Some(0.0), None), (None, Some(-1.0)), (Some(f64::NAN), None)] {
+            let e = svc.pdf(INS, "T1", None, None, w, h).await.unwrap_err();
+            assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
+        }
+        assert_eq!(calls_of(&calls, "Page.printToPDF").len(), 0);
+    }
+
+    // ---------------- 工具：emulate（W-cap）-------------------------------
+
+    /// preset 形态：metrics + UA + touch 三命令成套（iphone-14 自带 mobile/touch
+    /// 与真实 UA），deviceScaleFactor 不覆盖（0 = 保持宿主缩放）。
+    #[tokio::test]
+    async fn emulate_preset_applies_metrics_ua_touch() {
+        let (svc, _w, calls, _script) = armed();
+        let resp = svc
+            .emulate(
+                INS,
+                "T1",
+                crate::domain::emulate::EmulateRequest {
+                    preset: Some("iphone-14".into()),
+                    viewport: None,
+                    user_agent: None,
+                    mobile: None,
+                    touch: None,
+                    off: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(resp["result"].as_str().unwrap().contains("iphone-14"));
+        let m = calls_of(&calls, "Emulation.setDeviceMetricsOverride");
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            m[0].params,
+            json!({ "width": 390, "height": 844, "deviceScaleFactor": 0, "mobile": true })
+        );
+        let ua = calls_of(&calls, "Emulation.setUserAgentOverride");
+        assert!(ua[0].param("userAgent").as_str().unwrap().contains("CriOS/"));
+        let touch = calls_of(&calls, "Emulation.setTouchEmulationEnabled");
+        assert_eq!(touch[0].param("enabled"), json!(true));
+        for c in [m[0].clone(), ua[0].clone(), touch[0].clone()] {
+            assert_eq!(c.session.as_deref(), Some("S1"), "仿真发 page session，非 browser 级");
+        }
+    }
+
+    /// 覆盖语义：第二次 viewport 形态未给 UA → clearUserAgentOverride（未给 =
+    /// 恢复默认，非保持旧值）；touch 未给 → 关闭。
+    #[tokio::test]
+    async fn emulate_reapplies_overwrite_semantics() {
+        let (svc, _w, calls, _script) = armed();
+        let req = |w: i64, h: i64, ua: Option<&str>| crate::domain::emulate::EmulateRequest {
+            preset: None,
+            viewport: Some(crate::domain::emulate::Viewport { width: w, height: h }),
+            user_agent: ua.map(str::to_string),
+            mobile: None,
+            touch: None,
+            off: false,
+        };
+        svc.emulate(INS, "T1", req(390, 844, Some("Bot/1.0")))
+            .await
+            .unwrap();
+        svc.emulate(INS, "T1", req(200, 200, None)).await.unwrap();
+        let metrics = calls_of(&calls, "Emulation.setDeviceMetricsOverride");
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[1].param("width"), json!(200));
+        let ua = calls_of(&calls, "Emulation.setUserAgentOverride");
+        assert_eq!(ua.len(), 1, "仅第一次设 UA");
+        let clear = calls_of(&calls, "Emulation.clearUserAgentOverride");
+        assert_eq!(clear.len(), 1, "第二次未给 UA 必须清掉旧 override");
+        let touch = calls_of(&calls, "Emulation.setTouchEmulationEnabled");
+        assert_eq!(touch[1].param("enabled"), json!(false));
+    }
+
+    /// off 清全部三域：metrics / UA / touch。
+    #[tokio::test]
+    async fn emulate_off_clears_all_three() {
+        let (svc, _w, calls, _script) = armed();
+        svc.emulate(
+            INS,
+            "T1",
+            crate::domain::emulate::EmulateRequest {
+                preset: None,
+                viewport: None,
+                user_agent: None,
+                mobile: None,
+                touch: None,
+                off: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls_of(&calls, "Emulation.clearDeviceMetricsOverride").len(), 1);
+        assert_eq!(calls_of(&calls, "Emulation.clearUserAgentOverride").len(), 1);
+        let touch = calls_of(&calls, "Emulation.setTouchEmulationEnabled");
+        assert_eq!((touch.len(), touch[0].param("enabled")), (1, json!(false)));
+        assert_eq!(calls_of(&calls, "Emulation.setDeviceMetricsOverride").len(), 0);
+    }
+
+    /// 未知预设 → 422 PAGE_EMULATE_UNKNOWN_PRESET，且**建连前**拒绝：
+    /// 不发任何 Emulation 命令（resolve 在 command 之前）。
+    #[tokio::test]
+    async fn emulate_unknown_preset_422_before_any_cdp() {
+        let (svc, _w, calls, _script) = armed();
+        let e = svc
+            .emulate(
+                INS,
+                "T1",
+                crate::domain::emulate::EmulateRequest {
+                    preset: Some("nokia-3310".into()),
+                    viewport: None,
+                    user_agent: None,
+                    mobile: None,
+                    touch: None,
+                    off: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!((e.code(), e.status()), ("PAGE_EMULATE_UNKNOWN_PRESET", 422));
+        assert!(e.to_string().contains("iphone-14"), "message 附可用预设");
+        let emulate_calls = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.method.starts_with("Emulation."))
+            .count();
+        assert_eq!(emulate_calls, 0);
     }
 }

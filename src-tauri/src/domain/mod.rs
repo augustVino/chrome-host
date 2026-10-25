@@ -1,4 +1,5 @@
 pub mod diagnostics;
+pub mod emulate;
 pub mod environment;
 pub mod extension;
 pub mod hosts;
