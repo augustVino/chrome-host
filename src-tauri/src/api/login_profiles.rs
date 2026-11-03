@@ -1,3 +1,4 @@
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::Json;
 use serde::Deserialize;
@@ -32,9 +33,12 @@ pub struct CaptureBody {
 pub async fn capture(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    body: Option<Json<CaptureBody>>,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    match body.and_then(|Json(b)| b.from_instance_id) {
+    // 无 body / 空（GUI 直拍）→ None → 传统母本捕获；宽容解析见 optional_json_body
+    let from_instance_id = super::optional_json_body::<CaptureBody>(&body)?
+        .and_then(|b| b.from_instance_id);
+    match from_instance_id {
         Some(ins_id) => Ok(Json(
             json!(state.session_service.capture_from_instance(&id, &ins_id).await?),
         )),

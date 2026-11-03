@@ -1,3 +1,4 @@
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -29,13 +30,14 @@ pub struct NavigateBody {
 }
 
 /// POST /api/v1/environments/{environmentId}/instances
-/// body 可选（无 body / 空 / {"name": null} = 不命名）
+/// body 可选（无 body / 空 / {"name": null} = 不命名；宽容解析见 optional_json_body）
 pub async fn create(
     State(state): State<ApiState>,
     Path(environment_id): Path<String>,
-    body: Option<Json<CreateInstanceBody>>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    let name = body.and_then(|Json(b)| b.name);
+    let name =
+        super::optional_json_body::<CreateInstanceBody>(&body)?.and_then(|b| b.name);
     let ins = state
         .instance_service
         .create(&environment_id, name.as_deref())
@@ -47,9 +49,10 @@ pub async fn create(
 pub async fn open(
     State(state): State<ApiState>,
     Path(environment_id): Path<String>,
-    body: Option<Json<CreateInstanceBody>>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    let name = body.and_then(|Json(b)| b.name);
+    let name =
+        super::optional_json_body::<CreateInstanceBody>(&body)?.and_then(|b| b.name);
     let ins = state
         .instance_service
         .create(&environment_id, name.as_deref())
