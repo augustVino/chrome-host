@@ -494,6 +494,39 @@ pub enum PageCommands {
         out: Option<String>,
     },
 
+    /// 启动页录屏（I4；常驻，不占实例串行锁）
+    #[command(
+        about = "启动页录屏：<FILE> [--fps N] [--cursor]（扩展名定容器；重复 start → 409；无 ffmpeg → 422；stop 结算）"
+    )]
+    RecordStart {
+        /// 实例 id
+        id: String,
+        /// 输出文件路径（app 主机；扩展名定容器：.webm/.mp4/.mov…；无扩展名 → 400）
+        #[arg(value_name = "FILE")]
+        file: String,
+        /// 采样率（1-60；缺省 30）
+        #[arg(long, value_name = "N")]
+        fps: Option<u32>,
+        /// 合成光标（页内覆盖层 + 输入采样插值）
+        #[arg(long)]
+        cursor: bool,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 停止录屏并结算产物（I4；按 start 锚点路由，无需 tab）
+    #[command(
+        about = "停止录屏：[--status]（编码收尾可能数秒；quiet = 产物路径；无运行中 → 409）"
+    )]
+    RecordStop {
+        /// 实例 id
+        id: String,
+        /// 附完整终态（capture 模式/设备缩放等披露字段）
+        #[arg(long)]
+        status: bool,
+    },
+
     /// 表格结构化提取（W-ext：表格/网格 → JSON；CSV 未做）
     #[command(
         about = "表格提取：[sel|@eN] 缺省 = 主文档最大表格；输出 { columns, rows, coverage, meta }；--out 写 JSON 文件"
@@ -800,6 +833,14 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
         PageCommands::ProfilerStop { id, out } => {
             profiler_stop(globals, client, id, out.as_deref())
         }
+        PageCommands::RecordStart {
+            id,
+            file,
+            fps,
+            cursor,
+            tab,
+        } => record_start(globals, client, id, file, *fps, *cursor, tab.as_deref()),
+        PageCommands::RecordStop { id, status } => record_stop(globals, client, id, *status),
         PageCommands::Extract {
             id,
             target,
@@ -1395,6 +1436,89 @@ fn profiler_stop(
             .unwrap_or("(响应缺少 result 字段)"),
         resp.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
         resp.get("eventCount")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
+    ));
+    Ok(())
+}
+
+/// `page record start <ID> <FILE> [--fps N] [--cursor] [--tab T]`（I4）：
+/// result 型渲染（path/fps/cursor 详情行）。FILE 必填（app 主机路径，
+/// 扩展名定容器——不设缺省名，静默写 <id>.webm 到未知位置比报 400 差）。
+fn record_start(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    file: &str,
+    fps: Option<u32>,
+    cursor: bool,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.page_record_start(id, file, fps, cursor, tab)?;
+    if out.quiet {
+        out.print_id(file);
+        return Ok(());
+    }
+    if out.json {
+        out.render_kv(&[], resp);
+        return Ok(());
+    }
+    let cursor_desc = if resp
+        .get("cursor")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(cursor)
+    {
+        "on"
+    } else {
+        "off"
+    };
+    out.render_text(format!(
+        "{}\npath: {} · fps: {} · cursor: {}",
+        resp.get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(响应缺少 result 字段)"),
+        resp.get("path").and_then(|v| v.as_str()).unwrap_or(file),
+        resp.get("fps")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| fps.map(|f| f.to_string()).unwrap_or_else(|| "30".into())),
+        cursor_desc,
+    ));
+    Ok(())
+}
+
+/// `page record stop <ID> [--status]`（I4）：quiet = 产物路径；table =
+/// result + path/frames 详情行（--status 时 json 分支自然携带完整终态）。
+fn record_stop(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    status: bool,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.page_record_stop(id, status)?;
+    if out.quiet {
+        out.print_id(
+            resp.get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(响应缺少 path 字段)"),
+        );
+        return Ok(());
+    }
+    if out.json {
+        out.render_kv(&[], resp);
+        return Ok(());
+    }
+    out.render_text(format!(
+        "{}\npath: {} · frames: {} · captured: {}",
+        resp.get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(响应缺少 result 字段)"),
+        resp.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+        resp.get("frames")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
+        resp.get("capturedFrames")
             .map(|v| v.to_string())
             .unwrap_or_else(|| "?".into()),
     ));

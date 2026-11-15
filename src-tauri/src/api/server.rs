@@ -323,6 +323,16 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/profiler/stop",
             post(crate::api::pages::profiler_stop),
         )
+        // page 控制命令族（I4）：页录屏 start/stop——薄透传，语义在
+        // page_service（recording_tool）
+        .route(
+            "/api/v1/instances/{id}/page/record/start",
+            post(crate::api::pages::record_start),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/record/stop",
+            post(crate::api::pages::record_stop),
+        )
         .route(
             "/api/v1/instances/{id}/page/emulate",
             post(crate::api::pages::emulate),

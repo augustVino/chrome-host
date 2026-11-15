@@ -5734,3 +5734,307 @@ fn validate_upload_file_enforces_host_side_rules() {
     let (_p, name, size) = validate_upload_file(&ok.display().to_string()).unwrap();
     assert_eq!((name.as_str(), size), ("ok.txt", 5));
 }
+
+// ---------------- 工具：record（I4：kit recording.rs）--------------------
+
+use crate::application::browser_kit::recording::{
+    CaptureSession, RecordingOptions, RecordingState,
+};
+use crate::application::page_service::recording_tool::record_cursor;
+
+/// 手工武装「录制中」的 Watched（绕过 ffmpeg/attach 链——豁免与钩子逻辑
+/// 单测化；capture_sid None = 模拟 attach in-flight（slot 只有 target_id））
+fn arm_recording(watched: &Watched, tid: &str, capture_sid: Option<&str>) {
+    let mut state = RecordingState::new();
+    crate::application::browser_kit::recording::recording_start(
+        &mut state,
+        "/tmp/i4-exempt.webm",
+        RecordingOptions::default(),
+    )
+    .unwrap();
+    *state.capture_session.lock().unwrap() = Some(CaptureSession {
+        target_id: tid.to_string(),
+        session_id: capture_sid.map(str::to_string),
+    });
+    *watched.recording.lock().unwrap() = Some(RecordingSlot {
+        state,
+        tid: tid.to_string(),
+    });
+}
+
+/// start 校验链全前置：无扩展名 / fps 越界 → 400（kit 原文透传）；槽位
+/// 占用 → 409 ALREADY_ACTIVE——三者均不动浏览器（无 attach 命令发出）。
+#[tokio::test]
+async fn record_start_validation_chain_rejects_before_io() {
+    let (svc, _watched, calls, _script) = armed();
+
+    let e1 = svc
+        .record_start(INS, "T1", "/tmp/noext", None, false)
+        .await
+        .unwrap_err();
+    assert_eq!((e1.code(), e1.status()), ("INVALID_REQUEST", 400));
+    assert!(e1.to_string().to_lowercase().contains("extension"), "{e1}");
+
+    let e2 = svc
+        .record_start(INS, "T1", "/tmp/ok.webm", Some(61), false)
+        .await
+        .unwrap_err();
+    assert_eq!((e2.code(), e2.status()), ("INVALID_REQUEST", 400));
+    assert!(e2.to_string().to_lowercase().contains("fps"), "{e2}");
+
+    assert!(
+        calls_of(&calls, "Target.attachToTarget").is_empty(),
+        "校验链失败不得发任何浏览器 IO"
+    );
+
+    let (svc2, watched2, calls2, _s2) = armed();
+    arm_recording(&watched2, "T1", Some("CAP0"));
+    let e3 = svc2
+        .record_start(INS, "T1", "/tmp/ok.webm", None, false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (e3.code(), e3.status()),
+        ("PAGE_RECORD_ALREADY_ACTIVE", 409)
+    );
+    assert!(
+        calls_of(&calls2, "Target.attachToTarget").is_empty(),
+        "互斥检查先于 ffmpeg/attach"
+    );
+}
+
+/// 无运行中录制的 stop → 409 PAGE_RECORD_NOT_RUNNING（message 披露废弃
+/// 路径，同 profiler 文案风格）
+#[tokio::test]
+async fn record_stop_without_running_conflicts() {
+    let (svc, _watched, _calls, _script) = armed();
+    let e = svc.record_stop(INS, false).await.unwrap_err();
+    assert_eq!((e.code(), e.status()), ("PAGE_RECORD_NOT_RUNNING", 409));
+    assert!(e.to_string().contains("连接重建"), "{e}");
+}
+
+/// attach/detach 豁免（I4 重点）：capture session 的事件不得进 tabs 生命周期
+/// ——attachedToTarget 不得覆写锚点 tab 的 session（否则后续命令全路由到
+/// capture session）、detachedFromTarget 不得误删锚点 tab。两层判定：
+/// kit owns_attachment（slot 有 sid / in-flight 无 sid）+ 豁免表（stop 后
+/// slot 已清的窗口，消费式摘除）。对照组：普通 tab 生命周期不受影响。
+#[tokio::test]
+async fn record_capture_session_events_exempt_from_tab_lifecycle() {
+    let (_svc, watched, _calls, _script) = armed();
+
+    // 形态 1：slot 已有 capture sessionId（attach 响应已回）
+    arm_recording(&watched, "T1", Some("CAP1"));
+    handle_event(&watched, &attach_event("T1", "CAP1", "page")).await;
+    assert_eq!(
+        tab_session(&watched, "T1").as_deref(),
+        Some("S1"),
+        "capture session attach 不得覆写锚点 tab 的 page session"
+    );
+
+    // 形态 2：attach in-flight（slot 只有 target_id，Chrome 先发事件再回响应）
+    {
+        let mut guard = watched.recording.lock().unwrap();
+        let slot = guard.as_mut().unwrap();
+        let mut cap = slot.state.capture_session.lock().unwrap();
+        if let Some(c) = cap.as_mut() {
+            c.session_id = None;
+        }
+    }
+    handle_event(&watched, &attach_event("T1", "CAP2", "page")).await;
+    assert_eq!(
+        tab_session(&watched, "T1").as_deref(),
+        Some("S1"),
+        "in-flight capture attach 按 target 匹配豁免"
+    );
+
+    // 形态 3：stop 后（kit slot 已清）在途 detach 事件——豁免表是唯一防线
+    watched.recording.lock().unwrap().take();
+    watched
+        .capture_sessions
+        .lock()
+        .unwrap()
+        .insert("CAP2".into(), "T1".into());
+    handle_event(
+        &watched,
+        &json!({
+            "method": "Target.detachedFromTarget",
+            "params": { "targetId": "T1", "sessionId": "CAP2" }
+        }),
+    )
+    .await;
+    assert_eq!(
+        tab_session(&watched, "T1").as_deref(),
+        Some("S1"),
+        "capture session detach（带锚点 targetId）不得误删整 tab"
+    );
+    assert!(
+        !watched
+            .capture_sessions
+            .lock()
+            .unwrap()
+            .contains_key("CAP2"),
+        "豁免条目由 detach 事件消费式摘除"
+    );
+
+    // 对照组：普通 tab 的 attach/detach 生命周期不受豁免影响
+    handle_event(&watched, &attach_event("TABX", "SX", "page")).await;
+    assert_eq!(tab_session(&watched, "TABX").as_deref(), Some("SX"));
+    handle_event(
+        &watched,
+        &json!({
+            "method": "Target.detachedFromTarget",
+            "params": { "targetId": "TABX", "sessionId": "SX" }
+        }),
+    )
+    .await;
+    assert!(
+        tab_session(&watched, "TABX").is_none(),
+        "普通 tab 关闭照常摘除"
+    );
+}
+
+/// --cursor 采样钩子：仅 cursor 录制中积累（kit record 的 enabled 判定），
+/// 无录制时零副作用；at() 读最近样本（buttons/坐标透传）。
+#[tokio::test]
+async fn record_cursor_samples_only_during_cursor_recording() {
+    let (_svc, watched, _calls, _script) = armed();
+    // 无录制：零开销路径（一次 lock 读 Option），不 panic 不采样
+    record_cursor(&watched, 1.0, 2.0, 0);
+
+    let mut state = RecordingState::new();
+    crate::application::browser_kit::recording::recording_start(
+        &mut state,
+        "/tmp/i4-cursor.webm",
+        RecordingOptions {
+            cursor: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    *watched.recording.lock().unwrap() = Some(RecordingSlot {
+        state,
+        tid: "T1".into(),
+    });
+    record_cursor(&watched, 10.0, 20.0, 1);
+    let guard = watched.recording.lock().unwrap();
+    let slot = guard.as_ref().unwrap();
+    let cur = slot
+        .state
+        .shared_cursor
+        .lock()
+        .unwrap()
+        .at(crate::application::browser_kit::recording::cursor_timestamp());
+    assert_eq!(
+        (cur.x, cur.y, cur.buttons, cur.visible),
+        (10.0, 20.0, 1, true)
+    );
+}
+
+/// ffmpeg 是否可用（真机链路测试的软门槛：缺二进制则 skip 不 fail——
+/// cargo test 任何环境必须可绿）
+fn ffmpeg_present() -> bool {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// start → stop 全链路（需本机 ffmpeg，缺则 skip）：getTargetInfo →
+/// attachToTarget（capture session）→ 初始帧（viewport + 截图）→ spawn
+/// 常驻采集（startScreencast）→ stop：cancel → teardown（stopScreencast/
+/// detachFromTarget）→ ffmpeg 收尾写产物。锚点 tab 的 session 全程不被
+/// capture session 覆写（豁免在真实事件时序下生效）。
+#[tokio::test]
+async fn record_start_stop_roundtrip_writes_video() {
+    if !ffmpeg_present() {
+        eprintln!("[skip] 本机无 ffmpeg，record 全链路测试跳过（真机门槛由 owner 验证）");
+        return;
+    }
+    let (svc, watched, calls, script) = armed();
+    let out_path = std::env::temp_dir()
+        .join(format!("ins-page-rec-{}.webm", uuid::Uuid::new_v4()))
+        .to_string_lossy()
+        .to_string();
+
+    given(
+        &script,
+        "Target.getTargetInfo",
+        vec![Ok(json!({ "targetInfo": { "targetId": "T1" } }))],
+    );
+    given(
+        &script,
+        "Target.attachToTarget",
+        vec![Ok(json!({ "sessionId": "CAP1" }))],
+    );
+    given(
+        &script,
+        "Runtime.evaluate",
+        vec![Ok(
+            json!({ "result": { "type": "object", "value": [1280.0, 800.0, 2.0] } }),
+        )],
+    );
+    given(
+        &script,
+        "Page.captureScreenshot",
+        vec![Ok(json!({ "data": b64(&solid_png(8, 8, [10, 20, 30])) }))],
+    );
+
+    let r1 = svc
+        .record_start(INS, "T1", &out_path, Some(24), false)
+        .await
+        .unwrap();
+    assert_eq!(r1["instanceId"], json!(INS));
+    assert_eq!(r1["targetId"], json!("T1"));
+    assert!(r1["result"].as_str().unwrap().contains("recording started"));
+    assert_eq!(r1["fps"], json!(24), "显式 fps 生效");
+    assert!(watched.recording.lock().unwrap().is_some(), "运行态入库");
+    assert_eq!(
+        watched
+            .capture_sessions
+            .lock()
+            .unwrap()
+            .get("CAP1")
+            .map(String::as_str),
+        Some("T1"),
+        "豁免表已登记 capture session"
+    );
+
+    eventually("常驻采集任务已发 startScreencast", || {
+        !calls_of(&calls, "Page.startScreencast").is_empty()
+    })
+    .await;
+
+    let r2 = svc.record_stop(INS, true).await.unwrap();
+    assert!(r2["result"].as_str().unwrap().contains("stopped"));
+    assert_eq!(r2["path"].as_str().unwrap(), out_path);
+    assert!(
+        r2["frames"].as_u64().unwrap_or(0) >= 1,
+        "初始播种帧至少 1 帧: {}",
+        r2["frames"]
+    );
+    assert!(r2["status"].is_object(), "--status 附完整终态");
+    assert!(
+        watched.recording.lock().unwrap().is_none(),
+        "stop 后槽位清空"
+    );
+    let bytes = std::fs::read(&out_path).unwrap();
+    assert!(!bytes.is_empty(), "ffmpeg 产物非空");
+    // stop 后在途 detach 事件（真实时序里 Chrome 在 detach 响应前后发出）：
+    // 豁免表此时仍持有条目（消费式），不得误删锚点 tab
+    handle_event(
+        &watched,
+        &json!({
+            "method": "Target.detachedFromTarget",
+            "params": { "targetId": "T1", "sessionId": "CAP1" }
+        }),
+    )
+    .await;
+    assert_eq!(
+        tab_session(&watched, "T1").as_deref(),
+        Some("S1"),
+        "stop 后在途 detach 不得误删锚点 tab（豁免表竞态防御）"
+    );
+}

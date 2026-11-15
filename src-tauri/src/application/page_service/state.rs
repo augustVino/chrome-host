@@ -1,4 +1,5 @@
 use crate::application::browser_kit::element::RefMap;
+use crate::application::browser_kit::recording::RecordingState;
 use crate::application::browser_kit::tracing::TracingState;
 use crate::application::page_service::downloads::DownloadState;
 use crate::application::page_service::intercept::InterceptState;
@@ -96,6 +97,17 @@ pub(crate) struct ProfilerState {
     pub(crate) sid: String,
 }
 
+/// 实例级录制运行态（I4：page record start/stop）。包装 kit RecordingState
+///（kit 红线零修改，锚点字段在外层）：tid 是 start 时刻的 tab 锚点——stop
+/// 无 TAB 入参按锚点路由，drop_tab 废弃判定同 profiler；kit state 不 derive
+/// Clone，跨 await 的可变借用靠 take-out/写回（锁内不 await 的模块纪律）。
+pub(crate) struct RecordingSlot {
+    pub(crate) state: RecordingState,
+    /// start 时的 tab（targetId）：drop_tab 废弃判定 + 锚点披露。sid 锚点
+    /// 不入槽：capture session 与采集任务均自带会话句柄，stop 无需再路由
+    pub(crate) tid: String,
+}
+
 /// 一个实例的全部 page 控制运行态。
 pub(crate) struct Watched {
     /// 当前连接（断连置 None，重建整体替换）。std Mutex 只做槽位读写；
@@ -157,6 +169,20 @@ pub(crate) struct Watched {
     /// 锚点 tab 关闭（drop_tab）时废弃——session 死后事件流无处可收，trace
     /// 本就不可回收，保留只会让 stop 报误导性错误。
     pub(crate) profiler: Mutex<Option<ProfilerState>>,
+    /// 实例级录制运行态（I4）。同一实例至多一路（Chrome 每实例一路
+    /// screencast capture session + 一个 ffmpeg 编码器）；establish 整清
+    ///（连接死 → capture session 死，帧流不可回收），锚点 tab 关闭
+    ///（drop_tab）时废弃（同 profiler 语义：best-effort cancel，产物不可回收）。
+    pub(crate) recording: Mutex<Option<RecordingSlot>>,
+    /// 录制 capture session 豁免表（I4，attach 事件分流）：capture sessionId
+    /// → 锚点 targetId。kit 录制对同一 page target 建**第二个** flattened
+    /// session（screencast 专属），其 attachedToTarget/detachedFromTarget
+    /// 事件不得当作新 tab / tab 关闭处理（否则 tabs 表被污染、路由全乱）。
+    /// 登记：record start（attach 响应后）；移除：对应 detach 事件消费式摘除
+    ///（stop 后 detach 事件可能在途——若 stop 时直接满表移除，迟到事件会把
+    /// 锚点 tab 误删，故条目终点 = detach 事件而非 stop 命令）；兜底：
+    /// establish 整清 + drop_tab 摘锚点条目（capture session 同死）。
+    pub(crate) capture_sessions: Mutex<HashMap<String, String>>,
     /// 代际计数：每次建连 +1。旧代 watch_loop 在清理点核对代际，新一代已
     /// 接管时不动登记表/连接槽（防僵尸 loop 误删新代状态）。
     pub(crate) generation: AtomicU64,
@@ -189,6 +215,8 @@ impl Watched {
             downloads: Mutex::new(DownloadState::default()),
             last_snap: Mutex::new(HashMap::new()),
             profiler: Mutex::new(None),
+            recording: Mutex::new(None),
+            capture_sessions: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             event_bus: tokio::sync::broadcast::channel(EVENT_BUS_CAPACITY).0,
         }

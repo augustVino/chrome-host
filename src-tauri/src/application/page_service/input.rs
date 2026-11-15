@@ -213,6 +213,8 @@ pub(crate) async fn click_tool(
         "click",
     )
     .await?;
+    // I4 --cursor 采样钩子：成功派发后记入帧间插值历史（无录制时零开销）
+    super::recording_tool::record_cursor(watched, result.x, result.y, 0);
     // 坐标 = kit 投影后的顶层视口坐标（帧内元素含帧偏移；旧 ref 路径打印
     // 帧本地坐标——文案坐标基准变化，提交信息披露）
     let verb = match (double, right) {
@@ -556,6 +558,8 @@ pub(crate) async fn clickxy_tool(
 ) -> Result<Value, AppError> {
     let conn = require_conn(watched)?;
     dispatch_click(&conn, sid, x, y).await?;
+    // I4 --cursor 采样钩子（成功派发后；坐标即意图无 hit-test，直接记）
+    super::recording_tool::record_cursor(watched, x, y, 0);
     Ok(json!({
         "result": format!("Clicked at CSS ({}, {})", js_num(x), js_num(y))
     }))
@@ -797,12 +801,18 @@ pub(crate) async fn drag_tool(
     let pts = drag_trajectory((fx, fy), (tx, ty));
     let (first, rest) = (pts.first().copied().unwrap_or((fx, fy)), &pts[1..]);
     drag_mouse(&client, &fsid, "mouseMoved", first.0, first.1, 0, None).await?;
+    // I4 --cursor 采样钩子：每个轨迹点（含按钮态 0→1→1…→0）逐点记入，
+    // 帧间插值才能复现拖拽路径（仅追加调用点，控制流不变）
+    super::recording_tool::record_cursor(watched, first.0, first.1, 0);
     drag_mouse(&client, &fsid, "mousePressed", first.0, first.1, 1, Some(1)).await?;
+    super::recording_tool::record_cursor(watched, first.0, first.1, 1);
     for &(x, y) in rest {
         drag_mouse(&client, &fsid, "mouseMoved", x, y, 1, None).await?;
+        super::recording_tool::record_cursor(watched, x, y, 1);
     }
     let last = pts.last().copied().unwrap_or((tx, ty));
     drag_mouse(&client, &fsid, "mouseReleased", last.0, last.1, 0, Some(1)).await?;
+    super::recording_tool::record_cursor(watched, last.0, last.1, 0);
     Ok(json!({
         "result": format!(
             "Dragged {from_subject} to {to_subject} ({} steps)",

@@ -651,6 +651,36 @@ struct PageProfilerStopArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct PageRecordStartArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+    #[schemars(
+        description = "输出文件路径（app 主机；扩展名定容器：.webm/.mp4/.mov…，无扩展名 → 400）。录制期间其他 page 命令正常执行；click/drag/clickxy 的输入自动采样（--cursor 时合成光标）"
+    )]
+    file: String,
+    #[schemars(description = "采样率 1-60，缺省 30")]
+    fps: Option<u32>,
+    #[schemars(
+        description = "合成光标覆盖层（页内 JS 动画 + Rust 侧输入采样帧间插值）；缺省 false。同一实例同时只允许一路录制：重复 → 409 PAGE_RECORD_ALREADY_ACTIVE；ffmpeg 不可用 → 422 PAGE_RECORD_NO_FFMPEG"
+    )]
+    cursor: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageRecordStopArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "附 kit 完整终态（capture 模式/设备缩放等披露字段）。停止按 start 锚点路由，无需 tab 参数；编码收尾可能数秒。无运行中录制 → 409 PAGE_RECORD_NOT_RUNNING"
+    )]
+    status: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct PageReloadArgs {
     #[schemars(description = "实例 id（ins_ 前缀）")]
     instance_id: String,
@@ -1663,6 +1693,40 @@ impl ChromeHostMcp {
         Parameters(a): Parameters<PageProfilerStopArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run(|| self.state.page.profiler_stop(&a.instance_id, a.out)).await
+    }
+
+    #[tool(
+        description = "启动页录屏（screencast 帧流 → ffmpeg 编码）：file 路径扩展名定容器（.webm/.mp4/.mov…，无扩展名 → 400）；fps 1-60 缺省 30；cursor=true 合成光标（页内覆盖层动画 + click/drag/clickxy 输入采样插值）。常驻任务不占实例串行锁，录制期间其他 page 命令正常执行。前置 ffmpeg 探测：不可用 → 422 PAGE_RECORD_NO_FFMPEG（message 带安装提示）；同实例重复 start → 409 PAGE_RECORD_ALREADY_ACTIVE。停止用 page_record_stop"
+    )]
+    async fn page_record_start(
+        &self,
+        Parameters(a): Parameters<PageRecordStartArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.record_start(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.file,
+                a.fps,
+                a.cursor.unwrap_or(false),
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "停止录屏并结算产物：编码收尾（screencast teardown + ffmpeg flush，可能数秒）→ 响应 { result, path, frames, capturedFrames, fps }；status=true 附 kit 完整终态。无运行中录制 → 409 PAGE_RECORD_NOT_RUNNING（含连接重建/锚点 tab 关闭致废弃，message 披露）"
+    )]
+    async fn page_record_stop(
+        &self,
+        Parameters(a): Parameters<PageRecordStopArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .record_stop(&a.instance_id, a.status.unwrap_or(false))
+        })
+        .await
     }
 
     #[tool(
