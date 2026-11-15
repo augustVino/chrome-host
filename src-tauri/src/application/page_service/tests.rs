@@ -4963,7 +4963,7 @@ async fn click_ref_in_frame_resolves_and_dispatches_on_frame_session() {
     assert_eq!(
         resp["result"],
         json!("Clicked @e1 \"OK\" at CSS (70, 60)"),
-        "结果坐标 = 帧本地 (60, 40) + 帧偏移 (10, 20)（I2：文案坐标基准改为顶层视口）"
+        "结果坐标 = 帧本地 (60, 40) + 帧偏移 (10, 20)（文案坐标基准为顶层视口）"
     );
     let resolve = calls_of(&_calls, "DOM.resolveNode");
     assert_eq!(
