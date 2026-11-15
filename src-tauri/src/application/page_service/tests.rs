@@ -3053,10 +3053,10 @@ async fn load_event_resolves_waiter_by_tab_and_cleanup_on_drop() {
     assert!(watched.load_waiters.lock().unwrap().get("TAB2").is_none());
 }
 
-// ---------------- 工具：screenshot（W-cap）-----------------------------
+// ---------------- 工具：screenshot（W-cap；I3 内核 = kit screenshot.rs）----
 
-/// 无 target = 整视口：captureScreenshot 无 clip、png 格式、响应形状与
-/// 诊断面 screenshot 一致（format/data + command 补的 instanceId/targetId）。
+/// 无 target = 整视口：kit captureScreenshot（fromSurface=true，无 clip——
+/// 与 CDP 缺省 fromSurface 同义）；响应形状契约不变（format/data）。
 #[tokio::test]
 async fn screenshot_viewport_captures_without_clip() {
     let (svc, _w, calls, script) = armed();
@@ -3073,17 +3073,22 @@ async fn screenshot_viewport_captures_without_clip() {
     let cap = calls_of(&calls, "Page.captureScreenshot");
     assert_eq!(cap.len(), 1);
     assert_eq!(cap[0].param("format"), json!("png"));
+    assert_eq!(
+        cap[0].param("fromSurface"),
+        json!(true),
+        "kit 恒带 fromSurface"
+    );
     assert!(cap[0].params.get("clip").is_none(), "无 target 不带 clip");
+    assert!(cap[0].params.get("captureBeyondViewport").is_none());
     assert_eq!(cap[0].session.as_deref(), Some("S1"));
 }
 
-/// ref 路径：scrollIntoView + quads（backendNodeId）→ 联合 bbox 外扩取整
-/// → clip {scale:1}。两个跨行 quad 的并集必须完整进 clip（取最大 quad
-/// ref 路径（I1b：kit 对象解析 → 滚动 + getBoundingClientRect → 外扩取整
-/// clip）。getBoundingClientRect 本就是多碎片 border-box 并集（与旧 quads
-/// 联合 bbox 同义——跨行 inline 元素两行都进 clip）。
+/// ref 路径（I3：kit 对象解析 → getBoundingClientRect（视口 rect）→ 文档
+/// 坐标换算（帧偏移 + window scroll）→ 浮点 clip + captureBeyondViewport）。
+/// **不滚动页面**（kit 文档坐标换算不依赖滚动，截图无副作用——与旧实现
+/// 的 scrollIntoView 差异，报告披露）；clip 不再外扩取整（kit 浮点直传）。
 #[tokio::test]
-async fn screenshot_ref_clips_union_bbox_rounded_outward() {
+async fn screenshot_ref_clips_document_rect_without_scrolling() {
     let (svc, watched, calls, script) = armed();
     seed_ref(&watched, "T1", "e1", 101, None);
     given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj101")]);
@@ -3092,7 +3097,10 @@ async fn screenshot_ref_clips_union_bbox_rounded_outward() {
         "Runtime.callFunctionOn",
         vec![
             fn_value(json!(true)), // kit isConnected 检查
-            fn_value(json!({ "x": 10.2, "y": 20.7, "w": 100.0, "h": 119.8 })),
+            // getBoundingClientRect（视口坐标）
+            fn_value(json!({ "x": 10.2, "y": 20.7, "width": 100.0, "height": 119.8 })),
+            // 文档偏移（帧偏移 + window scroll）
+            fn_value(json!({ "x": 0.0, "y": 503.0 })),
         ],
     );
     given(
@@ -3102,48 +3110,41 @@ async fn screenshot_ref_clips_union_bbox_rounded_outward() {
     );
     let resp = svc.screenshot(INS, "T1", Some("@e1"), false).await.unwrap();
     assert_eq!(resp["data"], json!("aGVsbG8="));
-    let scroll = calls_of(&calls, "DOM.scrollIntoViewIfNeeded");
+    // 不滚动（旧实现的 scrollIntoViewIfNeeded 在 kit 路径不存在）
     assert_eq!(
-        scroll[0].param("objectId"),
-        json!("obj101"),
-        "滚动 best-effort（objectId）"
+        calls_of(&calls, "DOM.scrollIntoViewIfNeeded").len(),
+        0,
+        "kit 文档坐标换算不依赖滚动"
     );
-    let rect_calls = calls_of(&calls, "Runtime.callFunctionOn");
-    let rect_call = &rect_calls[1];
-    assert!(rect_call
-        .param("functionDeclaration")
-        .as_str()
-        .unwrap()
-        .contains("getBoundingClientRect"));
     let cap = calls_of(&calls, "Page.captureScreenshot");
-    // 外扩取整：floor(10.2,20.7) / ceil(110.2,140.5) → (10,20) 101×121
+    assert_eq!(cap[0].param("captureBeyondViewport"), json!(true));
+    // kit 浮点 clip：视口 rect + 文档偏移（20.7 + 503 = 523.7），不取整
     assert_eq!(
         cap[0].params.get("clip"),
-        Some(&json!({ "x": 10.0, "y": 20.0, "width": 101.0, "height": 121.0, "scale": 1 }))
+        Some(&json!({ "x": 10.2, "y": 523.7, "width": 100.0, "height": 119.8, "scale": 1.0 }))
     );
+    assert_eq!(cap[0].param("fromSurface"), json!(true));
 }
 
-/// selector 路径：getDocument → querySelector（nodeId 链，与 fill 同源）；
-/// 未命中（nodeId 0）→ 404 PAGE_ELEMENT_NOT_FOUND（与 click/fill 同码）。
+/// selector 路径（I3：kit Runtime.evaluate 对象解析，不再走 nodeId 链）；
+/// 未命中（result 无 objectId）→ kit "Element not found" → 404 同码。
 #[tokio::test]
-async fn screenshot_selector_uses_node_id_and_reports_not_found() {
+async fn screenshot_selector_resolves_via_kit_and_reports_not_found() {
     let (svc, _w, calls, script) = armed();
     given(
         &script,
-        "DOM.getDocument",
-        vec![Ok(json!({ "root": { "nodeId": 3 } }))],
-    );
-    given(
-        &script,
-        "DOM.querySelector",
-        vec![Ok(json!({ "nodeId": 7 }))],
-    );
-    given(
-        &script,
-        "DOM.getContentQuads",
+        "Runtime.evaluate",
         vec![Ok(
-            json!({ "quads": [[0.0, 0.0, 50.0, 0.0, 50.0, 50.0, 0.0, 50.0]] }),
+            json!({ "result": { "type": "object", "objectId": "obj7" } }),
         )],
+    );
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![
+            fn_value(json!({ "x": 0.0, "y": 0.0, "width": 50.0, "height": 50.0 })),
+            fn_value(json!({ "x": 0.0, "y": 0.0 })), // 文档偏移
+        ],
     );
     given(
         &script,
@@ -3153,32 +3154,27 @@ async fn screenshot_selector_uses_node_id_and_reports_not_found() {
     svc.screenshot(INS, "T1", Some("#hero"), false)
         .await
         .unwrap();
-    let q = calls_of(&calls, "DOM.querySelector");
-    assert_eq!(q[0].param("selector"), json!("#hero"));
-    assert_eq!(q[0].param("nodeId"), json!(3));
-    let scroll = calls_of(&calls, "DOM.scrollIntoViewIfNeeded");
-    assert_eq!(
-        scroll[0].param("nodeId"),
-        json!(7),
-        "selector 路径走 nodeId 句柄"
+    let ev = calls_of(&calls, "Runtime.evaluate");
+    assert!(
+        ev[0]
+            .param("expression")
+            .as_str()
+            .unwrap()
+            .contains("#hero"),
+        "kit 页内解析脚本携带 selector"
     );
     let cap = calls_of(&calls, "Page.captureScreenshot");
     assert_eq!(
         cap[0].params.get("clip"),
-        Some(&json!({ "x": 0.0, "y": 0.0, "width": 50.0, "height": 50.0, "scale": 1 }))
+        Some(&json!({ "x": 0.0, "y": 0.0, "width": 50.0, "height": 50.0, "scale": 1.0 }))
     );
 
-    // 未命中 → 404，且不截屏
+    // 未命中（result 无 objectId）→ 404，且不截屏
     let (svc2, _w2, _c2, script2) = armed();
     given(
         &script2,
-        "DOM.getDocument",
-        vec![Ok(json!({ "root": { "nodeId": 3 } }))],
-    );
-    given(
-        &script2,
-        "DOM.querySelector",
-        vec![Ok(json!({ "nodeId": 0 }))],
+        "Runtime.evaluate",
+        vec![Ok(json!({ "result": { "type": "undefined" } }))],
     );
     let e = svc2
         .screenshot(INS, "T1", Some(".missing"), false)
@@ -3187,10 +3183,11 @@ async fn screenshot_selector_uses_node_id_and_reports_not_found() {
     assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
 }
 
-/// quads 退化 → resolveNode + getBoundingClientRect 回退（与点击链同源），
-/// 退化 rect（零高）→ 409 PAGE_TARGET_MOVED（不发明新码）。
+/// 零面积 rect（I3 行为变化，报告披露）：kit 无退化前置校验，0 高 rect
+/// 原样进 clip → CDP 拒绝 → 500 PAGE_ACTION_FAILED 带原文（旧实现为 409
+/// PAGE_TARGET_MOVED——截图三形态契约不变，错误码语义变化已披露）。
 #[tokio::test]
-async fn screenshot_falls_back_to_rect_and_reports_moved() {
+async fn screenshot_zero_height_rect_fails_via_cdp_rejection() {
     let (svc, watched, _calls, script) = armed();
     seed_ref(&watched, "T1", "e1", 9, None);
     given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj9")]);
@@ -3199,27 +3196,38 @@ async fn screenshot_falls_back_to_rect_and_reports_moved() {
         "Runtime.callFunctionOn",
         vec![
             fn_value(json!(true)),
-            fn_value(json!({ "x": 5.0, "y": 6.0, "w": 100.0, "h": 0.0 })),
+            fn_value(json!({ "x": 5.0, "y": 6.0, "width": 100.0, "height": 0.0 })),
+            fn_value(json!({ "x": 0.0, "y": 0.0 })),
         ],
+    );
+    given(
+        &script,
+        "Page.captureScreenshot",
+        vec![Err("Unable to capture screenshot".into())],
     );
     let e = svc
         .screenshot(INS, "T1", Some("e1"), false)
         .await
         .unwrap_err();
-    assert_eq!((e.code(), e.status()), ("PAGE_TARGET_MOVED", 409));
+    assert_eq!((e.code(), e.status()), ("PAGE_ACTION_FAILED", 500));
+    assert!(
+        e.to_string().contains("screenshot"),
+        "tool 上下文在前缀: {}",
+        e
+    );
 }
 
-/// 响应缺 data 字段：显式 500 INTERNAL_ERROR，不装作成功（诊断面同款）。
+/// kit typed 反序列化缺 data：captureScreenshot 响应无 data 字段 → kit
+/// Err → 500（不装作成功，与旧实现的显式报错同语义）。
 #[tokio::test]
-async fn screenshot_missing_data_is_explicit_internal_error() {
+async fn screenshot_missing_data_is_explicit_failure() {
     let (svc, _w, _calls, script) = armed();
     given(&script, "Page.captureScreenshot", vec![Ok(json!({}))]);
     let e = svc.screenshot(INS, "T1", None, false).await.unwrap_err();
-    assert_eq!((e.code(), e.status()), ("INTERNAL_ERROR", 500));
-    assert!(e.to_string().contains("data"));
+    assert_eq!((e.code(), e.status()), ("PAGE_ACTION_FAILED", 500));
 }
 
-/// 空字符串 target：与 click 的空 selector 同门（400），缺省视口应传 None。
+/// 空字符串 target：service 入口 400（缺省视口应传 None）。
 #[tokio::test]
 async fn screenshot_empty_target_is_rejected() {
     let (svc, _w, calls, _script) = armed();
@@ -3231,19 +3239,21 @@ async fn screenshot_empty_target_is_rejected() {
     assert_eq!(calls_of(&calls, "Page.captureScreenshot").len(), 0);
 }
 
-// ---------------- 工具：screenshot --full（W-shot）--------------------
+// ---------------- 工具：screenshot --full（W-shot；I3 尺寸源 = kit 同源）--
 
-/// full：先 Runtime.evaluate 读文档尺寸+DPR，再 clip 全文档 +
-/// captureBeyondViewport=true + scale 1（DPR 换算留给 CDP 内部）；
-/// 响应带尺寸证据字段（full/width/height/documentWidth/documentHeight/
-/// truncated）——调用方靠它们核对 png 尺寸与截断，不靠猜。
+/// full 未超限（I3）：我方预读（eval DPR + getLayoutMetrics cssContentSize）
+/// → kit full_page（kit 内部再读一次 getLayoutMetrics 定 clip——幂等读，
+/// 与预读同源 cssContentSize）。响应尺寸证据字段 = 预读值；clip 由 kit
+/// 构造（0,0,w,h,scale 1）+ captureBeyondViewport。
 #[tokio::test]
 async fn screenshot_full_clips_whole_document_with_evidence_fields() {
     let (svc, _w, calls, script) = armed();
+    given(&script, "Runtime.evaluate", vec![rt_result(json!(2))]);
+    let metrics = json!({ "cssContentSize": { "width": 1280, "height": 2592 } });
     given(
         &script,
-        "Runtime.evaluate",
-        vec![rt_result(json!([1280, 2592, 2]))],
+        "Page.getLayoutMetrics",
+        vec![Ok(metrics.clone()), Ok(metrics)], // 我方预读 + kit 内部读
     );
     given(
         &script,
@@ -3268,33 +3278,34 @@ async fn screenshot_full_clips_whole_document_with_evidence_fields() {
     assert_eq!(cap[0].param("captureBeyondViewport"), json!(true));
     assert_eq!(
         cap[0].params.get("clip"),
-        Some(&json!({ "x": 0, "y": 0, "width": 1280, "height": 2592, "scale": 1 }))
+        Some(&json!({ "x": 0.0, "y": 0.0, "width": 1280.0, "height": 2592.0, "scale": 1.0 }))
     );
     assert_eq!(cap[0].param("format"), json!("png"));
-    // 尺寸读数经 tab 的 page session（不是 browser 级）
+    // DPR 读数经 tab 的 page session（不是 browser 级）
     assert_eq!(cap[0].session.as_deref(), Some("S1"));
 }
 
-/// 超限截断（DPR 感知）：上限按设备像素 16384 换算 CSS（真机 spike：
-/// 16384 device px 是 CDP 硬顶，超过即 -32000 拒绝）。DPR=2 → 上限 8192
-/// CSS px：20000×9000.8 文档 → 双边截到 8192、truncated=true；
-/// documentWidth/Height 保留原始读数（诚实证据：调用方能算出被截了多少）。
-/// DPR=1 → 上限 16384：20000 宽截、9000 高不截，truncated 仍 true（任一边）。
+/// 超限截断（DPR 感知，契约不变）：上限按设备像素 16384 换算 CSS。DPR=2 →
+/// 上限 8192 CSS px：20000×9000.8 文档 → 双边截到 8192、truncated=true、
+/// documentWidth/Height 保留原始读数。**此罕见路径 kit 无法表达截断 clip**
+///（ScreenshotOptions 无自定义 clip 入口），保留我方 CDP 直发序列——契约
+/// 优先于「全走 kit」（报告披露）。DPR=1 → 上限 16384：宽截高不截，
+/// truncated 仍 true（任一边）。
 #[tokio::test]
 async fn screenshot_full_caps_each_side_by_dpr_and_marks_truncated() {
     let (svc, _w, calls, script) = armed();
+    given(&script, "Runtime.evaluate", vec![rt_result(json!(2))]);
     given(
         &script,
-        "Runtime.evaluate",
-        vec![rt_result(json!([20000, 9000.8, 2]))],
+        "Page.getLayoutMetrics",
+        vec![Ok(
+            json!({ "cssContentSize": { "width": 20000, "height": 9000.8 } }),
+        )],
     );
     given(
         &script,
         "Page.captureScreenshot",
-        vec![
-            Ok(json!({ "data": "aGVsbG8=" })),
-            Ok(json!({ "data": "aGVsbG8=" })),
-        ],
+        vec![Ok(json!({ "data": "aGVsbG8=" }))],
     );
     let resp = svc.screenshot(INS, "T1", None, true).await.unwrap();
     assert_eq!(
@@ -3312,13 +3323,21 @@ async fn screenshot_full_caps_each_side_by_dpr_and_marks_truncated() {
         cap[0].params.get("clip"),
         Some(&json!({ "x": 0, "y": 0, "width": 8192, "height": 8192, "scale": 1 }))
     );
+    assert_eq!(
+        calls_of(&calls, "Page.getLayoutMetrics").len(),
+        1,
+        "超限路径不走 kit（无第二次 getLayoutMetrics）"
+    );
 
     // DPR=1：上限 16384；高 9000 未超限不截，宽 20000 截断
     let (svc2, _w2, _c2, script2) = armed();
+    given(&script2, "Runtime.evaluate", vec![rt_result(json!(1))]);
     given(
         &script2,
-        "Runtime.evaluate",
-        vec![rt_result(json!([20000, 9000, 1]))],
+        "Page.getLayoutMetrics",
+        vec![Ok(
+            json!({ "cssContentSize": { "width": 20000, "height": 9000 } }),
+        )],
     );
     given(
         &script2,
@@ -3336,8 +3355,17 @@ async fn screenshot_full_caps_each_side_by_dpr_and_marks_truncated() {
     );
 }
 
-/// full + target 互斥：两个语义拼在一起只会掩盖调用方 bug，显式 400，
-/// 且不发出任何 CDP 命令（校验在 service 入口，早于建连/尺寸读数）。
+/// DPR 读数非有限正数 → 500（预读层显式报错，不静默猜测）。
+#[tokio::test]
+async fn screenshot_full_rejects_bad_dpr_reading() {
+    let (svc, _w, _calls, script) = armed();
+    given(&script, "Runtime.evaluate", vec![rt_result(Value::Null)]);
+    let e = svc.screenshot(INS, "T1", None, true).await.unwrap_err();
+    assert_eq!((e.code(), e.status()), ("INTERNAL_ERROR", 500));
+    assert!(e.to_string().contains("devicePixelRatio"));
+}
+
+/// full + target 互斥：service 入口 400（校验早于建连/尺寸读数，不变）。
 #[tokio::test]
 async fn screenshot_full_and_target_are_mutually_exclusive() {
     let (svc, _w, calls, _script) = armed();
@@ -3405,6 +3433,429 @@ async fn pdf_rejects_non_positive_paper() {
         assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
     }
     assert_eq!(calls_of(&calls, "Page.printToPDF").len(), 0);
+}
+
+// ---------------- 工具：diff（I3：快照文本 diff）--------------------------
+
+/// 快照 mock：单按钮 AX 树（name 可变，构造两次 diff 间的变化）
+fn snap_tree(name: &str) -> Result<Value, String> {
+    Ok(json!({ "nodes": [
+        { "nodeId": "1", "role": axv("button".into()), "name": axv(name.into()), "backendDOMNodeId": 101 },
+    ]}))
+}
+
+/// durable ref 前置（同 loaderId 的 frameTree，次数 = 快照次数）：无它则
+/// 编号顺延（e1→e3…），diff 的 @eN 记号漂移会掩盖文本变化断言
+fn durable_frames(n: usize) -> Vec<Result<Value, String>> {
+    let tree = json!({ "frameTree": { "frame": { "id": "F0", "loaderId": "L1" } } });
+    (0..n).map(|_| Ok(tree.clone())).collect()
+}
+
+/// 无基线首次 diff：与空比较（一切皆 added），滚动基线入库——第二次同
+/// 快照 diff → changed:false（identical 快路径）。
+#[tokio::test]
+async fn diff_first_run_counts_all_added_then_baseline_updates() {
+    let (svc, watched, _calls, script) = armed();
+    given(&script, "Page.getFrameTree", durable_frames(2));
+    given(
+        &script,
+        "Accessibility.getFullAXTree",
+        vec![snap_tree("OK"), snap_tree("OK")],
+    );
+
+    let r1 = svc
+        .diff(INS, "T1", SnapParams::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(r1["instanceId"], json!(INS));
+    assert_eq!(r1["changed"], json!(true), "首次（空基线）全部计为 added");
+    assert_eq!(r1["counts"]["added"].as_u64().unwrap(), 1);
+    assert_eq!(r1["counts"]["removed"].as_u64().unwrap(), 0);
+    let added: Vec<&str> = r1["added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        added.iter().any(|l| l.contains("button \"OK\"")),
+        "added 行含快照行: {added:?}"
+    );
+    assert!(
+        r1["diff"].as_str().unwrap().contains("+++"),
+        "diff = unified 文本"
+    );
+    assert!(
+        watched.last_snap.lock().unwrap().contains_key("T1"),
+        "滚动基线入库"
+    );
+
+    // 第二次同快照：identical → changed:false，added/removed 空
+    let r2 = svc
+        .diff(INS, "T1", SnapParams::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(r2["changed"], json!(false));
+    assert_eq!(r2["added"], json!([]));
+    assert_eq!(r2["removed"], json!([]));
+}
+
+/// 变化检测：按钮 name 变化 → removed 旧行 + added 新行 + counts 对齐；
+/// @eN 记号不剥（durable refs 下记号漂移即真实变化信号——I1b 决策）。
+#[tokio::test]
+async fn diff_detects_content_change_and_keeps_ref_tokens() {
+    let (svc, watched, _calls, script) = armed();
+    given(&script, "Page.getFrameTree", durable_frames(2));
+    given(
+        &script,
+        "Accessibility.getFullAXTree",
+        vec![snap_tree("OK"), snap_tree("Changed")],
+    );
+    svc.diff(INS, "T1", SnapParams::default(), None)
+        .await
+        .unwrap();
+    let r2 = svc
+        .diff(INS, "T1", SnapParams::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(r2["changed"], json!(true));
+    assert_eq!(r2["counts"]["added"].as_u64().unwrap(), 1);
+    assert_eq!(r2["counts"]["removed"].as_u64().unwrap(), 1);
+    let added = r2["added"][0].as_str().unwrap();
+    let removed = r2["removed"][0].as_str().unwrap();
+    assert!(
+        added.contains("Changed") && added.contains("@e1"),
+        "{added}"
+    );
+    assert!(
+        removed.contains("OK") && removed.contains("@e1"),
+        "{removed}"
+    );
+    assert!(
+        watched
+            .last_snap
+            .lock()
+            .unwrap()
+            .get("T1")
+            .unwrap()
+            .contains("Changed"),
+        "基线滚动到新快照"
+    );
+}
+
+/// 显式 baseline：只比较不更新滚动基线（库内仍是上次 diff 的快照）。
+#[tokio::test]
+async fn diff_explicit_baseline_compares_without_updating_store() {
+    let (svc, watched, _calls, script) = armed();
+    given(&script, "Page.getFrameTree", durable_frames(2));
+    given(
+        &script,
+        "Accessibility.getFullAXTree",
+        vec![snap_tree("Stored"), snap_tree("Now")],
+    );
+    // 第一次无显式：入库 Stored 快照
+    svc.diff(INS, "T1", SnapParams::default(), None)
+        .await
+        .unwrap();
+    // 第二次显式基线（Stored 文本）vs 当前（Now）→ changed:true（真实差异），
+    // 但滚动基线不被 Now 覆盖——否则下次 diff 会假报 identical
+    let r2 = svc
+        .diff(
+            INS,
+            "T1",
+            SnapParams::default(),
+            Some("- button \"Stored\" @e1".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2["changed"], json!(true), "显式 Stored 基线 vs 当前 Now");
+    assert_eq!(r2["counts"]["removed"].as_u64().unwrap(), 1);
+    assert!(
+        watched
+            .last_snap
+            .lock()
+            .unwrap()
+            .get("T1")
+            .unwrap()
+            .contains("Stored"),
+        "显式基线不更新滚动基线"
+    );
+}
+
+/// 错误路径：snap 管线失败（AX 树命令报错）→ 500 原样上抛，基线不动。
+#[tokio::test]
+async fn diff_snap_failure_propagates_and_keeps_baseline() {
+    let (svc, watched, _calls, script) = armed();
+    given(&script, "Page.getFrameTree", durable_frames(2));
+    given(
+        &script,
+        "Accessibility.getFullAXTree",
+        vec![snap_tree("OK"), Err("boom".into())],
+    );
+    svc.diff(INS, "T1", SnapParams::default(), None)
+        .await
+        .unwrap();
+    let e = svc
+        .diff(INS, "T1", SnapParams::default(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.status(), 500);
+    assert!(
+        watched.last_snap.lock().unwrap().contains_key("T1"),
+        "失败不清洗基线"
+    );
+}
+
+/// 快照超 2MiB：不入库 + 清旧基线 + baselineCleared 披露。
+#[tokio::test]
+async fn diff_oversized_snapshot_clears_baseline_with_disclosure() {
+    let (svc, watched, _calls, script) = armed();
+    let big = "x".repeat(3 * 1024 * 1024);
+    given(&script, "Page.getFrameTree", durable_frames(2));
+    given(
+        &script,
+        "Accessibility.getFullAXTree",
+        vec![snap_tree("OK"), snap_tree(&big)],
+    );
+    svc.diff(INS, "T1", SnapParams::default(), None)
+        .await
+        .unwrap();
+    let r2 = svc
+        .diff(INS, "T1", SnapParams::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(r2["baselineCleared"], json!(true));
+    assert!(
+        !watched.last_snap.lock().unwrap().contains_key("T1"),
+        "超限不入库且清旧基线"
+    );
+}
+
+// ---------------- 工具：diff-shot（I3：像素 diff）------------------------
+
+/// 构造纯色 png bytes（image crate 编码，与 kit diff_screenshot 同依赖）
+fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let img = image::RgbaImage::from_fn(w, h, |_, _| image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .unwrap();
+    buf.into_inner()
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// 成功路径：同尺寸异色 → differing + ratio=100 + 差异图（红标 png）。
+#[tokio::test]
+async fn diff_shot_reports_differing_ratio_and_diff_image() {
+    let (svc, _w, _calls, script) = armed();
+    given(
+        &script,
+        "Page.captureScreenshot",
+        vec![Ok(json!({ "data": b64(&solid_png(4, 4, [0, 0, 0])) }))],
+    );
+    let resp = svc
+        .diff_shot(INS, "T1", false, &b64(&solid_png(4, 4, [255, 255, 255])))
+        .await
+        .unwrap();
+    assert_eq!(resp["instanceId"], json!(INS));
+    assert_eq!(resp["differing"], json!(true));
+    let ratio = resp["ratio"].as_f64().unwrap();
+    assert!(
+        (ratio - 100.0).abs() < 0.01,
+        "全像素异色 ratio=100: {ratio}"
+    );
+    assert!(
+        resp["image"].as_str().unwrap().starts_with("iVBOR"),
+        "差异图为 png base64"
+    );
+}
+
+/// identical：同图 → differing:false、无 image 字段（不传无谓负载）。
+#[tokio::test]
+async fn diff_shot_identical_yields_no_image() {
+    let (svc, _w, _calls, script) = armed();
+    let png = b64(&solid_png(4, 4, [10, 20, 30]));
+    given(
+        &script,
+        "Page.captureScreenshot",
+        vec![Ok(json!({ "data": png.clone() }))],
+    );
+    let resp = svc.diff_shot(INS, "T1", false, &png).await.unwrap();
+    assert_eq!(resp["differing"], json!(false));
+    assert_eq!(resp["ratio"], json!(0.0));
+    assert!(resp.get("image").is_none());
+}
+
+/// 尺寸不一致：differing + ratio=100 + dimensionMismatch 披露（不产图）。
+#[tokio::test]
+async fn diff_shot_dimension_mismatch_is_disclosed() {
+    let (svc, _w, _calls, script) = armed();
+    given(
+        &script,
+        "Page.captureScreenshot",
+        vec![Ok(json!({ "data": b64(&solid_png(4, 4, [0, 0, 0])) }))],
+    );
+    let resp = svc
+        .diff_shot(INS, "T1", false, &b64(&solid_png(8, 4, [0, 0, 0])))
+        .await
+        .unwrap();
+    assert_eq!(resp["differing"], json!(true));
+    assert!(resp.get("image").is_none(), "尺寸不一致无差异图");
+    assert_eq!(
+        resp["dimensionMismatch"],
+        json!({ "expected": { "width": 8, "height": 4 }, "actual": { "width": 4, "height": 4 } }),
+        "expected = baseline 尺寸，actual = 当前截图尺寸"
+    );
+}
+
+/// 错误路径：baseline 空 / 非 png → 400（不触发截图）。
+#[tokio::test]
+async fn diff_shot_rejects_bad_baseline() {
+    let (svc, _w, calls, _script) = armed();
+    let e = svc.diff_shot(INS, "T1", false, "").await.unwrap_err();
+    assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
+    assert_eq!(calls_of(&calls, "Page.captureScreenshot").len(), 0);
+
+    let (svc2, _w2, _c2, script2) = armed();
+    given(
+        &script2,
+        "Page.captureScreenshot",
+        vec![Ok(json!({ "data": b64(&solid_png(2, 2, [0, 0, 0])) }))],
+    );
+    let e2 = svc2
+        .diff_shot(INS, "T1", false, &b64(b"not a png at all"))
+        .await
+        .unwrap_err();
+    assert_eq!((e2.code(), e2.status()), ("INVALID_REQUEST", 400));
+    assert!(e2.to_string().contains("baseline"), "{e2}");
+}
+
+// ---------------- 工具：profiler（I3：kit tracing.rs）--------------------
+
+/// start → stop 全链路：Tracing.start（categories 透传 + ReportEvents 采样
+/// 模式）→ 事件总线注入 dataCollected/tracingComplete → Tracing.end →
+/// traceEvents JSON 落盘（文件真实存在 + eventCount）。
+/// 注入时序确定性：kit profiler_stop 的 subscribe 先于 Tracing.end 发送，
+/// 注入任务等 Tracing.end 进入调用记录（= subscribe 已就绪）再广播事件。
+#[tokio::test]
+async fn profiler_start_stop_roundtrip_writes_trace_json() {
+    let (svc, watched, calls, _script) = armed();
+    let out_path = std::env::temp_dir()
+        .join(format!("ins-page-prof-{}.json", uuid::Uuid::new_v4()))
+        .to_string_lossy()
+        .to_string();
+
+    let r1 = svc
+        .profiler_start(INS, "T1", Some(vec!["a.b".into(), "c.d".into()]))
+        .await
+        .unwrap();
+    assert_eq!(r1["instanceId"], json!(INS));
+    assert_eq!(r1["targetId"], json!("T1"));
+    assert!(r1["result"].as_str().unwrap().contains("profiler started"));
+    let start = calls_of(&calls, "Tracing.start");
+    assert_eq!(
+        start[0].params.pointer("/traceConfig/includedCategories"),
+        Some(&json!(["a.b", "c.d"])),
+        "categories 透传"
+    );
+    assert_eq!(start[0].param("transferMode"), json!("ReportEvents"));
+    assert!(watched.profiler.lock().unwrap().is_some(), "运行态入库");
+
+    // 事件注入任务：等 Tracing.end 记录在案（subscribe 已就绪）→ 广播事件
+    let calls2 = Arc::clone(&calls);
+    let bus = watched.event_bus.clone();
+    let injector = tokio::spawn(async move {
+        eventually("Tracing.end 发出（subscribe 已就绪）", || {
+            calls2
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.method == "Tracing.end")
+        })
+        .await;
+        let _ = bus.send(crate::application::browser_kit::CdpEvent {
+            method: "Tracing.dataCollected".into(),
+            params: json!({ "value": [{ "name": "a" }, { "name": "b" }] }),
+            session_id: Some("S1".into()),
+        });
+        let _ = bus.send(crate::application::browser_kit::CdpEvent {
+            method: "Tracing.tracingComplete".into(),
+            params: json!({}),
+            session_id: Some("S1".into()),
+        });
+    });
+    let r2 = svc
+        .profiler_stop(INS, Some(out_path.clone()))
+        .await
+        .unwrap();
+    injector.await.unwrap();
+    assert!(r2["result"].as_str().unwrap().contains("stopped"));
+    assert_eq!(r2["eventCount"], json!(2));
+    assert_eq!(r2["path"].as_str().unwrap(), out_path);
+    let written = std::fs::read_to_string(&out_path).unwrap();
+    assert!(
+        written.contains("\"traceEvents\"") && written.contains("\"name\":\"a\""),
+        "traceEvents JSON（serde 紧凑形态）: {}",
+        &written[..written.len().min(200)]
+    );
+    assert!(
+        watched.profiler.lock().unwrap().is_none(),
+        "stop 成功后运行态终结"
+    );
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// 重复 start → 409 PAGE_PROFILER_ALREADY_ACTIVE（Chrome tracing 单会话资源）。
+#[tokio::test]
+async fn profiler_double_start_conflicts() {
+    let (svc, _w, calls, _script) = armed();
+    svc.profiler_start(INS, "T1", None).await.unwrap();
+    let default_cats = calls_of(&calls, "Tracing.start");
+    assert!(
+        default_cats[0]
+            .params
+            .pointer("/traceConfig/includedCategories")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| a.len() > 5),
+        "categories 缺省 = kit 全家桶"
+    );
+    assert!(default_cats[0]
+        .params
+        .pointer("/traceConfig/enableSampling")
+        .is_some_and(|v| v == &json!(true)));
+    let e = svc.profiler_start(INS, "T1", None).await.unwrap_err();
+    assert_eq!(
+        (e.code(), e.status()),
+        ("PAGE_PROFILER_ALREADY_ACTIVE", 409)
+    );
+}
+
+/// 无运行中 profiler 的 stop → 409 PAGE_PROFILER_NOT_RUNNING（message 披露
+/// 废弃原因路径）；tab 关闭（drop_tab 锚点匹配）后运行态废弃、stop 同码。
+#[tokio::test]
+async fn profiler_stop_without_running_conflicts_and_tab_drop_discards() {
+    let (svc, watched, _calls, _script) = armed();
+    let e = svc.profiler_stop(INS, None).await.unwrap_err();
+    assert_eq!((e.code(), e.status()), ("PAGE_PROFILER_NOT_RUNNING", 409));
+    assert!(
+        e.to_string().contains("tab 已关闭"),
+        "message 披露废弃路径: {e}"
+    );
+
+    // start 后锚点 tab 关闭 → 运行态废弃（session 死，事件流无处可收）
+    svc.profiler_start(INS, "T1", None).await.unwrap();
+    assert!(watched.profiler.lock().unwrap().is_some());
+    drop_tab(&watched, "T1");
+    assert!(
+        watched.profiler.lock().unwrap().is_none(),
+        "锚点 tab 关闭 → 运行态废弃"
+    );
+    let e2 = svc.profiler_stop(INS, None).await.unwrap_err();
+    assert_eq!((e2.code(), e2.status()), ("PAGE_PROFILER_NOT_RUNNING", 409));
 }
 
 // ---------------- 工具：emulate（W-cap）-------------------------------

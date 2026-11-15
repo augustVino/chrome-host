@@ -456,7 +456,7 @@ struct PageScreenshotArgs {
     #[schemars(description = "实例 id（ins_ 前缀）")]
     instance_id: String,
     #[schemars(
-        description = "截图目标：@eN 引用（上次 page_snap 产生）或 CSS 选择器；省略 = 当前视口整幅。元素路径先滚动入视口再截其包围盒（跨行元素取并集）"
+        description = "截图目标：@eN 引用（上次 page_snap 产生）或 CSS 选择器；省略 = 当前视口整幅。元素路径不滚动页面（文档坐标 clip + captureBeyondViewport 可截屏外元素）"
     )]
     target: Option<String>,
     #[schemars(
@@ -491,6 +491,64 @@ struct PagePdfArgs {
     paper_height: Option<f64>,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageDiffArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+    #[schemars(description = "只快照该 CSS 选择器命中子树（与 page_snap 的 selector 同源）")]
+    selector: Option<String>,
+    #[schemars(description = "压缩快照输出（与 page_snap 的 compact 同源），默认 false")]
+    compact: Option<bool>,
+    #[schemars(description = "渲染深度上限（缩进层级），默认不限")]
+    depth: Option<usize>,
+    #[schemars(
+        description = "显式基线快照文本：给定则只比较不更新服务端滚动基线；省略 = 与该 tab 上次 diff 的快照（滚动基线）比较并更新之。首次无基线 → 与空比较（全部计为 added）"
+    )]
+    baseline: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageDiffShotArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+    #[schemars(
+        description = "基线截图（base64 png，必填）：与当前截图做像素 diff。尺寸不一致 → differing=true + ratio=100 + dimensionMismatch 披露"
+    )]
+    baseline: String,
+    #[schemars(description = "true = 当前侧用全页截图；缺省当前视口")]
+    full: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageProfilerStartArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+    #[schemars(
+        description = "追踪分类数组；缺省 = 全家桶（devtools.timeline/v8.execute/blink/latencyInfo 等，kit 默认）。同一实例同时只允许一个 profiler，重复 start → 409 PAGE_PROFILER_ALREADY_ACTIVE"
+    )]
+    categories: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageProfilerStopArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "traceEvents JSON 落盘路径（app 主机；缺省 <实例id>-trace.json）。停止按 start 时的 tab 路由，无需 tab 参数；无运行中 profiler → 409 PAGE_PROFILER_NOT_RUNNING"
+    )]
+    out: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1248,7 +1306,7 @@ impl ChromeHostMcp {
     }
 
     #[tool(
-        description = "png 截图：target 省略 = 当前视口整幅；target 为 @eN 引用或 CSS 选择器时截该元素（与 page_click 同定位链，先滚动入视口，clip 取元素包围盒）；full=true 截发起时刻的整文档（captureBeyondViewport，不滚动页面，懒加载/虚拟列表未加载内容不在图中——响应 documentHeight 供判断；单边超限截断标 truncated，上限 = 16384 设备像素 ÷ DPR，Retina = 8192 CSS px）。响应 data 为 base64 png；未命中 → 404 PAGE_ELEMENT_NOT_FOUND，几何退化 → 409 PAGE_TARGET_MOVED，full 与 target 同给 → 400"
+        description = "png 截图：target 省略 = 当前视口整幅；target 为 @eN 引用或 CSS 选择器时截该元素（不滚动页面，clip 文档坐标 + captureBeyondViewport）；full=true 截发起时刻的整文档（captureBeyondViewport，懒加载/虚拟列表未加载内容不在图中——响应 documentHeight 供判断；单边超限截断标 truncated，上限 = 16384 设备像素 ÷ DPR，Retina = 8192 CSS px）。响应 data 为 base64 png；未命中 → 404 PAGE_ELEMENT_NOT_FOUND，full 与 target 同给 → 400"
     )]
     async fn page_screenshot(
         &self,
@@ -1330,6 +1388,76 @@ impl ChromeHostMcp {
             )
         })
         .await
+    }
+
+    #[tool(
+        description = "快照文本 diff：当前 snap（与 page_snap 同管线，@eN 引用正常演进）↔ 基线的行级 unified diff。响应 { changed, added（新增行数组）, removed（删除行数组）, counts: {added,removed,unchanged}, diff（unified 文本） }；快照超 2MiB 不入滚动基线并标 baselineCleared。diff 不剥 @eN 记号（durable refs 下同文档 ref 稳定，记号漂移即真实变化）；基线给 baseline 参数则只比较不更新滚动基线；首次无基线 = 与空比较（全部 added）"
+    )]
+    async fn page_diff(
+        &self,
+        Parameters(a): Parameters<PageDiffArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let params = crate::application::page_service::SnapParams {
+            compact: a.compact.unwrap_or(false),
+            interactive: false,
+            depth: a.depth,
+            urls: false,
+            selector: a.selector,
+        };
+        run(|| {
+            self.state.page.diff(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                params,
+                a.baseline,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "像素 diff：baseline（base64 png）↔ 当前截图（full=true 全页，缺省视口；与 page_screenshot 同管线）。响应 { differing, ratio（差异像素百分比 0-100）, image?（差异图 base64 png：差异红标 + 原图灰阶，仅 differing 时）, dimensionMismatch?（尺寸不一致披露，此时 ratio=100） }；颜色距离阈值 0.1（容忍抗锯齿噪声）"
+    )]
+    async fn page_diff_shot(
+        &self,
+        Parameters(a): Parameters<PageDiffShotArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.diff_shot(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.full.unwrap_or(false),
+                &a.baseline,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "启动性能采样（Chrome tracing，Tracing.start ReportEvents + 采样）：常驻任务不占实例串行锁，采样期间其他 page 命令可正常执行。categories 缺省 = 全家桶（devtools.timeline/v8/blink 等）。同一实例同时只允许一个：重复 → 409 PAGE_PROFILER_ALREADY_ACTIVE。停止用 page_profiler_stop（无需 tab，按 start 锚点路由）"
+    )]
+    async fn page_profiler_start(
+        &self,
+        Parameters(a): Parameters<PageProfilerStartArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.profiler_start(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.categories,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "停止采样并落盘：收集 tracing 事件（至多 30s）→ traceEvents JSON 写 out 路径（app 主机；缺省 <实例id>-trace.json）。响应 { result, path, eventCount }。无运行中 profiler → 409 PAGE_PROFILER_NOT_RUNNING；收集超时 → 504 可重试（tracing 仍 active）"
+    )]
+    async fn page_profiler_stop(
+        &self,
+        Parameters(a): Parameters<PageProfilerStopArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| self.state.page.profiler_stop(&a.instance_id, a.out)).await
     }
 
     #[tool(

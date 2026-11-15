@@ -164,12 +164,14 @@ pub struct ReloadBody {
 #[derive(Deserialize)]
 pub struct ScreenshotBody {
     /// 截图目标：@eN ref（上次 snap 产生）或 CSS 选择器；缺省 = 当前视口整幅。
-    /// 元素路径与 click 同定位链（scrollIntoView + quads），clip 取联合包围盒
+    /// 元素路径（I3 起 = kit screenshot.rs）：不滚动页面，clip 文档坐标 +
+    /// captureBeyondViewport（可截屏外元素）
     pub target: Option<String>,
     /// true = 全页截图：截发起时刻的整文档（clip 全文档 + captureBeyondViewport，
     /// 不滚动页面）；与 target 互斥（同给 → 400）。单边超限截断并标 truncated
     /// （上限 = 16384 设备像素 ÷ DPR，Retina DPR2 = 8192 CSS px）；响应带
-    /// width/height/documentWidth/documentHeight。
+    /// width/height/documentWidth/documentHeight（尺寸源 = getLayoutMetrics
+    /// cssContentSize，I3 起与 kit clip 同源）。
     pub full: Option<bool>,
     pub tab: Option<String>,
 }
@@ -243,6 +245,55 @@ pub struct UploadBody {
     /// 主机本地绝对路径（拒符号链接；≤100MB；不存在 → 404）
     pub file_path: String,
     pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/diff —— 快照文本 diff（I3）：当前
+/// snap ↔ 基线的行级 unified diff。无 baseline = 与 per-tab 滚动基线
+///（上次无显式 baseline 的 diff 快照）比较并更新之；有 baseline = 显式
+/// 基线文本，只比较不更新。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffBody {
+    pub tab: Option<String>,
+    /// 只快照该 CSS 选择器命中子树（与 snap --selector 同源）
+    pub selector: Option<String>,
+    /// 压缩输出（与 snap --compact 同源）
+    pub compact: Option<bool>,
+    /// 渲染深度上限
+    pub depth: Option<usize>,
+    /// 显式基线文本：上次 diff --json 的 diff 输入方（或自备）；给定则
+    /// 只比较不更新滚动基线。缺省 = 与服务端滚动基线比较
+    pub baseline: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/diff-shot —— 像素 diff（I3）：base64
+/// png 基线 ↔ 服务端当前截图 → kit 像素 diff。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffShotBody {
+    pub tab: Option<String>,
+    /// true = 当前侧用全页截图（缺省视口）
+    pub full: Option<bool>,
+    /// 基线截图（base64 png，必填；尺寸与当前不一致 → differing + 100%
+    /// + dimensionMismatch 披露）
+    pub baseline: String,
+}
+
+/// POST /api/v1/instances/{id}/page/profiler/start —— 启动性能采样（I3）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilerStartBody {
+    pub tab: Option<String>,
+    /// 追踪分类（数组；缺省 = kit 全家桶：devtools.timeline/v8/blink 等）
+    pub categories: Option<Vec<String>>,
+}
+
+/// POST /api/v1/instances/{id}/page/profiler/stop —— 停止采样并落盘（I3）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilerStopBody {
+    /// 落盘路径（服务端主机；缺省 <实例id>-trace.json）
+    pub out: Option<String>,
 }
 
 pub async fn snap(
@@ -557,6 +608,72 @@ pub async fn pdf(
             body.paper_height,
         )
         .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/diff —— 快照文本 diff（I3）。
+pub async fn diff(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DiffBody>,
+) -> Result<Json<Value>, AppError> {
+    let params = crate::application::page_service::SnapParams {
+        compact: body.compact.unwrap_or(false),
+        interactive: false,
+        depth: body.depth,
+        urls: false,
+        selector: body.selector,
+    };
+    let resp = state
+        .page
+        .diff(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            params,
+            body.baseline,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/diff-shot —— 像素 diff（I3）。
+pub async fn diff_shot(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DiffShotBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .diff_shot(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            body.full.unwrap_or(false),
+            &body.baseline,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/profiler/start —— 启动性能采样（I3）。
+pub async fn profiler_start(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ProfilerStartBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .profiler_start(&id, body.tab.as_deref().unwrap_or(""), body.categories)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/profiler/stop —— 停止采样并落盘（I3）。
+pub async fn profiler_stop(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ProfilerStopBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state.page.profiler_stop(&id, body.out).await?;
     Ok(Json(resp))
 }
 
