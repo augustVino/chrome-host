@@ -93,6 +93,7 @@ use super::fetch_mock::MockUpstream;
 
 mod capture;
 mod dialogs;
+mod diff_tool;
 mod downloads;
 mod eval;
 mod events;
@@ -101,6 +102,7 @@ mod frames;
 mod input;
 mod intercept;
 mod navigation;
+mod profiler;
 mod refs;
 mod snap;
 mod state;
@@ -376,6 +378,10 @@ impl PageService {
         // Fetch 拦截随死会话失效（Fetch.enable 是 session 级，新连接需重新
         // 下发规则——契约：连接重建即失效，GET intercept 返回空 + liveSince null）
         watched.intercept.lock().unwrap().clear();
+        // I3：diff 滚动基线与 profiler 运行态同理属于死会话——tracing session
+        // 随连接失效，基线快照的 @eN 也随 refs 代际作废，整清不残留
+        watched.last_snap.lock().unwrap().clear();
+        *watched.profiler.lock().unwrap() = None;
         // 下载运行态同理重建：新连接重发 setDownloadBehavior + 新目录；
         // 等待者被 drop → 各自 download_wait 的 rx Err 分支诚实报「等待失效」
         watched.downloads.lock().unwrap().reset(dl_dir);

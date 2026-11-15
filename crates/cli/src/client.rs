@@ -1199,4 +1199,78 @@ impl AgentClient {
             true,
         ))
     }
+
+    /// POST /api/v1/instances/{id}/page/diff —— body `{tab?, selector?, compact?,
+    /// depth?, baseline?}`（快照文本 diff：无 baseline = 与服务端滚动基线
+    /// 比较并更新；响应 {changed, added, removed, counts, diff}）
+    pub fn page_diff(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+        selector: Option<&str>,
+        compact: bool,
+        depth: Option<usize>,
+        baseline: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({
+            "tab": tab,
+            "selector": selector,
+            "compact": compact,
+            "depth": depth,
+            "baseline": baseline,
+        });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "diff"), Some(body), true))
+    }
+
+    /// POST /api/v1/instances/{id}/page/diff-shot —— body `{tab?, full?, baseline}`
+    ///（像素 diff：baseline = 基线 png 的 base64；响应 {differing, ratio,
+    /// image?, dimensionMismatch?}）
+    pub fn page_diff_shot(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+        full: bool,
+        baseline: &str,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "tab": tab, "full": full, "baseline": baseline });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "diff-shot"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/profiler/start —— body `{tab?, categories?}`
+    ///（常驻采样：不占实例串行锁；重复 start → 409）
+    pub fn page_profiler_start(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+        categories: Option<Vec<String>>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "tab": tab, "categories": categories });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "profiler/start"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/profiler/stop —— body `{out?}`
+    ///（停止采样并落盘 traceEvents JSON；out 缺省 <id>-trace.json 服务端 cwd）
+    pub fn page_profiler_stop(
+        &self,
+        id: &str,
+        out: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "out": out });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "profiler/stop"),
+            Some(body),
+            true,
+        ))
+    }
 }

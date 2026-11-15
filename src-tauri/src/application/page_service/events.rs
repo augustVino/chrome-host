@@ -456,6 +456,11 @@ pub(crate) fn drop_tab(watched: &Watched, tid: &str) {
     watched.sheets.lock().unwrap().remove(tid);
     watched.css_since.lock().unwrap().remove(tid);
     watched.frames.lock().unwrap().remove(tid);
+    // I3：diff 滚动基线随 tab 摘除；profiler 锚点匹配时废弃（session 死后
+    // 事件流无处可收，trace 不可回收——stop 将报 NOT_RUNNING 并在 message
+    // 披露废弃原因，不装作可继续）
+    watched.last_snap.lock().unwrap().remove(tid);
+    watched.profiler.lock().unwrap().take_if(|p| p.tid == tid);
 }
 
 /// frame session → (tab tid, frame tid)；未登记返回 None

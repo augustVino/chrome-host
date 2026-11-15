@@ -21,7 +21,11 @@
 //! - dialogs：SEQ TYPE MESSAGE 表 + cursor 行（增量拉取的 --since 值）；
 //! - screenshot/pdf：解码 base64 落盘（--out，缺省 <实例id>.png/.pdf；
 //!   screenshot --full 缺省 <实例id>-full.png，文本输出附 size 与截断标注），
-//!   quiet 输出路径（与 instance screenshot/har 同先例）；emulate：一行 result。
+//!   quiet 输出路径（与 instance screenshot/har 同先例）；emulate：一行 result；
+//! - diff（I3）：摘要行（changed + counts）+ unified diff 文本，quiet =
+//!   changed 布尔串；diff-shot：differing/ratio 行 + --out 落差异图，quiet =
+//!   differing；profiler start/stop：result 型（stop 附 path/eventCount，
+//!   quiet = 落盘路径）。
 //! - 三态：`--json` 响应原样透传（P2-F F3 修复：snap 与 result 型命令的
 //!   shell 此前缺 --json 分支，文本树直接打到 stdout，管道侧拿不到合法
 //!   JSON；分流收敛在 [`snap_out`]/[`result_out`] 纯函数）；`--quiet` 输出
@@ -332,6 +336,76 @@ pub enum PageCommands {
         out: Option<String>,
     },
 
+    /// 快照文本 diff（I3）：当前 snap ↔ 基线的行级 diff
+    #[command(
+        about = "快照 diff：[TAB]（当前 snap ↔ 上次基线；无变化 quiet 输出 false；快照超 2MiB 不入基线标 baselineCleared）"
+    )]
+    Diff {
+        /// 实例 id
+        id: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(value_name = "TAB_ID")]
+        tab: Option<String>,
+        /// 只快照该 CSS 选择器命中的子树（与 snap --selector 同源）
+        #[arg(short = 's', long, value_name = "SEL")]
+        selector: Option<String>,
+        /// 压缩快照输出（与 snap --compact 同源）
+        #[arg(short = 'c', long)]
+        compact: bool,
+        /// 渲染深度上限（缩进层级）
+        #[arg(short = 'd', long, value_name = "N")]
+        depth: Option<usize>,
+        /// 基线快照文本文件（上次 diff --json 的基线或自备；给定 = 只比较不更新滚动基线）
+        #[arg(long, value_name = "PATH")]
+        baseline_file: Option<String>,
+    },
+
+    /// 像素 diff（I3）：基线 png ↔ 当前截图
+    #[command(
+        about = "像素 diff：<--baseline-file PNG>（必填）↔ 当前截图；--full 当前侧全页；--out 写差异图"
+    )]
+    DiffShot {
+        /// 实例 id
+        id: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(value_name = "TAB_ID")]
+        tab: Option<String>,
+        /// 基线截图文件（png；必填——像素 diff 无默认基线）
+        #[arg(long, value_name = "PNG")]
+        baseline_file: String,
+        /// 当前侧用全页截图（缺省当前视口）
+        #[arg(long)]
+        full: bool,
+        /// 差异图落盘路径（仅 differing 时有图；缺省不落盘，--json 可取 base64）
+        #[arg(long = "out")]
+        out: Option<String>,
+    },
+
+    /// 启动性能采样（I3；常驻，不占实例串行锁）
+    #[command(
+        about = "启动性能采样：[TAB] [--categories \"a,b\"]（缺省全家桶；重复 start → 409；stop 落盘）"
+    )]
+    ProfilerStart {
+        /// 实例 id
+        id: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(value_name = "TAB_ID")]
+        tab: Option<String>,
+        /// 追踪分类（逗号分割；缺省 = devtools.timeline/v8/blink 全家桶）
+        #[arg(long, value_name = "CATS")]
+        categories: Option<String>,
+    },
+
+    /// 停止采样并落盘（I3；按 start 锚点路由，无需 tab）
+    #[command(about = "停止采样并落盘：[--out F]（缺省 <实例id>-trace.json；traceEvents JSON）")]
+    ProfilerStop {
+        /// 实例 id
+        id: String,
+        /// 落盘路径（app 主机；缺省 <实例id>-trace.json）
+        #[arg(long = "out")]
+        out: Option<String>,
+    },
+
     /// 表格结构化提取（W-ext：表格/网格 → JSON；CSV 未做）
     #[command(
         about = "表格提取：[sel|@eN] 缺省 = 主文档最大表格；输出 { columns, rows, coverage, meta }；--out 写 JSON 文件"
@@ -568,6 +642,52 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             tab.as_deref(),
             out.as_deref(),
         ),
+        PageCommands::Diff {
+            id,
+            tab,
+            selector,
+            compact,
+            depth,
+            baseline_file,
+        } => diff(
+            globals,
+            client,
+            id,
+            tab.as_deref(),
+            selector.as_deref(),
+            *compact,
+            *depth,
+            baseline_file.as_deref(),
+        ),
+        PageCommands::DiffShot {
+            id,
+            tab,
+            baseline_file,
+            full,
+            out,
+        } => diff_shot(
+            globals,
+            client,
+            id,
+            tab.as_deref(),
+            baseline_file,
+            *full,
+            out.as_deref(),
+        ),
+        PageCommands::ProfilerStart {
+            id,
+            tab,
+            categories,
+        } => profiler_start(
+            globals,
+            client,
+            id,
+            tab.as_deref(),
+            categories.as_deref().unwrap_or(""),
+        ),
+        PageCommands::ProfilerStop { id, out } => {
+            profiler_stop(globals, client, id, out.as_deref())
+        }
         PageCommands::Extract {
             id,
             target,
@@ -943,6 +1063,135 @@ fn pdf(
     Ok(())
 }
 
+/// `page diff <ID> [TAB] [-s SEL] [-c] [-d N] [--baseline-file F]`（I3）：
+/// 当前 snap ↔ 基线的行级 diff。--baseline-file 读文本文件（缺本地文件
+/// → exit 1，不建连）；无则用服务端滚动基线。table = 摘要行 + diff 文本
+//（无变化时省略）；quiet = changed 布尔串；json 原样。
+fn diff(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    tab: Option<&str>,
+    selector: Option<&str>,
+    compact: bool,
+    depth: Option<usize>,
+    baseline_file: Option<&str>,
+) -> Result<(), CliError> {
+    let baseline = match baseline_file {
+        Some(p) => Some(
+            std::fs::read_to_string(p)
+                .map_err(|e| CliError::Local(format!("读基线文件失败 {p}: {e}")))?,
+        ),
+        None => None,
+    };
+    let resp = client.page_diff(id, tab, selector, compact, depth, baseline.as_deref())?;
+    print_page_out(
+        &OutputCtx::from(globals),
+        diff_out(&resp, &OutputCtx::from(globals)),
+    );
+    Ok(())
+}
+
+/// `page diff-shot <ID> --baseline-file <png> [--full] [--tab T] [--out F]`
+//（I3）：像素 diff。CLI 读 png 转 base64 上行；--out 在 differing 时写
+/// 差异图（quiet = 路径）；无 --out 的 quiet = differing 布尔串。
+fn diff_shot(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    tab: Option<&str>,
+    baseline_file: &str,
+    full: bool,
+    out_path: Option<&str>,
+) -> Result<(), CliError> {
+    use base64::Engine;
+    let png_bytes = std::fs::read(baseline_file)
+        .map_err(|e| CliError::Local(format!("读基线截图失败 {baseline_file}: {e}")))?;
+    if !png_bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(CliError::Local(format!(
+            "基线文件不是 png（魔数校验失败）: {baseline_file}"
+        )));
+    }
+    let baseline_b64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+    let out = OutputCtx::from(globals);
+    let resp = client.page_diff_shot(id, tab, full, &baseline_b64)?;
+    // --out：仅 differing（有差异图）时落盘；给了 --out 但 identical → 提示行
+    if let Some(p) = out_path {
+        if let Some(img) = resp.get("image").and_then(|v| v.as_str()) {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(img)
+                .map_err(|e| CliError::Local(format!("差异图 base64 解码失败: {e}")))?;
+            std::fs::write(p, &bytes)
+                .map_err(|e| CliError::Local(format!("写差异图失败 {p}: {e}")))?;
+        } else if !out.quiet && !out.json {
+            out.render_text(format!("no diff image (identical) — {p} not written"));
+            return Ok(());
+        }
+    }
+    print_page_out(&out, diff_shot_out(&resp, &out, out_path));
+    Ok(())
+}
+
+/// `page profiler start <ID> [TAB] [--categories "a,b"]`（I3）：result 型
+/// 渲染。categories 逗号分割（trim 空项）。
+fn profiler_start(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    tab: Option<&str>,
+    categories: &str,
+) -> Result<(), CliError> {
+    let cats: Option<Vec<String>> = if categories.is_empty() {
+        None
+    } else {
+        Some(
+            categories
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect(),
+        )
+    };
+    let resp = client.page_profiler_start(id, tab, cats)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page profiler stop <ID> [--out F]`（I3）：result 行含落盘路径；
+/// --out 缺省本地拼 <id>-trace.json（与 screenshot 缺省名同风格，CLI cwd）；
+/// quiet = 落盘路径。
+fn profiler_stop(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    out_path: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let path = out_path
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{id}-trace.json"));
+    let resp = client.page_profiler_stop(id, Some(&path))?;
+    if out.quiet {
+        out.print_id(resp.get("path").and_then(|v| v.as_str()).unwrap_or(&path));
+        return Ok(());
+    }
+    if out.json {
+        out.render_kv(&[], resp);
+        return Ok(());
+    }
+    out.render_text(format!(
+        "{}\npath: {} · events: {}",
+        resp.get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(响应缺少 result 字段)"),
+        resp.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+        resp.get("eventCount")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
+    ));
+    Ok(())
+}
+
 /// `page emulate <ID> (--preset P | --viewport WxH [--user-agent UA] [--mobile]
 /// [--touch] | --off) [--tab T]`：三形态互斥在 clap 层拦（preset 冲突
 /// viewport/UA/mobile/touch/off；viewport 冲突 off），服务端仍独立校验。
@@ -1249,6 +1498,85 @@ fn snap_text(resp: &serde_json::Value) -> String {
     } else {
         format!("{meta}\nremoved: {removed}\n{tree}")
     }
+}
+
+/// diff 三态：quiet = changed 布尔串；json = 响应原样；table = 摘要行
+//（changed + counts + baselineCleared 披露）+ diff 文本（无变化省略；
+/// 首次无基线时全部计为 added——文档披露语义）。
+fn diff_out(resp: &serde_json::Value, out: &OutputCtx) -> PageOut {
+    if out.quiet {
+        return PageOut::Quiet(
+            resp.get("changed")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        );
+    }
+    if out.json {
+        return PageOut::Json(resp.clone());
+    }
+    let counts = |key: &str| {
+        resp.pointer(&format!("/counts/{key}"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into())
+    };
+    let changed = resp
+        .get("changed")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".into());
+    let mut summary = format!(
+        "changed: {changed} · added: {} · removed: {} · unchanged: {}",
+        counts("added"),
+        counts("removed"),
+        counts("unchanged"),
+    );
+    if resp
+        .get("baselineCleared")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        summary.push_str("\nbaselineCleared: 快照超 2MiB 未入基线（下次 diff 与空基线比较）");
+    }
+    let diff_text = resp.get("diff").and_then(|v| v.as_str()).unwrap_or("");
+    if diff_text.is_empty() {
+        PageOut::Text(summary)
+    } else {
+        PageOut::Text(format!("{summary}\n{diff_text}"))
+    }
+}
+
+/// diff-shot 三态：quiet = differing 布尔串（--out 落差异图时路径优先，
+/// 落盘在 diff_shot 命令层已处理）；json 原样；table = differing/ratio 行
+//（+ 尺寸不一致披露 + 落盘路径行）。
+fn diff_shot_out(resp: &serde_json::Value, out: &OutputCtx, out_path: Option<&str>) -> PageOut {
+    if out.quiet {
+        return PageOut::Quiet(
+            resp.get("differing")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        );
+    }
+    if out.json {
+        return PageOut::Json(resp.clone());
+    }
+    let differing = resp
+        .get("differing")
+        .and_then(|v| v.as_bool())
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "?".into());
+    let ratio = resp
+        .get("ratio")
+        .and_then(|v| v.as_f64())
+        .map(|r| format!("{r:.2}%"))
+        .unwrap_or_else(|| "?".into());
+    let mut text = format!("differing: {differing} · ratio: {ratio}");
+    if let Some(dm) = resp.get("dimensionMismatch") {
+        text.push_str(&format!("\ndimensionMismatch: {}", dm));
+    }
+    if let Some(p) = out_path {
+        text.push_str(&format!("\ndiff image: {p}"));
+    }
+    PageOut::Text(text)
 }
 
 /// click/fill/press/wait/eval/clickxy/loadall/type 的主结果行（服务端 result

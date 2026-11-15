@@ -1,4 +1,5 @@
 use crate::application::browser_kit::element::RefMap;
+use crate::application::browser_kit::tracing::TracingState;
 use crate::application::page_service::downloads::DownloadState;
 use crate::application::page_service::intercept::InterceptState;
 use crate::application::page_service::SheetRegistry;
@@ -83,6 +84,18 @@ pub(crate) struct FrameInfo {
     pub(crate) owner_backend_node_id: Option<i64>,
 }
 
+/// 实例级 profiler 运行态（I3：page profiler start/stop）。kit TracingState
+/// 不 derive Clone（kit 红线零修改），跨 await 的可变借用靠 take-out/写回
+///（锁内不 await 的模块纪律）；tid/sid 是 start 时刻的会话锚点——stop
+/// 无 TAB 入参，按锚点路由 Tracing.end 与事件过滤。
+pub(crate) struct ProfilerState {
+    pub(crate) tracing: TracingState,
+    /// start 时的 tab（targetId）：stop 路由 + drop_tab 废弃判定
+    pub(crate) tid: String,
+    /// start 时的 page sessionId（kit 事件过滤按它匹配）
+    pub(crate) sid: String,
+}
+
 /// 一个实例的全部 page 控制运行态。
 pub(crate) struct Watched {
     /// 当前连接（断连置 None，重建整体替换）。std Mutex 只做槽位读写；
@@ -134,6 +147,16 @@ pub(crate) struct Watched {
     /// 记录（容量 20）；waiters = download-wait 的等待者（先注册后触发，
     /// 命令式等待）。establish 整体重置（等待者 rx 收 Err 诚实报失效）。
     pub(crate) downloads: Mutex<DownloadState>,
+    /// per-tab 上次快照文本（I3：page diff 的滚动基线）。establish 整清、
+    /// drop_tab 摘除；单条 2MiB 上限（超限不存并在 diff 响应披露
+    /// baselineCleared——见 diff_tool 的 LAST_SNAP_MAX_BYTES）。锁纪律同
+    /// refs：锁内不 await。
+    pub(crate) last_snap: Mutex<HashMap<String, String>>,
+    /// 实例级 profiler 运行态（I3）。同一时刻至多一个（Chrome tracing 是
+    /// 实例级单会话资源）；establish 整清（连接死 → tracing session 失效），
+    /// 锚点 tab 关闭（drop_tab）时废弃——session 死后事件流无处可收，trace
+    /// 本就不可回收，保留只会让 stop 报误导性错误。
+    pub(crate) profiler: Mutex<Option<ProfilerState>>,
     /// 代际计数：每次建连 +1。旧代 watch_loop 在清理点核对代际，新一代已
     /// 接管时不动登记表/连接槽（防僵尸 loop 误删新代状态）。
     pub(crate) generation: AtomicU64,
@@ -164,6 +187,8 @@ impl Watched {
             css_since: Mutex::new(HashMap::new()),
             intercept: Mutex::new(HashMap::new()),
             downloads: Mutex::new(DownloadState::default()),
+            last_snap: Mutex::new(HashMap::new()),
+            profiler: Mutex::new(None),
             generation: AtomicU64::new(0),
             event_bus: tokio::sync::broadcast::channel(EVENT_BUS_CAPACITY).0,
         }
