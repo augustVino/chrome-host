@@ -294,20 +294,28 @@ base64 + `encoding: "base64"`，HAR 惯例）；`_meta.uncollected` 逐行声明
 ### 页面控制（Page Control）
 
 实例级常驻 CDP 连接上的页面操作面：`snap` 产生 @eN 引用，`click`/`fill`/
-`press` 消费引用或 CSS 选择器，`wait` 轮询等待，`dialogs` 读自动应答的对话框
-日志；`eval`/`html`/`clickxy`/`loadall`/`type` 为 cdp.mjs 退役补齐的兑底五件
-（行为规格同源 TS 工具）；`navigate`/`back`/`forward`/`reload` 为导航四件套
-（page session 内导航/历史回退/重载，保留历史——实例级 `navigate` 的
-new+close 组合近似会丢历史，保留给 GUI）。连接惰性建立（实例首次 page
+`press`/`hover`/`scroll`/`drag`/`select`/`check`/`tap` 消费引用或 CSS 选择器
+（v0.9+ / I2：input 族内核 = browser_kit interaction——settle + actionability
+全开 + 对话框竞速），`wait` 轮询等待（我方自有实现），`dialogs` 读自动应答的
+对话框日志；`eval`/`html`/`clickxy`/`loadall`/`type` 为 cdp.mjs 退役补齐的兑
+底五件（行为规格同源 TS 工具）；`navigate`/`back`/`forward`/`reload` 为导航
+四件套（page session 内导航/历史回退/重载，保留历史——实例级 `navigate`
+的 new+close 组合近似会丢历史，保留给 GUI）。连接惰性建立（实例首次 page
 命令时），与常驻诊断连接互不干扰；仅对运行中实例可用（否则 `409
 PAGE_SERVICE_UNAVAILABLE`）。
 
 | 端点 | 说明 |
 |---|---|
 | `POST /api/v1/instances/{id}/page/snap` | kit 快照管线 + durable @eN refs + hover 感知标记（行尾 `[hover]` / `[hover-reveal]`，meta `hoverScan`）。body `{ "tab?", "compact?", "interactive?", "depth?", "urls?", "selector?" }`（全缺省 = 完整树）；跨域 iframe 内容内嵌在 Iframe 节点行下（@eN 跨 frame 连续编号）；响应含 `removedRefs`（本次快照消失的旧引用，非空时才有） |
-| `POST /api/v1/instances/{id}/page/click` | 原生输入点击（三段鼠标事件，非 `el.click()`）。body `{ "target", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/click` | 原生输入点击（v0.9+/I2 kit 内核：三段 ClickPhase + settle + 可见/启用/遮挡 + 对话框竞速；press→release 间弹框自动 accept 后补发 release）。body `{ "target", "double?", "right?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/hover` | 悬停（mouseMoved 到元素中心；菜单展开后重 snap）。body `{ "target", "tab?" }`（I2 新增） |
+| `POST /api/v1/instances/{id}/page/scroll` | 滚动：有 target 滚元素、无 target 滚页面；dx/dy 单位 CSS 像素可负。body `{ "target?", "dx", "dy", "tab?" }`（I2 新增） |
+| `POST /api/v1/instances/{id}/page/drag` | 拖拽（人类化弧线轨迹；两端点须同帧，跨帧 → 422 `PAGE_DRAG_CROSS_FRAME`）。body `{ "from", "to", "tab?" }`（I2 新增） |
+| `POST /api/v1/instances/{id}/page/select` | 下拉选择（原生 select 与 role=combobox/listbox；value 按 value 或可见文本匹配）。body `{ "target", "value", "tab?" }`（I2 新增） |
+| `POST /api/v1/instances/{id}/page/check` | 勾选/取消勾选复选框、单选钮（已处于目标态 no-op 成功）。body `{ "target", "uncheck?", "tab?" }`（I2 新增） |
+| `POST /api/v1/instances/{id}/page/tap` | 触摸轻点（touchStart/touchEnd，移动端仿真页）。body `{ "target", "tab?" }`（I2 新增） |
 | `POST /api/v1/instances/{id}/page/fill` | 聚焦→全选清空→insertText→回读校验。body `{ "target", "value", "tab?" }` |
-| `POST /api/v1/instances/{id}/page/press` | 键盘三段序列。body `{ "key", "target?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/press` | 键盘事件（v0.9+/I2：keyDown+keyUp 两段，Ctrl/Meta 组合抑制 text；--target 先聚焦，统一 kit 解析链）。body `{ "key", "target?", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/wait` | 轮询等待元素状态（250ms 间隔）。body `{ "selector", "state?", "timeout?", "tab?" }` |
 | `GET /api/v1/instances/{id}/page/dialogs` | 已自动应答的对话框日志。query `tab?&since=` |
 | `POST /api/v1/instances/{id}/page/eval` | 任意 JS 求值（⚠ 高权限，见下）。body `{ "expression", "tab?" }` |
@@ -438,8 +446,9 @@ block/redirect/headers，intercept 管任务内 mock/改头/按需 block）。**
   "text": "- link \"More information...\" @e1 [hover]\n- heading \"Example Domain\"",
   "refs_count": 1, "generation": 2, "hoverScan": "ok", "removedRefs": ["@e3"] }
 
-// POST .../page/click 响应（fill/press/wait 同为 result 单行形态）
-{ "result": "Clicked <BUTTON> \"Save\" (native input @150,130)",
+// POST .../page/click 响应（v0.9+/I2：selector 路径无 tag/text 可供回显，
+// 结果串改为选择器 + 顶层视口坐标；fill/press/wait 等同为 result 单行形态）
+{ "result": "Clicked \"#save\" at CSS (150, 130)",
   "instanceId": "ins_...", "targetId": "ABC123" }
 
 // 命令期间自动应答了对话框时，成功响应附 dialogs_seen（snake_case 条目，同 dialogs 端点）
@@ -692,7 +701,9 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 404 | `PAGE_UPLOAD_FILE_NOT_FOUND` | upload 的主机文件不存在（W-file） |
 | 409 | `PAGE_DOWNLOAD_TIMEOUT` | download-wait 窗口耗尽且无终态证据（有下载在进行中会在 message 披露；与失败严格区分，W-file） |
 | 500 | `PAGE_DOWNLOAD_FAILED` | 下载终态 = interrupted/canceled（或文件名不安全被拒）——下载了但失败（W-file） |
-| 500 | `PAGE_DISPATCH_FAILED` | Input 派发失败（message 附 effect_state：`none`=未发出可重试 / `unknown`=已发出禁盲目重试） |
+| 500 | `PAGE_DISPATCH_FAILED` | Input 派发失败（message 附 effect_state：`none`=未发出可重试 / `unknown`=已发出禁盲目重试；v0.9+/I2 kit click/drag 链不外露失败相位，一律保守 unknown） |
+| 422 | `PAGE_SELECT_NO_OPTION` / `PAGE_SELECT_NOT_SELECT` | select：选项未命中（message 列出可用项） / 目标非 select 或 role=combobox/listbox 控件（I2 新增） |
+| 409 | `PAGE_SELECT_AMBIGUOUS` / `PAGE_DRAG_CROSS_FRAME` | select 多候选匹配 / drag 两端点在不同帧（I2 新增） |
 | 500 | `PAGE_EVAL_FAILED` / `CDP_COMMAND_FAILED` | page 工具页内 eval 失败 / CDP 发送失败 |
 | 500 | `PAGE_NAV_FAILED` | page navigate 导航失败（`Page.navigate` 响应 errorText，`net::ERR_*` 族——与 `loaded:false`「已开始未证实」严格区分） |
 | 504 | `PAGE_TOOL_TIMEOUT` | page 工具超出预算（常规 30s；wait = 用户 timeout + 5s） |
