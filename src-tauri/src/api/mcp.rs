@@ -287,6 +287,10 @@ struct PageClickArgs {
         description = "点击目标：@eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）或 CSS 选择器"
     )]
     target: String,
+    #[schemars(description = "true = 双击（clickCount=2）；缺省 false")]
+    double: Option<bool>,
+    #[schemars(description = "true = 右键（button=right）；缺省 false（左键）")]
+    right: Option<bool>,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
 }
@@ -317,6 +321,100 @@ struct PagePressArgs {
     key: String,
     #[schemars(description = "可选聚焦目标：@eN 引用或 CSS 选择器（先 focus 再按键）")]
     target: Option<String>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageHoverArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "悬停目标：@eN 引用（上次 page_snap 产生）或 CSS 选择器（菜单类页面的 hover 展开）"
+    )]
+    target: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageScrollArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "滚动目标：@eN 引用或 CSS 选择器；省略 = 整页滚动（window.scrollBy）"
+    )]
+    target: Option<String>,
+    #[schemars(description = "水平滚动量（CSS 像素，可负；0 = 不动）")]
+    dx: f64,
+    #[schemars(description = "垂直滚动量（CSS 像素，可负；负值向上滚）")]
+    dy: f64,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageDragArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "拖拽起点：@eN 引用或 CSS 选择器（可见/启用/未被遮挡，否则 422/409）"
+    )]
+    from: String,
+    #[schemars(
+        description = "拖拽终点：@eN 引用或 CSS 选择器（须与 from 同帧；跨帧拖拽 → 422 PAGE_DRAG_CROSS_FRAME）"
+    )]
+    to: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageSelectArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "选择目标：@eN 引用或 CSS 选择器（原生 <select> 或 role=combobox/listbox 控件；非此类 → 422 PAGE_SELECT_NOT_SELECT）"
+    )]
+    target: String,
+    #[schemars(
+        description = "选项的 value 或可见文本（label），两者任一匹配即选中；空串 = 选中空值选项。未命中 → 422 PAGE_SELECT_NO_OPTION（message 列出可用项）；多候选 → 409 PAGE_SELECT_AMBIGUOUS"
+    )]
+    value: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageCheckArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "勾选目标：@eN 引用或 CSS 选择器（input[type=checkbox/radio]、关联 label 或内嵌 input 的容器）"
+    )]
+    target: String,
+    #[schemars(
+        description = "true = 取消勾选；缺省 false = 勾选。已处于目标态时 no-op 成功（结果串明示 already）"
+    )]
+    uncheck: Option<bool>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageTapArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "轻点目标：@eN 引用或 CSS 选择器（触摸序列 touchStart/touchEnd——移动端仿真页面用 tap 而非 click）"
+    )]
+    target: String,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
 }
@@ -1046,16 +1144,20 @@ impl ChromeHostMcp {
     }
 
     #[tool(
-        description = "原生输入点击（mouseMoved→mousePressed→mouseReleased，非 el.click()）：target 支持 @eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）与 CSS 选择器两种形态；selector 路径带可见性/遮挡校验（422 PAGE_ELEMENT_NOT_VISIBLE / 409 PAGE_ELEMENT_BLOCKED），ref 路径遮挡校验来自 kit 解析链（409 PAGE_ELEMENT_BLOCKED）。实例须运行中（409 PAGE_SERVICE_UNAVAILABLE）"
+        description = "原生输入点击（kit ClickPhase：mouseMoved→mousePressed→mouseReleased，非 el.click()；settle + 可见/启用/遮挡校验全开 + 对话框竞速）：target 支持 @eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）与 CSS 选择器；double=true 双击、right=true 右键（ClickSpec 透传）。不可见/被遮挡 → 422 PAGE_ELEMENT_NOT_VISIBLE / 409 PAGE_ELEMENT_BLOCKED；press 与 release 间弹对话框会自动 accept 并补发 release（结果串标注）。实例须运行中（409 PAGE_SERVICE_UNAVAILABLE）"
     )]
     async fn page_click(
         &self,
         Parameters(a): Parameters<PageClickArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run(|| {
-            self.state
-                .page
-                .click(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.target)
+            self.state.page.click(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.target,
+                a.double.unwrap_or(false),
+                a.right.unwrap_or(false),
+            )
         })
         .await
     }
@@ -1079,7 +1181,7 @@ impl ChromeHostMcp {
     }
 
     #[tool(
-        description = "按键（rawKeyDown/char/keyUp 三段，IME 安全）：key 支持 Enter/Tab/Escape/Backspace/Delete/Home/End/PageUp/PageDown/ArrowUp…/Space/F1-F12、单字符、组合键（Control+A / Meta+V / Shift+ArrowDown）；未知键名 → 400 PAGE_KEY_UNKNOWN。可选 target 先聚焦（@eN 引用或 CSS 选择器）再按键"
+        description = "按键（kit keyDown+keyUp 两段，IME 安全）：key 支持 Enter/Tab/Escape/Backspace/Delete/Home/End/PageUp/PageDown/ArrowUp…/Space/F1-F12、单字符、组合键（Control+A / Meta+V / Shift+ArrowDown）；未知键名 → 400 PAGE_KEY_UNKNOWN。可选 target 先聚焦（@eN 引用或 CSS 选择器，统一 kit 解析链）再按键"
     )]
     async fn page_press(
         &self,
@@ -1092,6 +1194,109 @@ impl ChromeHostMcp {
                 &a.key,
                 a.target.as_deref(),
             )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "悬停（mouseMoved 到元素中心）：菜单类页面展开 hover 菜单用它，展开后重 page_snap 拿新引用。target 支持 @eN 引用与 CSS 选择器；不可见/被遮挡 → 422 PAGE_ELEMENT_NOT_VISIBLE / 409 PAGE_ELEMENT_BLOCKED"
+    )]
+    async fn page_hover(
+        &self,
+        Parameters(a): Parameters<PageHoverArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .hover(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.target)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "滚动：target 给 @eN 引用/选择器时滚该元素（scrollBy），省略时滚整页（window.scrollBy）。dx/dy 单位 CSS 像素可负（如 dy=-600 向上滚 600px；dy=0 dx=500 横向滚）。懒加载页面滚动后用 page_wait 等新内容"
+    )]
+    async fn page_scroll(
+        &self,
+        Parameters(a): Parameters<PageScrollArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.scroll(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.target.as_deref(),
+                a.dx,
+                a.dy,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "拖拽（滑块/排序/拖放）：from/to 支持 @eN 引用与 CSS 选择器；轨迹为人类化插值（弧线 + 缓动，非直线瞬移）。两端点须在同一帧内（跨帧 → 422 PAGE_DRAG_CROSS_FRAME）；端点不可见/被遮挡同 click 错误码"
+    )]
+    async fn page_drag(
+        &self,
+        Parameters(a): Parameters<PageDragArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.drag(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.from,
+                &a.to,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "下拉选择：value 按 option 的 value 或可见文本（label）任一匹配（空串 = 选中空值选项）。原生 <select> 与 role=combobox/listbox 组件（Radix/Headless UI 等）都支持；未命中 → 422 PAGE_SELECT_NO_OPTION（message 列出可用项）；多候选 → 409 PAGE_SELECT_AMBIGUOUS；非选择控件 → 422 PAGE_SELECT_NOT_SELECT"
+    )]
+    async fn page_select(
+        &self,
+        Parameters(a): Parameters<PageSelectArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.select(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.target,
+                &a.value,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "勾选复选框/单选钮：uncheck=true 取消勾选。已处于目标态时 no-op 成功（结果串明示 already）。目标支持 input 本体、关联 label 或内嵌 input 的容器（@eN 引用或 CSS 选择器）"
+    )]
+    async fn page_check(
+        &self,
+        Parameters(a): Parameters<PageCheckArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.check(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.target,
+                a.uncheck.unwrap_or(false),
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "触摸轻点（touchStart/touchEnd）：移动端仿真（page_emulate）页面上某些控件只响应 touch 事件时用它替代 page_click。target 支持 @eN 引用与 CSS 选择器"
+    )]
+    async fn page_tap(
+        &self,
+        Parameters(a): Parameters<PageTapArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .tap(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.target)
         })
         .await
     }
@@ -1218,7 +1423,7 @@ impl ChromeHostMcp {
     }
 
     #[tool(
-        description = "向当前焦点元素直接输入文本（Input.insertText，无定位无校验）：跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达跨域 frame）——先用 page_clickxy 点入 iframe 获得焦点再 type；空文本 → 400"
+        description = "向当前焦点元素逐字符输入（可打印字符 insertText、\\n/\\t 走真按键事件，无定位无校验）：跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达跨域 frame）——先用 page_clickxy 点入 iframe 获得焦点再 type；空文本 → 400"
     )]
     async fn page_type(
         &self,

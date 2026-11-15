@@ -203,6 +203,31 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/click",
             post(crate::api::pages::click),
         )
+        // I2 新命令：hover/scroll/drag/select/check/tap（input 族 kit 化随行）
+        .route(
+            "/api/v1/instances/{id}/page/hover",
+            post(crate::api::pages::hover),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/scroll",
+            post(crate::api::pages::scroll),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/drag",
+            post(crate::api::pages::drag),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/select",
+            post(crate::api::pages::select),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/check",
+            post(crate::api::pages::check),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/tap",
+            post(crate::api::pages::tap),
+        )
         .route(
             "/api/v1/instances/{id}/page/fill",
             post(crate::api::pages::fill),

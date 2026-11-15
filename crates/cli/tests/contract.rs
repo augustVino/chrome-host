@@ -1557,11 +1557,11 @@ fn page_endpoints_contract() {
 
     // click：result 行 + 参数透传（target 与显式 tab 均进 body）
     let click = client
-        .page_click("ins_x", "@e1", Some("TAB9F"))
+        .page_click("ins_x", "@e1", false, false, Some("TAB9F"))
         .expect("click 应成功");
     assert_eq!(click["result"], "Clicked @e1 \"OK\" at CSS (100, 50)");
     let echo = client
-        .page_click("ins_pg", "#save", Some("TAB"))
+        .page_click("ins_pg", "#save", false, false, Some("TAB"))
         .expect("click echo 应成功");
     assert_eq!(echo["echo"]["target"], "#save");
     assert_eq!(echo["echo"]["tab"], "TAB");
@@ -1743,7 +1743,9 @@ fn page_endpoints_contract() {
     assert_eq!(echo["echo"]["tab"], "TAB");
 
     // 错误映射：404 tab 路由未命中 → exit 3
-    let err = client.page_click("err_tab", "@e1", None).unwrap_err();
+    let err = client
+        .page_click("err_tab", "@e1", false, false, None)
+        .unwrap_err();
     match &err {
         CliError::Api { status, code, .. } => {
             assert_eq!((*status, code.as_str()), (404, "PAGE_TAB_NOT_FOUND"));
@@ -1753,15 +1755,21 @@ fn page_endpoints_contract() {
     assert_eq!(exit::from_cli_error(&err).as_u8(), 3);
 
     // 409 引用失效 → exit 5（重 snap 而非重试）
-    let err = client.page_click("err_stale", "@e1", None).unwrap_err();
+    let err = client
+        .page_click("err_stale", "@e1", false, false, None)
+        .unwrap_err();
     assert_eq!(exit::from_cli_error(&err).as_u8(), 5);
 
     // 422 元素不可见 → exit 7（未知 4xx → VALIDATION 兑底）
-    let err = client.page_click("err_vis", ".x", None).unwrap_err();
+    let err = client
+        .page_click("err_vis", ".x", false, false, None)
+        .unwrap_err();
     assert_eq!(exit::from_cli_error(&err).as_u8(), 7);
 
     // 504 工具预算超时 → exit 5（RUNTIME_ERROR_CODES 显式条目，非 GENERAL 兑底）
-    let err = client.page_click("err_busy", ".x", None).unwrap_err();
+    let err = client
+        .page_click("err_busy", ".x", false, false, None)
+        .unwrap_err();
     match &err {
         CliError::Api { status, code, .. } => {
             assert_eq!((*status, code.as_str()), (504, "PAGE_TOOL_TIMEOUT"));

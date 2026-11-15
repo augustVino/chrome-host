@@ -187,8 +187,8 @@ export const API_CATALOG: CatalogGroup[] = [
       {
         method: 'POST',
         path: '/instances/:id/page/click',
-        desc: '原生输入点击：<sel|@eN>（可见性检查 + 遮挡拦截 + 三段鼠标事件）',
-        body: '{ "target": "@e1", "tab": null }',
+        desc: '原生输入点击：<sel|@eN>（v0.9+ kit 内核：settle + 可见/启用/遮挡 + 对话框竞速；double/right 透传）',
+        body: '{ "target": "@e1", "double": false, "right": false, "tab": null }',
       },
       {
         method: 'POST',
@@ -199,8 +199,44 @@ export const API_CATALOG: CatalogGroup[] = [
       {
         method: 'POST',
         path: '/instances/:id/page/press',
-        desc: '按键：命名键/单字符/组合键（Control+A）；target 先聚焦',
+        desc: '按键：命名键/单字符/组合键（Control+A）；target 先聚焦（v0.9+ keyDown+keyUp）',
         body: '{ "key": "Enter", "target": "@e1", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/hover',
+        desc: '悬停（mouseMoved 到元素中心）：菜单展开后重 snap（v0.9+）',
+        body: '{ "target": "@e1", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/scroll',
+        desc: '滚动：有 target 滚元素、无 target 滚页面（dx/dy = CSS 像素可负）（v0.9+）',
+        body: '{ "target": "#feed", "dx": 0, "dy": -600, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/drag',
+        desc: '拖拽：<from> <to>（人类化弧线轨迹；两端点同帧，跨帧 → 422）（v0.9+）',
+        body: '{ "from": "#thumb", "to": "#drop", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/select',
+        desc: '下拉选择：value 按 option 的 value 或可见文本匹配（原生 select 与 combobox 组件）（v0.9+）',
+        body: '{ "target": "#state", "value": "已上线", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/check',
+        desc: '勾选/取消勾选复选框、单选钮（uncheck=true 取消；已处于目标态 no-op 成功）（v0.9+）',
+        body: '{ "target": "#agree", "uncheck": false, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/tap',
+        desc: '触摸轻点（touchStart/touchEnd）：移动端仿真页专用（v0.9+）',
+        body: '{ "target": "#pay", "tab": null }',
       },
       {
         method: 'POST',

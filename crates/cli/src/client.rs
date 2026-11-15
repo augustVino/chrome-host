@@ -856,8 +856,27 @@ impl AgentClient {
         Self::decode(self.send(Method::POST, &Self::page_path(id, "snap"), Some(body), true))
     }
 
-    /// POST /api/v1/instances/{id}/page/click —— body `{target, tab?}`
+    /// POST /api/v1/instances/{id}/page/click —— body `{target, double?, right?, tab?}`
     pub fn page_click(
+        &self,
+        id: &str,
+        target: &str,
+        double: bool,
+        right: bool,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body =
+            serde_json::json!({ "target": target, "double": double, "right": right, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "click"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/hover —— body `{target, tab?}`
+    pub fn page_hover(
         &self,
         id: &str,
         target: &str,
@@ -866,10 +885,87 @@ impl AgentClient {
         let body = serde_json::json!({ "target": target, "tab": tab });
         Self::decode(self.send(
             Method::POST,
-            &Self::page_path(id, "click"),
+            &Self::page_path(id, "hover"),
             Some(body),
             true,
         ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/scroll —— body `{target?, dx, dy, tab?}`
+    ///（dx/dy = CSS 像素可负；target 缺省 = 整页滚动）
+    pub fn page_scroll(
+        &self,
+        id: &str,
+        target: Option<&str>,
+        dx: f64,
+        dy: f64,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "dx": dx, "dy": dy, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "scroll"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/drag —— body `{from, to, tab?}`
+    pub fn page_drag(
+        &self,
+        id: &str,
+        from: &str,
+        to: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "from": from, "to": to, "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "drag"), Some(body), true))
+    }
+
+    /// POST /api/v1/instances/{id}/page/select —— body `{target, value, tab?}`
+    ///（value 按 option 的 value 或可见文本匹配）
+    pub fn page_select(
+        &self,
+        id: &str,
+        target: &str,
+        value: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "value": value, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "select"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/check —— body `{target, uncheck?, tab?}`
+    pub fn page_check(
+        &self,
+        id: &str,
+        target: &str,
+        uncheck: bool,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "uncheck": uncheck, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "check"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/tap —— body `{target, tab?}`
+    pub fn page_tap(
+        &self,
+        id: &str,
+        target: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "tap"), Some(body), true))
     }
 
     /// POST /api/v1/instances/{id}/page/fill —— body `{target, value, tab?}`

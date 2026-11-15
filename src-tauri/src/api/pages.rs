@@ -40,10 +40,77 @@ pub struct SnapBody {
     pub selector: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/click —— 原生输入点击。
+/// POST /api/v1/instances/{id}/page/click —— 原生输入点击（I2：kit
+/// interaction 内核；双击/右键经 ClickSpec 透传）。
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClickBody {
     /// 点击目标：@eN ref（上次 snap 产生）或 CSS 选择器
+    pub target: String,
+    /// 双击（clickCount=2）；缺省 false
+    pub double: Option<bool>,
+    /// 右键（button=right）；缺省 false（left）
+    pub right: Option<bool>,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/hover —— 悬停（I2 新命令：mouseMoved）。
+#[derive(Deserialize)]
+pub struct HoverBody {
+    /// 悬停目标：@eN ref 或 CSS 选择器
+    pub target: String,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/scroll —— 滚动（I2 新命令：有 target
+/// 滚元素、无 target 滚页面；dx/dy 单位 CSS 像素，可负）。
+#[derive(Deserialize)]
+pub struct ScrollBody {
+    /// 滚动目标：@eN ref 或 CSS 选择器；缺省 = 整页滚动
+    pub target: Option<String>,
+    pub dx: f64,
+    pub dy: f64,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/drag —— 拖拽（I2 新命令：轨迹插值链，
+/// LCG 弧线 + smoothstep，人类化轨迹）。
+#[derive(Deserialize)]
+pub struct DragBody {
+    /// 拖拽起点：@eN ref 或 CSS 选择器
+    pub from: String,
+    /// 拖拽终点：@eN ref 或 CSS 选择器（与 from 同帧）
+    pub to: String,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/select —— 下拉选择（I2 新命令：按
+/// value 或可见文本匹配；原生 select 与 role=combobox/listbox 控件）。
+#[derive(Deserialize)]
+pub struct SelectBody {
+    /// 选择目标：@eN ref 或 CSS 选择器
+    pub target: String,
+    /// 选项 value 或可见文本（label）；空串 = 选中空值选项
+    pub value: String,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/check —— 勾选/取消勾选（I2 新命令；
+/// 已处于目标态 = no-op 成功）。复选框/单选钮与关联 label 控件。
+#[derive(Deserialize)]
+pub struct CheckBody {
+    /// 勾选目标：@eN ref 或 CSS 选择器（input 或关联 label）
+    pub target: String,
+    /// true = 取消勾选；缺省 false = 勾选
+    pub uncheck: Option<bool>,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/tap —— 触摸轻点（I2 新命令：
+/// touchStart/touchEnd，移动端仿真页面用 tap 而非 click）。
+#[derive(Deserialize)]
+pub struct TapBody {
+    /// 轻点目标：@eN ref 或 CSS 选择器
     pub target: String,
     pub tab: Option<String>,
 }
@@ -279,7 +346,101 @@ pub async fn click(
 ) -> Result<Json<Value>, AppError> {
     let resp = state
         .page
-        .click(&id, body.tab.as_deref().unwrap_or(""), &body.target)
+        .click(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.target,
+            body.double.unwrap_or(false),
+            body.right.unwrap_or(false),
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn hover(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<HoverBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .hover(&id, body.tab.as_deref().unwrap_or(""), &body.target)
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn scroll(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ScrollBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .scroll(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            body.target.as_deref(),
+            body.dx,
+            body.dy,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn drag(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DragBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .drag(&id, body.tab.as_deref().unwrap_or(""), &body.from, &body.to)
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn select(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<SelectBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .select(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.target,
+            &body.value,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn check(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<CheckBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .check(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.target,
+            body.uncheck.unwrap_or(false),
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn tap(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<TapBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .tap(&id, body.tab.as_deref().unwrap_or(""), &body.target)
         .await?;
     Ok(Json(resp))
 }
