@@ -145,9 +145,8 @@ iframe 内可交互元素（@eN 跨 frame 连续编号），click 走坐标投�
 不受影响）；CSS 选择器仍只查主 frame；帧内 hover 标记不适用（迭代边界）。
 对话框（alert/confirm/prompt/beforeunload）自动
 accept，命令期间新弹的附在成功响应 `dialogs_seen`，历史查 `page_dialogs`。
-`page_eval`/`page_html`/`page_clickxy`/`page_loadall`/`page_type` 为 cdp.mjs
-退役补齐的兑底五件：eval 是高权限原语（可执行任意 JS，与退役前 cdp.mjs 同
-权限——仅在 page 原语不够用时使用）；跨域 iframe（OOPIF）内元素已支持：snap 在 Iframe 节点行下内嵌帧内容、@eN 跨 frame 连续编号，click/fill/press 对帧内 @eN 直接可用（kit 解析链帧会话路由）；CSS 选择器仍只查主 frame，帧内坐标级兜底仍可用（`page_clickxy` 点入获得焦点 → `page_type` 输入）。
+`page_eval`/`page_html`/`page_clickxy`/`page_loadall`/`page_type` 为兑底
+五件：eval 是高权限原语（可执行任意 JS——仅在 page 原语不够用时使用）；跨域 iframe（OOPIF）内元素已支持：snap 在 Iframe 节点行下内嵌帧内容、@eN 跨 frame 连续编号，click/fill/press 对帧内 @eN 直接可用（kit 解析链帧会话路由）；CSS 选择器仍只查主 frame，帧内坐标级兜底仍可用（`page_clickxy` 点入获得焦点 → `page_type` 输入）。
 `page_navigate`/`page_back`/`page_forward`/`page_reload` 为导航四件套：同一
 标签的 page session 内导航/历史回退/重载，**保留历史**（实例级 `navigate` 的
 new+close 组合近似会丢历史）；等待 load 至多 25s，未证实 → 响应 `loaded:false`
@@ -179,12 +178,12 @@ new+close 组合近似会丢历史）；等待 load 至多 25s，未证实 → �
 | `page_downloads` | `instanceId`；可选 `tab` | 下载终态记录环（最近 20 条，含已消费——matched 区分；并发下载未被等待者拿走的在此可查） |
 | `page_upload` | `instanceId`, `target`, `filePath`；可选 `tab` | 主机文件设入 input[type=file]（触发原生 change；React 受控表单同常收到）。filePath 绝对路径且拒符号链接（422，macOS /tmp 类软链拒绝）、不存在 → 404、超 100MB → 422；非 file input → 422 PAGE_TARGET_NOT_FILE_INPUT |
 | `page_extract` | `instanceId`；可选 `target`（@eN / CSS，缺省 = 最大表格自动发现）、`tab` | 表格 → 结构化 JSON：columns（name/path/source）/rows（null = 被合并覆盖，"" = 真实空单元格）/meta（spans 锚点）/coverage（datasetComplete 只有 unknown/incomplete，永不装作取全）。非表格目标 → 422 PAGE_EXTRACT_NOT_A_TABLE |
-| `page_diff` | `instanceId`；可选 `tab`、`selector`、`compact`、`depth`、`baseline` | 快照文本 diff（I3）：当前 snap（与 page_snap 同管线，@eN 正常演进）↔ 基线的行级 unified diff。无 baseline = 与该 tab 上次 diff 的快照（滚动基线）比较并更新之；有 = 只比较不更新。响应 `{changed, added[], removed[], counts, diff, baselineCleared?}`；@eN 记号不剥（记号漂移即真实变化）；首次无基线 = 全部 added；快照超 2MiB 不入基线并标 baselineCleared |
-| `page_diff_shot` | `instanceId`, `baseline`（base64 png，必填）；可选 `tab`、`full` | 像素 diff（I3）：基线 png ↔ 当前截图（full=true 全页，缺省视口；与 page_screenshot 同管线）。响应 `{differing, ratio（差异像素百分比）, image?（差异图 base64：红标 + 灰阶，仅 differing）, dimensionMismatch?（尺寸不一致，此时 ratio=100）}`；颜色距离阈值 0.1（容忍抗锯齿噪声） |
-| `page_profiler_start` | `instanceId`；可选 `tab`、`categories`（数组） | 启动性能采样（I3，Chrome tracing ReportEvents + 采样；常驻不占实例串行锁，采样期间其他 page 命令正常）。categories 缺省 = 全家桶（devtools.timeline/v8/blink 等）。同一实例同时只允许一个：重复 → 409 PAGE_PROFILER_ALREADY_ACTIVE |
-| `page_profiler_stop` | `instanceId`；可选 `out`（app 主机落盘路径，缺省 <实例id>-trace.json） | 停止采样并落盘（I3；按 start 锚点路由，无需 tab）。事件收集至多 30s → traceEvents JSON。响应 `{result, path, eventCount}`；无运行中 → 409 PAGE_PROFILER_NOT_RUNNING；收集超时 → 504 可重试（tracing 仍 active） |
-| `page_record_start` | `instanceId`, `file`（app 主机路径，必填）；可选 `fps`（1-60，缺省 30）、`cursor`、`tab` | 启动页录屏（I4，screencast 帧流 → ffmpeg 编码；常驻不占实例串行锁，录制期间其他 page 命令正常）。file 扩展名定容器（.webm/.mp4/.mov…，无扩展名 → 400）；cursor=true 合成光标（页内覆盖层动画 + click/drag/clickxy 输入采样帧间插值）；重复 → 409 PAGE_RECORD_ALREADY_ACTIVE；无 ffmpeg → 422 PAGE_RECORD_NO_FFMPEG（message 带安装提示） |
-| `page_record_stop` | `instanceId`；可选 `status` | 停止录屏并结算产物（I4；按 start 锚点路由，无需 tab；编码收尾可能数秒）。响应 `{result, path, frames, capturedFrames, fps}`；status=true 附 kit 完整终态（capture 模式/设备缩放）；无运行中 → 409 PAGE_RECORD_NOT_RUNNING（含连接重建/锚点 tab 关闭致废弃，message 披露） |
+| `page_diff` | `instanceId`；可选 `tab`、`selector`、`compact`、`depth`、`baseline` | 快照文本 diff：当前 snap（与 page_snap 同管线，@eN 正常演进）↔ 基线的行级 unified diff。无 baseline = 与该 tab 上次 diff 的快照（滚动基线）比较并更新之；有 = 只比较不更新。响应 `{changed, added[], removed[], counts, diff, baselineCleared?}`；@eN 记号不剥（记号漂移即真实变化）；首次无基线 = 全部 added；快照超 2MiB 不入基线并标 baselineCleared |
+| `page_diff_shot` | `instanceId`, `baseline`（base64 png，必填）；可选 `tab`、`full` | 像素 diff：基线 png ↔ 当前截图（full=true 全页，缺省视口；与 page_screenshot 同管线）。响应 `{differing, ratio（差异像素百分比）, image?（差异图 base64：红标 + 灰阶，仅 differing）, dimensionMismatch?（尺寸不一致，此时 ratio=100）}`；颜色距离阈值 0.1（容忍抗锯齿噪声） |
+| `page_profiler_start` | `instanceId`；可选 `tab`、`categories`（数组） | 启动性能采样（Chrome tracing ReportEvents + 采样；常驻不占实例串行锁，采样期间其他 page 命令正常）。categories 缺省 = 全家桶（devtools.timeline/v8/blink 等）。同一实例同时只允许一个：重复 → 409 PAGE_PROFILER_ALREADY_ACTIVE |
+| `page_profiler_stop` | `instanceId`；可选 `out`（app 主机落盘路径，缺省 <实例id>-trace.json） | 停止采样并落盘（按 start 锚点路由，无需 tab）。事件收集至多 30s → traceEvents JSON。响应 `{result, path, eventCount}`；无运行中 → 409 PAGE_PROFILER_NOT_RUNNING；收集超时 → 504 可重试（tracing 仍 active） |
+| `page_record_start` | `instanceId`, `file`（app 主机路径，必填）；可选 `fps`（1-60，缺省 30）、`cursor`、`tab` | 启动页录屏（screencast 帧流 → ffmpeg 编码；常驻不占实例串行锁，录制期间其他 page 命令正常）。file 扩展名定容器（.webm/.mp4/.mov…，无扩展名 → 400）；cursor=true 合成光标（页内覆盖层动画 + click/drag/clickxy 输入采样帧间插值）；重复 → 409 PAGE_RECORD_ALREADY_ACTIVE；无 ffmpeg → 422 PAGE_RECORD_NO_FFMPEG（message 带安装提示） |
+| `page_record_stop` | `instanceId`；可选 `status` | 停止录屏并结算产物（按 start 锚点路由，无需 tab；编码收尾可能数秒）。响应 `{result, path, frames, capturedFrames, fps}`；status=true 附 kit 完整终态（capture 模式/设备缩放）；无运行中 → 409 PAGE_RECORD_NOT_RUNNING（含连接重建/锚点 tab 关闭致废弃，message 披露） |
 
 `tab` = targetId 或唯一前缀（`list_tabs` 获得）；省略 = 唯一页面标签自动选中，
 多标签 409 并在 message 列出全部 targetId。错误处置看 code 分支：`PAGE_REF_STALE`/

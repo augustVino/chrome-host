@@ -139,7 +139,7 @@ export const API_CATALOG: CatalogGroup[] = [
       {
         method: 'GET',
         path: '/instances/:id/diagnostics',
-        desc: '页面诊断快照（M5）',
+        desc: '页面诊断快照',
         note: '页面扩展采集的即时快照（JS 错误/失败资源/LCP/FCP）；对第一个 http(s) 页短连接求值，与常驻诊断互补',
       },
       {

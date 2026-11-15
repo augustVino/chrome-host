@@ -210,9 +210,9 @@ chrome-host env delete <id> --yes
 
 ### page — 页面控制
 
-页面操作面（P2-C；仅运行中实例，否则 409 exit 5）。操作循环：`page snap` 拿
+页面操作面（仅运行中实例，否则 409 exit 5）。操作循环：`page snap` 拿
 @eN 引用 → `page click/fill/press --target` 用引用操作 → 页面变化后重新 `snap`。
-引用是 **durable** 的（v0.7+，I1b）：SPA 同文档更新（局部刷新/pushState）后旧
+引用是 **durable** 的（v0.7+）：SPA 同文档更新（局部刷新/pushState）后旧
 @eN 仍可用（同节点直接命中，节点失联时按 role/name 唯一匹配恢复）；只有解析
 报 `PAGE_REF_STALE`（节点已随导航/替换死亡且恢复无果）时才**重 snap，不要对
 旧引用重试**；`PAGE_REF_NOT_FOUND` = 从未 snap / 引用拼错。对话框（alert/confirm/prompt/beforeunload）会被自动
@@ -237,19 +237,19 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 | `page wait <ID> <selector> [--state V] [--timeout 10s] [--tab T]` | 轮询等待（250ms 间隔）；state = visible（缺省）/hidden/attached/detached；超时 → 409 exit 5 |
 | `page dialogs <ID> [--tab T] [--since N]` | 已自动应答的对话框日志（SEQ/TYPE/MESSAGE 表 + cursor 行；`--since` 增量拉取） |
 | `page eval <ID> <expr> [--tab T]` | 任意 JS 求值（⚠ 高权限：优先 snap/click 等专用原语，仅在不够用时用）；对象结果 = pretty JSON |
-| `page raw <ID> <method> [json] [--tab T] [--browser]` | 任意 CDP 命令透传（⚠ 最高权限逃生舱，对齐退役前 cdp.mjs evalraw）；--browser 发 browser 级（Target 域等），缺省发 tab 的 page session；params 非法 JSON 本地 exit 2 |
+| `page raw <ID> <method> [json] [--tab T] [--browser]` | 任意 CDP 命令透传（⚠ 最高权限逃生舱）；--browser 发 browser 级（Target 域等），缺省发 tab 的 page session；params 非法 JSON 本地 exit 2 |
 | `page html <ID> [selector] [--tab T]` | 读 outerHTML（缺省 = 整文档；未命中 → 404 exit 3）；html 原样到 stdout，`--json` 包 `html` 字段 |
 | `page clickxy <ID> <x> <y> [--tab T]` | 视口坐标点击（CSS 像素；无定位/遮挡校验，坐标即意图） |
 | `page loadall <ID> <selector> [--interval 1500ms] [--max-clicks 200] [--tab T]` | 循环点击「加载更多」直到消失；达上限仍未消失时结果明示 still present |
 | `page type <ID> <text> [--tab T]` | 向当前焦点元素输入文本（跨域 iframe 内坐标级兑底：@eN 已支持帧直达，selector 不可达帧内时先 clickxy 点入）；空文本 → 400 exit 7 |
 | `page screenshot <ID> [sel\|@eN] [--full] [--tab T] [--out F]` | png 截图三形态：目标缺省 = 视口；@eN/选择器 = 元素；--full = 全页（截发起时刻整文档，懒加载未加载内容不在图；上限 16384 设备像素 ÷ DPR）；--full 缺省 `<id>-full.png`；与 target 互斥 exit 2 |
 | `page pdf <ID> [--landscape] [--no-print-background] [--paper-width 8.5] [--paper-height 11] [--tab T] [--out F]` | 整页 PDF（缺省 Letter 纵向带背景；缺省 `<id>.pdf`） |
-| `page diff <ID> [TAB] [-s SEL] [-c] [-d N] [--baseline-file F]` | 快照文本 diff（I3）：当前 snap ↔ 上次基线（滚动更新，@eN 记号不剥——记号漂移即真实变化）；--baseline-file 显式基线只比较不更新；响应 `{changed, added, removed, counts, diff}`；快照超 2MiB 不入基线标 baselineCleared；首次无基线 = 全部 added；quiet = changed |
-| `page diff-shot <ID> --baseline-file <png> [--full] [--tab T] [--out F]` | 像素 diff（I3）：基线 png（必填）↔ 当前截图（--full 全页，缺省视口）；响应 `{differing, ratio, image?, dimensionMismatch?}`（阈值 0.1 容忍抗锯齿）；--out 落差异图（差异红标 + 原图灰阶） |
-| `page profiler-start <ID> [TAB] [--categories "a,b"]` | 启动性能采样（I3，Chrome tracing ReportEvents + 采样；常驻不占实例串行锁；categories 缺省 = 全家桶；重复 start → 409 `PAGE_PROFILER_ALREADY_ACTIVE`） |
-| `page profiler-stop <ID> [--out F]` | 停止采样并落盘 traceEvents JSON（I3；按 start 锚点路由无需 tab；事件收集至多 30s；--out 缺省 `<id>-trace.json`；无运行中 → 409 `PAGE_PROFILER_NOT_RUNNING`；quiet = 落盘路径） |
-| `page record-start <ID> <FILE> [--fps N] [--cursor] [--tab T]` | 启动页录屏（I4，screencast 帧流 → ffmpeg 编码；常驻不占实例串行锁，录制期间其他 page 命令正常）。FILE 必填（app 主机路径，扩展名定容器 .webm/.mp4/.mov…，无扩展名 → 400）；fps 1-60 缺省 30；--cursor 合成光标（页内覆盖层 + click/drag/clickxy 输入采样插值）；重复 start → 409 `PAGE_RECORD_ALREADY_ACTIVE`；无 ffmpeg → 422 `PAGE_RECORD_NO_FFMPEG`（带安装提示） |
-| `page record-stop <ID> [--status]` | 停止录屏并结算产物（I4；按 start 锚点路由无需 tab；编码收尾可能数秒——screencast teardown/ffmpeg flush）。响应 `{result, path, frames, capturedFrames, fps}`；--status 附完整终态（capture 模式/设备缩放）；无运行中 → 409 `PAGE_RECORD_NOT_RUNNING`；quiet = 产物路径 |
+| `page diff <ID> [TAB] [-s SEL] [-c] [-d N] [--baseline-file F]` | 快照文本 diff：当前 snap ↔ 上次基线（滚动更新，@eN 记号不剥——记号漂移即真实变化）；--baseline-file 显式基线只比较不更新；响应 `{changed, added, removed, counts, diff}`；快照超 2MiB 不入基线标 baselineCleared；首次无基线 = 全部 added；quiet = changed |
+| `page diff-shot <ID> --baseline-file <png> [--full] [--tab T] [--out F]` | 像素 diff：基线 png（必填）↔ 当前截图（--full 全页，缺省视口）；响应 `{differing, ratio, image?, dimensionMismatch?}`（阈值 0.1 容忍抗锯齿）；--out 落差异图（差异红标 + 原图灰阶） |
+| `page profiler-start <ID> [TAB] [--categories "a,b"]` | 启动性能采样（Chrome tracing ReportEvents + 采样；常驻不占实例串行锁；categories 缺省 = 全家桶；重复 start → 409 `PAGE_PROFILER_ALREADY_ACTIVE`） |
+| `page profiler-stop <ID> [--out F]` | 停止采样并落盘 traceEvents JSON（按 start 锚点路由无需 tab；事件收集至多 30s；--out 缺省 `<id>-trace.json`；无运行中 → 409 `PAGE_PROFILER_NOT_RUNNING`；quiet = 落盘路径） |
+| `page record-start <ID> <FILE> [--fps N] [--cursor] [--tab T]` | 启动页录屏（screencast 帧流 → ffmpeg 编码；常驻不占实例串行锁，录制期间其他 page 命令正常）。FILE 必填（app 主机路径，扩展名定容器 .webm/.mp4/.mov…，无扩展名 → 400）；fps 1-60 缺省 30；--cursor 合成光标（页内覆盖层 + click/drag/clickxy 输入采样插值）；重复 start → 409 `PAGE_RECORD_ALREADY_ACTIVE`；无 ffmpeg → 422 `PAGE_RECORD_NO_FFMPEG`（带安装提示） |
+| `page record-stop <ID> [--status]` | 停止录屏并结算产物（按 start 锚点路由无需 tab；编码收尾可能数秒——screencast teardown/ffmpeg flush）。响应 `{result, path, frames, capturedFrames, fps}`；--status 附完整终态（capture 模式/设备缩放）；无运行中 → 409 `PAGE_RECORD_NOT_RUNNING`；quiet = 产物路径 |
 | `page emulate <ID> --preset P \| --viewport WxH [--user-agent UA] [--mobile] [--touch] \| --off [--tab T]` | 设备仿真（仅作用该 tab；重复 = 覆盖，--off 恢复；预设：iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p） |
 | `page navigate <ID> <url> [--tab T]` | 页内导航（page session 上 Page.navigate，保留历史）；等 load 至多 25s，未证实 → loaded:false；导航失败（net::ERR_*）→ 500 exit 5；URL 非法 → 400 exit 7 |
 | `page back <ID> [--tab T]` | 历史后退一步；无更早条目 → 409 `PAGE_NAV_NO_HISTORY` exit 5 |
@@ -286,7 +286,7 @@ chrome-host page press ins_xxx Enter --target @e2
 chrome-host page wait ins_xxx '.result-item' --state visible --timeout 15s
 chrome-host page dialogs ins_xxx --since 3
 
-# 兑底五件（cdp.mjs 退役补齐）
+# 兑底五件（html/loadall/clickxy/type/eval）
 chrome-host page html ins_xxx '#main'          # 读命中元素 outerHTML
 chrome-host page loadall ins_xxx '.load-more' --interval 2s --max-clicks 50
 # 跨域 iframe：坐标点入获得焦点 → 直接输入（selector 不可达 frame）
@@ -294,7 +294,7 @@ chrome-host page clickxy ins_xxx 320 240
 chrome-host page type ins_xxx 'hello iframe'
 chrome-host page eval ins_xxx 'document.title'   # 高权限，最后手段
 
-# 输入面六新件（v0.7+ / I2：hover/scroll/drag/select/check/tap）
+# 输入面六新件（v0.7+：hover/scroll/drag/select/check/tap）
 chrome-host page hover ins_xxx @e3              # 悬停展开菜单 → 重 snap 拿新引用
 chrome-host page scroll ins_xxx '#feed' 0 -600  # 滚元素（省略目标滚整页）
 chrome-host page drag ins_xxy '#thumb' '#drop'  # 拖拽（弧线轨迹）
