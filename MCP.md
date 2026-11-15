@@ -8,7 +8,7 @@
 
 - [连接配置](#连接配置)
 - [通用行为约定](#通用行为约定)
-- [工具总览（67 个）](#工具总览67-个)
+- [工具总览（69 个）](#工具总览69-个)
 - [内核](#内核)
 - [环境](#环境)
 - [实例](#实例)
@@ -66,7 +66,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 4. **内核未装时 `create_instance` 会阻塞于首次下载**（约 150MB）——复杂任务先调 `kernel_status` 预判。
 5. 扩展启停只影响**之后启动的实例**；实例创建非幂等（每次新增一个）。可选 `name` 在同环境内唯一——重名创建会得到 409，可先 `list_instances` 查名再建。
 
-- [工具总览（67 个）](#工具总览67-个)
+- [工具总览（69 个）](#工具总览69-个)
 
 | 分组 | 工具 |
 |---|---|
@@ -75,7 +75,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | 实例（9） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
 | 常驻诊断（6） | `get_diagnostics` · `get_console` · `get_network` · `get_network_body` · `get_screenshot` · `get_har` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
-- [工具总览（67 个）](#工具总览67-个)
+- [工具总览（69 个）](#工具总览69-个)
 | 页面控制（35） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_hover` · `page_scroll` · `page_drag` · `page_select` · `page_check` · `page_tap` · `page_wait` · `page_dialogs` · `page_eval` · `page_raw` · `page_html` · `page_clickxy` · `page_loadall` · `page_type` · `page_navigate` · `page_back` · `page_forward` · `page_reload` · `page_screenshot` · `page_pdf` · `page_diff` · `page_diff_shot` · `page_profiler_start` · `page_profiler_stop` · `page_record_start` · `page_record_stop` · `page_emulate` · `page_extract` · `page_download_wait` · `page_downloads` · `page_upload` |
 | 登录态（2） | `login_profile`（action: get / capture / reset） · `session_status` |
 | 扩展（7） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` · `get_extension_config` · `set_extension_config` |
@@ -137,7 +137,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 
 实例级常驻连接上的页面操作面（与 CLI `page` 命令族、REST `/instances/{id}/page/*`
 同源）。操作循环：`page_snap` 拿 @eN 引用 → `page_click`/`page_fill`/`page_press`
-用引用操作 → 页面变化后重新 `page_snap`。引用是 durable 的（v0.8+）：SPA 同文档
+用引用操作 → 页面变化后重新 `page_snap`。引用是 durable 的（v0.7+）：SPA 同文档
 局部刷新后旧 @eN 仍可用；收到 409 `PAGE_REF_STALE`（节点死亡且恢复无果）时重
 snap，而非对旧引用重试。**跨域 iframe（OOPIF）**：snap 的 Iframe 节点行下内嵌
 iframe 内可交互元素（@eN 跨 frame 连续编号），click 走坐标投影、fill/press 走
@@ -156,8 +156,8 @@ new+close 组合近似会丢历史）；等待 load 至多 25s，未证实 → �
 
 | 工具 | 输入 | 说明 |
 |---|---|---|
-| `page_snap` | `instanceId`；可选 `tab`、`compact`、`interactive`、`depth`、`urls`、`selector` | AX 树快照（v0.8+ kit 管线）：上游风格文本树（`- button "Buy" @e1`）+ `refs_count` + `generation` + `removedRefs`（有旧引用消失时）+ hover 感知（行尾 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化；meta `hoverScan`：ok/truncated(预算截断 32 表/2MiB/256 规则)/skipped(无 hover 规则)/error）；跨域 iframe 内容内嵌在 Iframe 节点行下 |
-| `page_click` | `instanceId`, `target`；可选 `double`, `right`, `tab` | 原生输入点击（v0.9+ kit 内核：settle + 可见/启用/遮挡校验全开 + 对话框竞速）；target 支持 @eN 引用（durable：同文档更新仍可用，报 409 `PAGE_REF_STALE` 时重 snap）与 CSS 选择器；double=true 双击、right=true 右键 |
+| `page_snap` | `instanceId`；可选 `tab`、`compact`、`interactive`、`depth`、`urls`、`selector` | AX 树快照（v0.7+ kit 管线）：上游风格文本树（`- button "Buy" @e1`）+ `refs_count` + `generation` + `removedRefs`（有旧引用消失时）+ hover 感知（行尾 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化；meta `hoverScan`：ok/truncated(预算截断 32 表/2MiB/256 规则)/skipped(无 hover 规则)/error）；跨域 iframe 内容内嵌在 Iframe 节点行下 |
+| `page_click` | `instanceId`, `target`；可选 `double`, `right`, `tab` | 原生输入点击（v0.7+ kit 内核：settle + 可见/启用/遮挡校验全开 + 对话框竞速）；target 支持 @eN 引用（durable：同文档更新仍可用，报 409 `PAGE_REF_STALE` 时重 snap）与 CSS 选择器；double=true 双击、right=true 右键 |
 | `page_fill` | `instanceId`, `target`, `value`；可选 `tab` | 聚焦→清空→输入→回读校验；空 value = 仅清空 |
 | `page_press` | `instanceId`, `key`；可选 `target`, `tab` | 键盘事件（keyDown+keyUp，组合键如 Control+A）；target 先聚焦 |
 | `page_hover` | `instanceId`, `target`；可选 `tab` | 悬停（mouseMoved 到元素中心）：菜单类页面展开 hover 菜单，展开后重 `page_snap` 拿新引用 |
@@ -174,7 +174,7 @@ new+close 组合近似会丢历史）；等待 load 至多 25s，未证实 → �
 | `page_clickxy` | `instanceId`, `x`, `y`；可选 `tab` | 视口坐标点击（CSS 像素；无定位/遮挡校验，坐标即意图）；跨域 iframe 元素兜底 |
 | `page_loadall` | `instanceId`, `selector`；可选 `interval`, `maxClicks`, `tab` | 循环点击直到消失（interval 缺省 `"1500ms"`，maxClicks 缺省 200）；达上限仍未消失时结果明示 still present |
 | `page_type` | `instanceId`, `text`；可选 `tab` | 向当前焦点元素直接输入（无定位无校验）；跨域 iframe 内坐标级兜底（@eN 已支持帧直达，selector 不可达帧内时先 `page_clickxy` 点入）；空文本 → 400 |
-- [工具总览（67 个）](#工具总览67-个)
+- [工具总览（69 个）](#工具总览69-个)
 | `page_download_wait` | `instanceId`；可选 `timeoutMs`（缺省 30000）、`tab` | 等待**下一次**下载完成（命令式：先调本工具再另行 `page_click` 触发；等待期不阻塞其他命令）。返回 filePath/fileName/bytes（落盘在实例 profile 的 downloads/）；失败/取消 → 500 PAGE_DOWNLOAD_FAILED；超时 → 409 PAGE_DOWNLOAD_TIMEOUT |
 | `page_downloads` | `instanceId`；可选 `tab` | 下载终态记录环（最近 20 条，含已消费——matched 区分；并发下载未被等待者拿走的在此可查） |
 | `page_upload` | `instanceId`, `target`, `filePath`；可选 `tab` | 主机文件设入 input[type=file]（触发原生 change；React 受控表单同常收到）。filePath 绝对路径且拒符号链接（422，macOS /tmp 类软链拒绝）、不存在 → 404、超 100MB → 422；非 file input → 422 PAGE_TARGET_NOT_FILE_INPUT |

@@ -295,7 +295,7 @@ base64 + `encoding: "base64"`，HAR 惯例）；`_meta.uncollected` 逐行声明
 
 实例级常驻 CDP 连接上的页面操作面：`snap` 产生 @eN 引用，`click`/`fill`/
 `press`/`hover`/`scroll`/`drag`/`select`/`check`/`tap` 消费引用或 CSS 选择器
-（v0.9+ / I2：input 族内核 = browser_kit interaction——settle + actionability
+（v0.7+ / I2：input 族内核 = browser_kit interaction——settle + actionability
 全开 + 对话框竞速），`wait` 轮询等待（我方自有实现），`dialogs` 读自动应答的
 对话框日志；`eval`/`html`/`clickxy`/`loadall`/`type` 为 cdp.mjs 退役补齐的兑
 底五件（行为规格同源 TS 工具）；`navigate`/`back`/`forward`/`reload` 为导航
@@ -307,7 +307,7 @@ PAGE_SERVICE_UNAVAILABLE`）。
 | 端点 | 说明 |
 |---|---|
 | `POST /api/v1/instances/{id}/page/snap` | kit 快照管线 + durable @eN refs + hover 感知标记（行尾 `[hover]` / `[hover-reveal]`，meta `hoverScan`）。body `{ "tab?", "compact?", "interactive?", "depth?", "urls?", "selector?" }`（全缺省 = 完整树）；跨域 iframe 内容内嵌在 Iframe 节点行下（@eN 跨 frame 连续编号）；响应含 `removedRefs`（本次快照消失的旧引用，非空时才有） |
-| `POST /api/v1/instances/{id}/page/click` | 原生输入点击（v0.9+/I2 kit 内核：三段 ClickPhase + settle + 可见/启用/遮挡 + 对话框竞速；press→release 间弹框自动 accept 后补发 release）。body `{ "target", "double?", "right?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/click` | 原生输入点击（v0.7+/I2 kit 内核：三段 ClickPhase + settle + 可见/启用/遮挡 + 对话框竞速；press→release 间弹框自动 accept 后补发 release）。body `{ "target", "double?", "right?", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/hover` | 悬停（mouseMoved 到元素中心；菜单展开后重 snap）。body `{ "target", "tab?" }`（I2 新增） |
 | `POST /api/v1/instances/{id}/page/scroll` | 滚动：有 target 滚元素、无 target 滚页面；dx/dy 单位 CSS 像素可负。body `{ "target?", "dx", "dy", "tab?" }`（I2 新增） |
 | `POST /api/v1/instances/{id}/page/drag` | 拖拽（人类化弧线轨迹；两端点须同帧，跨帧 → 422 `PAGE_DRAG_CROSS_FRAME`）。body `{ "from", "to", "tab?" }`（I2 新增） |
@@ -315,7 +315,7 @@ PAGE_SERVICE_UNAVAILABLE`）。
 | `POST /api/v1/instances/{id}/page/check` | 勾选/取消勾选复选框、单选钮（已处于目标态 no-op 成功）。body `{ "target", "uncheck?", "tab?" }`（I2 新增） |
 | `POST /api/v1/instances/{id}/page/tap` | 触摸轻点（touchStart/touchEnd，移动端仿真页）。body `{ "target", "tab?" }`（I2 新增） |
 | `POST /api/v1/instances/{id}/page/fill` | 聚焦→全选清空→insertText→回读校验。body `{ "target", "value", "tab?" }` |
-| `POST /api/v1/instances/{id}/page/press` | 键盘事件（v0.9+/I2：keyDown+keyUp 两段，Ctrl/Meta 组合抑制 text；--target 先聚焦，统一 kit 解析链）。body `{ "key", "target?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/press` | 键盘事件（v0.7+/I2：keyDown+keyUp 两段，Ctrl/Meta 组合抑制 text；--target 先聚焦，统一 kit 解析链）。body `{ "key", "target?", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/wait` | 轮询等待元素状态（250ms 间隔）。body `{ "selector", "state?", "timeout?", "tab?" }` |
 | `GET /api/v1/instances/{id}/page/dialogs` | 已自动应答的对话框日志。query `tab?&since=` |
 | `POST /api/v1/instances/{id}/page/eval` | 任意 JS 求值（⚠ 高权限，见下）。body `{ "expression", "tab?" }` |
@@ -361,7 +361,7 @@ PAGE_SERVICE_UNAVAILABLE`）。
   `display:none` 隐藏的 reveal 目标不在 AX 树（hover 后出现，重新 snap 可见）；
   CSS 解析为启发式（`@keyframes`/注释/`:not(:hover)` 已排除，误报由 DOM
   求值兜底——查不到元素的选择器自然无标记）。
-- **`target`**：`@eN` 引用（durable，v0.8+/I1b：SPA 同文档更新后旧引用仍可用
+- **`target`**：`@eN` 引用（durable，v0.7+/I1b：SPA 同文档更新后旧引用仍可用
   ——同节点直接命中，失联时按 role/name 唯一匹配恢复；导航/文档替换后节点死亡
   → `PAGE_REF_STALE`，重 snap 而非对旧引用重试）或 CSS 选择器两种形态。
 - **跨域 iframe（OOPIF）**：snap 的 AX 树包含跨域 iframe 内的可交互元素
@@ -469,13 +469,13 @@ block/redirect/headers，intercept 管任务内 mock/改头/按需 block）。**
 | `GET /api/v1/instances/{id}/page/intercept?tab=` | 拦截状态：各规则命中计数/剩余/活跃 + 干预记录环（最近 200 条，url 已脱敏）+ `liveSince` |
 
 ```json
-// POST .../page/snap 响应（v0.8+ 上游风格行 + @eN 后处理；hoverScan 见下；
+// POST .../page/snap 响应（v0.7+ 上游风格行 + @eN 后处理；hoverScan 见下；
 // removedRefs 仅在本次快照有旧引用消失时出现）
 { "instanceId": "ins_...", "targetId": "ABC123",
   "text": "- link \"More information...\" @e1 [hover]\n- heading \"Example Domain\"",
   "refs_count": 1, "generation": 2, "hoverScan": "ok", "removedRefs": ["@e3"] }
 
-// POST .../page/click 响应（v0.9+/I2：selector 路径无 tag/text 可供回显，
+// POST .../page/click 响应（v0.7+/I2：selector 路径无 tag/text 可供回显，
 // 结果串改为选择器 + 顶层视口坐标；fill/press/wait 等同为 result 单行形态）
 { "result": "Clicked \"#save\" at CSS (150, 130)",
   "instanceId": "ins_...", "targetId": "ABC123" }
@@ -725,15 +725,15 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `PAGE_PROFILER_ALREADY_ACTIVE` / `PAGE_PROFILER_NOT_RUNNING` | profiler 重复 start / stop 时无运行中采样（含从未 start、已 stop、连接重建或锚点 tab 关闭致运行态废弃——message 披露具体路径） |
 | 409 | `PAGE_RECORD_ALREADY_ACTIVE` / `PAGE_RECORD_NOT_RUNNING` | record 重复 start（同实例同时只允许一路录制）/ stop 时无运行中录制（废弃路径同 profiler，message 披露） |
 | 409 | `PAGE_FOCUS_FAILED` / `PAGE_FILL_FOCUS_LOST` | page press/fill 焦点失败 / 页面在 fill 过程中抢走焦点 |
-| 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_ELEMENT_DISABLED` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / 元素被禁用（v0.8+ kit 解析链） / fill 目标不可编辑 |
+| 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_ELEMENT_DISABLED` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / 元素被禁用（v0.7+ kit 解析链） / fill 目标不可编辑 |
 | 422 | `PAGE_RECORD_NO_FFMPEG` | 录制前置 ffmpeg 探测失败（message 带安装提示 brew/apt install ffmpeg） |
-| 500 | `PAGE_ACTION_FAILED` | page 工具链未分类失败（v0.8+ kit String 错误兜底，message 原文透传） |
+| 500 | `PAGE_ACTION_FAILED` | page 工具链未分类失败（v0.7+ kit String 错误兜底，message 原文透传） |
 | 422 | `PAGE_EMULATE_UNKNOWN_PRESET` / `PAGE_EXTRACT_NOT_A_TABLE` | 未知仿真预设 / extract 目标非表格（仅接受 table/[role=table\|grid\|treegrid]） |
 | 422 | `PAGE_TARGET_NOT_FILE_INPUT` / `PAGE_UPLOAD_PATH_INVALID` / `PAGE_UPLOAD_FILE_TOO_LARGE` | upload 目标非 input[type=file] / filePath 非绝对路径或经符号链接或非普通文件 / 超 100MB 上限（W-file） |
 | 404 | `PAGE_UPLOAD_FILE_NOT_FOUND` | upload 的主机文件不存在（W-file） |
 | 409 | `PAGE_DOWNLOAD_TIMEOUT` | download-wait 窗口耗尽且无终态证据（有下载在进行中会在 message 披露；与失败严格区分，W-file） |
 | 500 | `PAGE_DOWNLOAD_FAILED` | 下载终态 = interrupted/canceled（或文件名不安全被拒）——下载了但失败（W-file） |
-| 500 | `PAGE_DISPATCH_FAILED` | Input 派发失败（message 附 effect_state：`none`=未发出可重试 / `unknown`=已发出禁盲目重试；v0.9+/I2 kit click/drag 链不外露失败相位，一律保守 unknown） |
+| 500 | `PAGE_DISPATCH_FAILED` | Input 派发失败（message 附 effect_state：`none`=未发出可重试 / `unknown`=已发出禁盲目重试；v0.7+/I2 kit click/drag 链不外露失败相位，一律保守 unknown） |
 | 422 | `PAGE_SELECT_NO_OPTION` / `PAGE_SELECT_NOT_SELECT` | select：选项未命中（message 列出可用项） / 目标非 select 或 role=combobox/listbox 控件（I2 新增） |
 | 409 | `PAGE_SELECT_AMBIGUOUS` / `PAGE_DRAG_CROSS_FRAME` | select 多候选匹配 / drag 两端点在不同帧（I2 新增） |
 | 500 | `PAGE_EVAL_FAILED` / `CDP_COMMAND_FAILED` | page 工具页内 eval 失败 / CDP 发送失败 |

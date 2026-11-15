@@ -341,6 +341,42 @@ export const API_CATALOG: CatalogGroup[] = [
       },
       {
         method: 'POST',
+        path: '/instances/:id/page/diff',
+        desc: '快照文本 diff：当前 snap ↔ 基线（无 baseline 用滚动基线并更新；baseline 给定只比较；首次全 added）（v0.7+）',
+        body: '{ "baseline": null, "selector": null, "compact": false, "depth": null, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/diff-shot',
+        desc: '像素 diff：base64 png 基线 ↔ 当前截图（阈值 0.1 容抗锯齿；尺寸不一致披露 dimensionMismatch）（v0.7+）',
+        body: '{ "baseline": "<b64png>", "full": false, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/profiler/start',
+        desc: '启动性能采样（Chrome tracing；categories 缺省全家桶；常驻不占串行锁；重复 → 409）（v0.7+）',
+        body: '{ "categories": null, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/profiler/stop',
+        desc: '停止采样落盘 traceEvents JSON（out 缺省 <id>-trace.json；收集至多 30s；无运行中 → 409）（v0.7+）',
+        body: '{ "out": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/record/start',
+        desc: '启动页录屏（screencast→ffmpeg；file 扩展名定容器；fps 1-60 缺省 30；cursor 合成光标；重复 → 409；无 ffmpeg → 422）（v0.7+）',
+        body: '{ "file": "/tmp/demo.webm", "fps": 30, "cursor": true, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/record/stop',
+        desc: '停止录屏并落盘（编码收尾数秒；响应 path/frames/capturedFrames/fps；无运行中 → 409）（v0.7+）',
+        body: '{ "status": false }',
+      },
+      {
+        method: 'POST',
         path: '/instances/:id/page/emulate',
         desc: '设备仿真：preset（iphone-14 等 6 款，自带真实 UA）或 viewport+可选 userAgent/mobile/touch；off=true 恢复',
         body: '{ "preset": "iphone-14", "tab": null }',

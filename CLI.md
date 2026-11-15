@@ -212,7 +212,7 @@ chrome-host env delete <id> --yes
 
 页面操作面（P2-C；仅运行中实例，否则 409 exit 5）。操作循环：`page snap` 拿
 @eN 引用 → `page click/fill/press --target` 用引用操作 → 页面变化后重新 `snap`。
-引用是 **durable** 的（v0.8+，I1b）：SPA 同文档更新（局部刷新/pushState）后旧
+引用是 **durable** 的（v0.7+，I1b）：SPA 同文档更新（局部刷新/pushState）后旧
 @eN 仍可用（同节点直接命中，节点失联时按 role/name 唯一匹配恢复）；只有解析
 报 `PAGE_REF_STALE`（节点已随导航/替换死亡且恢复无果）时才**重 snap，不要对
 旧引用重试**；`PAGE_REF_NOT_FOUND` = 从未 snap / 引用拼错。对话框（alert/confirm/prompt/beforeunload）会被自动
@@ -224,16 +224,16 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 
 | 命令 | 说明 |
 |---|---|
-| `page snap <ID\|NAME> [TAB_ID] [-c] [-i] [-d N] [-u] [-s SEL]` | AX 树文本快照（上游风格行：`- button "Buy" @e1`，可交互节点内联 @e1..@eN 引用）+ 元信息行（targetId/refs/generation；引用有消失时附 `removed: @e2, @e5` 行）；行尾 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化（meta `hoverScan`：ok/truncated/skipped/error，预算 32 表/2MiB/256 规则）；跨域 iframe 内容内嵌在 Iframe 节点行下（缩进子树，@eN 跨 frame 连续编号；click/fill/press 对帧内 @eN 直接可用，CSS 选择器仍只查主 frame）。flags（v0.8+，全缺省 = 完整树）：`-c/--compact` 压缩输出、`-i/--interactive` 只保留可交互节点、`-d/--depth N` 渲染深度上限、`-u/--urls` link 附 url、`-s/--selector SEL` 只快照该选择器命中子树；`--quiet` 输出 targetId |
-| `page click <ID> <sel\|@eN> [--double] [--right] [--tab T]` | 原生输入点击（v0.9+ kit 内核：settle + 可见/启用/遮挡校验 + 对话框竞速）；--double 双击 / --right 右键 |
-| `page fill <ID> <sel\|@eN> <value> [--tab T]` | 聚焦→清空→输入→回读校验（v0.9+ kit fill 主链 + 我方回读契约）；空 value = 仅清空；不可编辑 → 422 exit 7 |
-| `page press <ID> <key> [--target <sel\|@eN>] [--tab T]` | 键盘事件（keyDown+keyUp，v0.9+）；key 支持 Enter/Tab/单字符/组合键（`Control+A`）；`--target` 先聚焦 |
-| `page hover <ID> <sel\|@eN> [--tab T]` | 悬停（mouseMoved）：菜单类页面展开 hover 菜单，展开后重 snap 拿新引用（v0.9+ 新增） |
-| `page scroll <ID> [sel\|@eN] <dx> <dy> [--tab T]` | 滚动：有目标滚元素、无目标滚页面；dx/dy 单位 CSS 像素可负（v0.9+ 新增） |
-| `page drag <ID> <from> <to> [--tab T]` | 拖拽（滑块/排序/拖放；人类化弧线轨迹）；两端点须同帧，跨帧 → 422（v0.9+ 新增） |
-| `page select <ID> <sel\|@eN> <value> [--tab T]` | 下拉选择：value 按 option 的 value 或可见文本匹配（原生 select 与 combobox 组件）；未命中 → 422 且 message 列可用项（v0.9+ 新增） |
-| `page check <ID> <sel\|@eN> [--uncheck] [--tab T]` | 勾选/取消勾选复选框、单选钮；已处于目标态 no-op 成功（结果串明示 already）（v0.9+ 新增） |
-| `page tap <ID> <sel\|@eN> [--tab T]` | 触摸轻点（touchStart/touchEnd）：移动端仿真页只响应 touch 事件的控件用它替代 click（v0.9+ 新增） |
+| `page snap <ID\|NAME> [TAB_ID] [-c] [-i] [-d N] [-u] [-s SEL]` | AX 树文本快照（上游风格行：`- button "Buy" @e1`，可交互节点内联 @e1..@eN 引用）+ 元信息行（targetId/refs/generation；引用有消失时附 `removed: @e2, @e5` 行）；行尾 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化（meta `hoverScan`：ok/truncated/skipped/error，预算 32 表/2MiB/256 规则）；跨域 iframe 内容内嵌在 Iframe 节点行下（缩进子树，@eN 跨 frame 连续编号；click/fill/press 对帧内 @eN 直接可用，CSS 选择器仍只查主 frame）。flags（v0.7+，全缺省 = 完整树）：`-c/--compact` 压缩输出、`-i/--interactive` 只保留可交互节点、`-d/--depth N` 渲染深度上限、`-u/--urls` link 附 url、`-s/--selector SEL` 只快照该选择器命中子树；`--quiet` 输出 targetId |
+| `page click <ID> <sel\|@eN> [--double] [--right] [--tab T]` | 原生输入点击（v0.7+ kit 内核：settle + 可见/启用/遮挡校验 + 对话框竞速）；--double 双击 / --right 右键 |
+| `page fill <ID> <sel\|@eN> <value> [--tab T]` | 聚焦→清空→输入→回读校验（v0.7+ kit fill 主链 + 我方回读契约）；空 value = 仅清空；不可编辑 → 422 exit 7 |
+| `page press <ID> <key> [--target <sel\|@eN>] [--tab T]` | 键盘事件（keyDown+keyUp，v0.7+）；key 支持 Enter/Tab/单字符/组合键（`Control+A`）；`--target` 先聚焦 |
+| `page hover <ID> <sel\|@eN> [--tab T]` | 悬停（mouseMoved）：菜单类页面展开 hover 菜单，展开后重 snap 拿新引用（v0.7+ 新增） |
+| `page scroll <ID> [sel\|@eN] <dx> <dy> [--tab T]` | 滚动：有目标滚元素、无目标滚页面；dx/dy 单位 CSS 像素可负（v0.7+ 新增） |
+| `page drag <ID> <from> <to> [--tab T]` | 拖拽（滑块/排序/拖放；人类化弧线轨迹）；两端点须同帧，跨帧 → 422（v0.7+ 新增） |
+| `page select <ID> <sel\|@eN> <value> [--tab T]` | 下拉选择：value 按 option 的 value 或可见文本匹配（原生 select 与 combobox 组件）；未命中 → 422 且 message 列可用项（v0.7+ 新增） |
+| `page check <ID> <sel\|@eN> [--uncheck] [--tab T]` | 勾选/取消勾选复选框、单选钮；已处于目标态 no-op 成功（结果串明示 already）（v0.7+ 新增） |
+| `page tap <ID> <sel\|@eN> [--tab T]` | 触摸轻点（touchStart/touchEnd）：移动端仿真页只响应 touch 事件的控件用它替代 click（v0.7+ 新增） |
 | `page wait <ID> <selector> [--state V] [--timeout 10s] [--tab T]` | 轮询等待（250ms 间隔）；state = visible（缺省）/hidden/attached/detached；超时 → 409 exit 5 |
 | `page dialogs <ID> [--tab T] [--since N]` | 已自动应答的对话框日志（SEQ/TYPE/MESSAGE 表 + cursor 行；`--since` 增量拉取） |
 | `page eval <ID> <expr> [--tab T]` | 任意 JS 求值（⚠ 高权限：优先 snap/click 等专用原语，仅在不够用时用）；对象结果 = pretty JSON |
@@ -273,7 +273,7 @@ loadall 缺省 1500ms。`page eval <ID> '--x'` 这类以 `-` 开头的表达式�
 `element_blocked` 先处理遮挡；`element_not_visible`/`target_not_fillable`/`element_disabled`
 检查页面状态；`fill_value_mismatch` 写入可能已部分生效，先观察再决定；
 `dispatch_failed` 附 effect_state（`none`=未发出可重试 / `unknown`=已发出禁盲目
-重试；v0.9+ click/drag 链一律保守 unknown）；`select_no_option` 检查选项拼写
+重试；v0.7+ click/drag 链一律保守 unknown）；`select_no_option` 检查选项拼写
 （message 列出可用项）；`drag_cross_frame` 两端点改同帧目标；`tool_timeout`
 连接停滞或页面无响应。
 
@@ -294,7 +294,7 @@ chrome-host page clickxy ins_xxx 320 240
 chrome-host page type ins_xxx 'hello iframe'
 chrome-host page eval ins_xxx 'document.title'   # 高权限，最后手段
 
-# 输入面六新件（v0.9+ / I2：hover/scroll/drag/select/check/tap）
+# 输入面六新件（v0.7+ / I2：hover/scroll/drag/select/check/tap）
 chrome-host page hover ins_xxx @e3              # 悬停展开菜单 → 重 snap 拿新引用
 chrome-host page scroll ins_xxx '#feed' 0 -600  # 滚元素（省略目标滚整页）
 chrome-host page drag ins_xxy '#thumb' '#drop'  # 拖拽（弧线轨迹）
