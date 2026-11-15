@@ -76,7 +76,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | 常驻诊断（6） | `get_diagnostics` · `get_console` · `get_network` · `get_network_body` · `get_screenshot` · `get_har` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
 - [工具总览（67 个）](#工具总览67-个)
-| 页面控制（33） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_hover` · `page_scroll` · `page_drag` · `page_select` · `page_check` · `page_tap` · `page_wait` · `page_dialogs` · `page_eval` · `page_raw` · `page_html` · `page_clickxy` · `page_loadall` · `page_type` · `page_navigate` · `page_back` · `page_forward` · `page_reload` · `page_screenshot` · `page_pdf` · `page_diff` · `page_diff_shot` · `page_profiler_start` · `page_profiler_stop` · `page_emulate` · `page_extract` · `page_download_wait` · `page_downloads` · `page_upload` |
+| 页面控制（35） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_hover` · `page_scroll` · `page_drag` · `page_select` · `page_check` · `page_tap` · `page_wait` · `page_dialogs` · `page_eval` · `page_raw` · `page_html` · `page_clickxy` · `page_loadall` · `page_type` · `page_navigate` · `page_back` · `page_forward` · `page_reload` · `page_screenshot` · `page_pdf` · `page_diff` · `page_diff_shot` · `page_profiler_start` · `page_profiler_stop` · `page_record_start` · `page_record_stop` · `page_emulate` · `page_extract` · `page_download_wait` · `page_downloads` · `page_upload` |
 | 登录态（2） | `login_profile`（action: get / capture / reset） · `session_status` |
 | 扩展（7） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` · `get_extension_config` · `set_extension_config` |
 
@@ -183,6 +183,8 @@ new+close 组合近似会丢历史）；等待 load 至多 25s，未证实 → �
 | `page_diff_shot` | `instanceId`, `baseline`（base64 png，必填）；可选 `tab`、`full` | 像素 diff（I3）：基线 png ↔ 当前截图（full=true 全页，缺省视口；与 page_screenshot 同管线）。响应 `{differing, ratio（差异像素百分比）, image?（差异图 base64：红标 + 灰阶，仅 differing）, dimensionMismatch?（尺寸不一致，此时 ratio=100）}`；颜色距离阈值 0.1（容忍抗锯齿噪声） |
 | `page_profiler_start` | `instanceId`；可选 `tab`、`categories`（数组） | 启动性能采样（I3，Chrome tracing ReportEvents + 采样；常驻不占实例串行锁，采样期间其他 page 命令正常）。categories 缺省 = 全家桶（devtools.timeline/v8/blink 等）。同一实例同时只允许一个：重复 → 409 PAGE_PROFILER_ALREADY_ACTIVE |
 | `page_profiler_stop` | `instanceId`；可选 `out`（app 主机落盘路径，缺省 <实例id>-trace.json） | 停止采样并落盘（I3；按 start 锚点路由，无需 tab）。事件收集至多 30s → traceEvents JSON。响应 `{result, path, eventCount}`；无运行中 → 409 PAGE_PROFILER_NOT_RUNNING；收集超时 → 504 可重试（tracing 仍 active） |
+| `page_record_start` | `instanceId`, `file`（app 主机路径，必填）；可选 `fps`（1-60，缺省 30）、`cursor`、`tab` | 启动页录屏（I4，screencast 帧流 → ffmpeg 编码；常驻不占实例串行锁，录制期间其他 page 命令正常）。file 扩展名定容器（.webm/.mp4/.mov…，无扩展名 → 400）；cursor=true 合成光标（页内覆盖层动画 + click/drag/clickxy 输入采样帧间插值）；重复 → 409 PAGE_RECORD_ALREADY_ACTIVE；无 ffmpeg → 422 PAGE_RECORD_NO_FFMPEG（message 带安装提示） |
+| `page_record_stop` | `instanceId`；可选 `status` | 停止录屏并结算产物（I4；按 start 锚点路由，无需 tab；编码收尾可能数秒）。响应 `{result, path, frames, capturedFrames, fps}`；status=true 附 kit 完整终态（capture 模式/设备缩放）；无运行中 → 409 PAGE_RECORD_NOT_RUNNING（含连接重建/锚点 tab 关闭致废弃，message 披露） |
 
 `tab` = targetId 或唯一前缀（`list_tabs` 获得）；省略 = 唯一页面标签自动选中，
 多标签 409 并在 message 列出全部 targetId。错误处置看 code 分支：`PAGE_REF_STALE`/
