@@ -336,6 +336,8 @@ PAGE_SERVICE_UNAVAILABLE`）。
 | `POST /api/v1/instances/{id}/page/diff-shot` | 像素 diff（I3）。body `{ "tab?", "full?", "baseline" }`（baseline = 基线 png 的 base64，必填）→ 响应 `{differing, ratio, image?, dimensionMismatch?}`；尺寸不一致 → differing + ratio=100 + dimensionMismatch |
 | `POST /api/v1/instances/{id}/page/profiler/start` | 启动性能采样（I3，Chrome tracing；常驻不占实例串行锁）。body `{ "tab?", "categories?" }`（数组，缺省全家桶）；重复 → 409 |
 | `POST /api/v1/instances/{id}/page/profiler/stop` | 停止采样并落盘 traceEvents JSON（I3；按 start 锚点路由，无 tab 入参）。body `{ "out?" }`（app 主机路径，缺省 `<实例id>-trace.json`）；响应 `{result, path, eventCount}` |
+| `POST /api/v1/instances/{id}/page/record/start` | 启动页录屏（I4，screencast 帧流 → ffmpeg 编码；常驻不占实例串行锁）。body `{ "file", "fps?", "cursor?", "tab?" }`——file 必填（app 主机路径，扩展名定容器 .webm/.mp4/.mov…，无扩展名 → 400）；fps 1-60 缺省 30；cursor 合成光标；重复 → 409 |
+| `POST /api/v1/instances/{id}/page/record/stop` | 停止录屏并结算产物（I4；按 start 锚点路由，无 tab 入参；编码收尾可能数秒）。body `{ "status?" }`；响应 `{result, path, frames, capturedFrames, fps}`（status=true 附完整终态）；无运行中 → 409 |
 | `POST /api/v1/instances/{id}/page/emulate` | 设备仿真（preset / viewport / off 三形态互斥）。body `{ "preset?" \| "viewport"+"userAgent?"+"mobile?"+"touch?" \| "off", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/extract` | 表格结构化提取 → `{ columns, rows, coverage, meta }`。body `{ "target?", "tab?" }`（target 缺省 = 主文档最大表格自动发现；详见下文「表格提取」） |
 | `GET /api/v1/instances/{id}/page/downloads` | 下载终态记录环（最近 20 条，含已消费——matched 字段区分） |
@@ -721,8 +723,10 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `PAGE_ELEMENT_BLOCKED` / `PAGE_FILL_VALUE_MISMATCH` / `PAGE_WAIT_TIMEOUT` | 点击点被遮挡 / fill 回读不一致（写入可能已部分生效，先观察再决定）/ 等待超时 |
 | 409 | `PAGE_NAV_NO_HISTORY` | page back/forward 已在导航历史边界（无更早/更晚条目） |
 | 409 | `PAGE_PROFILER_ALREADY_ACTIVE` / `PAGE_PROFILER_NOT_RUNNING` | profiler 重复 start / stop 时无运行中采样（含从未 start、已 stop、连接重建或锚点 tab 关闭致运行态废弃——message 披露具体路径） |
+| 409 | `PAGE_RECORD_ALREADY_ACTIVE` / `PAGE_RECORD_NOT_RUNNING` | record 重复 start（同实例同时只允许一路录制）/ stop 时无运行中录制（废弃路径同 profiler，message 披露） |
 | 409 | `PAGE_FOCUS_FAILED` / `PAGE_FILL_FOCUS_LOST` | page press/fill 焦点失败 / 页面在 fill 过程中抢走焦点 |
 | 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_ELEMENT_DISABLED` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / 元素被禁用（v0.8+ kit 解析链） / fill 目标不可编辑 |
+| 422 | `PAGE_RECORD_NO_FFMPEG` | 录制前置 ffmpeg 探测失败（message 带安装提示 brew/apt install ffmpeg） |
 | 500 | `PAGE_ACTION_FAILED` | page 工具链未分类失败（v0.8+ kit String 错误兜底，message 原文透传） |
 | 422 | `PAGE_EMULATE_UNKNOWN_PRESET` / `PAGE_EXTRACT_NOT_A_TABLE` | 未知仿真预设 / extract 目标非表格（仅接受 table/[role=table\|grid\|treegrid]） |
 | 422 | `PAGE_TARGET_NOT_FILE_INPUT` / `PAGE_UPLOAD_PATH_INVALID` / `PAGE_UPLOAD_FILE_TOO_LARGE` | upload 目标非 input[type=file] / filePath 非绝对路径或经符号链接或非普通文件 / 超 100MB 上限（W-file） |

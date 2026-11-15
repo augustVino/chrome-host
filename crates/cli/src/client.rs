@@ -1369,4 +1369,35 @@ impl AgentClient {
             true,
         ))
     }
+
+    /// POST /api/v1/instances/{id}/page/record/start —— body `{file, fps?, cursor?, tab?}`
+    ///（I4 录屏：常驻不占实例串行锁；重复 start → 409；无 ffmpeg → 422）
+    pub fn page_record_start(
+        &self,
+        id: &str,
+        file: &str,
+        fps: Option<u32>,
+        cursor: bool,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "file": file, "fps": fps, "cursor": cursor, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "record/start"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/record/stop —— body `{status?}`
+    ///（I4：编码收尾可能数秒；响应 { result, path, frames, capturedFrames, fps }）
+    pub fn page_record_stop(&self, id: &str, status: bool) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "status": status });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "record/stop"),
+            Some(body),
+            true,
+        ))
+    }
 }

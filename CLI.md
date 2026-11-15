@@ -248,6 +248,8 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 | `page diff-shot <ID> --baseline-file <png> [--full] [--tab T] [--out F]` | 像素 diff（I3）：基线 png（必填）↔ 当前截图（--full 全页，缺省视口）；响应 `{differing, ratio, image?, dimensionMismatch?}`（阈值 0.1 容忍抗锯齿）；--out 落差异图（差异红标 + 原图灰阶） |
 | `page profiler start <ID> [TAB] [--categories "a,b"]` | 启动性能采样（I3，Chrome tracing ReportEvents + 采样；常驻不占实例串行锁；categories 缺省 = 全家桶；重复 start → 409 `PAGE_PROFILER_ALREADY_ACTIVE`） |
 | `page profiler stop <ID> [--out F]` | 停止采样并落盘 traceEvents JSON（I3；按 start 锚点路由无需 tab；事件收集至多 30s；--out 缺省 `<id>-trace.json`；无运行中 → 409 `PAGE_PROFILER_NOT_RUNNING`；quiet = 落盘路径） |
+| `page record start <ID> <FILE> [--fps N] [--cursor] [--tab T]` | 启动页录屏（I4，screencast 帧流 → ffmpeg 编码；常驻不占实例串行锁，录制期间其他 page 命令正常）。FILE 必填（app 主机路径，扩展名定容器 .webm/.mp4/.mov…，无扩展名 → 400）；fps 1-60 缺省 30；--cursor 合成光标（页内覆盖层 + click/drag/clickxy 输入采样插值）；重复 start → 409 `PAGE_RECORD_ALREADY_ACTIVE`；无 ffmpeg → 422 `PAGE_RECORD_NO_FFMPEG`（带安装提示） |
+| `page record stop <ID> [--status]` | 停止录屏并结算产物（I4；按 start 锚点路由无需 tab；编码收尾可能数秒——screencast teardown/ffmpeg flush）。响应 `{result, path, frames, capturedFrames, fps}`；--status 附完整终态（capture 模式/设备缩放）；无运行中 → 409 `PAGE_RECORD_NOT_RUNNING`；quiet = 产物路径 |
 | `page emulate <ID> --preset P \| --viewport WxH [--user-agent UA] [--mobile] [--touch] \| --off [--tab T]` | 设备仿真（仅作用该 tab；重复 = 覆盖，--off 恢复；预设：iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p） |
 | `page navigate <ID> <url> [--tab T]` | 页内导航（page session 上 Page.navigate，保留历史）；等 load 至多 25s，未证实 → loaded:false；导航失败（net::ERR_*）→ 500 exit 5；URL 非法 → 400 exit 7 |
 | `page back <ID> [--tab T]` | 历史后退一步；无更早条目 → 409 `PAGE_NAV_NO_HISTORY` exit 5 |

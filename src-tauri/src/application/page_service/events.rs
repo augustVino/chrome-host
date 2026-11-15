@@ -1,4 +1,5 @@
 use super::cdp_send;
+use crate::application::browser_kit::recording;
 use crate::application::page_service::dialogs::on_dialog_opening;
 use crate::application::page_service::downloads::{on_download_begin, on_download_progress};
 use crate::application::page_service::intercept::on_request_paused;
@@ -230,6 +231,23 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
     }
 }
 
+/// 录制 capture session 判定（I4）：该 (targetId, sessionId) 是否属于当前
+/// 录制的专属 capture session。两层：豁免表（attach 响应后登记，含 stop
+/// 后 slot 已清的窗口——detach 事件消费式摘除）；kit owns_attachment
+///（attach in-flight：Chrome 先发 attachedToTarget 再回 attach 响应，
+/// 该窗口 slot 里只有 target_id 无 session_id，按 target 匹配）。
+fn is_capture_session(watched: &Watched, tid: &str, sid: &str) -> bool {
+    if watched.capture_sessions.lock().unwrap().contains_key(sid) {
+        return true;
+    }
+    watched
+        .recording
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|slot| recording::owns_attachment(&slot.state.capture_session, tid, sid))
+}
+
 /// attachedToTarget：type=page 建 targetId→sessionId 映射并补域 enable；
 /// type=iframe 登记 OOPIF 帧会话（W-oopif，enable 复用同一套——fill/press/
 /// eval 的 DOM/Runtime 命令将路由到 frame session）。best-effort：enable/
@@ -248,6 +266,13 @@ async fn on_attached(watched: &Watched, params: &Value) {
     let Some(sid) = params.get("sessionId").and_then(Value::as_str) else {
         return;
     };
+    // I4 attach 豁免（关键）：kit 录制对锚点 page target 建第二个 flattened
+    // capture session（screencast 专属），其 attach 事件 type=page——不豁免会
+    // 被 tabs.attach 原位覆写锚点 tab 的 session（后续命令全部路由到 capture
+    // session，路由全乱）。两层判定见 is_capture_session。
+    if is_capture_session(watched, tid, sid) {
+        return;
+    }
     let Some(conn) = watched.conn.lock().unwrap().clone() else {
         return;
     };
@@ -424,6 +449,27 @@ fn drop_frame(watched: &Watched, tab_tid: &str, fid: &str) {
 fn on_detached(watched: &Watched, params: &Value) {
     let tid = params.get("targetId").and_then(Value::as_str);
     let sid = params.get("sessionId").and_then(Value::as_str);
+    // I4 detach 豁免：capture session 的 detachedFromTarget 带**锚点 targetId**
+    //（capture session 挂在同一 page target 上）——不豁免会被 drop_target
+    // 当作锚点 tab 关闭误删整 tab。豁免表按 sessionId 消费式摘除（条目
+    // 生命周期终点；stop 后在途事件依豁免此层，见 state.rs 注释）；kit
+    // owns_attachment 兼容豁免表登记前的窗口（attach 事件先于响应）。
+    if let Some(s) = sid {
+        if watched.capture_sessions.lock().unwrap().remove(s).is_some() {
+            return;
+        }
+    }
+    if let (Some(t), Some(s)) = (tid, sid) {
+        if watched
+            .recording
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|slot| recording::owns_attachment(&slot.state.capture_session, t, s))
+        {
+            return;
+        }
+    }
     match (tid, sid) {
         (Some(t), _) => drop_target(watched, t),
         (None, Some(s)) => {
@@ -461,6 +507,21 @@ pub(crate) fn drop_tab(watched: &Watched, tid: &str) {
     // 披露废弃原因，不装作可继续）
     watched.last_snap.lock().unwrap().remove(tid);
     watched.profiler.lock().unwrap().take_if(|p| p.tid == tid);
+    // I4：录制随锚点 tab 关闭废弃（同 profiler 语义——capture session 死于
+    // 同一 target，帧流不可回收，保留只会让 stop 报误导性错误）。锁内同步
+    // best-effort：发 cancel 让常驻任务自行收尾（stopScreencast/detach 由
+    // 任务内部 best-effort，client clone 在任务闭包内）；JoinHandle 随 state
+    // drop = detached。豁免表指向本锚点的条目一并摘（capture session 同死）。
+    if let Some(mut slot) = watched.recording.lock().unwrap().take_if(|r| r.tid == tid) {
+        if let Some(tx) = slot.state.cancel_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+    watched
+        .capture_sessions
+        .lock()
+        .unwrap()
+        .retain(|_, anchor| anchor.as_str() != tid);
 }
 
 /// frame session → (tab tid, frame tid)；未登记返回 None

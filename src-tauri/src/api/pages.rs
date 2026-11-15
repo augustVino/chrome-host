@@ -363,6 +363,28 @@ pub struct ProfilerStopBody {
     pub out: Option<String>,
 }
 
+/// POST /api/v1/instances/{id}/page/record/start —— 启动页录屏（I4）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordStartBody {
+    /// 输出文件路径（服务端主机；扩展名定容器：.webm/.mp4/.mov…；
+    /// 无扩展名 → 400）
+    pub file: String,
+    /// 采样率（1-60；缺省 30）
+    pub fps: Option<u32>,
+    /// 合成光标覆盖层（页内 JS 动画 + Rust 侧输入采样插值）
+    pub cursor: Option<bool>,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/record/stop —— 停止录屏并结算产物（I4）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordStopBody {
+    /// 附 kit 完整终态（capture 模式/设备缩放等披露字段）
+    pub status: Option<bool>,
+}
+
 pub async fn snap(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -835,6 +857,38 @@ pub async fn profiler_stop(
     Json(body): Json<ProfilerStopBody>,
 ) -> Result<Json<Value>, AppError> {
     let resp = state.page.profiler_stop(&id, body.out).await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/record/start —— 启动页录屏（I4）。
+pub async fn record_start(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<RecordStartBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .record_start(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.file,
+            body.fps,
+            body.cursor.unwrap_or(false),
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/record/stop —— 停止录屏并结算产物（I4）。
+pub async fn record_stop(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<RecordStopBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .record_stop(&id, body.status.unwrap_or(false))
+        .await?;
     Ok(Json(resp))
 }
 

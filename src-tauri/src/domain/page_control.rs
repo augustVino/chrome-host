@@ -178,6 +178,36 @@ impl PageControlError {
         Self::business(500, "PAGE_ACTION_FAILED", message.into())
     }
 
+    /// 409：record stop 时无运行中录制（I4 新码：从未 start / 已 stop /
+    /// 连接重建或锚点 tab 关闭致运行态废弃——reason 披露具体路径）
+    pub fn record_not_running(reason: &str) -> Self {
+        Self::business(
+            409,
+            "PAGE_RECORD_NOT_RUNNING",
+            format!("无运行中的录制（{reason}）"),
+        )
+    }
+
+    /// 409：同实例重复 record start（I4 新码：Chrome 每实例同时只允许一路
+    /// 录制——capture session/编码器均为单实例资源）
+    pub fn record_already_active(message: impl Into<String>) -> Self {
+        Self::business(409, "PAGE_RECORD_ALREADY_ACTIVE", message.into())
+    }
+
+    /// 422：ffmpeg 探测失败（I4 新码：录制编码的前置环境检查，失败先于
+    /// 浏览器 attach 暴露；detail = kit check_ffmpeg_available 原文，
+    /// 追加具体安装命令）
+    pub fn record_no_ffmpeg(detail: impl Into<String>) -> Self {
+        Self::business(
+            422,
+            "PAGE_RECORD_NO_FFMPEG",
+            format!(
+                "{} — 安装后重试: brew install ffmpeg (macOS) / apt install ffmpeg (Debian/Ubuntu)",
+                detail.into()
+            ),
+        )
+    }
+
     /// 409：wait 超时（504 → 409，任务约定；消息逐字对齐 TS waitStr 超时分支）
     pub fn wait_timeout(
         selector: &str,

@@ -103,6 +103,7 @@ mod input;
 mod intercept;
 mod navigation;
 mod profiler;
+mod recording_tool;
 mod refs;
 mod snap;
 mod state;
@@ -382,6 +383,12 @@ impl PageService {
         // 随连接失效，基线快照的 @eN 也随 refs 代际作废，整清不残留
         watched.last_snap.lock().unwrap().clear();
         *watched.profiler.lock().unwrap() = None;
+        // I4：录制运行态同理属于死会话（capture session / 常驻采集任务随连接
+        // 死亡，帧流不可回收）——整清；豁免表同理（残留 sessionId 永不再匹配，
+        // 清掉防泄漏）。已 spawn 的采集任务持有 cancel_tx 发送端在 Watched 侧
+        // 随槽位清空而 drop → 任务自行收尾退场。
+        *watched.recording.lock().unwrap() = None;
+        watched.capture_sessions.lock().unwrap().clear();
         // 下载运行态同理重建：新连接重发 setDownloadBehavior + 新目录；
         // 等待者被 drop → 各自 download_wait 的 rx Err 分支诚实报「等待失效」
         watched.downloads.lock().unwrap().reset(dl_dir);
