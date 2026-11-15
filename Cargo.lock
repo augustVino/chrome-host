@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "chrome-host"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "chrome-host-cli"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "axum",
  "base64 0.22.1",
