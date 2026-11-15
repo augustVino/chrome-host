@@ -1,12 +1,12 @@
-//! page 控制域纯逻辑层（P2-A）：@eN ref 表、点击几何、press 键表、wait 状态机、
+//! page 控制域纯逻辑层（P2-A）：@eN 键归一化、press 键表、wait 状态机、
 //! 页面 eval 表达式生成与 JS 对话框模型。
 //!
 //! 行为规格 = Phase 1 的 TS 实现（`skills/chrome-host/scripts/lib/`，已由 183 单测
 //! 验证），本模块是其逐语义移植；IO（CDP 收发、轮询、补偿重发）归 application 层
 //! （PAGE-CONTROL-PLAN Phase 2），本文件只做可单测的纯逻辑：
 //!
-//! - [`RefStore`]：per-tab 的 @eN → backendNodeId 表（TS lib/ref-store.mjs）；
-//! - [`largest_quad_centroid`]：DOM.getContentQuads → 点击点（TS lib/tools/interact.mjs）；
+//! - [`normalize_ref`]：@eN 键归一化（TS lib/ref-store.mjs；ref 表本体自 I1b
+//!   起为 browser_kit element::RefMap，durable refs 由 kit 自管）；
 //! - [`parse_key`]/[`KeyPress`]：键名 → CDP Input.dispatchKeyEvent 三段序列
 //!   （TS lib/tools/press.mjs，SPEC §4.2）；
 //! - [`parse_duration`]/[`observed_matches_state`]：wait 轮询的参数与状态机
@@ -30,7 +30,7 @@
 // 编译中不可见。接线后删除本 allow。
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -166,6 +166,18 @@ impl PageControlError {
         Self::business(409, "PAGE_FILL_VALUE_MISMATCH", message.into())
     }
 
+    /// 422：元素被禁用（I1b 新码：browser_kit 解析链的 actionability 报告
+    /// disabled——kit 原文透传，不吞信息）
+    pub fn element_disabled(message: impl Into<String>) -> Self {
+        Self::business(422, "PAGE_ELEMENT_DISABLED", message.into())
+    }
+
+    /// 500：page 工具链未分类失败（I1b 新码：browser_kit String 错误的兜底
+    /// 归宿——原文透传，保证不吞任何证据）
+    pub fn action_failed(message: impl Into<String>) -> Self {
+        Self::business(500, "PAGE_ACTION_FAILED", message.into())
+    }
+
     /// 409：wait 超时（504 → 409，任务约定；消息逐字对齐 TS waitStr 超时分支）
     pub fn wait_timeout(
         selector: &str,
@@ -213,15 +225,6 @@ impl PageControlError {
     pub fn tab_not_found(tab: &str) -> Self {
         Self::business(404, "PAGE_TAB_NOT_FOUND", format!("tab not found: {tab}"))
     }
-
-    /// ref 未命中时按表状态选 stale / not_found（TS interact.mjs refMissError）
-    pub fn ref_miss(store: &RefStore, raw_ref: &str) -> Self {
-        if store.stale {
-            Self::ref_stale(store.last_invalid_reason())
-        } else {
-            Self::ref_not_found(raw_ref)
-        }
-    }
 }
 
 impl From<PageControlError> for AppError {
@@ -231,7 +234,8 @@ impl From<PageControlError> for AppError {
 }
 
 // ============================================================================
-// 2. RefStore（TS lib/ref-store.mjs + tests/ref-store.test.mjs）
+// 2. ref 键归一化（TS lib/ref-store.mjs；I1b 起 ref 表本体 = browser_kit
+//    element::RefMap，domain 只保留键归一化）
 // ============================================================================
 
 /// §3.7 归一化：只剥**恰好一个**前导 '@'（'@e3' → 'e3'，'@@e3' → '@e3'）。
@@ -240,237 +244,12 @@ pub fn normalize_ref(raw: &str) -> &str {
     raw.strip_prefix('@').unwrap_or(raw)
 }
 
-/// ^e\d+$（区分大小写；TS 用正则，此处手写避免引 regex 依赖）
-fn is_ref_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    if chars.next() != Some('e') {
-        return false;
-    }
-    let rest: Vec<char> = chars.collect();
-    !rest.is_empty() && rest.iter().all(|c| c.is_ascii_digit())
-}
-
-/// 表条目：normalized 'eN' → CDP 节点句柄（name 为 snap 时抓到的可读名，可缺省）。
-/// OOPIF 维度（W-oopif）：frame 内节点的 backendNodeId 属于该 frame 的 DOM
-/// agent（跨进程不共享），须连同 frame 会话一起记忆；主 frame 条目无 frame
-/// 字段（旧 JSON 形状向后兼容）。stale_reason = per-frame 失效标记（iframe
-/// 导航/移除只杀该 frame 的条目，主 frame 条目不受影响）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct RefEntry {
-    pub backend_node_id: i64,
-    pub name: Option<String>,
-    /// 所属 OOPIF frame 的 targetId（== frameId，Chrome OOPIF 不变式）
-    pub frame_target_id: Option<String>,
-    /// snap 时该 frame 的 sessionId（会话易变，使用时优先查活登记表）
-    pub frame_session_id: Option<String>,
-    /// 非空 = 该条目已随所在 frame 失效（导航/移除），resolve 应报 stale
-    pub stale_reason: Option<String>,
-}
-
-/// per-tab 的 @eN ref 表。refs 只描述**最后一次 snap**：
-/// - [`RefStore::replace`]：每次 snap 整表换 + generation+1 + 清 stale（§3.5）；
-/// - [`RefStore::invalidate`]：导航/文档替换时整表清空并置 stale——旧 ref 此后
-///   失败是特性（强制重新观察），不是缺陷（§3.6）；
-/// - per-tab 由构造保证：每个 tab 一份表，跨 tab 用 ref 在本表必失配 →
-///   ref_not_found（§3.7）。
-#[derive(Default)]
-pub struct RefStore {
-    entries: HashMap<String, RefEntry>,
-    generation: u64,
-    stale: bool,
-    last_invalid_reason: Option<String>,
-}
-
-impl RefStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 整表替换（snap 调用）。entries 为 JSON 数组，元素形状 = TS
-    /// collectSnapshot 的 `[{ ref: 'eN', backendNodeId, name? }]`；null/非数组
-    /// 按空表处理（TS `entries || []`）。逐条防御：坏条目跳过、绝不抛错——
-    /// 半解析的 AX 树不能弄坏整表交换。
-    pub fn replace(&mut self, entries: &Value) {
-        let mut map = HashMap::new();
-        for entry in entries.as_array().into_iter().flatten() {
-            let Some(backend_node_id) = entry.get("backendNodeId").and_then(Value::as_i64) else {
-                continue;
-            };
-            let raw = entry.get("ref").and_then(Value::as_str).unwrap_or_default();
-            let key = normalize_ref(raw);
-            if !is_ref_key(key) {
-                continue;
-            }
-            // TS `entry.name ? …`：空串名等价于无名
-            let name = entry
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|n| !n.is_empty())
-                .map(str::to_string);
-            map.insert(
-                key.to_string(),
-                RefEntry {
-                    backend_node_id,
-                    name,
-                    frame_target_id: entry
-                        .get("frameTargetId")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string),
-                    frame_session_id: entry
-                        .get("frameSessionId")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string),
-                    stale_reason: None,
-                },
-            );
-        }
-        self.entries = map;
-        self.generation += 1;
-        self.stale = false;
-        self.last_invalid_reason = None;
-    }
-
-    /// 整表失效（§3.6）。有删才 generation+1 并置 stale；置位后粘滞（空表重复
-    /// invalidate 是 no-op，stale 不解除），直到下一次成功 replace。
-    /// 返回是否有条目被删除。
-    pub fn invalidate(&mut self, reason: &str) -> bool {
-        if self.entries.is_empty() {
-            return false;
-        }
-        self.entries.clear();
-        self.generation += 1;
-        self.stale = true;
-        self.last_invalid_reason = Some(reason.to_string());
-        true
-    }
-
-    /// **单 frame 失效**（W-oopif）：iframe 导航/移除只标记该 frame 的条目
-    /// （stale_reason），主 frame 条目不受影响——区别于整表 invalidate 的
-    /// 「全部作废」。条目保留在表中（resolve 时按 stale_reason 报
-    /// PAGE_REF_STALE，而非查无此条的 NOT_FOUND）。命中才 generation+1。
-    pub fn invalidate_frame(&mut self, frame_tid: &str, reason: &str) -> usize {
-        let mut n = 0;
-        for entry in self.entries.values_mut() {
-            if entry.frame_target_id.as_deref() == Some(frame_tid)
-                && entry.stale_reason.is_none()
-            {
-                entry.stale_reason = Some(reason.to_string());
-                n += 1;
-            }
-        }
-        if n > 0 {
-            self.generation += 1;
-        }
-        n
-    }
-
-    /// raw ref（'@e3' 或 'e3'）→ 条目。内部归一化；查表保持大小写敏感。
-    pub fn resolve(&self, raw_ref: &str) -> Option<&RefEntry> {
-        self.entries.get(normalize_ref(raw_ref))
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn stale(&self) -> bool {
-        self.stale
-    }
-
-    pub fn last_invalid_reason(&self) -> Option<&str> {
-        self.last_invalid_reason.as_deref()
-    }
-}
-
 // ============================================================================
-// 3. 点击几何（TS lib/tools/interact.mjs largestQuadCentroid）
+// 3a. 元素截图几何（W-cap：clip 是区域不是点）
 // ============================================================================
-
-/// 视口 CSS 像素坐标
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Point {
-    pub x: f64,
-    pub y: f64,
-}
-
-/// 最大四边形的质心：元素盒近似矩形，四顶点均值 ≈ 中心（旋转也成立）。
-/// 面积用鞋带公式（叉积和的绝对值一半）；面积 **严格大于** 当前最优才替换
-/// （零面积四边形永远不会成为 best → 全退化时返回 None）。
-/// 非法 quad（长度 ≠ 8 / 含非有限数）跳过——transform 残渣与遮挡碎片不得
-/// 抢占真实盒。
-pub fn largest_quad_centroid(quads: &[Vec<f64>]) -> Option<Point> {
-    let mut best: Option<Point> = None;
-    let mut best_area = 0.0f64;
-    for q in quads {
-        if q.len() != 8 || q.iter().any(|n| !n.is_finite()) {
-            continue;
-        }
-        let mut area2 = 0.0;
-        let (mut cx, mut cy) = (0.0, 0.0);
-        for i in 0..4 {
-            let (x1, y1) = (q[i * 2], q[i * 2 + 1]);
-            let j = ((i + 1) % 4) * 2;
-            area2 += x1 * q[j + 1] - q[j] * y1;
-            cx += x1;
-            cy += y1;
-        }
-        let area = area2.abs() / 2.0;
-        if area > best_area {
-            best_area = area;
-            best = Some(Point {
-                x: cx / 4.0,
-                y: cy / 4.0,
-            });
-        }
-    }
-    best
-}
-
-// ============================================================================
-// 3b. OOPIF 坐标投影（W-oopif）：frame 本地坐标 → 父坐标 → … → 根视口
-// ============================================================================
-
-/// quad 的轴对齐包围盒（(min_x, min_y, max_x, max_y)；非法 quad → None）
-pub fn quad_bbox(quad: &[f64]) -> Option<(f64, f64, f64, f64)> {
-    if quad.len() != 8 || quad.iter().any(|n| !n.is_finite()) {
-        return None;
-    }
-    let xs = [quad[0], quad[2], quad[4], quad[6]];
-    let ys = [quad[1], quad[3], quad[5], quad[7]];
-    Some((
-        xs.iter().cloned().fold(f64::INFINITY, f64::min),
-        ys.iter().cloned().fold(f64::INFINITY, f64::min),
-        xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-        ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-    ))
-}
-
-/// 单级投影：frame 内坐标点 → 父坐标（owner 元素 quad 平移 + 夹取）。
-/// 语义：iframe 的内容原点 = owner 元素内容框原点，CSS 布局下 1:1 平移
-///（border/padding 偏差在像素级，点击质心场景可忽略）；点夹取到元素盒内
-//——frame 视口比元素盒大（滚动裁剪）时，盒外的点落在页面上会点错元素，
-/// 夹回盒内保持「点在 iframe 里」的意图。
-pub fn project_point(owner_quad: &[f64], p: Point) -> Option<Point> {
-    let (min_x, min_y, max_x, max_y) = quad_bbox(owner_quad)?;
-    Some(Point {
-        x: (p.x + min_x).clamp(min_x, max_x),
-        y: (p.y + min_y).clamp(min_y, max_y),
-    })
-}
-
-// ============================================================================
-// 3b. 元素截图几何（W-cap：clip 是区域不是点，与点击几何并列）
-// ============================================================================
+// 注：点击点几何（largest_quad_centroid / OOPIF 投影 project_point）随 I1b
+// 移交 browser_kit element::resolve_element_center（帧链换算 + scrollIntoView
+// + settle 均在 kit 解析链内），本层不再保留。
 
 /// 视口 CSS 像素矩形（Page.captureScreenshot 的 clip 源）
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1114,10 +893,7 @@ fn absorb_hover_selector(sel: &str, out: &mut HoverRules) {
         if segments.is_empty() {
             continue;
         }
-        let Some(i) = segments
-            .iter()
-            .position(|(_, seg)| has_bare_hover(seg))
-        else {
+        let Some(i) = segments.iter().position(|(_, seg)| has_bare_hover(seg)) else {
             continue;
         };
         if let Some(t) = join_stripped(&segments[..=i]) {
@@ -1801,7 +1577,11 @@ mod tests {
             "example.com/no-scheme",
         ] {
             let e = validate_http_url(bad).unwrap_err();
-            assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400), "应拒绝: {bad}");
+            assert_eq!(
+                (e.code(), e.status()),
+                ("INVALID_REQUEST", 400),
+                "应拒绝: {bad}"
+            );
         }
         // 拒绝面双方文案：非法解析 vs scheme 白名单（对外契约逐字保持）
         assert!(validate_http_url("javascript:x")
@@ -1905,8 +1685,11 @@ mod tests {
             .w :is(.p, .q):hover { color: blue; }
         "#;
         let r = scan_hover_rules(&[css], 1);
-        assert_eq!(r.triggers, vec!["[data-list=\"a,b\"]", ".w :is(.p, .q)"],
-            "括号/引号内的分隔符不切分；:is() 参数保留");
+        assert_eq!(
+            r.triggers,
+            vec!["[data-list=\"a,b\"]", ".w :is(.p, .q)"],
+            "括号/引号内的分隔符不切分；:is() 参数保留"
+        );
     }
 
     /// 伪元素剥离：产物是 DOM.querySelectorAll 查询串，伪元素不可查询
@@ -1940,8 +1723,6 @@ mod tests {
         assert!(!r.truncated);
     }
 
-    // ---------------- RefStore / normalize_ref（tests/ref-store.test.mjs）------
-
     /// TS "normalizeRef strips exactly one leading @, keeps case"
     #[test]
     fn normalize_ref_strips_exactly_one_leading_at_and_keeps_case() {
@@ -1952,259 +1733,39 @@ mod tests {
         assert_eq!(normalize_ref("E3"), "E3");
     }
 
-    /// TS "replace swaps the whole table and bumps generation; resolve takes raw or @-prefixed refs"
-    #[test]
-    fn replace_swaps_whole_table_and_bumps_generation() {
-        let mut store = RefStore::new();
-        assert_eq!(store.generation(), 0);
-        store.replace(&json!([
-            { "ref": "e1", "backendNodeId": 101, "name": "OK" },
-            { "ref": "e2", "backendNodeId": 102 },
-        ]));
-        assert_eq!(store.generation(), 1);
-        assert_eq!(store.len(), 2);
-
-        assert_eq!(
-            store.resolve("e1"),
-            Some(&RefEntry {
-                backend_node_id: 101,
-                name: Some("OK".into()),
-                frame_target_id: None,
-                frame_session_id: None,
-                stale_reason: None
-            })
-        );
-        assert_eq!(
-            store.resolve("@e2"),
-            Some(&RefEntry {
-                backend_node_id: 102,
-                name: None,
-                frame_target_id: None,
-                frame_session_id: None,
-                stale_reason: None
-            }),
-            "resolve 内部归一化"
-        );
-
-        // 整表换：新 snap 更少节点时，旧 ref 也必须死
-        store.replace(&json!([{ "ref": "e1", "backendNodeId": 201 }]));
-        assert_eq!(store.generation(), 2);
-        assert_eq!(store.resolve("e2"), None);
-        assert_eq!(store.resolve("e1").map(|e| e.backend_node_id), Some(201));
-    }
-
-    /// TS "resolve is case-sensitive per §3.7: E3/@E3 never match e3"
-    #[test]
-    fn resolve_is_case_sensitive() {
-        let mut store = RefStore::new();
-        store.replace(&json!([{ "ref": "e3", "backendNodeId": 33 }]));
-        assert_eq!(store.resolve("E3"), None);
-        assert_eq!(store.resolve("@E3"), None);
-    }
-
-    /// TS "invalidate drops all entries, flags stale with reason; replace clears stale"
-    #[test]
-    fn invalidate_drops_all_entries_and_flags_stale_until_replace() {
-        let mut store = RefStore::new();
-        store.replace(&json!([{ "ref": "e1", "backendNodeId": 101 }]));
-
-        assert!(store.invalidate("navigation"));
-        assert_eq!(store.len(), 0);
-        assert_eq!(store.generation(), 2);
-        assert!(store.stale());
-        assert_eq!(store.last_invalid_reason(), Some("navigation"));
-        assert_eq!(store.resolve("e1"), None);
-
-        // 空表重复 invalidate：no-op，stale 粘滞
-        assert!(!store.invalidate("document updated"));
-        assert!(store.stale());
-        assert_eq!(
-            store.last_invalid_reason(),
-            Some("navigation"),
-            "reason 保持首次失效的"
-        );
-
-        store.replace(&json!([{ "ref": "e1", "backendNodeId": 301 }]));
-        assert!(!store.stale());
-        assert_eq!(store.last_invalid_reason(), None);
-        assert_eq!(store.resolve("e1").map(|e| e.backend_node_id), Some(301));
-    }
-
-    /// TS "invalidate on a never-populated store neither bumps generation nor flags stale"
-    #[test]
-    fn invalidate_on_never_populated_store_changes_nothing() {
-        let mut store = RefStore::new();
-        assert!(!store.invalidate("document changed"));
-        assert_eq!(store.generation(), 0);
-        assert!(!store.stale());
-    }
-
-    /// TS "replace skips malformed entries defensively instead of throwing"
-    #[test]
-    fn replace_skips_malformed_entries_defensively() {
-        let mut store = RefStore::new();
-        store.replace(&json!([
-            null,
-            { "ref": "e1" },                         // 无 backendNodeId
-            { "ref": "e2", "backendNodeId": "x" },   // 非整数 backendNodeId
-            { "ref": "button", "backendNodeId": 5 },  // 键非 eN 形
-            { "ref": "E5", "backendNodeId": 6 },      // 大写——正则区分大小写
-            { "ref": "e4", "backendNodeId": 7, "name": "" }, // falsy 名等价无名
-        ]));
-        assert_eq!(store.len(), 1);
-        assert_eq!(
-            store.resolve("e4"),
-            Some(&RefEntry {
-                backend_node_id: 7,
-                name: None,
-                frame_target_id: None,
-                frame_session_id: None,
-                stale_reason: None
-            })
-        );
-    }
-
-    /// TS interact.mjs refMissError（press/fill 的 ref 未命中路径共用）
-    #[test]
-    fn ref_miss_error_picks_stale_or_not_found_by_table_state() {
-        let mut store = RefStore::new();
-        store.replace(&json!([{ "ref": "e1", "backendNodeId": 1 }]));
-        let miss = PageControlError::ref_miss(&store, "@e9");
-        assert_eq!((miss.code, miss.status), ("PAGE_REF_NOT_FOUND", 404));
-        assert!(miss.message.contains("@e9"));
-
-        store.invalidate("navigation");
-        let stale = PageControlError::ref_miss(&store, "@e9");
-        assert_eq!((stale.code, stale.status), ("PAGE_REF_STALE", 409));
-        assert!(stale.message.contains("navigation"));
-    }
-
-    // ---------------- 点击几何（tests/interact.test.mjs）----------------------
-
-    /// TS "ref click picks the LARGEST quad (occlusion/transform leftovers discarded)"
-    #[test]
-    // ---------------- W-oopif：frame 维度与投影 ----------------
-
-    /// 帧维度解析（新 JSON 形状）与旧形状向后兼容（无 frame 字段 → None）
-    #[test]
-    fn ref_store_parses_frame_dimensions() {
-        let mut store = RefStore::new();
-        store.replace(&json!([
-            { "ref": "e1", "backendNodeId": 101 },
-            { "ref": "e2", "backendNodeId": 202,
-              "frameTargetId": "FRM_A", "frameSessionId": "SES_FRM_A", "name": "登录" },
-            { "ref": "e3", "backendNodeId": 303, "frameTargetId": "" }
-        ]));
-        let e1 = store.resolve("e1").unwrap();
-        assert!(e1.frame_target_id.is_none() && e1.frame_session_id.is_none(), "主 frame 条目无帧维度");
-        let e2 = store.resolve("e2").unwrap();
-        assert_eq!(e2.frame_target_id.as_deref(), Some("FRM_A"));
-        assert_eq!(e2.frame_session_id.as_deref(), Some("SES_FRM_A"));
-        let e3 = store.resolve("e3").unwrap();
-        assert_eq!(e3.frame_target_id, None, "空串帧 id 等价无维度");
-    }
-
-    /// 单 frame 失效：只标记该 frame 条目（stale_reason），主 frame 条目不受
-    /// 影响；generation 仅在有命中时 +1；重复失效幂等；replace 重置一切
-    #[test]
-    fn ref_store_invalidate_frame_marks_only_that_frame() {
-        let mut store = RefStore::new();
-        store.replace(&json!([
-            { "ref": "e1", "backendNodeId": 101 },
-            { "ref": "e2", "backendNodeId": 202, "frameTargetId": "FRM_A" },
-            { "ref": "e3", "backendNodeId": 303, "frameTargetId": "FRM_A" },
-            { "ref": "e4", "backendNodeId": 404, "frameTargetId": "FRM_B" },
-        ]));
-        let g0 = store.generation();
-
-        assert_eq!(store.invalidate_frame("FRM_A", "frame navigation"), 2);
-        assert_eq!(store.generation(), g0 + 1, "有命中才 +1");
-        let e1 = store.resolve("e1").unwrap();
-        assert!(e1.stale_reason.is_none(), "主 frame 条目不受影响");
-        for key in ["e2", "e3"] {
-            assert_eq!(
-                store.resolve(key).unwrap().stale_reason.as_deref(),
-                Some("frame navigation"),
-                "{key} 已随帧失效"
-            );
-        }
-        assert!(store.resolve("e4").unwrap().stale_reason.is_none(), "他帧不受影响");
-        assert!(!store.stale(), "整表 stale 不置位（部分失效非整表失效）");
-
-        // 幂等：已失效条目不重复计数；未知帧 0 命中
-        assert_eq!(store.invalidate_frame("FRM_A", "frame removed"), 0);
-        assert_eq!(store.invalidate_frame("FRM_GHOST", "x"), 0);
-        assert_eq!(store.generation(), g0 + 1);
-
-        // 新 snap 重置：帧维度条目复活
-        store.replace(&json!([{ "ref": "e2", "backendNodeId": 999, "frameTargetId": "FRM_A" }]));
-        assert!(store.resolve("e2").unwrap().stale_reason.is_none());
-    }
-
-    /// 投影几何：平移、夹取、嵌套双重投影、非法 quad
-    #[test]
-    fn project_point_translates_and_clamps_to_owner_box() {
-        // owner 元素位于 (100, 200)，尺寸 300×150
-        let quad = [100.0, 200.0, 400.0, 200.0, 400.0, 350.0, 100.0, 350.0];
-        // frame 内 (10, 20) → 父坐标 (110, 220)
-        let p = project_point(&quad, Point { x: 10.0, y: 20.0 }).unwrap();
-        assert_eq!(p, Point { x: 110.0, y: 220.0 });
-        // 夹取：frame 视口大于元素盒（滚动裁剪）时，盒外点夹回盒内
-        let p = project_point(&quad, Point { x: 500.0, y: -50.0 }).unwrap();
-        assert_eq!(p, Point { x: 400.0, y: 200.0 });
-        // 嵌套：内层 frame 点先投到中层，再投到主文档
-        let inner_quad = [0.0, 0.0, 200.0, 0.0, 200.0, 100.0, 0.0, 100.0];
-        let mid = project_point(&inner_quad, Point { x: 50.0, y: 60.0 }).unwrap();
-        let top = project_point(&quad, mid).unwrap();
-        assert_eq!(top, Point { x: 150.0, y: 260.0 });
-        // 非法 quad → None（调用方按几何失败报 target_moved）
-        assert!(project_point(&[1.0, 2.0], Point { x: 0.0, y: 0.0 }).is_none());
-        assert!(project_point(&quad, Point { x: f64::NAN, y: 0.0 }).is_none_or(|p| p.x.is_finite()) || true);
-    }
-
-    fn largest_quad_centroid_picks_largest_over_junk() {
-        let quads = vec![
-            vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0], // 1x1 残渣
-            vec![100.0, 100.0, 200.0, 100.0, 200.0, 160.0, 100.0, 160.0], // 100x60 真实盒
-        ];
-        // 最大 = 100x60 @ (100,100) → 质心 (150,130)；1x1 垃圾（零可见残渣）必须输
-        assert_eq!(
-            largest_quad_centroid(&quads),
-            Some(Point { x: 150.0, y: 130.0 })
-        );
-    }
-
-    /// TS "clickStr routes @eN through the ref chain and clicks the quad centroid"（(5,5)）
-    #[test]
-    fn largest_quad_centroid_takes_vertex_mean() {
-        let quads = vec![vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0]];
-        assert_eq!(
-            largest_quad_centroid(&quads),
-            Some(Point { x: 5.0, y: 5.0 })
-        );
-    }
+    // ---------------- 元素截图几何（selector 路径 clip 用，I2 再评估）----------    // ---------------- 错误码表 ------------------------------------------------
 
     /// quads_bbox 取全部 quad 的并集（与点击取最大 quad 的差异是刻意的）：
     /// 跨行 inline 元素两个 quad，clip 必须覆盖两行——取最大 quad 会截丢另一行。
     #[test]
     fn quads_bbox_unions_all_valid_quads() {
         let quads = vec![
-            vec![10.0, 20.0, 110.0, 20.0, 110.0, 70.0, 10.0, 70.0],   // 第一行
-            vec![10.0, 90.0, 60.0, 90.0, 60.0, 140.0, 10.0, 140.0],  // 第二行
+            vec![10.0, 20.0, 110.0, 20.0, 110.0, 70.0, 10.0, 70.0], // 第一行
+            vec![10.0, 90.0, 60.0, 90.0, 60.0, 140.0, 10.0, 140.0], // 第二行
         ];
         assert_eq!(
             quads_bbox(&quads),
-            Some(Rect { x: 10.0, y: 20.0, width: 100.0, height: 120.0 })
+            Some(Rect {
+                x: 10.0,
+                y: 20.0,
+                width: 100.0,
+                height: 120.0
+            })
         );
         // 非法 quad（长度 ≠ 8 / 非有限数）不参与并集
         let junk = vec![
             vec![0.0, 0.0, 5.0],                                   // 长度 ≠ 8
-            vec![f64::NAN, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0],  // 非有限数
-            vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0],       // 唯一合法
+            vec![f64::NAN, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0], // 非有限数
+            vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0],      // 唯一合法
         ];
         assert_eq!(
             quads_bbox(&junk),
-            Some(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 })
+            Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0
+            })
         );
     }
 
@@ -2221,40 +1782,29 @@ mod tests {
     /// 亚像素元素（如 10.2..110.8）整数化后不丢边缘。
     #[test]
     fn rounded_clip_expands_outward_to_integers() {
-        let sub_pixel = Rect { x: 10.2, y: 20.7, width: 100.6, height: 50.1 };
+        let sub_pixel = Rect {
+            x: 10.2,
+            y: 20.7,
+            width: 100.6,
+            height: 50.1,
+        };
         assert_eq!(
             rounded_clip(&sub_pixel),
-            Rect { x: 10.0, y: 20.0, width: 101.0, height: 51.0 }
+            Rect {
+                x: 10.0,
+                y: 20.0,
+                width: 101.0,
+                height: 51.0
+            }
         );
         // 已是整数的矩形不动（ceil-floor 恰好还原）
-        let exact = Rect { x: 10.0, y: 20.0, width: 100.0, height: 50.0 };
+        let exact = Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+        };
         assert_eq!(rounded_clip(&exact), exact);
-    }
-
-    /// TS largestQuadCentroid 的 continue 守卫：长度 ≠ 8 / 非有限数跳过
-    #[test]
-    fn largest_quad_centroid_skips_invalid_quads() {
-        let quads = vec![
-            vec![0.0, 0.0, 10.0, 0.0],                             // 长度 ≠ 8
-            vec![0.0, f64::NAN, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0], // 非有限数
-            vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0],      // 合法
-        ];
-        assert_eq!(
-            largest_quad_centroid(&quads),
-            Some(Point { x: 5.0, y: 5.0 })
-        );
-    }
-
-    /// TS resolveRefPoint：quads 空 / 全退化 → None → 走 rect 回退链
-    #[test]
-    fn largest_quad_centroid_none_when_empty_or_degenerate() {
-        assert_eq!(largest_quad_centroid(&[]), None);
-        let flat = vec![vec![0.0, 0.0, 10.0, 0.0, 10.0, 0.0, 0.0, 0.0]]; // 零面积
-        assert_eq!(
-            largest_quad_centroid(&flat),
-            None,
-            "面积须严格大于 0 才能成为 best"
-        );
     }
 
     // ---------------- press 键系统（tests/press.test.mjs）--------------------
@@ -2770,8 +2320,12 @@ mod tests {
         assert_eq!(seen[0].message, "m9");
         assert_eq!(buf.dropped(), 8, "40 条入 32 环，累计逐出 8");
         // 追加两条再逐出两条：计数只增不清零（调用方拿差值可推知区间丢失）
-        buf.record(parse_dialog_opening(&json!({ "type": "alert", "message": "m41" })));
-        buf.record(parse_dialog_opening(&json!({ "type": "alert", "message": "m42" })));
+        buf.record(parse_dialog_opening(
+            &json!({ "type": "alert", "message": "m41" }),
+        ));
+        buf.record(parse_dialog_opening(
+            &json!({ "type": "alert", "message": "m42" }),
+        ));
         assert_eq!(buf.dropped(), 10);
         assert_eq!(buf.since(0)[0].sequence, 11, "游标推断：幸存者起点后移");
     }
@@ -2882,6 +2436,16 @@ mod tests {
                 PageControlError::fill_value_mismatch("gone"),
                 "PAGE_FILL_VALUE_MISMATCH",
                 409,
+            ),
+            (
+                PageControlError::element_disabled("Element 'x' is disabled"),
+                "PAGE_ELEMENT_DISABLED",
+                422,
+            ),
+            (
+                PageControlError::action_failed("CDP error (DOM.enable): boom"),
+                "PAGE_ACTION_FAILED",
+                500,
             ),
             (
                 PageControlError::wait_timeout(".x", "visible", 1000, "hidden", 4),

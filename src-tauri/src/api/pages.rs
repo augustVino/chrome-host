@@ -18,11 +18,26 @@ use crate::error::AppError;
 
 use super::server::ApiState;
 
-/// POST /api/v1/instances/{id}/page/snap —— AX 树快照 + @eN ref 整表替换。
+/// POST /api/v1/instances/{id}/page/snap —— kit 快照管线（durable refs）。
 #[derive(Deserialize)]
 pub struct SnapBody {
     /// 目标 tab（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签 409 列出全部）
     pub tab: Option<String>,
+    /// --compact：压缩文本树（kit compact_tree）
+    #[serde(default)]
+    pub compact: Option<bool>,
+    /// --interactive：只保留可交互节点
+    #[serde(default)]
+    pub interactive: Option<bool>,
+    /// --depth：渲染深度上限
+    #[serde(default)]
+    pub depth: Option<u64>,
+    /// --urls：link 节点附 url 属性
+    #[serde(default)]
+    pub urls: Option<bool>,
+    /// --selector：只快照该 CSS 选择器命中的子树
+    #[serde(default)]
+    pub selector: Option<String>,
 }
 
 /// POST /api/v1/instances/{id}/page/click —— 原生输入点击。
@@ -235,9 +250,24 @@ pub async fn snap(
     Path(id): Path<String>,
     Json(body): Json<SnapBody>,
 ) -> Result<Json<Value>, AppError> {
+    let depth = match body.depth {
+        Some(d) if d > usize::MAX as u64 => {
+            return Err(AppError::invalid_request(format!(
+                "depth 超出上限（got {d}）"
+            )))
+        }
+        d => d.map(|d| d as usize),
+    };
+    let params = crate::application::page_service::SnapParams {
+        compact: body.compact.unwrap_or(false),
+        interactive: body.interactive.unwrap_or(false),
+        depth,
+        urls: body.urls.unwrap_or(false),
+        selector: body.selector,
+    };
     let resp = state
         .page
-        .snap(&id, body.tab.as_deref().unwrap_or(""))
+        .snap(&id, body.tab.as_deref().unwrap_or(""), params)
         .await?;
     Ok(Json(resp))
 }
@@ -563,7 +593,11 @@ pub async fn extract(
 ) -> Result<Json<Value>, AppError> {
     let resp = state
         .page
-        .extract(&id, body.tab.as_deref().unwrap_or(""), body.target.as_deref())
+        .extract(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            body.target.as_deref(),
+        )
         .await?;
     Ok(Json(resp))
 }
@@ -575,12 +609,10 @@ pub async fn emulate(
 ) -> Result<Json<Value>, AppError> {
     let req = crate::domain::emulate::EmulateRequest {
         preset: body.preset,
-        viewport: body
-            .viewport
-            .map(|v| crate::domain::emulate::Viewport {
-                width: v.width,
-                height: v.height,
-            }),
+        viewport: body.viewport.map(|v| crate::domain::emulate::Viewport {
+            width: v.width,
+            height: v.height,
+        }),
         user_agent: body.user_agent,
         mobile: body.mobile,
         touch: body.touch,

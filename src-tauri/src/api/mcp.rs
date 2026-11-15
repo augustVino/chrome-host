@@ -92,7 +92,9 @@ struct InstanceArgs {
 struct CreateInstanceArgs {
     #[schemars(description = "环境 id（env_ 前缀）")]
     environment_id: String,
-    #[schemars(description = "可选实例名：1-64 字符、非纯空白；同环境内唯一，重名 → 409 INSTANCE_NAME_CONFLICT。多任务并行时建议命名，便于后续按名锚定")]
+    #[schemars(
+        description = "可选实例名：1-64 字符、非纯空白；同环境内唯一，重名 → 409 INSTANCE_NAME_CONFLICT。多任务并行时建议命名，便于后续按名锚定"
+    )]
     name: Option<String>,
 }
 
@@ -215,7 +217,9 @@ struct NetworkBodyArgs {
     request_id: String,
     #[schemars(description = "窗口起点，UTF-16 code unit（JS String 同构）；缺省 0")]
     offset: Option<usize>,
-    #[schemars(description = "窗口长度（UTF-16 unit）；缺省 8192，上限 65536。truncated=true 时用 offset+=returned 续读")]
+    #[schemars(
+        description = "窗口长度（UTF-16 unit）；缺省 8192，上限 65536。truncated=true 时用 offset+=returned 续读"
+    )]
     limit: Option<usize>,
 }
 
@@ -260,6 +264,18 @@ struct PageSnapArgs {
     instance_id: String,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
+    #[schemars(description = "压缩输出（kit compact_tree：去掉空行/冗余层级），默认 false")]
+    compact: Option<bool>,
+    #[schemars(description = "只保留可交互节点（带 @eN 引用的行），默认 false")]
+    interactive: Option<bool>,
+    #[schemars(description = "渲染深度上限（缩进层级），默认不限")]
+    depth: Option<usize>,
+    #[schemars(description = "link 节点附 url= 属性，默认 false")]
+    urls: Option<bool>,
+    #[schemars(
+        description = "只快照该 CSS 选择器命中子树（未命中 → 500 PAGE_ACTION_FAILED 带原因）"
+    )]
+    selector: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -268,7 +284,7 @@ struct PageClickArgs {
     #[schemars(description = "实例 id（ins_ 前缀）")]
     instance_id: String,
     #[schemars(
-        description = "点击目标：@eN 引用（上次 page_snap 产生，导航后失效需重新 snap）或 CSS 选择器"
+        description = "点击目标：@eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）或 CSS 选择器"
     )]
     target: String,
     #[schemars(description = TAB_ARG_DESC)]
@@ -281,7 +297,7 @@ struct PageFillArgs {
     #[schemars(description = "实例 id（ins_ 前缀）")]
     instance_id: String,
     #[schemars(
-        description = "填写目标：@eN 引用（上次 page_snap 产生，导航后失效需重新 snap）或 CSS 选择器"
+        description = "填写目标：@eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）或 CSS 选择器"
     )]
     target: String,
     #[schemars(description = "填入文本；空串 = 仅清空")]
@@ -359,7 +375,9 @@ struct PageRawArgs {
     params: Option<serde_json::Value>,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
-    #[schemars(description = "true = 发 browser 级（Target 域等）；缺省 false = 发到 tab 的 page session（Runtime/DOM/Input/Emulation）")]
+    #[schemars(
+        description = "true = 发 browser 级（Target 域等）；缺省 false = 发到 tab 的 page session（Runtime/DOM/Input/Emulation）"
+    )]
     browser: Option<bool>,
 }
 
@@ -695,7 +713,9 @@ impl ChromeHostMcp {
         .await
     }
 
-    #[tool(description = "列出环境下的全部实例（含 name/状态/端口/pid；name 在同环境内唯一，可用于任务锚定）")]
+    #[tool(
+        description = "列出环境下的全部实例（含 name/状态/端口/pid；name 在同环境内唯一，可用于任务锚定）"
+    )]
     async fn list_instances(
         &self,
         Parameters(a): Parameters<EnvironmentArgs>,
@@ -1004,22 +1024,29 @@ impl ChromeHostMcp {
     // ── 页面控制（P2-C）───────────────────────────────────────
 
     #[tool(
-        description = "可访问性树快照：返回精简文本树（可交互节点带 @e1..@eN 引用，内联 role/name/value）+ refs_count + generation。跨域 iframe 内容以 [frame] 段内嵌，@eN 跨 frame 连续编号（click 走坐标投影、fill/press 走帧会话；CSS 选择器仍只查主 frame）。操作循环的起点：snap → 用 @eN 引用 click/fill/press → 页面变化后重新 snap（导航会使全部引用失效 → 409 PAGE_REF_STALE；单帧导航只失效该帧内引用，需重 snap 而非重试）"
+        description = "可访问性树快照（上游风格文本树：- role \"name\" @eN，可交互节点带 @e1..@eN 引用）+ refs_count + generation + hoverScan + removedRefs（本次快照消失的旧引用）。引用是 durable 的：SPA 同文档更新后旧 @eN 仍可用（同 backendNodeId 或按 role/name 唯一匹配恢复）；导航/文档替换后旧引用报 409 PAGE_REF_STALE 时重 snap。跨域 iframe 内容内嵌在 Iframe 节点行下（kit 帧递归，@eN 跨帧连续）；CSS 选择器仍只查主 frame。操作循环：snap → 用 @eN 引用 click/fill/press → 页面变化后重 snap（或旧引用报 STALE 时再 snap）"
     )]
     async fn page_snap(
         &self,
         Parameters(a): Parameters<PageSnapArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run(|| {
+            let params = crate::application::page_service::SnapParams {
+                compact: a.compact.unwrap_or(false),
+                interactive: a.interactive.unwrap_or(false),
+                depth: a.depth,
+                urls: a.urls.unwrap_or(false),
+                selector: a.selector.clone(),
+            };
             self.state
                 .page
-                .snap(&a.instance_id, a.tab.as_deref().unwrap_or(""))
+                .snap(&a.instance_id, a.tab.as_deref().unwrap_or(""), params)
         })
         .await
     }
 
     #[tool(
-        description = "原生输入点击（mouseMoved→mousePressed→mouseReleased，非 el.click()）：target 支持 @eN 引用（上次 page_snap 产生，导航后失效需重新 snap）与 CSS 选择器两种形态；selector 路径带可见性/遮挡校验（422 PAGE_ELEMENT_NOT_VISIBLE / 409 PAGE_ELEMENT_BLOCKED）。实例须运行中（409 PAGE_SERVICE_UNAVAILABLE）"
+        description = "原生输入点击（mouseMoved→mousePressed→mouseReleased，非 el.click()）：target 支持 @eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）与 CSS 选择器两种形态；selector 路径带可见性/遮挡校验（422 PAGE_ELEMENT_NOT_VISIBLE / 409 PAGE_ELEMENT_BLOCKED），ref 路径遮挡校验来自 kit 解析链（409 PAGE_ELEMENT_BLOCKED）。实例须运行中（409 PAGE_SERVICE_UNAVAILABLE）"
     )]
     async fn page_click(
         &self,
@@ -1034,7 +1061,7 @@ impl ChromeHostMcp {
     }
 
     #[tool(
-        description = "填写输入框：target 支持 @eN 引用（上次 page_snap 产生，导航后失效需重新 snap）与 CSS 选择器；聚焦→全选清空→Input.insertText→回读校验，value 空串 = 仅清空。不可编辑 → 422 PAGE_TARGET_NOT_FILLABLE；回读不一致 → 409 PAGE_FILL_VALUE_MISMATCH（写入可能已部分生效，先观察再决定）"
+        description = "填写输入框：target 支持 @eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）与 CSS 选择器；聚焦→全选清空→Input.insertText→回读校验，value 空串 = 仅清空。不可编辑 → 422 PAGE_TARGET_NOT_FILLABLE；回读不一致 → 409 PAGE_FILL_VALUE_MISMATCH（写入可能已部分生效，先观察再决定）"
     )]
     async fn page_fill(
         &self,
@@ -1213,11 +1240,9 @@ impl ChromeHostMcp {
         Parameters(a): Parameters<PageNavigateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run(|| {
-            self.state.page.navigate(
-                &a.instance_id,
-                a.tab.as_deref().unwrap_or(""),
-                &a.url,
-            )
+            self.state
+                .page
+                .navigate(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.url)
         })
         .await
     }
@@ -1247,8 +1272,12 @@ impl ChromeHostMcp {
         &self,
         Parameters(a): Parameters<PageNavHistoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        run(|| self.state.page.back(&a.instance_id, a.tab.as_deref().unwrap_or("")))
-            .await
+        run(|| {
+            self.state
+                .page
+                .back(&a.instance_id, a.tab.as_deref().unwrap_or(""))
+        })
+        .await
     }
 
     #[tool(
@@ -1258,8 +1287,12 @@ impl ChromeHostMcp {
         &self,
         Parameters(a): Parameters<PageNavHistoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        run(|| self.state.page.forward(&a.instance_id, a.tab.as_deref().unwrap_or("")))
-            .await
+        run(|| {
+            self.state
+                .page
+                .forward(&a.instance_id, a.tab.as_deref().unwrap_or(""))
+        })
+        .await
     }
 
     #[tool(
@@ -1308,18 +1341,21 @@ impl ChromeHostMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let req = crate::domain::emulate::EmulateRequest {
             preset: a.preset,
-            viewport: a
-                .viewport
-                .map(|v| crate::domain::emulate::Viewport {
-                    width: v.width,
-                    height: v.height,
-                }),
+            viewport: a.viewport.map(|v| crate::domain::emulate::Viewport {
+                width: v.width,
+                height: v.height,
+            }),
             user_agent: a.user_agent,
             mobile: a.mobile,
             touch: a.touch,
             off: a.off.unwrap_or(false),
         };
-        run(|| self.state.page.emulate(&a.instance_id, a.tab.as_deref().unwrap_or(""), req)).await
+        run(|| {
+            self.state
+                .page
+                .emulate(&a.instance_id, a.tab.as_deref().unwrap_or(""), req)
+        })
+        .await
     }
 
     #[tool(

@@ -1,8 +1,10 @@
-use super::{cdp_send, require_conn, FULL_SHOT_MAX_DEVICE_SIDE};
+use super::{cdp_send, kit_client, require_conn, FULL_SHOT_MAX_DEVICE_SIDE};
+use crate::application::browser_kit::element::{resolve_element_object_id, RefMap};
 use crate::application::page_service::eval::eval_raw;
-use crate::application::page_service::refs::{is_ref_target, resolve_ref_entry, RECT_CENTER_FN};
+use crate::application::page_service::frames::iframe_sessions_view;
+use crate::application::page_service::refs::{is_ref_target, map_kit_error, require_ref};
 use crate::application::page_service::state::Watched;
-use crate::domain::page_control::{quads_bbox, rounded_clip, PageControlError};
+use crate::domain::page_control::{quads_bbox, rounded_clip, PageControlError, Rect};
 use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::SharedPageConn;
 use serde_json::{json, Value};
@@ -10,42 +12,39 @@ use serde_json::{json, Value};
 // 6b. 截图 / PDF / 仿真（W-cap）
 // ============================================================================
 
-/// DOM 节点句柄：ref 路径拿到 backendNodeId，selector 路径（getDocument →
-/// querySelector）拿到 nodeId——scrollIntoViewIfNeeded / getContentQuads /
-/// resolveNode 三个命令同时接受两者，统一透传不换算。
+/// DOM 节点句柄（selector 路径：getDocument → querySelector 得 nodeId）——
+/// scrollIntoViewIfNeeded / getContentQuads / resolveNode 同时接受 nodeId。
+/// （ref 路径自 I1b 走 kit 对象解析链，不再产出 backendNodeId 句柄。）
 #[derive(Clone, Copy)]
-enum NodeHandle {
-    BackendNode(i64),
-    Node(i64),
+struct NodeHandle {
+    node_id: i64,
 }
 
-impl NodeHandle {
-    /// CDP 参数键值对（json! 里展开：{ key: value }）
-    fn param(&self) -> (&'static str, i64) {
-        match self {
-            NodeHandle::BackendNode(id) => ("backendNodeId", *id),
-            NodeHandle::Node(id) => ("nodeId", *id),
-        }
-    }
-}
-
-/// 元素在视口中的可截图矩形：与 click 的 resolve_ref_point 同链（scroll
-/// best-effort → quads → rect 回退），差异仅在产出——点 → 联合包围盒，
-/// 且退化几何统一报 PAGE_TARGET_MOVED（与点击链同语义，不另造码）。
+/// 元素在视口中的可截图矩形：scroll best-effort → quads 联合 bbox →
+/// rect 回退，退化几何统一报 PAGE_TARGET_MOVED（与点击链同语义，不另造码）。
+/// selector 路径专用（nodeId 句柄）；ref 路径自 I1b 走 kit 对象解析 +
+/// getBoundingClientRect（见 [`element_clip_rect`]，与旧 quads 链的联合
+/// bbox 语义等价——getBoundingClientRect 本就是多碎片 border-box 的并集）。
 async fn resolve_clip_rect(
     conn: &SharedPageConn,
     sid: &str,
     handle: NodeHandle,
-) -> Result<crate::domain::page_control::Rect, AppError> {
-    let (key, id) = handle.param();
+) -> Result<Rect, AppError> {
     let _ = cdp_send(
         conn,
         "DOM.scrollIntoViewIfNeeded",
-        json!({ key: id }),
+        json!({ "nodeId": handle.node_id }),
         Some(sid),
     )
     .await;
-    if let Ok(resp) = cdp_send(conn, "DOM.getContentQuads", json!({ key: id }), Some(sid)).await {
+    if let Ok(resp) = cdp_send(
+        conn,
+        "DOM.getContentQuads",
+        json!({ "nodeId": handle.node_id }),
+        Some(sid),
+    )
+    .await
+    {
         let quads: Vec<Vec<f64>> = resp
             .get("quads")
             .and_then(Value::as_array)
@@ -63,17 +62,44 @@ async fn resolve_clip_rect(
         }
     }
     // 回退：resolveNode → getBoundingClientRect（与 resolve_ref_point 同源）
-    let resp = cdp_send(conn, "DOM.resolveNode", json!({ key: id }), Some(sid))
-        .await
-        .map_err(|e| PageControlError::target_moved(&e.to_string()))?;
+    let resp = cdp_send(
+        conn,
+        "DOM.resolveNode",
+        json!({ "nodeId": handle.node_id }),
+        Some(sid),
+    )
+    .await
+    .map_err(|e| PageControlError::target_moved(&e.to_string()))?;
     let object_id = resp
         .pointer("/object/objectId")
         .and_then(Value::as_str)
         .ok_or_else(|| PageControlError::target_moved("no objectId"))?;
+    rect_from_object(conn, sid, object_id).await
+}
+
+/// rect 读取页内脚本（原 refs.rs RECT_CENTER_FN 迁入，唯一消费者）：
+/// getBoundingClientRect 的 {x,y,w,h}（多碎片 inline 元素返回并集盒，
+/// 与 quads 联合 bbox 同义）
+const RECT_READ_FN: &str = "function(){ const r = this.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; }";
+
+/// 对象句柄 → 可截图矩形（ref 路径：kit 已解析出 objectId + effective
+/// session，此处滚动 + 读 rect；退化 → PAGE_TARGET_MOVED）
+async fn rect_from_object(
+    conn: &SharedPageConn,
+    sid: &str,
+    object_id: &str,
+) -> Result<Rect, AppError> {
+    let _ = cdp_send(
+        conn,
+        "DOM.scrollIntoViewIfNeeded",
+        json!({ "objectId": object_id }),
+        Some(sid),
+    )
+    .await;
     let resp = cdp_send(
         conn,
         "Runtime.callFunctionOn",
-        json!({ "objectId": object_id, "functionDeclaration": RECT_CENTER_FN, "returnByValue": true }),
+        json!({ "objectId": object_id, "functionDeclaration": RECT_READ_FN, "returnByValue": true }),
         Some(sid),
     )
     .await
@@ -89,14 +115,12 @@ async fn resolve_clip_rect(
         rect.get("h").and_then(Value::as_f64),
     );
     match (x, y, w, h) {
-        (Some(x), Some(y), Some(w), Some(h)) if w > 0.0 && h > 0.0 => {
-            Ok(crate::domain::page_control::Rect {
-                x,
-                y,
-                width: w,
-                height: h,
-            })
-        }
+        (Some(x), Some(y), Some(w), Some(h)) if w > 0.0 && h > 0.0 => Ok(Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }),
         _ => Err(PageControlError::target_moved("empty rect").into()),
     }
 }
@@ -189,9 +213,38 @@ pub(crate) async fn screenshot_tool(
         }
         (false, None) => json!({ "format": "png" }),
         (false, Some(t)) => {
-            let handle = if is_ref_target(t) {
-                let entry = resolve_ref_entry(watched, tid, t)?;
-                NodeHandle::BackendNode(entry.backend_node_id)
+            if is_ref_target(t) {
+                // I1b：kit 对象解析链（帧路由 + stale 恢复在 kit 内）→ 滚动 +
+                // rect 读取 → rounded_clip（行为不变：外扩取整；退化 →
+                // PAGE_TARGET_MOVED）。captureScreenshot 发 effective session
+                //（同源帧即主会话；OOPIF 帧会话按其自身视口截取）
+                require_ref(watched, tid, t)?;
+                let client = kit_client(watched)?;
+                let iframe_sessions = iframe_sessions_view(watched, tid);
+                let ref_map = watched
+                    .refs
+                    .lock()
+                    .unwrap()
+                    .get(tid)
+                    .cloned()
+                    .unwrap_or_else(RefMap::new);
+                let (object_id, esid) =
+                    resolve_element_object_id(&client, sid, &ref_map, t, &iframe_sessions)
+                        .await
+                        .map_err(|e| map_kit_error(&e, "screenshot"))?;
+                let rect = rect_from_object(&conn, &esid, &object_id).await?;
+                let _ = cdp_send(
+                    &conn,
+                    "Runtime.releaseObject",
+                    json!({ "objectId": object_id }),
+                    Some(&esid),
+                )
+                .await;
+                let clip = rounded_clip(&rect);
+                json!({
+                    "format": "png",
+                    "clip": { "x": clip.x, "y": clip.y, "width": clip.width, "height": clip.height, "scale": 1 }
+                })
             } else {
                 // selector 路径：与 fill 同链（getDocument → querySelector），
                 // nodeId 0 = 未命中（同码 PAGE_ELEMENT_NOT_FOUND）
@@ -211,14 +264,14 @@ pub(crate) async fn screenshot_tool(
                 if node_id == 0 {
                     return Err(PageControlError::element_not_found(t).into());
                 }
-                NodeHandle::Node(node_id)
-            };
-            let rect = resolve_clip_rect(&conn, sid, handle).await?;
-            let clip = rounded_clip(&rect);
-            json!({
-                "format": "png",
-                "clip": { "x": clip.x, "y": clip.y, "width": clip.width, "height": clip.height, "scale": 1 }
-            })
+                let handle = NodeHandle { node_id };
+                let rect = resolve_clip_rect(&conn, sid, handle).await?;
+                let clip = rounded_clip(&rect);
+                json!({
+                    "format": "png",
+                    "clip": { "x": clip.x, "y": clip.y, "width": clip.width, "height": clip.height, "scale": 1 }
+                })
+            }
         }
     };
     let resp = cdp_send(&conn, "Page.captureScreenshot", params, Some(sid)).await?;

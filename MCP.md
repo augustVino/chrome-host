@@ -137,8 +137,9 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 
 实例级常驻连接上的页面操作面（与 CLI `page` 命令族、REST `/instances/{id}/page/*`
 同源）。操作循环：`page_snap` 拿 @eN 引用 → `page_click`/`page_fill`/`page_press`
-用引用操作 → 页面变化后重新 `page_snap`（导航后引用整表失效 → 409 `PAGE_REF_STALE`，
-重 snap 而非对旧引用重试）。**跨域 iframe（OOPIF）**：snap 的 `[frame]` 段内嵌
+用引用操作 → 页面变化后重新 `page_snap`。引用是 durable 的（v0.8+）：SPA 同文档
+局部刷新后旧 @eN 仍可用；收到 409 `PAGE_REF_STALE`（节点死亡且恢复无果）时重
+snap，而非对旧引用重试。**跨域 iframe（OOPIF）**：snap 的 Iframe 节点行下内嵌
 iframe 内可交互元素（@eN 跨 frame 连续编号），click 走坐标投影、fill/press 走
 帧会话——帧内 @eN 直接可用；单帧导航/移除只失效该帧内引用（主 frame 引用
 不受影响）；CSS 选择器仍只查主 frame；帧内 hover 标记不适用（迭代边界）。
@@ -146,7 +147,7 @@ iframe 内可交互元素（@eN 跨 frame 连续编号），click 走坐标投�
 accept，命令期间新弹的附在成功响应 `dialogs_seen`，历史查 `page_dialogs`。
 `page_eval`/`page_html`/`page_clickxy`/`page_loadall`/`page_type` 为 cdp.mjs
 退役补齐的兑底五件：eval 是高权限原语（可执行任意 JS，与退役前 cdp.mjs 同
-权限——仅在 page 原语不够用时使用）；跨域 iframe（OOPIF）内元素已支持：snap 以 `[frame]` 段内嵌帧内容、@eN 跨 frame 连续编号，click（坐标投影）/fill/press（帧会话）对帧内 @eN 直接可用；CSS 选择器仍只查主 frame，帧内坐标级兜底仍可用（`page_clickxy` 点入获得焦点 → `page_type` 输入）。
+权限——仅在 page 原语不够用时使用）；跨域 iframe（OOPIF）内元素已支持：snap 在 Iframe 节点行下内嵌帧内容、@eN 跨 frame 连续编号，click/fill/press 对帧内 @eN 直接可用（kit 解析链帧会话路由）；CSS 选择器仍只查主 frame，帧内坐标级兜底仍可用（`page_clickxy` 点入获得焦点 → `page_type` 输入）。
 `page_navigate`/`page_back`/`page_forward`/`page_reload` 为导航四件套：同一
 标签的 page session 内导航/历史回退/重载，**保留历史**（实例级 `navigate` 的
 new+close 组合近似会丢历史）；等待 load 至多 25s，未证实 → 响应 `loaded:false`
@@ -155,8 +156,8 @@ new+close 组合近似会丢历史）；等待 load 至多 25s，未证实 → �
 
 | 工具 | 输入 | 说明 |
 |---|---|---|
-| `page_snap` | `instanceId`；可选 `tab` | AX 树快照：精简文本树（@e1..@eN 内联）+ `refs_count` + `generation` + hover 感知（行内 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化；meta `hoverScan`：ok/truncated(预算截断 32 表/2MiB/256 规则)/skipped(无 hover 规则)/error） |
-| `page_click` | `instanceId`, `target`；可选 `tab` | 原生输入点击；target 支持 @eN 引用（导航后失效需重新 snap）与 CSS 选择器 |
+| `page_snap` | `instanceId`；可选 `tab`、`compact`、`interactive`、`depth`、`urls`、`selector` | AX 树快照（v0.8+ kit 管线）：上游风格文本树（`- button "Buy" @e1`）+ `refs_count` + `generation` + `removedRefs`（有旧引用消失时）+ hover 感知（行尾 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化；meta `hoverScan`：ok/truncated(预算截断 32 表/2MiB/256 规则)/skipped(无 hover 规则)/error）；跨域 iframe 内容内嵌在 Iframe 节点行下 |
+| `page_click` | `instanceId`, `target`；可选 `tab` | 原生输入点击；target 支持 @eN 引用（durable：同文档更新仍可用，报 409 `PAGE_REF_STALE` 时重 snap）与 CSS 选择器 |
 | `page_fill` | `instanceId`, `target`, `value`；可选 `tab` | 聚焦→清空→输入→回读校验；空 value = 仅清空 |
 | `page_press` | `instanceId`, `key`；可选 `target`, `tab` | 三段键盘事件（组合键如 Control+A）；target 先聚焦 |
 | `page_wait` | `instanceId`, `selector`；可选 `state`, `timeout`, `tab` | 轮询等待（250ms）；timeout 如 `"10s"`（裸数字 = ms），缺省 10s |

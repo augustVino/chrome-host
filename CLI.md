@@ -211,9 +211,11 @@ chrome-host env delete <id> --yes
 ### page — 页面控制
 
 页面操作面（P2-C；仅运行中实例，否则 409 exit 5）。操作循环：`page snap` 拿
-@eN 引用 → `page click/fill/press --target` 用引用操作 → 页面变化后重新 `snap`
-（导航后引用整表失效，报 `PAGE_REF_STALE` / `PAGE_REF_NOT_FOUND` → **重 snap，
-不要对旧引用重试**）。对话框（alert/confirm/prompt/beforeunload）会被自动
+@eN 引用 → `page click/fill/press --target` 用引用操作 → 页面变化后重新 `snap`。
+引用是 **durable** 的（v0.8+，I1b）：SPA 同文档更新（局部刷新/pushState）后旧
+@eN 仍可用（同节点直接命中，节点失联时按 role/name 唯一匹配恢复）；只有解析
+报 `PAGE_REF_STALE`（节点已随导航/替换死亡且恢复无果）时才**重 snap，不要对
+旧引用重试**；`PAGE_REF_NOT_FOUND` = 从未 snap / 引用拼错。对话框（alert/confirm/prompt/beforeunload）会被自动
 accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示行，历史用
 `page dialogs` 查。导航四件套（navigate/back/forward/reload）在同一标签内
 导航并**保留历史**（`instance navigate` 的 new+close 组合近似会丢历史，保留
@@ -222,7 +224,7 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 
 | 命令 | 说明 |
 |---|---|
-| `page snap <ID\|NAME> [TAB_ID]` | AX 树文本快照（可交互节点内联 @e1..@eN 引用）+ 元信息行（targetId/refs/generation）；行内 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化（meta `hoverScan`：ok/truncated/skipped/error，预算 32 表/2MiB/256 规则）；跨域 iframe 内容以 `[frame]` 段内嵌，@eN 跨 frame 连续编号（v0.7+；click/fill/press 对帧内 @eN 直接可用，CSS 选择器仍只查主 frame）；`--quiet` 输出 targetId |
+| `page snap <ID\|NAME> [TAB_ID] [-c] [-i] [-d N] [-u] [-s SEL]` | AX 树文本快照（上游风格行：`- button "Buy" @e1`，可交互节点内联 @e1..@eN 引用）+ 元信息行（targetId/refs/generation；引用有消失时附 `removed: @e2, @e5` 行）；行尾 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化（meta `hoverScan`：ok/truncated/skipped/error，预算 32 表/2MiB/256 规则）；跨域 iframe 内容内嵌在 Iframe 节点行下（缩进子树，@eN 跨 frame 连续编号；click/fill/press 对帧内 @eN 直接可用，CSS 选择器仍只查主 frame）。flags（v0.8+，全缺省 = 完整树）：`-c/--compact` 压缩输出、`-i/--interactive` 只保留可交互节点、`-d/--depth N` 渲染深度上限、`-u/--urls` link 附 url、`-s/--selector SEL` 只快照该选择器命中子树；`--quiet` 输出 targetId |
 | `page click <ID> <sel\|@eN> [--tab T]` | 原生输入点击（三段鼠标事件，非 el.click()）；selector 路径带可见性/遮挡校验 |
 | `page fill <ID> <sel\|@eN> <value> [--tab T]` | 聚焦→全选清空→输入→回读校验；空 value = 仅清空；不可编辑 → 422 exit 7 |
 | `page press <ID> <key> [--target <sel\|@eN>] [--tab T]` | 三段键盘事件；key 支持 Enter/Tab/单字符/组合键（`Control+A`）；`--target` 先聚焦 |
@@ -254,14 +256,15 @@ targetId（诚实语义：不猜活跃 tab，避免取错页面；真机复测�
 loadall 缺省 1500ms。`page eval <ID> '--x'` 这类以 `-` 开头的表达式需 `--`
 分隔。
 
-错误看 `[PAGE_XXX]` 前缀分支处置（不解析文案）：`ref_stale`/`ref_not_found` 重
-snap；`element_blocked` 先处理遮挡；`element_not_visible`/`target_not_fillable`
+错误看 `[PAGE_XXX]` 前缀分支处置（不解析文案）：`ref_stale` 重 snap（durable
+语义下只在节点真正死亡时出现）；`ref_not_found` 先确认 snap 过/引用没拼错；
+`element_blocked` 先处理遮挡；`element_not_visible`/`target_not_fillable`/`element_disabled`
 检查页面状态；`fill_value_mismatch` 写入可能已部分生效，先观察再决定；
 `dispatch_failed` 附 effect_state（`none`=未发出可重试 / `unknown`=已发出禁盲目重试）；
 `tool_timeout` 连接停滞或页面无响应。
 
 ```bash
-# 典型循环：snap → 引用操作 → 变化后重 snap
+# 典型循环：snap → 引用操作 → 变化后重 snap（SPA 局部刷新后旧 @eN 仍可用）
 chrome-host page snap ins_xxx
 chrome-host page click ins_xxx @e3
 chrome-host page fill ins_xxx '#search input' 'hello world'

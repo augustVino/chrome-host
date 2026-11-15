@@ -80,6 +80,25 @@ struct FakeCdp {
 }
 
 impl PageCdp for FakeCdp {
+    /// kit typed_raw 通道（I1b）：同一脚本表/调用记录，响应帧文本化
+    /// （{"result": ...} / {"error": {...}} 信封，对齐 ws.rs 透传形态）
+    fn send_raw<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+        session_id: Option<&'a str>,
+    ) -> crate::infrastructure::cdp::page_cdp::PageCdpRawFuture<'a> {
+        let fut = self.send_value(method, params, session_id);
+        Box::pin(async move {
+            let envelope = match fut.await {
+                Ok(v) => json!({ "result": v }),
+                Err(e) => json!({ "error": { "code": -32000, "message": e.to_string() } }),
+            };
+            serde_json::to_string(&envelope)
+                .map_err(|e| AppError::business(500, "CDP_COMMAND_FAILED", e.to_string()))
+        })
+    }
+
     fn send_value<'a>(
         &'a self,
         method: &'a str,
@@ -169,6 +188,43 @@ fn armed() -> (PageService, Arc<Watched>, Calls, Script) {
         .unwrap()
         .insert(INS.into(), Arc::clone(&watched));
     (svc, watched, calls, script)
+}
+
+/// 测试 ref 预种子（S5：RefMap::add_with_frame 构造，替代旧 RefStore JSON 形态）。
+/// role/name 是 kit stale 恢复链的输入，默认 button/OK；frame 传 Some 时帧内条目。
+fn seed_ref(watched: &Watched, tid: &str, ref_id: &str, bni: i64, frame: Option<&str>) {
+    seed_ref_as(watched, tid, ref_id, bni, frame, "button", "OK");
+}
+
+fn seed_ref_as(
+    watched: &Watched,
+    tid: &str,
+    ref_id: &str,
+    bni: i64,
+    frame: Option<&str>,
+    role: &str,
+    name: &str,
+) {
+    use crate::application::browser_kit::element::RefMap;
+    let mut refs = watched.refs.lock().unwrap();
+    refs.entry(tid.to_string())
+        .or_insert_with(RefMap::new)
+        .add_with_frame(ref_id.to_string(), Some(bni), role, name, None, frame);
+}
+
+/// kit AXValue 形态（typed_raw 反序列化要求 type 字段；value 原样嵌入）
+fn axv(v: Value) -> Value {
+    json!({ "type": "string", "value": v })
+}
+
+/// DOM.resolveNode 的 kit typed 响应（RemoteObject.type 必填）
+fn resolve_node_ok(object_id: &str) -> Result<Value, String> {
+    Ok(json!({ "object": { "type": "object", "objectId": object_id } }))
+}
+
+/// Runtime.callFunctionOn 的取值响应（returnByValue）
+fn fn_value(v: Value) -> Result<Value, String> {
+    Ok(json!({ "result": { "type": "object", "value": v } }))
 }
 
 fn given(script: &Script, method: &str, responses: Vec<Result<Value, String>>) {
@@ -310,147 +366,6 @@ fn is_ref_target_matches_ts_routing() {
     for no in ["E3", ".btn", "#a", "e", "e3x", ""] {
         assert!(!is_ref_target(no), "{no} 应走 selector 路径");
     }
-}
-
-// ---------------- 纯逻辑：AX 快照（snapshot.mjs 移植）-------------------
-
-fn ax_node(id: &str, role: &str, extra: Value) -> Value {
-    let mut n = json!({ "nodeId": id, "role": { "value": role } });
-    for (k, v) in extra.as_object().unwrap() {
-        n[k] = v.clone();
-    }
-    n
-}
-
-/// 编号 = 前序 DFS、只有 ref-worthy 消耗编号；行 = 缩进树 + @eN + 值
-#[test]
-fn collect_ax_tree_assigns_refs_preorder_and_formats_lines() {
-    let nodes = vec![
-        ax_node("1", "WebArea", json!({ "name": { "value": "Home" } })),
-        ax_node(
-            "2",
-            "button",
-            json!({
-                "parentId": "1", "name": { "value": "OK" }, "backendDOMNodeId": 101
-            }),
-        ),
-        ax_node("3", "generic", json!({ "parentId": "1" })),
-        ax_node(
-            "4",
-            "textbox",
-            json!({
-                "parentId": "1", "name": { "value": "q" },
-                "value": { "value": "hi" }, "backendDOMNodeId": 102
-            }),
-        ),
-    ];
-    let marks = HoverMarks::default();
-    let (text, refs) = collect_ax_tree(&nodes, &marks);
-    assert_eq!(
-        text, "[WebArea] Home\n  @e1 [button] OK\n  @e2 [textbox] q = \"hi\"",
-        "generic 隐藏；interactive 前序编号；值按 JSON.stringify 形态"
-    );
-    assert_eq!(
-        refs,
-        vec![
-            json!({ "ref": "e1", "backendNodeId": 101, "name": "OK" }),
-            json!({ "ref": "e2", "backendNodeId": 102, "name": "q" }),
-        ]
-    );
-}
-
-/// 别名折叠、URL-bearing 行列、隐藏角色、无名无值节点的可引用豁免
-#[test]
-fn collect_ax_tree_alias_urlbearing_and_hidden_roles() {
-    let nodes = vec![
-        ax_node("1", "textfield", json!({ "backendDOMNodeId": 1 })), // 别名 → textbox
-        ax_node(
-            "2",
-            "row",
-            json!({ "name": { "value": "https://x/" }, "backendDOMNodeId": 2 }),
-        ), // URL-bearing
-        ax_node(
-            "3",
-            "row",
-            json!({ "name": { "value": "R2" }, "backendDOMNodeId": 3 }),
-        ), // 非 URL：无 ref
-        ax_node("4", "checkbox", json!({ "backendDOMNodeId": 4 })),  // 无名无值但可引用 → 显示
-        ax_node(
-            "5",
-            "radio",
-            json!({ "backendDOMNodeId": 5, "childIds": [] }),
-        ), // 无名不可引用？可引用 → 显示
-        ax_node("6", "InlineTextBox", json!({ "name": { "value": "xx" } })), // compact 隐藏
-        ax_node("7", "heading", json!({ "backendDOMNodeId": 7 })),   // 无名无值且不可引用 → 隐藏
-    ];
-    let marks = HoverMarks::default();
-    let (text, refs) = collect_ax_tree(&nodes, &marks);
-    // 别名折叠只影响 ref 判定，显示行保留原始角色名（TS formatAxNode 同）
-    assert!(text.contains("@e1 [textfield]"));
-    assert!(text.contains("@e2 [row] https://x/"));
-    assert!(text.contains("[row] R2"));
-    assert!(
-        text.contains("@e3 [checkbox]"),
-        "无名无值的可引用节点必须可见"
-    );
-    assert!(text.contains("@e4 [radio]"));
-    assert!(
-        !text.contains("InlineTextBox"),
-        "compact 形态隐藏 InlineTextBox"
-    );
-    assert!(!text.contains("[heading]"), "无名无值且不可引用 → 隐藏");
-    assert_eq!(refs.len(), 4, "row(R2) 与 heading 不消耗编号");
-}
-
-/// childIds 优先 + parent 反查补位 + 游离节点兜底 + backendDOMNodeId 缺失。
-/// （无名非交互节点如 list 本身不显示行——只有子项可见，TS 同规则）
-#[test]
-fn collect_ax_tree_children_ordering_orphans_and_missing_backend() {
-    let nodes = vec![
-        // 根：childIds 声明 3→2；反查表里 4 也挂在 1 下
-        ax_node(
-            "1",
-            "list",
-            json!({ "childIds": ["3", "2"], "name": { "value": "items" } }),
-        ),
-        ax_node(
-            "2",
-            "listitem",
-            json!({ "backendDOMNodeId": 21, "name": { "value": "b" } }),
-        ),
-        ax_node(
-            "3",
-            "listitem",
-            json!({ "backendDOMNodeId": 31, "name": { "value": "a" } }),
-        ),
-        ax_node(
-            "4",
-            "listitem",
-            json!({ "backendDOMNodeId": 41, "name": { "value": "c" } }),
-        ),
-        // parentId 指向不存在的节点 → 游离根（兜底遍历兜住）；无 backend → 无 ref
-        ax_node("5", "tab", json!({ "parentId": "999" })),
-    ];
-    let mut with_parent = nodes.clone();
-    with_parent[3]["parentId"] = json!("1"); // 4 挂 1
-    let marks = HoverMarks::default();
-    let (text, refs) = collect_ax_tree(&with_parent, &marks);
-    // childIds 顺序（3 在 2 前）优先于反查表（4 最后）；listitem 非 URL 名无 ref
-    let items: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("[listitem]"))
-        .map(|l| l.trim_start())
-        .collect();
-    assert_eq!(items, vec!["[listitem] a", "[listitem] b", "[listitem] c"]);
-    assert!(text.contains("[tab]"), "游离根节点兜底可见");
-    assert!(
-        refs.is_empty(),
-        "无 URL 名的 listitem 与无 backend 的 tab 都不发 ref"
-    );
-    // 防御：nodes 缺失时输出空表而非 panic
-    let marks = HoverMarks::default();
-    let (empty_text, empty_refs) = collect_ax_tree(&[], &marks);
-    assert_eq!((empty_text.as_str(), empty_refs.len()), ("", 0));
 }
 
 // ---------------- 纯逻辑：locate / hit 分类 -----------------------------
@@ -620,7 +535,7 @@ async fn ensure_handshake_window_absorbs_late_first_attach() {
 
     let t0 = Instant::now();
     let resp = svc
-        .snap(INS, "")
+        .snap(INS, "", SnapParams::default())
         .await
         .expect("握手窗口等到迟到 attach，不再 NOT_FOUND");
     assert_eq!(
@@ -641,7 +556,7 @@ async fn ensure_handshake_window_absorbs_late_first_attach() {
 
     // 连接已在位（tabs 非空）→ 后续命令不重等窗口（ensure 只在建连分支等）
     let t1 = Instant::now();
-    let resp2 = svc.snap(INS, "").await.unwrap();
+    let resp2 = svc.snap(INS, "", SnapParams::default()).await.unwrap();
     assert_eq!(resp2["targetId"], json!("TAB_LATE"));
     assert!(
         t1.elapsed() < ATTACH_HANDSHAKE_WINDOW,
@@ -656,7 +571,7 @@ async fn ensure_handshake_window_absorbs_late_first_attach() {
 async fn ensure_handshake_window_times_out_into_retry_semantics() {
     let (svc, _calls, _script, _tap) = fake_service();
     let t0 = Instant::now();
-    let err = svc.snap(INS, "").await.unwrap_err();
+    let err = svc.snap(INS, "", SnapParams::default()).await.unwrap_err();
     assert_eq!((err.code(), err.status()), ("PAGE_TAB_NOT_FOUND", 404));
     assert!(
         err.to_string().contains("retry shortly"),
@@ -777,15 +692,18 @@ async fn attach_probe_coexists_with_event_driven_dialog_flow() {
     assert_eq!(calls_of(&calls, "Page.handleJavaScriptDialog").len(), 2);
 }
 
-/// detachedFromTarget / targetDestroyed：映射 + RefStore + DialogBuffer 同清
+/// detachedFromTarget / targetDestroyed：映射 + RefMap / snap_gen /
+/// DialogBuffer 同清
 #[tokio::test]
 async fn detached_and_destroyed_drop_tab_state() {
     let (_svc, watched, _calls, _script) = armed();
+    use crate::application::browser_kit::element::RefMap;
     watched
         .refs
         .lock()
         .unwrap()
-        .insert("T1".into(), RefStore::new());
+        .insert("T1".into(), RefMap::new());
+    watched.snap_gen.lock().unwrap().insert("T1".into(), 3);
     watched
         .dialogs
         .lock()
@@ -799,6 +717,10 @@ async fn detached_and_destroyed_drop_tab_state() {
         .await;
     assert!(tab_session(&watched, "T1").is_none());
     assert!(watched.refs.lock().unwrap().get("T1").is_none());
+    assert!(
+        watched.snap_gen.lock().unwrap().get("T1").is_none(),
+        "snap_gen 随 per-tab 状态同清（I1b）"
+    );
     assert!(watched.dialogs.lock().unwrap().get("T1").is_none());
 
     // 仅带 sessionId 的 detach：按映射反查清理
@@ -807,7 +729,7 @@ async fn detached_and_destroyed_drop_tab_state() {
         .refs
         .lock()
         .unwrap()
-        .insert("T2".into(), RefStore::new());
+        .insert("T2".into(), RefMap::new());
     handle_event(
         &watched,
         &json!({ "method": "Target.detachedFromTarget", "params": { "sessionId": "S9" } }),
@@ -821,7 +743,7 @@ async fn detached_and_destroyed_drop_tab_state() {
         .refs
         .lock()
         .unwrap()
-        .insert("T3".into(), RefStore::new());
+        .insert("T3".into(), RefMap::new());
     handle_event(
         &watched,
         &json!({ "method": "Target.targetDestroyed", "params": { "targetId": "T3" } }),
@@ -962,7 +884,7 @@ async fn empty_tab_selects_unique_target_or_lists_all() {
         vec![Ok(json!({ "nodes": [] }))],
     );
     // armed 有 T1/TAB2 两 target → 409 列全表
-    let amb = svc.snap(INS, "").await.unwrap_err();
+    let amb = svc.snap(INS, "", SnapParams::default()).await.unwrap_err();
     assert_eq!((amb.code(), amb.status()), ("PAGE_TAB_AMBIGUOUS", 409));
     let msg = amb.to_string();
     assert!(
@@ -972,94 +894,54 @@ async fn empty_tab_selects_unique_target_or_lists_all() {
 
     // 剩唯一 target → 自动选中
     watched.tabs.lock().unwrap().detach("TAB2");
-    let resp = svc.snap(INS, "").await.unwrap();
+    let resp = svc.snap(INS, "", SnapParams::default()).await.unwrap();
     assert_eq!(resp["targetId"], json!("T1"));
 }
 
 /// 根 frame 导航失效 ref；子 frame 导航不失效；文档事件按各自 reason
+/// I1b 行为变化 ②（durable refs）：导航（根/子帧）、documentOpened、
+/// documentUpdated 都**不再主动失效** refs——stale 由解析时判定产生（见
+/// click 的 stale 测试）。各事件处理后表内容不变。
 #[tokio::test]
-async fn navigation_invalidates_refs_root_frame_only() {
+async fn navigation_keeps_refs_durable_until_resolve_fails() {
     let (_svc, watched, _calls, _script) = armed();
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("T1".into())
-        .or_default()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 1 }]));
+    seed_ref(&watched, "T1", "e1", 1, None);
 
-    // 子 frame 导航：parentId 非空 → 跳过
-    handle_event(
-        &watched,
-        &json!({
-            "method": "Page.frameNavigated", "sessionId": "S1",
-            "params": { "frame": { "id": "f1", "parentId": "root" } }
-        }),
-    )
-    .await;
-    assert!(!watched.refs.lock().unwrap().get("T1").unwrap().stale());
-
-    // 根 frame 导航 → invalidate("navigation")
-    handle_event(
-        &watched,
-        &json!({
-            "method": "Page.frameNavigated", "sessionId": "S1",
-            "params": { "frame": { "id": "root" } }
-        }),
-    )
-    .await;
-    {
-        let binding = watched.refs.lock().unwrap();
-        let store = binding.get("T1").unwrap();
-        assert!(store.stale());
-        assert_eq!(store.last_invalid_reason(), Some("navigation"));
+    for event in [
+        json!({ "method": "Page.frameNavigated", "sessionId": "S1",
+            "params": { "frame": { "id": "f1", "parentId": "root" } } }),
+        json!({ "method": "Page.frameNavigated", "sessionId": "S1",
+            "params": { "frame": { "id": "root" } } }),
+        json!({ "method": "Page.documentOpened", "sessionId": "S1" }),
+    ] {
+        handle_event(&watched, &event).await;
+        assert!(
+            watched
+                .refs
+                .lock()
+                .unwrap()
+                .get("T1")
+                .unwrap()
+                .get("e1")
+                .is_some(),
+            "durable：导航/换文档不主动失效（{event}）"
+        );
     }
 
-    // documentOpened / documentUpdated 同理（replace 后再失效才有感）
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .get_mut("T1")
-        .unwrap()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 2 }]));
-    handle_event(
-        &watched,
-        &json!({ "method": "Page.documentOpened", "sessionId": "S1" }),
-    )
-    .await;
-    assert_eq!(
-        watched
-            .refs
-            .lock()
-            .unwrap()
-            .get("T1")
-            .unwrap()
-            .last_invalid_reason(),
-        Some("document opened")
-    );
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .get_mut("T1")
-        .unwrap()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 3 }]));
+    // DOM.documentUpdated 事件臂已删除（durable 语义下无事可做）——同样不动 refs
     handle_event(
         &watched,
         &json!({ "method": "DOM.documentUpdated", "sessionId": "S1" }),
     )
     .await;
-    assert_eq!(
-        watched
-            .refs
-            .lock()
-            .unwrap()
-            .get("T1")
-            .unwrap()
-            .last_invalid_reason(),
-        Some("document updated")
-    );
+    assert!(watched
+        .refs
+        .lock()
+        .unwrap()
+        .get("T1")
+        .unwrap()
+        .get("e1")
+        .is_some());
 }
 
 /// 通道关闭 = 连接死亡 → 清连接槽 + 移除登记（代际与指针双守卫的主路径）
@@ -1143,35 +1025,107 @@ async fn watch_loop_zombie_leaves_new_generation_alone() {
 #[tokio::test]
 async fn snap_builds_text_swaps_refs_and_bumps_generation() {
     let (svc, watched, _calls, script) = armed();
+    // kit 快照引擎的 AX 树形态（AXValue 需带 type；无 Page.getFrameTree 脚本
+    // → loader 未知 → 本次断言按非 durable 编号递进）
     given(
         &script,
         "Accessibility.getFullAXTree",
         vec![
             Ok(json!({ "nodes": [
-                { "nodeId": "1", "role": { "value": "button" }, "name": { "value": "OK" }, "backendDOMNodeId": 101 },
-                { "nodeId": "2", "role": { "value": "link" }, "name": { "value": "Home" }, "backendDOMNodeId": 102 },
+                { "nodeId": "1", "role": axv("button".into()), "name": axv("OK".into()), "backendDOMNodeId": 101 },
+                { "nodeId": "2", "role": axv("link".into()), "name": axv("Home".into()), "backendDOMNodeId": 102 },
             ]})),
             Ok(json!({ "nodes": [
-                { "nodeId": "1", "role": { "value": "button" }, "name": { "value": "New" }, "backendDOMNodeId": 201 },
+                { "nodeId": "1", "role": axv("button".into()), "name": axv("New".into()), "backendDOMNodeId": 201 },
             ]})),
         ],
     );
 
-    let r1 = svc.snap(INS, "T1").await.unwrap();
+    let r1 = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(r1["instanceId"], json!(INS));
     assert_eq!(r1["targetId"], json!("T1"));
     assert_eq!(r1["refs_count"], json!(2));
-    assert_eq!(r1["generation"], json!(1));
-    assert!(r1["text"].as_str().unwrap().contains("@e1 [button] OK"));
+    assert_eq!(r1["generation"], json!(1), "generation 来自 snap_gen 计数");
+    // 上游行格式 + 我方 [ref=eN] → @eN 后处理
+    assert!(
+        r1["text"].as_str().unwrap().contains("- button \"OK\" @e1"),
+        "{}",
+        r1["text"]
+    );
+    assert!(
+        r1["text"].as_str().unwrap().contains("- link \"Home\" @e2"),
+        "{}",
+        r1["text"]
+    );
+    assert!(r1.get("removedRefs").is_none(), "首拍无 removedRefs");
 
-    // 整表替换：第二次 snap 后 e2 死、e1 指向新节点、generation+1（§3.5）
-    let r2 = svc.snap(INS, "T1").await.unwrap();
+    // 快照重建：旧节点（e1/e2）不在新树 → removedRefs 披露；generation+1
+    let r2 = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(r2["refs_count"], json!(1));
     assert_eq!(r2["generation"], json!(2));
+    assert_eq!(
+        r2["removedRefs"],
+        json!(["@e1", "@e2"]),
+        "消失的旧 ref 逐个披露"
+    );
     let binding = watched.refs.lock().unwrap();
-    let store = binding.get("T1").unwrap();
-    assert_eq!(store.resolve("e2"), None, "旧 ref 必须死");
-    assert_eq!(store.resolve("e1").map(|e| e.backend_node_id), Some(201));
+    let m = binding.get("T1").unwrap();
+    assert!(
+        m.get("e1").is_none(),
+        "不在新树的旧 ref 必须死（不僵尸残留）"
+    );
+    assert_eq!(
+        m.entries_sorted()
+            .first()
+            .map(|(id, e)| (id.as_str(), e.backend_node_id)),
+        Some(("e3", Some(201))),
+        "编号从计数器顺延（loader 未知 → 非 durable 分配）"
+    );
+}
+
+/// durable refs（I1b 行为变化 ①）：同文档（frameTree loaderId 不变）两次
+/// snap，@eN 对同一 backendNodeId 稳定复用；无 ref 消失 → removedRefs 省略。
+#[tokio::test]
+async fn snap_durable_refs_reuse_ids_across_snaps_same_document() {
+    let (svc, watched, _calls, script) = armed();
+    let tree = json!({ "nodes": [
+        { "nodeId": "1", "role": axv("button".into()), "name": axv("OK".into()), "backendDOMNodeId": 101 },
+    ]});
+    given(
+        &script,
+        "Page.getFrameTree",
+        vec![
+            Ok(json!({ "frameTree": { "frame": { "id": "F0", "loaderId": "L1" } } })),
+            Ok(json!({ "frameTree": { "frame": { "id": "F0", "loaderId": "L1" } } })),
+        ],
+    );
+    given(
+        &script,
+        "Accessibility.getFullAXTree",
+        vec![Ok(tree.clone()), Ok(tree)],
+    );
+
+    let r1 = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
+    assert!(r1["text"].as_str().unwrap().contains("@e1"));
+    let r2 = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
+    assert!(
+        r2["text"].as_str().unwrap().contains("- button \"OK\" @e1"),
+        "{}",
+        r2["text"]
+    );
+    assert!(r2.get("removedRefs").is_none(), "无 ref 消失 → 字段省略");
+    assert_eq!(
+        watched
+            .refs
+            .lock()
+            .unwrap()
+            .get("T1")
+            .unwrap()
+            .get("e1")
+            .map(|e| e.backend_node_id),
+        Some(Some(101)),
+        "durable：同文档同节点复用 e1"
+    );
 }
 
 // ---------------- 工具：snap hover 感知 -----------------------------------
@@ -1253,7 +1207,7 @@ async fn extension_style_sheets_are_excluded_from_registry() {
         "Accessibility.getFullAXTree",
         vec![Ok(json!({ "nodes": [] }))],
     );
-    let resp = svc2.snap(INS, "T1").await.unwrap();
+    let resp = svc2.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(
         resp["hoverScan"],
         json!("skipped"),
@@ -1287,9 +1241,9 @@ async fn snap_marks_hover_and_reveal_from_css() {
         &script,
         "Accessibility.getFullAXTree",
         vec![Ok(json!({ "nodes": [
-            { "nodeId": "1", "role": { "value": "WebArea" }, "name": { "value": "Menu Page" } },
-            { "nodeId": "2", "role": { "value": "button" }, "name": { "value": "Menu" }, "parentId": "1", "backendDOMNodeId": 101 },
-            { "nodeId": "3", "role": { "value": "link" }, "name": { "value": "Item" }, "parentId": "1", "backendDOMNodeId": 102 },
+            { "nodeId": "1", "role": axv("WebArea".into()), "name": axv("Menu Page".into()), "childIds": [2, 3] },
+            { "nodeId": "2", "role": axv("button".into()), "name": axv("Menu".into()), "backendDOMNodeId": 101 },
+            { "nodeId": "3", "role": axv("link".into()), "name": axv("Item".into()), "backendDOMNodeId": 102 },
         ]}))],
     );
     given(
@@ -1309,12 +1263,15 @@ async fn snap_marks_hover_and_reveal_from_css() {
         vec![Ok(json!({ "nodeIds": [8, 9] }))],
     );
 
-    let resp = svc.snap(INS, "T1").await.unwrap();
+    let resp = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(resp["hoverScan"], json!("ok"));
     assert_eq!(resp["refs_count"], json!(2));
     let text = resp["text"].as_str().unwrap();
-    assert!(text.contains("@e1 [button] [hover] Menu"), "{text}");
-    assert!(text.contains("@e2 [link] [hover-reveal] Item"), "{text}");
+    assert!(text.contains("- button \"Menu\" @e1 [hover]"), "{text}");
+    assert!(
+        text.contains("- link \"Item\" @e2 [hover-reveal]"),
+        "{text}"
+    );
     // 文本取自 sheet s2（排序后 s1 在前但 origin 过滤跳过）；桥接逐位对齐
     let sheet = calls_of(&calls, "CSS.getStyleSheetText");
     assert_eq!(sheet.len(), 1);
@@ -1343,7 +1300,7 @@ async fn snap_hover_scan_skips_invalid_selectors_instead_of_truncating() {
         &script,
         "Accessibility.getFullAXTree",
         vec![Ok(json!({ "nodes": [
-            { "nodeId": "1", "role": { "value": "button" }, "name": { "value": "B" }, "backendDOMNodeId": 9 },
+            { "nodeId": "1", "role": axv("button".into()), "name": axv("B".into()), "backendDOMNodeId": 9 },
         ]}))],
     );
     given(
@@ -1366,7 +1323,7 @@ async fn snap_hover_scan_skips_invalid_selectors_instead_of_truncating() {
         vec![Ok(json!({ "nodeIds": [3] }))],
     );
 
-    let resp = svc.snap(INS, "T1").await.unwrap();
+    let resp = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(
         resp["hoverScan"],
         json!("ok"),
@@ -1392,14 +1349,14 @@ async fn snap_hover_scan_skipped_when_no_hover_rules() {
         &script,
         "Accessibility.getFullAXTree",
         vec![Ok(json!({ "nodes": [
-            { "nodeId": "1", "role": { "value": "button" }, "name": { "value": "OK" }, "backendDOMNodeId": 7 },
+            { "nodeId": "1", "role": axv("button".into()), "name": axv("OK".into()), "backendDOMNodeId": 7 },
         ]}))],
     );
-    let resp = svc.snap(INS, "T1").await.unwrap();
+    let resp = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(resp["hoverScan"], json!("skipped"));
     let text = resp["text"].as_str().unwrap();
     assert!(
-        text.contains("@e1 [button] OK") && !text.contains("[hover"),
+        text.contains("- button \"OK\" @e1") && !text.contains("[hover"),
         "{text}"
     );
     assert_eq!(calls_of(&calls, "DOM.querySelectorAll").len(), 0);
@@ -1414,11 +1371,15 @@ async fn snap_hover_scan_skipped_when_registry_empty() {
     given(
         &script,
         "Accessibility.getFullAXTree",
-        vec![Ok(json!({ "nodes": [] })), Ok(json!({ "nodes": [] }))],
+        vec![
+            Ok(json!({ "nodes": [] })),
+            Ok(json!({ "nodes": [] })),
+            Ok(json!({ "nodes": [] })),
+        ],
     );
     // 路径 1：armed 未走 on_attached，无 css_since → 即时 skipped
     let t0 = Instant::now();
-    let resp = svc.snap(INS, "T1").await.unwrap();
+    let resp = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(resp["hoverScan"], json!("skipped"));
     assert!(
         t0.elapsed() < HOVER_SETTLE_WINDOW,
@@ -1432,7 +1393,7 @@ async fn snap_hover_scan_skipped_when_registry_empty() {
         .unwrap()
         .insert("T1".into(), Instant::now());
     let t1 = Instant::now();
-    let resp2 = svc.snap(INS, "T1").await.unwrap();
+    let resp2 = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(resp2["hoverScan"], json!("skipped"));
     assert!(
         t1.elapsed() >= HOVER_SETTLE_WINDOW,
@@ -1445,7 +1406,7 @@ async fn snap_hover_scan_skipped_when_registry_empty() {
         Instant::now() - HOVER_SETTLE_WINDOW - Duration::from_millis(50),
     );
     let t2 = Instant::now();
-    let resp3 = svc.snap(INS, "T1").await.unwrap();
+    let resp3 = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(resp3["hoverScan"], json!("skipped"));
     assert!(t2.elapsed() < HOVER_SETTLE_WINDOW);
 }
@@ -1470,7 +1431,7 @@ async fn snap_hover_scan_truncated_by_rule_budget() {
         vec![Ok(json!({ "nodes": [] }))],
     );
     // 后续 querySelectorAll/push 不脚本化 → Ok(Null)/空命中，链路不炸
-    let resp = svc.snap(INS, "T1").await.unwrap();
+    let resp = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(resp["hoverScan"], json!("truncated"));
     assert_eq!(resp["refs_count"], json!(0));
 }
@@ -1490,7 +1451,7 @@ async fn snap_hover_scan_error_when_bridge_fails() {
         &script,
         "Accessibility.getFullAXTree",
         vec![Ok(json!({ "nodes": [
-            { "nodeId": "1", "role": { "value": "button" }, "name": { "value": "Menu" }, "backendDOMNodeId": 101 },
+            { "nodeId": "1", "role": axv("button".into()), "name": axv("Menu".into()), "backendDOMNodeId": 101 },
         ]}))],
     );
     given(
@@ -1508,11 +1469,11 @@ async fn snap_hover_scan_error_when_bridge_fails() {
         "DOM.pushNodesByBackendIdsToFrontend",
         vec![Err("backend node not found".into())],
     );
-    let resp = svc.snap(INS, "T1").await.unwrap();
+    let resp = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(resp["hoverScan"], json!("error"));
     let text = resp["text"].as_str().unwrap();
     assert!(
-        text.contains("@e1 [button] Menu") && !text.contains("[hover"),
+        text.contains("- button \"Menu\" @e1") && !text.contains("[hover"),
         "{text}"
     );
 }
@@ -1523,15 +1484,6 @@ async fn snap_hover_scan_error_when_bridge_fails() {
 #[tokio::test]
 async fn navigation_clears_sheet_registry_root_frame_only() {
     let (svc, watched, _calls, script) = armed();
-    // 预置 ref 表（invalidate_refs 只对已存在的 store 起效，与 sheets
-    // 清理同一事件分支触发——钉住两条链路不回归）
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("T1".into())
-        .or_default()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 1 }]));
     handle_event(&watched, &sheet_added_event("S1", "a-1", "regular", false)).await;
     handle_event(&watched, &sheet_added_event("S1", "a-2", "regular", false)).await;
     assert_eq!(watched.sheets.lock().unwrap()["T1"].len(), 2);
@@ -1560,21 +1512,10 @@ async fn navigation_clears_sheet_registry_root_frame_only() {
         }),
     )
     .await;
+    // I1b：refs 不随导航失效（durable）；sheets 清理独立发生
     assert!(
         watched.sheets.lock().unwrap().get("T1").is_none(),
         "根 frame 导航整清登记"
-    );
-    // refs 失效链路与 sheets 清理同一事件分支触发（既有语义不回归；
-    // 须在 snap 前断言——snap 的 replace 会清 stale 与 reason）
-    assert_eq!(
-        watched
-            .refs
-            .lock()
-            .unwrap()
-            .get("T1")
-            .unwrap()
-            .last_invalid_reason(),
-        Some("navigation")
     );
 
     // 新文档的表重新登记 → snap ok（死表已不存在，无 Err 无假 truncated）
@@ -1588,7 +1529,7 @@ async fn navigation_clears_sheet_registry_root_frame_only() {
         &script,
         "Accessibility.getFullAXTree",
         vec![Ok(json!({ "nodes": [
-            { "nodeId": "1", "role": { "value": "button" }, "name": { "value": "B" }, "backendDOMNodeId": 9 },
+            { "nodeId": "1", "role": axv("button".into()), "name": axv("B".into()), "backendDOMNodeId": 9 },
         ]}))],
     );
     given(
@@ -1606,7 +1547,7 @@ async fn navigation_clears_sheet_registry_root_frame_only() {
         "DOM.pushNodesByBackendIdsToFrontend",
         vec![Ok(json!({ "nodeIds": [3] }))],
     );
-    let resp = svc.snap(INS, "T1").await.unwrap();
+    let resp = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     assert_eq!(resp["hoverScan"], json!("ok"));
     assert!(resp["text"].as_str().unwrap().contains("[hover]"));
 }
@@ -1724,21 +1665,18 @@ async fn style_sheet_events_maintain_registry_per_tab() {
 
 // ---------------- 工具：click（ref / selector 两路）----------------------
 
+/// ref 路径（I1b：kit resolve_element_center 解析链——DOM.resolveNode →
+/// 页内 JS 连接检查 + 点击点；坐标 + 我方三段派发）
 #[tokio::test]
-async fn click_ref_path_resolves_quad_centroid_and_dispatches() {
+async fn click_ref_path_resolves_center_and_dispatches() {
     let (svc, watched, calls, script) = armed();
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("T1".into())
-        .or_default()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 101, "name": "OK" }]));
+    seed_ref(&watched, "T1", "e1", 101, None);
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj101")]);
     given(
         &script,
-        "DOM.getContentQuads",
-        vec![Ok(
-            json!({ "quads": [[0.0, 0.0, 200.0, 0.0, 200.0, 100.0, 0.0, 100.0]] }),
+        "Runtime.callFunctionOn",
+        vec![fn_value(
+            json!({ "connected": true, "x": 100.0, "y": 50.0 }),
         )],
     );
 
@@ -1746,17 +1684,12 @@ async fn click_ref_path_resolves_quad_centroid_and_dispatches() {
     assert_eq!(
         resp["result"],
         json!("Clicked @e1 \"OK\" at CSS (100, 50)"),
-        "坐标 = 最大四边形质心，JS 数字形态"
+        "坐标 = kit 解析链返回的点击点，JS 数字形态"
     );
-    // 命令链：scrollIntoViewIfNeeded → getContentQuads → 三段鼠标（均带 session）
-    let scroll = calls_of(&calls, "DOM.scrollIntoViewIfNeeded");
+    let resolve = calls_of(&calls, "DOM.resolveNode");
     assert_eq!(
-        (scroll.len(), scroll[0].param("backendNodeId")),
+        (resolve.len(), resolve[0].param("backendNodeId")),
         (1, json!(101))
-    );
-    assert_eq!(
-        calls_of(&calls, "DOM.getContentQuads")[0].param("backendNodeId"),
-        json!(101)
     );
     let mouse = calls_of(&calls, "Input.dispatchMouseEvent");
     assert_eq!(
@@ -1765,7 +1698,8 @@ async fn click_ref_path_resolves_quad_centroid_and_dispatches() {
             json!("mouseMoved"),
             json!("mousePressed"),
             json!("mouseReleased")
-        ]
+        ],
+        "我方三段派发保留"
     );
     for c in &mouse {
         assert_eq!(c.param("x"), json!(100.0));
@@ -1776,72 +1710,96 @@ async fn click_ref_path_resolves_quad_centroid_and_dispatches() {
     }
 }
 
-/// quads 空/退化 → resolveNode + getBoundingClientRect 回退链
+/// kit 解析链的 stale 恢复（durable 核心）：旧节点脱离文档（connected:false）
+/// → AX 唯一匹配恢复 → 正常点击。SPA 同文档旧 ref 可用的机制。
 #[tokio::test]
-async fn click_ref_falls_back_to_rect_when_quads_degenerate() {
-    let (svc, watched, calls, script) = armed();
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("T1".into())
-        .or_default()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 7 }]));
-    given(
-        &script,
-        "DOM.getContentQuads",
-        vec![Ok(json!({ "quads": [] }))],
-    );
+async fn click_stale_ref_recovers_by_unique_role_name_match() {
+    let (svc, watched, _calls, script) = armed();
+    seed_ref(&watched, "T1", "e1", 101, None);
+    // resolveNode 两次：旧节点（失联）→ 恢复命中的新节点 205
     given(
         &script,
         "DOM.resolveNode",
-        vec![Ok(json!({ "object": { "objectId": "obj7" } }))],
+        vec![resolve_node_ok("objOld"), resolve_node_ok("obj205")],
     );
     given(
         &script,
         "Runtime.callFunctionOn",
-        vec![Ok(
-            json!({ "result": { "value": { "x": 10.0, "y": 20.0, "w": 100.0, "h": 60.0 } } }),
-        )],
-    );
-
-    let resp = svc.click(INS, "T1", "e1").await.unwrap();
-    assert_eq!(resp["result"], json!("Clicked @e1 at CSS (60, 50)"));
-    let calls = calls.lock().unwrap();
-    let order: Vec<&str> = calls
-        .iter()
-        .map(|c| c.method.as_str())
-        .filter(|m| *m != "Runtime.enable")
-        .collect();
-    assert_eq!(
-        order,
         vec![
-            "DOM.scrollIntoViewIfNeeded",
-            "DOM.getContentQuads",
-            "DOM.resolveNode",
-            "Runtime.callFunctionOn",
-            "Input.dispatchMouseEvent",
-            "Input.dispatchMouseEvent",
-            "Input.dispatchMouseEvent",
-        ]
+            fn_value(json!({ "connected": false })), // 旧节点已脱离文档
+            fn_value(json!({ "connected": true, "x": 80.0, "y": 60.0 })), // 恢复后的点击点
+        ],
     );
+    // AX 恢复查询：同 role/name 唯一命中（backendDOMNodeId=205）
+    given(
+        &script,
+        "Accessibility.getFullAXTree",
+        vec![Ok(json!({ "nodes": [
+            { "nodeId": "1", "role": axv("button".into()), "name": axv("OK".into()), "backendDOMNodeId": 205 },
+        ]}))],
+    );
+    let resp = svc.click(INS, "T1", "@e1").await.unwrap();
+    assert_eq!(resp["result"], json!("Clicked @e1 \"OK\" at CSS (80, 60)"));
 }
 
-/// ref 未命中：无表 = not_found；失效后 = stale（P2-A ref_miss 语义）
+/// ref 未命中：无表 / miss（含 @E3 大写形态）→ 404 PAGE_REF_NOT_FOUND；
+/// 解析时判 stale（脱离 + 恢复无果 / 多候选不可恢复）→ 409 PAGE_REF_STALE
 #[tokio::test]
 async fn click_ref_miss_and_stale_errors() {
     let (svc, _w, _calls, _script) = armed();
-    let miss = svc.click(INS, "T1", "@e9").await.unwrap_err();
-    assert_eq!((miss.code(), miss.status()), ("PAGE_REF_NOT_FOUND", 404));
+    for t in ["@e9", "@E3"] {
+        let miss = svc.click(INS, "T1", t).await.unwrap_err();
+        assert_eq!(
+            (miss.code(), miss.status()),
+            ("PAGE_REF_NOT_FOUND", 404),
+            "{t}"
+        );
+    }
 
-    let (svc2, watched2, _c2, _s2) = armed();
-    let mut store = RefStore::new();
-    store.replace(&json!([{ "ref": "e1", "backendNodeId": 1 }]));
-    store.invalidate("navigation");
-    watched2.refs.lock().unwrap().insert("T1".into(), store);
+    // 旧 ref 在解析时判 stale：节点脱离 + AX 恢复无果
+    //（I1b 行为变化 ②：stale 不再来自事件失效，来自解析链判定）
+    let (svc2, watched2, _c2, script2) = armed();
+    seed_ref(&watched2, "T1", "e1", 1, None);
+    given(&script2, "DOM.resolveNode", vec![resolve_node_ok("obj1")]);
+    given(
+        &script2,
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!({ "connected": false }))],
+    );
+    given(
+        &script2,
+        "Accessibility.getFullAXTree",
+        vec![Ok(json!({ "nodes": [] }))],
+    );
     let stale = svc2.click(INS, "T1", "@e1").await.unwrap_err();
     assert_eq!((stale.code(), stale.status()), ("PAGE_REF_STALE", 409));
-    assert!(stale.to_string().contains("navigation"));
+    assert!(
+        stale.to_string().contains("Could not locate element"),
+        "kit 恢复无果原文透传: {stale}"
+    );
+
+    // 多候选恢复不可判定 → 同样 stale（kit cannot be recovered 文案）
+    let (svc3, watched3, _c3, script3) = armed();
+    seed_ref(&watched3, "T1", "e1", 1, None);
+    given(&script3, "DOM.resolveNode", vec![resolve_node_ok("obj1")]);
+    given(
+        &script3,
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!({ "connected": false }))],
+    );
+    given(
+        &script3,
+        "Accessibility.getFullAXTree",
+        vec![Ok(json!({ "nodes": [
+            { "nodeId": "1", "role": axv("button".into()), "name": axv("OK".into()), "backendDOMNodeId": 2 },
+            { "nodeId": "2", "role": axv("button".into()), "name": axv("OK".into()), "backendDOMNodeId": 3 },
+        ]}))],
+    );
+    let ambiguous = svc3.click(INS, "T1", "@e1").await.unwrap_err();
+    assert_eq!(
+        (ambiguous.code(), ambiguous.status()),
+        ("PAGE_REF_STALE", 409)
+    );
 }
 
 #[tokio::test]
@@ -2148,26 +2106,31 @@ async fn press_dispatches_three_part_sequence_and_suppresses_combo_text() {
     }
 }
 
-/// --target ref：先 DOM.focus（backendNodeId），再发键序
+/// --target ref：I1b kit 对象解析（isConnected 检查）→ DOM.focus(objectId)
+/// → 键序；对象归还到解析它的同一会话
 #[tokio::test]
 async fn press_focuses_ref_target_before_dispatch() {
-    let (svc, watched, calls, _script) = armed();
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("T1".into())
-        .or_default()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 42, "name": "search" }]));
-
+    let (svc, watched, calls, script) = armed();
+    seed_ref_as(&watched, "T1", "e1", 42, None, "textbox", "search");
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj42")]);
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!(true))],
+    );
     let resp = svc.press(INS, "T1", "Enter", Some("@e1")).await.unwrap();
     assert_eq!(resp["result"], json!("Pressed Enter on @e1 \"search\""));
     let focus = calls_of(&calls, "DOM.focus");
     assert_eq!(
-        (focus.len(), focus[0].param("backendNodeId")),
-        (1, json!(42))
+        (focus.len(), focus[0].param("objectId")),
+        (1, json!("obj42"))
     );
     assert_eq!(calls_of(&calls, "Input.dispatchKeyEvent").len(), 3);
+    assert_eq!(
+        calls_of(&calls, "Runtime.releaseObject")[0].param("objectId"),
+        json!("obj42"),
+        "对象句柄归还（fill 同构）"
+    );
 }
 
 // ---------------- 工具：wait ---------------------------------------------
@@ -2584,24 +2547,16 @@ async fn extract_non_table_target_is_422() {
 #[tokio::test]
 async fn extract_ref_path_resolves_and_calls_on_element() {
     let (svc, watched, calls, script) = armed();
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("T1".into())
-        .or_default()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 7 }]));
-    given(
-        &script,
-        "DOM.resolveNode",
-        vec![Ok(json!({ "object": { "objectId": "OID-1" } }))],
-    );
+    seed_ref(&watched, "T1", "e1", 7, None);
+    // kit 对象解析：DOM.resolveNode → isConnected 检查 → 收集器调用
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("OID-1")]);
     given(
         &script,
         "Runtime.callFunctionOn",
-        vec![Ok(
-            json!({ "result": { "type": "string", "value": facts_wire().to_string() } }),
-        )],
+        vec![
+            fn_value(json!(true)),
+            Ok(json!({ "result": { "type": "string", "value": facts_wire().to_string() } })),
+        ],
     );
     let r = svc.extract(INS, "T1", Some("@e1")).await.unwrap();
     assert_eq!(r["rows"], json!([["张三", ""]]));
@@ -2610,13 +2565,18 @@ async fn extract_ref_path_resolves_and_calls_on_element() {
     assert_eq!(rn[0].param("backendNodeId"), json!(7));
     assert_eq!(rn[0].session.as_deref(), Some("S1"));
     let cfo = calls_of(&calls, "Runtime.callFunctionOn");
-    assert_eq!(cfo[0].param("objectId"), json!("OID-1"));
-    assert_eq!(cfo[0].param("returnByValue"), json!(true));
-    assert!(cfo[0]
+    assert_eq!(cfo[1].param("objectId"), json!("OID-1"));
+    assert_eq!(cfo[1].param("returnByValue"), json!(true));
+    assert!(cfo[1]
         .param("functionDeclaration")
         .as_str()
         .unwrap()
         .contains("BUDGET = 10000"));
+    assert_eq!(
+        calls_of(&calls, "Runtime.releaseObject")[0].param("objectId"),
+        json!("OID-1"),
+        "对象归还（fill 同构）"
+    );
 
     // 未 snap 的 ref：refs 表空（另一个 tab 无表）→ 404
     let e = svc.extract(INS, "TAB2", Some("@e9")).await.unwrap_err();
@@ -3119,24 +3079,21 @@ async fn screenshot_viewport_captures_without_clip() {
 
 /// ref 路径：scrollIntoView + quads（backendNodeId）→ 联合 bbox 外扩取整
 /// → clip {scale:1}。两个跨行 quad 的并集必须完整进 clip（取最大 quad
-/// 会截丢另一行——这是 clip 与点击质心的语义差异）。
+/// ref 路径（I1b：kit 对象解析 → 滚动 + getBoundingClientRect → 外扩取整
+/// clip）。getBoundingClientRect 本就是多碎片 border-box 并集（与旧 quads
+/// 联合 bbox 同义——跨行 inline 元素两行都进 clip）。
 #[tokio::test]
 async fn screenshot_ref_clips_union_bbox_rounded_outward() {
     let (svc, watched, calls, script) = armed();
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("T1".into())
-        .or_default()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 101, "name": "OK" }]));
+    seed_ref(&watched, "T1", "e1", 101, None);
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj101")]);
     given(
         &script,
-        "DOM.getContentQuads",
-        vec![Ok(json!({ "quads": [
-                [10.2, 20.7, 110.2, 20.7, 110.2, 70.7, 10.2, 70.7],
-                [10.2, 90.5, 60.2, 90.5, 60.2, 140.5, 10.2, 140.5]
-            ] }))],
+        "Runtime.callFunctionOn",
+        vec![
+            fn_value(json!(true)), // kit isConnected 检查
+            fn_value(json!({ "x": 10.2, "y": 20.7, "w": 100.0, "h": 119.8 })),
+        ],
     );
     given(
         &script,
@@ -3146,14 +3103,20 @@ async fn screenshot_ref_clips_union_bbox_rounded_outward() {
     let resp = svc.screenshot(INS, "T1", Some("@e1"), false).await.unwrap();
     assert_eq!(resp["data"], json!("aGVsbG8="));
     let scroll = calls_of(&calls, "DOM.scrollIntoViewIfNeeded");
-    assert_eq!(scroll[0].param("backendNodeId"), json!(101));
     assert_eq!(
-        calls_of(&calls, "DOM.getContentQuads")[0].param("backendNodeId"),
-        json!(101)
+        scroll[0].param("objectId"),
+        json!("obj101"),
+        "滚动 best-effort（objectId）"
     );
+    let rect_calls = calls_of(&calls, "Runtime.callFunctionOn");
+    let rect_call = &rect_calls[1];
+    assert!(rect_call
+        .param("functionDeclaration")
+        .as_str()
+        .unwrap()
+        .contains("getBoundingClientRect"));
     let cap = calls_of(&calls, "Page.captureScreenshot");
-    // 并集 bbox (10.2,20.7)→(110.2,140.5)，外扩取整 → (10,20) 101×121
-    // （右/下界 ceil：ceil(110.2)=111 − floor(10.2)=10 → 101）
+    // 外扩取整：floor(10.2,20.7) / ceil(110.2,140.5) → (10,20) 101×121
     assert_eq!(
         cap[0].params.get("clip"),
         Some(&json!({ "x": 10.0, "y": 20.0, "width": 101.0, "height": 121.0, "scale": 1 }))
@@ -3225,74 +3188,21 @@ async fn screenshot_selector_uses_node_id_and_reports_not_found() {
 }
 
 /// quads 退化 → resolveNode + getBoundingClientRect 回退（与点击链同源），
-/// 回退也退化 → 409 PAGE_TARGET_MOVED（不发明新码）。
+/// 退化 rect（零高）→ 409 PAGE_TARGET_MOVED（不发明新码）。
 #[tokio::test]
 async fn screenshot_falls_back_to_rect_and_reports_moved() {
-    let (svc, watched, calls, script) = armed();
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("T1".into())
-        .or_default()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 9, "name": "OK" }]));
-    given(
-        &script,
-        "DOM.getContentQuads",
-        vec![Ok(json!({ "quads": [] }))],
-    );
-    given(
-        &script,
-        "DOM.resolveNode",
-        vec![Ok(json!({ "object": { "objectId": "obj9" } }))],
-    );
+    let (svc, watched, _calls, script) = armed();
+    seed_ref(&watched, "T1", "e1", 9, None);
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj9")]);
     given(
         &script,
         "Runtime.callFunctionOn",
-        vec![Ok(
-            json!({ "result": { "value": { "x": 5.1, "y": 6.2, "w": 100.4, "h": 40.9 } } }),
-        )],
+        vec![
+            fn_value(json!(true)),
+            fn_value(json!({ "x": 5.0, "y": 6.0, "w": 100.0, "h": 0.0 })),
+        ],
     );
-    given(
-        &script,
-        "Page.captureScreenshot",
-        vec![Ok(json!({ "data": "aGVsbG8=" }))],
-    );
-    svc.screenshot(INS, "T1", Some("e1"), false).await.unwrap();
-    let cap = calls_of(&calls, "Page.captureScreenshot");
-    // 外扩取整：floor(5.1)=5 / ceil(105.5)=106 → 101；floor(6.2)=6 / ceil(47.1)=48 → 42
-    assert_eq!(
-        cap[0].params.get("clip"),
-        Some(&json!({ "x": 5.0, "y": 6.0, "width": 101.0, "height": 42.0, "scale": 1 }))
-    );
-
-    // 回退 rect 也退化（零高）→ PAGE_TARGET_MOVED
-    let (svc2, watched2, _c2, script2) = armed();
-    watched2
-        .refs
-        .lock()
-        .unwrap()
-        .entry("T1".into())
-        .or_default()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 9, "name": "OK" }]));
-    given(
-        &script2,
-        "DOM.getContentQuads",
-        vec![Ok(json!({ "quads": [] }))],
-    );
-    given(
-        &script2,
-        "DOM.resolveNode",
-        vec![Ok(json!({ "object": { "objectId": "obj9" } }))],
-    );
-    given(
-        &script2,
-        "Runtime.callFunctionOn",
-        vec![Ok(
-            json!({ "result": { "value": { "x": 5.0, "y": 6.0, "w": 100.0, "h": 0.0 } } }),
-        )],
-    );
-    let e = svc2
+    let e = svc
         .screenshot(INS, "T1", Some("e1"), false)
         .await
         .unwrap_err();
@@ -3683,23 +3593,29 @@ fn register_frame(
 }
 
 /// frameAttached → iframe attach 认领 → frameDetached 摘除 + 帧内 ref 失效；
-/// attach 先于 frameAttached 的孤儿路径同样收敛
+/// frameAttached → iframe attach 认领 → frameDetached 摘除登记（I1b 起不
+/// 标记 ref 失效：durable refs，帧死亡由解析链自然判定）；attach 先于
+/// frameAttached 的孤儿路径同样收敛
 #[tokio::test]
 async fn frame_registry_lifecycle_via_events() {
     let (svc, calls, _script, tap) = fake_service();
     let (watched, g) = svc.ensure(INS).await.unwrap();
     drop(g);
-    // 预置 ref 表（帧条目 + 主条目），验证事件驱动的失效
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("TAB1".into())
-        .or_default()
-        .replace(&json!([
-            { "ref": "e1", "backendNodeId": 101 },
-            { "ref": "e2", "backendNodeId": 202, "frameTargetId": "FRM_A" },
-        ]));
+    // 预置 ref（帧条目 + 主条目），验证事件驱动的登记维护不动 refs（durable）
+    {
+        use crate::application::browser_kit::element::RefMap;
+        let mut m = RefMap::new();
+        m.add_with_frame("e1".to_string(), Some(101), "button", "OK", None, None);
+        m.add_with_frame(
+            "e2".to_string(),
+            Some(202),
+            "button",
+            "提交",
+            None,
+            Some("FRM_A"),
+        );
+        watched.refs.lock().unwrap().insert("TAB1".into(), m);
+    }
 
     let tx = tap.lock().unwrap().clone().unwrap();
     tx.send(attach_event("TAB1", "SES1", "page")).unwrap();
@@ -3759,7 +3675,7 @@ async fn frame_registry_lifecycle_via_events() {
     })
     .await;
 
-    // frameDetached：登记摘除 + 帧内 ref 失效（主条目不动）
+    // frameDetached：登记摘除；refs 保持 durable（条目不动，stale 由解析判定）
     tx.send(json!({ "method": "Page.frameDetached", "sessionId": "SES1",
             "params": { "frameId": "FRM_A", "reason": "replaced" } }))
         .unwrap();
@@ -3774,34 +3690,35 @@ async fn frame_registry_lifecycle_via_events() {
     })
     .await;
     let refs = watched.refs.lock().unwrap();
-    let store = refs.get("TAB1").unwrap();
+    let m = refs.get("TAB1").unwrap();
     assert!(
-        store.resolve("e1").unwrap().stale_reason.is_none(),
-        "主 frame 条目不受影响"
-    );
-    assert!(
-        store.resolve("e2").unwrap().stale_reason.is_some(),
-        "帧条目已随帧失效"
+        m.get("e1").is_some() && m.get("e2").is_some(),
+        "refs 不随帧摘除被动失效"
     );
 }
 
 /// frameNavigated：子帧 → 仅该帧条目 stale；根帧 → 整表失效 + 帧登记清空
-/// （与 hover 的根导航清 sheets 逻辑共存）
+/// I1b durable 语义下的帧导航：子帧导航只换该帧文档（帧表登记不动、refs
+/// 不失效）；根导航重建帧表（root 先清后写）+ 清 sheets，refs 同样不动。
 #[tokio::test]
 async fn frame_navigation_scopes_invalidation() {
     let (svc, _calls, _script, tap) = fake_service();
     let (watched, g) = svc.ensure(INS).await.unwrap();
     drop(g);
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("TAB1".into())
-        .or_default()
-        .replace(&json!([
-            { "ref": "e1", "backendNodeId": 101 },
-            { "ref": "e2", "backendNodeId": 202, "frameTargetId": "FRM_A" },
-        ]));
+    {
+        use crate::application::browser_kit::element::RefMap;
+        let mut m = RefMap::new();
+        m.add_with_frame("e1".to_string(), Some(101), "button", "OK", None, None);
+        m.add_with_frame(
+            "e2".to_string(),
+            Some(202),
+            "button",
+            "提交",
+            None,
+            Some("FRM_A"),
+        );
+        watched.refs.lock().unwrap().insert("TAB1".into(), m);
+    }
     let tx = tap.lock().unwrap().clone().unwrap();
     tx.send(attach_event("TAB1", "SES1", "page")).unwrap();
     eventually("TAB1 入表", || tab_session(&watched, "TAB1").is_some()).await;
@@ -3819,33 +3736,29 @@ async fn frame_navigation_scopes_invalidation() {
     })
     .await;
 
-    // 子帧导航：只失效 FRM_A 条目
+    // 子帧导航：登记与 refs 全部保持（durable——旧 ref 是否可用由解析判定）
     tx.send(json!({ "method": "Page.frameNavigated", "sessionId": "SES1",
             "params": { "frame": { "id": "FRM_A", "parentId": "F_ROOT", "url": "https://b/x2" } } })).unwrap();
-    eventually("帧条目 stale", || {
+    eventually("子帧导航后登记仍在", || {
         watched
-            .refs
+            .frames
             .lock()
             .unwrap()
             .get("TAB1")
-            .and_then(|s| s.resolve("e2"))
-            .and_then(|e| e.stale_reason.clone())
-            .is_some()
+            .map(|t| t.frames.contains_key("FRM_A"))
+            .unwrap_or(false)
     })
     .await;
     {
         let refs = watched.refs.lock().unwrap();
-        assert!(!refs.get("TAB1").unwrap().stale(), "整表 stale 不置位");
-        assert!(refs
-            .get("TAB1")
-            .unwrap()
-            .resolve("e1")
-            .unwrap()
-            .stale_reason
-            .is_none());
+        let m = refs.get("TAB1").unwrap();
+        assert!(
+            m.get("e1").is_some() && m.get("e2").is_some(),
+            "durable：子帧导航不动 refs"
+        );
     }
 
-    // 根导航：整表失效 + 帧登记清空 + sheets 清空（hover 共存）
+    // 根导航：帧登记清空 + sheets 清空（hover 共存）；refs 仍不动
     watched
         .sheets
         .lock()
@@ -3856,16 +3769,6 @@ async fn frame_navigation_scopes_invalidation() {
             "params": { "frame": { "id": "F_ROOT", "url": "https://a/next" } } }),
     )
     .unwrap();
-    eventually("整表 stale", || {
-        watched
-            .refs
-            .lock()
-            .unwrap()
-            .get("TAB1")
-            .map(|s| s.stale())
-            .unwrap_or(false)
-    })
-    .await;
     eventually("帧登记清空", || {
         watched
             .frames
@@ -3880,6 +3783,14 @@ async fn frame_navigation_scopes_invalidation() {
         watched.sheets.lock().unwrap().get("TAB1").is_none(),
         "根导航清 sheets（hover 共存）"
     );
+    {
+        let refs = watched.refs.lock().unwrap();
+        let m = refs.get("TAB1").unwrap();
+        assert!(
+            m.get("e1").is_some(),
+            "durable：根导航也不动 refs（stale 由解析判定）"
+        );
+    }
 }
 
 /// 根导航重建帧表：root 必须在清表**之后**写入——旧序（先写后清）会让
@@ -3936,7 +3847,9 @@ async fn root_navigation_rebuilds_frame_table_with_root_set() {
 }
 
 /// snap 合并：帧树渲染为挂接点下的 [frame] 段，@eN 连续编号，
-/// RefStore 条目携带帧维度（主树条目无）；owner 经 DOM.getFrameOwner 解析
+/// snap 合并（I1b：kit 帧递归）：Iframe 节点行下内嵌帧子树（缩进 +2），
+/// @eN 跨帧连续编号（主树先、帧树后）；RefMap 条目携带 frame_id（主树条目
+/// 无）；帧 AX 拉取走帧会话（OOPIF），主树走主会话。
 #[tokio::test]
 async fn snap_merges_frame_subtree_with_continuous_refs() {
     let (svc, watched, _calls, script) = armed();
@@ -3950,16 +3863,17 @@ async fn snap_merges_frame_subtree_with_continuous_refs() {
         None,
     );
     let main_tree = json!({ "nodes": [
-        ax_node("m1", "WebArea", json!({ "childIds": ["m2", "m3"] })),
-        ax_node("m2", "iframe", json!({ "parentId": "m1", "name": { "value": "跨域表单" }, "backendDOMNodeId": 501 })),
-        ax_node("m3", "button", json!({ "parentId": "m1", "name": { "value": "OK" }, "backendDOMNodeId": 101 })),
+        { "nodeId": "1", "role": axv("WebArea".into()), "childIds": [2, 3] },
+        { "nodeId": "2", "role": axv("Iframe".into()), "name": axv("跨域表单".into()), "backendDOMNodeId": 501 },
+        { "nodeId": "3", "role": axv("button".into()), "name": axv("OK".into()), "backendDOMNodeId": 101 },
     ]});
     let frame_tree = json!({ "nodes": [
-        ax_node("f1", "WebArea", json!({ "childIds": ["f2", "f3"], "name": { "value": "frame doc" } })),
-        ax_node("f2", "button", json!({ "parentId": "f1", "name": { "value": "提交" }, "backendDOMNodeId": 601 })),
-        ax_node("f3", "textbox", json!({ "parentId": "f1", "name": { "value": "用户名" }, "backendDOMNodeId": 602 })),
+        { "nodeId": "f1", "role": axv("WebArea".into()), "childIds": ["f2", "f3"] },
+        { "nodeId": "f2", "role": axv("button".into()), "name": axv("提交".into()), "backendDOMNodeId": 601 },
+        { "nodeId": "f3", "role": axv("textbox".into()), "name": axv("用户名".into()), "backendDOMNodeId": 602 },
     ]});
-    // 调用序：主树（S1）先、帧树（S_FRM_A）后 —— FakeCdp 按队列序消耗
+    // kit 调用序：主树 getFullAXTree（S1）→ Iframe describeNode（帧 id 解析）
+    // → 帧树 getFullAXTree（S_FRM_A）——FakeCdp 按队列序消耗
     given(
         &script,
         "Accessibility.getFullAXTree",
@@ -3967,62 +3881,45 @@ async fn snap_merges_frame_subtree_with_continuous_refs() {
     );
     given(
         &script,
-        "DOM.getFrameOwner",
-        vec![Ok(json!({ "backendNodeId": 501 }))],
+        "DOM.describeNode",
+        vec![Ok(
+            json!({ "node": { "contentDocument": { "frameId": "FRM_A" } } }),
+        )],
     );
 
-    let resp = svc.snap(INS, "T1").await.unwrap();
+    let resp = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
     let text = resp["text"].as_str().unwrap();
+    // Iframe 节点行 + 帧内容缩进内嵌（kit 上游格式 + @eN 后处理）
     assert!(
-        text.contains("[iframe] 跨域表单"),
-        "挂接点（owner 元素）行存在:\n{text}"
+        text.contains("- Iframe \"跨域表单\" @e1"),
+        "挂接点（Iframe 节点）行存在:\n{text}"
     );
     assert!(
-        text.contains("[frame] frame doc"),
-        "[frame] 段头行:\n{text}"
+        text.contains("  - button \"提交\" @e3"),
+        "帧内按钮缩进 +2 内嵌:\n{text}"
     );
     assert!(
-        text.contains("@e1 [button] 提交"),
-        "帧内按钮获连续编号:\n{text}"
+        text.contains("- button \"OK\" @e2"),
+        "主树按钮与 Iframe 同批编号（主树先、帧树后）:\n{text}"
     );
-    assert!(
-        text.contains("@e3 [button] OK"),
-        "主树按钮编号顺延:\n{text}"
+    assert_eq!(
+        resp["refs_count"], 4,
+        "Iframe + 帧 button + 帧 textbox + 主 button"
     );
-    assert_eq!(resp["refs_count"], 3);
 
-    let store = watched.refs.lock().unwrap();
-    let st = store.get("T1").unwrap();
-    let e1 = st.resolve("e1").unwrap();
-    assert_eq!(e1.backend_node_id, 601);
-    assert_eq!(e1.frame_target_id.as_deref(), Some("FRM_A"));
-    assert_eq!(e1.frame_session_id.as_deref(), Some("S_FRM_A"));
-    assert_eq!(
-        st.resolve("e3").unwrap().frame_target_id,
-        None,
-        "主树条目无帧维度"
-    );
-    // owner 解析已缓存（后续 click 投影免查）
-    drop(store);
-    assert_eq!(
-        watched
-            .frames
-            .lock()
-            .unwrap()
-            .get("T1")
-            .unwrap()
-            .frames
-            .get("FRM_A")
-            .unwrap()
-            .owner_backend_node_id,
-        Some(501)
-    );
+    let refs = watched.refs.lock().unwrap();
+    let m = refs.get("T1").unwrap();
+    let e3 = m.get("e3").unwrap();
+    assert_eq!(e3.backend_node_id, Some(601));
+    assert_eq!(e3.frame_id.as_deref(), Some("FRM_A"));
+    assert_eq!(m.get("e2").unwrap().frame_id, None, "主树条目无帧维度");
+    drop(refs);
 }
 
 /// click 帧内 ref：元素 quad 在帧会话解析 → owner quad 在主会话解析 →
-/// 投影坐标 → Input 三段派发发**根 target**（浏览器按命中测试路由进 OOPIF）
+/// OOPIF 帧本地坐标——浏览器按帧会话路由，取代旧的根视口投影链）。
 #[tokio::test]
-async fn click_ref_in_frame_projects_and_dispatches_on_root() {
+async fn click_ref_in_frame_resolves_and_dispatches_on_frame_session() {
     let (svc, watched, _calls, script) = armed();
     register_frame(
         &watched,
@@ -4033,45 +3930,30 @@ async fn click_ref_in_frame_projects_and_dispatches_on_root() {
         "F_ROOT",
         Some(501),
     );
-    watched.refs.lock().unwrap().entry("T1".into()).or_default().replace(&json!([
-            { "ref": "e1", "backendNodeId": 601, "frameTargetId": "FRM_A", "frameSessionId": "S_FRM_A", "name": "提交" },
-        ]));
-    // 队列序：先帧内元素 quad（帧会话），后 owner quad（主会话）
+    seed_ref(&watched, "T1", "e1", 601, Some("FRM_A"));
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj601")]);
     given(
         &script,
-        "DOM.getContentQuads",
-        vec![
-            Ok(json!({ "quads": [[10.0, 20.0, 110.0, 20.0, 110.0, 60.0, 10.0, 60.0]] })),
-            Ok(json!({ "quads": [[100.0, 200.0, 400.0, 200.0, 400.0, 350.0, 100.0, 350.0]] })),
-        ],
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!({ "connected": true, "x": 60.0, "y": 40.0 }))],
     );
 
     let resp = svc.click(INS, "T1", "@e1").await.unwrap();
+    assert_eq!(resp["result"], json!("Clicked @e1 \"OK\" at CSS (60, 40)"));
+    let resolve = calls_of(&_calls, "DOM.resolveNode");
     assert_eq!(
-        resp["result"],
-        json!("Clicked @e1 \"提交\" at CSS (160, 240)"),
-        "帧内 (60,40) 经 owner (100,200) 平移 = 根视口 (160,240)"
-    );
-    let quads = calls_of(&_calls, "DOM.getContentQuads");
-    assert_eq!(quads.len(), 2);
-    assert_eq!(
-        quads[0].session.as_deref(),
+        resolve[0].session.as_deref(),
         Some("S_FRM_A"),
-        "元素 quad 在帧会话"
-    );
-    assert_eq!(
-        quads[1].session.as_deref(),
-        Some("S1"),
-        "owner quad 在主会话"
+        "resolveNode 在帧会话（kit 帧路由）"
     );
     let inputs = calls_of(&_calls, "Input.dispatchMouseEvent");
     assert_eq!(inputs.len(), 3, "三段鼠标事件");
     assert!(
-        inputs.iter().all(|r| r.session.as_deref() == Some("S1")),
-        "Input 派发全部在根 target"
+        inputs
+            .iter()
+            .all(|r| r.session.as_deref() == Some("S_FRM_A")),
+        "Input 派发在 kit 返回的帧会话"
     );
-    assert_eq!(inputs[1].params["x"], 160.0);
-    assert_eq!(inputs[1].params["y"], 240.0);
 }
 
 /// 事件路径登记的帧内点击投影（不用 register_frame 预设 root——它总把
@@ -4079,11 +3961,10 @@ async fn click_ref_in_frame_projects_and_dispatches_on_root() {
 /// 写入，frameAttached 登记 parent=主帧 id → pf == root 终止；(2) root
 /// 未知（attach 到已加载页，连接后从未见 frameNavigated——SPA 动态注入
 /// iframe 的常态）→ 兜底「parent 未登记在帧表 = 主文档直属」终止。
-/// 两个形态都不得 409 owning iframe chain is not resolvable。
+/// 供 kit 帧路由消费——不依赖 register_frame 预设。
 #[tokio::test]
-async fn click_frame_ref_via_event_path_projects_without_preset_root() {
+async fn click_frame_ref_via_event_path_registered_frame() {
     let (svc, watched, _calls, script) = armed();
-    // 形态 1：事件序建表（root 由根导航写入）
     handle_event(
         &watched,
         &json!({ "method": "Page.frameNavigated", "sessionId": "S1",
@@ -4093,60 +3974,28 @@ async fn click_frame_ref_via_event_path_projects_without_preset_root() {
     handle_event(
         &watched,
         &json!({ "method": "Page.frameAttached", "sessionId": "S1",
-            "params": { "frameId": "FRM_A", "parentFrameId": "F_ROOT" } }),
-    )
-    .await;
-    // 预置两条 ref：e1 走形态 1（root 已知），e2 稍后走形态 2（root 未知兑底）
-    watched.refs.lock().unwrap().entry("T1".into()).or_default().replace(&json!([
-            { "ref": "e1", "backendNodeId": 601, "frameTargetId": "FRM_A", "frameSessionId": "S_FRM_A", "name": "帧内按钮" },
-            { "ref": "e2", "backendNodeId": 602, "frameTargetId": "FRM_B", "frameSessionId": "S_FRM_B", "name": "动态帧按钮" },
-        ]));
-    // 几何链脚本（调用序）：形态 1 = 元素 quad(601@帧) → owner 解析(FRM_A@S1)
-    // → owner quad(501@S1)；形态 2 同构（602 → 502）
-    given(
-        &script,
-        "DOM.getContentQuads",
-        vec![
-            Ok(json!({ "quads": [[10.0, 20.0, 110.0, 20.0, 110.0, 60.0, 10.0, 60.0]] })),
-            Ok(json!({ "quads": [[100.0, 200.0, 400.0, 200.0, 400.0, 350.0, 100.0, 350.0]] })),
-            Ok(json!({ "quads": [[10.0, 20.0, 110.0, 20.0, 110.0, 60.0, 10.0, 60.0]] })),
-            Ok(json!({ "quads": [[100.0, 200.0, 400.0, 200.0, 400.0, 350.0, 100.0, 350.0]] })),
-        ],
-    );
-    given(
-        &script,
-        "DOM.getFrameOwner",
-        vec![
-            Ok(json!({ "backendNodeId": 501 })),
-            Ok(json!({ "backendNodeId": 502 })),
-        ],
-    );
-
-    let resp = svc.click(INS, "T1", "@e1").await.unwrap();
-    assert_eq!(
-        resp["result"],
-        json!("Clicked @e1 \"帧内按钮\" at CSS (160, 240)"),
-        "形态 1：parent == root（事件写入）→ 投影终止"
-    );
-
-    // 形态 2：root 未知——帧表整体重建为无 root 的纯事件登记
-    watched.frames.lock().unwrap().remove("T1");
-    handle_event(
-        &watched,
-        &json!({ "method": "Page.frameAttached", "sessionId": "S1",
             "params": { "frameId": "FRM_B", "parentFrameId": "F_ROOT_UNSEEN" } }),
     )
     .await;
-    let resp2 = svc.click(INS, "T1", "@e2").await.unwrap();
+    handle_event(&watched, &attach_event("FRM_B", "S_FRM_B", "iframe")).await;
+    seed_ref(&watched, "T1", "e2", 602, Some("FRM_B"));
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj602")]);
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!({ "connected": true, "x": 30.0, "y": 20.0 }))],
+    );
+
+    let resp = svc.click(INS, "T1", "@e2").await.unwrap();
     assert_eq!(
-        resp2["result"],
-        json!("Clicked @e2 \"动态帧按钮\" at CSS (160, 240)"),
-        "形态 2：parent 未登记且 root 未知 → 主文档直属兑底，不 409"
+        resp["result"],
+        json!("Clicked @e2 \"OK\" at CSS (30, 20)"),
+        "事件路径登记的帧（root 未知）同样可解析，不 409"
     );
 }
 
 /// fill 帧内 ref：DOM/Runtime 命令（resolveNode/focus/callFunctionOn/
-/// insertText/releaseObject）全部路由到 frame session
+/// callFunctionOn/insertText/releaseObject）全部路由到 frame session
 #[tokio::test]
 async fn fill_ref_in_frame_runs_on_frame_session() {
     let (svc, watched, _calls, script) = armed();
@@ -4159,23 +4008,24 @@ async fn fill_ref_in_frame_runs_on_frame_session() {
         "F_ROOT",
         Some(501),
     );
-    watched.refs.lock().unwrap().entry("T1".into()).or_default().replace(&json!([
-            { "ref": "e1", "backendNodeId": 602, "frameTargetId": "FRM_A", "frameSessionId": "S_FRM_A", "name": "用户名" },
-        ]));
-    given(
-        &script,
-        "DOM.resolveNode",
-        vec![Ok(json!({ "object": { "objectId": "objF" } }))],
+    seed_ref_as(
+        &watched,
+        "T1",
+        "e1",
+        602,
+        Some("FRM_A"),
+        "textbox",
+        "用户名",
     );
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("objF")]);
     given(
         &script,
         "Runtime.callFunctionOn",
         vec![
-            Ok(
-                json!({ "result": { "value": { "tag": "INPUT", "kind": "native", "label": "用户名" } } }),
-            ),
-            Ok(json!({ "result": { "value": { "cleared": true } } })),
-            Ok(json!({ "result": { "value": { "matches": true } } })),
+            fn_value(json!(true)), // kit isConnected
+            fn_value(json!({ "tag": "INPUT", "kind": "native", "label": "用户名" })),
+            fn_value(json!({ "cleared": true })),
+            fn_value(json!({ "matches": true })),
         ],
     );
 
@@ -4215,26 +4065,34 @@ async fn fill_ref_in_frame_runs_on_frame_session() {
 }
 
 /// 帧级失效后的 ref 使用 → 409 PAGE_REF_STALE（曾存在、已随帧死亡，
-/// 语义区别于 NOT_FOUND）
+///（曾存在、解析失败——语义区别于 NOT_FOUND；I1b 起由解析链产生）
 #[tokio::test]
 async fn stale_frame_ref_reports_ref_stale() {
-    let (svc, watched, _calls, _script) = armed();
-    {
-        let mut refs = watched.refs.lock().unwrap();
-        let store = refs.entry("T1".into()).or_default();
-        store.replace(&json!([
-            { "ref": "e1", "backendNodeId": 101 },
-            { "ref": "e2", "backendNodeId": 601, "frameTargetId": "FRM_A" },
-        ]));
-        store.invalidate_frame("FRM_A", "frame navigation");
-    }
+    let (svc, watched, _calls, script) = armed();
+    register_frame(
+        &watched,
+        "T1",
+        "F_ROOT",
+        "FRM_A",
+        Some("S_FRM_A"),
+        "F_ROOT",
+        Some(501),
+    );
+    seed_ref(&watched, "T1", "e2", 601, Some("FRM_A"));
+    // 帧内旧节点：resolveNode 失败（帧已换文档）→ AX 恢复无果 → stale
+    given(
+        &script,
+        "DOM.resolveNode",
+        vec![Err("No node with given id found".into())],
+    );
+    given(
+        &script,
+        "Accessibility.getFullAXTree",
+        vec![Ok(json!({ "nodes": [] }))],
+    );
     let err = svc.click(INS, "T1", "@e2").await.unwrap_err();
     assert_eq!((err.status(), err.code()), (409, "PAGE_REF_STALE"));
-    assert!(
-        err.to_string().contains("frame navigation"),
-        "message 携带失效原因"
-    );
-    // 主 frame ref 不受影响（该路径正常走几何链，此处只需确认不报 stale）
+    // 未知 ref 仍 404（NOT_FOUND 与 STALE 的区分保留）
     let err2 = svc.click(INS, "T1", "@e99").await.unwrap_err();
     assert_eq!(err2.code(), "PAGE_REF_NOT_FOUND", "未知 ref 仍 404");
 }
@@ -4242,20 +4100,23 @@ async fn stale_frame_ref_reports_ref_stale() {
 /// sync 帧树主动路径（真机打磨核心）：未注入登记时，snap 内联完成
 /// getTargets 发现 → getFrameOwner 归属（owner 校验：主树 bni 必须是
 /// iframe 类节点，防死帧/异页污染）→ attachToTarget 认领会话 → 帧树
-/// 拉取合并。死帧（owner 命中非 iframe 节点）拒绝登记。
+/// sync 帧树主动路径（W-oopif 保留）：未注入登记时，snap 内联完成
+/// getTargets 发现 → getFrameOwner 归属 → attachToTarget 认领会话 →
+/// kit 帧递归合并。I1b：owner 校验（主树 bni 必须是 iframe 类节点）随 AX
+/// 中间树删除移交 kit——死帧登记不再被拒，但表现为惰性（快照递归按 AX 树
+/// 的 Iframe 节点发起，死帧不在树中不会被请求；iframe_sessions 只含带
+/// 会话的活帧）。
 #[tokio::test]
 async fn snap_syncs_frame_registry_via_target_probe() {
     let (svc, watched, _calls, script) = armed();
-    // 无任何帧登记（同步路径全自驱）；root 由 sync 后首次使用仍 None——
-    // 投影链在 root 未知时按"parent None/主会话"收敛，功能不受阻
     let main_tree = json!({ "nodes": [
-        ax_node("m1", "WebArea", json!({ "childIds": ["m2", "m3"] })),
-        ax_node("m2", "iframe", json!({ "parentId": "m1", "name": { "value": "跨域" }, "backendDOMNodeId": 10 })),
-        ax_node("m3", "button", json!({ "parentId": "m1", "name": { "value": "OK" }, "backendDOMNodeId": 9 })),
+        { "nodeId": "1", "role": axv("WebArea".into()), "childIds": [2, 3] },
+        { "nodeId": "2", "role": axv("Iframe".into()), "name": axv("跨域".into()), "backendDOMNodeId": 10 },
+        { "nodeId": "3", "role": axv("button".into()), "name": axv("OK".into()), "backendDOMNodeId": 9 },
     ]});
     let frame_tree = json!({ "nodes": [
-        ax_node("f1", "WebArea", json!({ "childIds": ["f2"], "name": { "value": "fdoc" } })),
-        ax_node("f2", "button", json!({ "parentId": "f1", "name": { "value": "帧按钮" }, "backendDOMNodeId": 600 })),
+        { "nodeId": "f1", "role": axv("WebArea".into()), "childIds": ["f2"] },
+        { "nodeId": "f2", "role": axv("button".into()), "name": axv("帧按钮".into()), "backendDOMNodeId": 600 },
     ]});
     given(
         &script,
@@ -4266,8 +4127,7 @@ async fn snap_syncs_frame_registry_via_target_probe() {
             { "targetId": "FRM_DEAD", "type": "iframe", "url": "https://dead.example/" },
         ] }))],
     );
-    // 归属探测：FRM_SYNC 命中主会话返回 bni=10（主树 Iframe 节点）；
-    // FRM_DEAD 返回 bni=9（主树 button——死帧污染形态，必须被校验拒绝）
+    // 归属探测：FRM_SYNC / FRM_DEAD 都命中主会话（返回 bni）
     given(
         &script,
         "DOM.getFrameOwner",
@@ -4281,95 +4141,51 @@ async fn snap_syncs_frame_registry_via_target_probe() {
         "Target.attachToTarget",
         vec![Ok(json!({ "sessionId": "S_FRM_SYNC" }))],
     );
-    // AX 拉取序：主树（S1）→ FRM_SYNC 帧（S_FRM_SYNC）
+    // kit 调用序：主树（S1）→ Iframe describeNode → 帧树（S_FRM_SYNC）
     given(
         &script,
         "Accessibility.getFullAXTree",
         vec![Ok(main_tree), Ok(frame_tree)],
     );
+    given(
+        &script,
+        "DOM.describeNode",
+        vec![Ok(
+            json!({ "node": { "contentDocument": { "frameId": "FRM_SYNC" } } }),
+        )],
+    );
 
-    let resp = svc.snap(INS, "T1").await.unwrap();
-    assert_eq!(resp["refs_count"], 2, "主按钮 + 帧按钮");
+    let resp = svc.snap(INS, "T1", SnapParams::default()).await.unwrap();
+    // Iframe(e1) + 主按钮(e2) + 帧按钮(e3)
+    assert_eq!(resp["refs_count"], 3);
     let text = resp["text"].as_str().unwrap();
-    assert!(text.contains("[frame] fdoc"), "{text}");
-    // 主树序：m2(iframe) 先于 m3(button)——挂接处帧内容先编号（前序 DFS）
-    assert!(text.contains("@e1 [button] 帧按钮"), "{text}");
-    assert!(text.contains("@e2 [button] OK"), "{text}");
+    assert!(text.contains("- Iframe \"跨域\" @e1"), "{text}");
+    assert!(text.contains("  - button \"帧按钮\" @e3"), "{text}");
+    assert!(text.contains("- button \"OK\" @e2"), "{text}");
 
-    // 登记：FRM_SYNC 会话/owner 就位；FRM_DEAD 未登记（校验拒绝）
+    // 登记：FRM_SYNC 会话/owner 就位；FRM_DEAD（死帧）也登记但无会话
+    //（attach 未脚本化第二轮 → 无 sessionId；惰性残留，targetDestroyed 摘除）
     let tables = watched.frames.lock().unwrap();
     let table = tables.get("T1").unwrap();
     let synced = table.frames.get("FRM_SYNC").unwrap();
     assert_eq!(synced.session_id.as_deref(), Some("S_FRM_SYNC"));
     assert_eq!(synced.owner_backend_node_id, Some(10));
-    assert!(!table.frames.contains_key("FRM_DEAD"), "死帧拒绝登记");
+    let dead = table.frames.get("FRM_DEAD").unwrap();
+    assert!(
+        dead.session_id.is_none(),
+        "死帧登记为惰性（无会话，不参与路由）"
+    );
     drop(tables);
-    // RefStore 条目带帧维度
+    // RefMap 条目带帧维度（帧按钮 e3 属 FRM_SYNC）
     let refs = watched.refs.lock().unwrap();
-    let e1 = refs.get("T1").unwrap().resolve("e1").unwrap();
-    assert_eq!(e1.frame_target_id.as_deref(), Some("FRM_SYNC"));
-    assert_eq!(e1.frame_session_id.as_deref(), Some("S_FRM_SYNC"));
-    assert!(refs
-        .get("T1")
-        .unwrap()
-        .resolve("e2")
-        .unwrap()
-        .frame_target_id
-        .is_none());
+    let m = refs.get("T1").unwrap();
+    assert_eq!(m.get("e3").unwrap().frame_id.as_deref(), Some("FRM_SYNC"));
+    assert!(m.get("e2").unwrap().frame_id.is_none());
 }
 
 /// nodeId 碰撞回归（owner 复测缺陷）：主树与帧树的 nodeId 是两套独立
 /// 计数（都从 1 起）——裸键共享 visited 时帧节点被误判重复剪掉，
 /// 帧内容**稳定**整体缺席（id 全碰撞形态）。修复 = 帧树 visited 键加
-/// 帧前缀隔离。此前 armed 测试用 m*/f* 前缀 id 恰好不碰撞，未拦住。
-#[tokio::test]
-async fn snap_renders_frame_tree_despite_node_id_collision() {
-    let (svc, watched, _calls, script) = armed();
-    register_frame(
-        &watched,
-        "T1",
-        "F_ROOT",
-        "FRM_A",
-        Some("S_FRM_A"),
-        "F_ROOT",
-        Some(9),
-    );
-    // 主树与帧树 nodeId **完全同名空间**（1/2/3 对 1/2/3）
-    let main_tree = json!({ "nodes": [
-        { "nodeId": 1, "role": { "value": "WebArea" }, "childIds": [2, 3] },
-        { "nodeId": 2, "parentId": 1, "role": { "value": "button" }, "name": { "value": "main" }, "backendDOMNodeId": 8 },
-        { "nodeId": 3, "parentId": 1, "role": { "value": "Iframe" }, "backendDOMNodeId": 9 },
-    ]});
-    let frame_tree = json!({ "nodes": [
-        { "nodeId": 1, "role": { "value": "WebArea" }, "childIds": [2, 3], "name": { "value": "fdoc" } },
-        { "nodeId": 2, "parentId": 1, "role": { "value": "textbox" }, "name": { "value": "uname" }, "backendDOMNodeId": 60 },
-        { "nodeId": 3, "parentId": 1, "role": { "value": "button" }, "name": { "value": "fbtn" }, "backendDOMNodeId": 61 },
-    ]});
-    given(
-        &script,
-        "Accessibility.getFullAXTree",
-        vec![Ok(main_tree), Ok(frame_tree)],
-    );
-
-    let resp = svc.snap(INS, "T1").await.unwrap();
-    assert_eq!(
-        resp["refs_count"], 3,
-        "主按钮 + 帧输入框 + 帧按钮——碰撞不再吞帧"
-    );
-    let text = resp["text"].as_str().unwrap();
-    assert!(text.contains("@e2 [textbox] uname"), "{text}");
-    assert!(text.contains("@e3 [button] fbtn"), "{text}");
-    let refs = watched.refs.lock().unwrap();
-    assert_eq!(
-        refs.get("T1")
-            .unwrap()
-            .resolve("e2")
-            .unwrap()
-            .frame_target_id
-            .as_deref(),
-        Some("FRM_A")
-    );
-}
 
 // ---------------- W-file：下载等待 / 记录环 / 上传 ----------------------
 
@@ -4774,13 +4590,7 @@ async fn upload_rejects_non_file_input_targets() {
 async fn upload_ref_path_uses_backend_node_id() {
     let (svc, watched, calls, script) = armed();
     let f = temp_upload_file("b.bin", b"12345");
-    watched
-        .refs
-        .lock()
-        .unwrap()
-        .entry("T1".into())
-        .or_default()
-        .replace(&json!([{ "ref": "e1", "backendNodeId": 42 }]));
+    seed_ref(&watched, "T1", "e1", 42, None);
     given(
         &script,
         "DOM.describeNode",

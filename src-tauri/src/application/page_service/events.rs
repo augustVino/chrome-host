@@ -2,7 +2,6 @@ use super::cdp_send;
 use crate::application::page_service::dialogs::on_dialog_opening;
 use crate::application::page_service::downloads::{on_download_begin, on_download_progress};
 use crate::application::page_service::intercept::on_request_paused;
-use crate::application::page_service::refs::{invalidate_frame_refs, invalidate_refs};
 use crate::application::page_service::snap::reset_sheet_registry;
 use crate::application::page_service::state::Watched;
 use crate::domain::page_control::{DialogBuffer, DialogInfo};
@@ -153,9 +152,10 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
         // Progress 终态结算 + 等待者放行（同步登记，不发命令，不碰串行锁）
         "Browser.downloadWillBegin" => on_download_begin(watched, &params),
         "Browser.downloadProgress" => on_download_progress(watched, &params),
-        // 仅根 frame（parentId 为空）才整表失效：子 frame 导航不换文档（§3.6）。
-        // W-oopif：子 frame 导航 → 仅该 frame 的 ref 失效（stale 标记）；根导航
-        // 另清帧登记表（新文档的旧子帧全部死亡，frameDetached 不保证补发）。
+        // 仅根 frame（parentId 为空）才换主文档。I1b 起 refs 不再主动失效
+        //（durable refs：stale 由解析时 is_detached / AX 唯一匹配恢复判定产生）；
+        // 帧表维护保留：根导航 = 新文档的旧子帧全部死亡（frameDetached 不保证
+        // 补发，整表重建），子帧导航无事可做。
         "Page.frameNavigated" => {
             if let Some(tid) = tab_of_session(watched, event) {
                 let fid = params
@@ -167,22 +167,16 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
                     .pointer("/frame/parentId")
                     .and_then(Value::as_str)
                     .is_some_and(|p| !p.is_empty());
-                if child_frame {
-                    if !fid.is_empty() {
-                        invalidate_frame_refs(watched, &tid, &fid, "frame navigation");
-                    }
-                } else {
-                    invalidate_refs(watched, &tid, "navigation");
-                    // 换文档 = 旧表全部失效：Chrome 在文档销毁时不保证逐张发
+                if !child_frame {
+                    // 换文档：Chrome 在文档销毁时不保证逐张发
                     // styleSheetRemoved（真机实测：导航后登记表残留死表，
                     // getStyleSheetText 报 No style sheet with given id found →
                     // hoverScan 恒 truncated）。新文档的表由 styleSheetAdded
-                    // 重新登记（CSS 域 session 级持续有效，不依赖 Removed 语义）。
+                    // 重新登记（CSS 域 session 级持续有效）。
                     reset_sheet_registry(watched, &tid);
-                    // 帧登记同理整体重建：新文档的 frameAttached/attach 会重登记。
+                    // 帧登记整体重建：新文档的 frameAttached/attach 会重登记。
                     // root 必须在清表**之后**写入——先写后清会让 root 随整表
-                    // 删除丢失（root 恒 None：顶层 OOPIF 投影链 at_root 永不
-                    // 命中、主帧发起的下载无 tab 归属）。
+                    // 删除丢失（root 恒 None：主帧发起的下载无 tab 归属）。
                     let mut tables = watched.frames.lock().unwrap();
                     tables.remove(&tid);
                     if !fid.is_empty() {
@@ -192,7 +186,7 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
             }
         }
         // OOPIF 帧树维护（主 frame session 事件）：attach 登记（含父链），
-        // detach → 摘除 + 该帧 ref 失效
+        // detach → 摘除登记（I1b 起不标记 ref 失效，durable refs 自判）
         "Page.frameAttached" => {
             if let Some(tid) = tab_of_session(watched, event) {
                 let (Some(fid), Some(parent)) = (
@@ -225,22 +219,11 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
         }
         "Page.documentOpened" => {
             if let Some(tid) = tab_of_session(watched, event) {
-                invalidate_refs(watched, &tid, "document opened");
                 // document.open() 同样换文档：旧样式表全部销毁且
                 // styleSheetRemoved 不保证补发（与根导航同一死表形态）——
                 // 清登记 + 重开结算窗口，新表由 styleSheetAdded 重放。
+                // refs 不主动失效（I1b durable 语义）。
                 reset_sheet_registry(watched, &tid);
-            }
-        }
-        "DOM.documentUpdated" => {
-            // 主 frame session → 整表失效；frame session → 仅该帧失效（W-oopif）
-            match tab_of_session(watched, event) {
-                Some(tid) => invalidate_refs(watched, &tid, "document updated"),
-                None => {
-                    if let Some((tid, fid)) = frame_of_session(watched, event) {
-                        invalidate_frame_refs(watched, &tid, &fid, "frame document updated");
-                    }
-                }
             }
         }
         _ => {}
@@ -407,31 +390,28 @@ async fn probe_reconnected_dialog(watched: &Watched, conn: &SharedPageConn, tid:
 }
 
 /// detachedFromTarget / targetDestroyed 的共同清理：page target → 整 tab
-/// 摘除（映射 + RefStore / DialogBuffer / load 等待者一起删——会话已死，
+/// 摘除（映射 + RefMap / DialogBuffer / load 等待者一起删——会话已死，
 /// 状态随之作废；等待中的导航命令各自走到自己的超时分支）；
-/// frame target → 仅摘除该帧登记 + 帧内 ref 失效（W-oopif）。
+/// frame target → 仅摘除该帧登记（I1b 起不标记 ref 失效：durable refs 由
+/// 解析链自行判定，帧会话死亡会让帧内 ref 的恢复解析自然失败）。
 pub(crate) fn drop_target(watched: &Watched, tid: &str) {
     if watched.tabs.lock().unwrap().contains_target(tid) {
         drop_tab(watched, tid);
         return;
     }
-    let mut owner: Option<(String, String)> = None;
     {
         let mut tables = watched.frames.lock().unwrap();
-        for (tab_tid, table) in tables.iter_mut() {
+        for (_tab_tid, table) in tables.iter_mut() {
             if table.frames.remove(tid).is_some() {
-                owner = Some((tab_tid.clone(), tid.to_string()));
                 break;
             }
         }
     }
     watched.orphan_frame_sessions.lock().unwrap().remove(tid);
-    if let Some((tab_tid, fid)) = owner {
-        invalidate_frame_refs(watched, &tab_tid, &fid, "frame detached");
-    }
 }
 
-/// 摘除单个 OOPIF 帧登记 + 该帧 ref 失效（frameDetached / drop_target 共用）
+/// 摘除单个 OOPIF 帧登记（frameDetached / drop_target 共用）
+/// 摘除单个 OOPIF 帧登记（frameDetached / drop_target 共用）
 fn drop_frame(watched: &Watched, tab_tid: &str, fid: &str) {
     watched
         .frames
@@ -439,7 +419,6 @@ fn drop_frame(watched: &Watched, tab_tid: &str, fid: &str) {
         .unwrap()
         .get_mut(tab_tid)
         .map(|t| t.frames.remove(fid));
-    invalidate_frame_refs(watched, tab_tid, fid, "frame detached");
 }
 
 fn on_detached(watched: &Watched, params: &Value) {
@@ -471,6 +450,7 @@ fn on_detached(watched: &Watched, params: &Value) {
 pub(crate) fn drop_tab(watched: &Watched, tid: &str) {
     watched.tabs.lock().unwrap().detach(tid);
     watched.refs.lock().unwrap().remove(tid);
+    watched.snap_gen.lock().unwrap().remove(tid);
     watched.dialogs.lock().unwrap().remove(tid);
     watched.load_waiters.lock().unwrap().remove(tid);
     watched.sheets.lock().unwrap().remove(tid);
@@ -489,12 +469,6 @@ pub(crate) fn frame_session_lookup(watched: &Watched, sid: &str) -> Option<(Stri
         }
     }
     None
-}
-
-/// 事件（顶层 sessionId）→ (tab tid, frame tid)：帧会话维度事件的定位入口
-fn frame_of_session(watched: &Watched, event: &Value) -> Option<(String, String)> {
-    let sid = event.get("sessionId").and_then(Value::as_str)?;
-    frame_session_lookup(watched, sid)
 }
 
 /// 顶层 sessionId → targetId（session 维度事件定位 tab 用）。
