@@ -1,33 +1,21 @@
-//! page 控制域纯逻辑层（P2-A）：@eN 键归一化、press 键表、wait 状态机、
-//! 页面 eval 表达式生成与 JS 对话框模型。
+//! page 控制域纯逻辑层：@eN 键归一化、press 键表、wait 状态机、
+//! 页面 eval 表达式生成与 JS 对话框模型。行为规格由文件内单测锁定；
+//! IO（CDP 收发、轮询、补偿重发）归 application 层，本文件只做可单测的
+//! 纯逻辑：
 //!
-//! 行为规格 = Phase 1 的 TS 实现（`skills/chrome-host/scripts/lib/`，已由 183 单测
-//! 验证），本模块是其逐语义移植；IO（CDP 收发、轮询、补偿重发）归 application 层
-//! （PAGE-CONTROL-PLAN Phase 2），本文件只做可单测的纯逻辑：
-//!
-//! - [`normalize_ref`]：@eN 键归一化（TS lib/ref-store.mjs；ref 表本体自 I1b
-//!   起为 browser_kit element::RefMap，durable refs 由 kit 自管）；
-//! - [`parse_key`]/[`KeyPress`]：键名 → CDP Input.dispatchKeyEvent 三段序列
-//!   （TS lib/tools/press.mjs，SPEC §4.2）；
-//! - [`parse_duration`]/[`observed_matches_state`]：wait 轮询的参数与状态机
-//!   （TS lib/tools/wait.mjs）；
+//! - [`normalize_ref`]：@eN 键归一化（ref 表本体为 browser_kit
+//!   element::RefMap，durable refs 由 kit 自管）；
+//! - [`parse_key`]/[`KeyPress`]：键名 → CDP Input.dispatchKeyEvent 三段序列；
+//! - [`parse_duration`]/[`observed_matches_state`]：wait 轮询的参数与状态机；
 //! - `*_expr` 表达式生成器：locate/hit-test/fill 检查/wait 观测的内嵌 JS
-//!   （TS lib/tools/click-native.mjs、fill.mjs、wait.mjs）——selector 一律经
-//!   [`json_escape`]（JSON.stringify 等价）转义后嵌入，防注入规则与 TS 一致；
-//! - [`parse_dialog_opening`]/[`DialogBuffer`]：对话框防御解析 + 有界缓冲
-//!   （TS lib/dialogs.mjs，BEHAVIOR-SPEC §1）。
+//!   ——selector 一律经 [`json_escape`]（JSON.stringify 等价）转义后嵌入，
+//!   防注入；
+//! - [`parse_dialog_opening`]/[`DialogBuffer`]：对话框防御解析 + 有界缓冲。
 //!
-//! 与 TS 的已知偏差（均为语义无关的形态差异，详见各条注释）：
-//! - 错误码统一加 `PAGE_` 前缀并 SCREAMING_SNAKE（TS 为 snake_case 消息前缀）；
-//!   message 去掉了 TS 里冗余的 `code:` 前缀（code 已是独立字段）；
-//! - `KeyPress.vk` 为 `Option<u16>`（TS 可 undefined：标点键无 vk，dispatch 时
-//!   必须整体省略该字段而非置 0）；
-//! - `PAGE_WAIT_TIMEOUT` 用 409 而非 504（HTTP 语义：客户端可重试的冲突态）；
-//! - key_unknown 提示语去掉了 CLI 专属尾巴 `(see "cdp help")`。
-
-// P2-B（application 层 L2 工具接线）尚未落地，本模块当前唯一消费者是
-// 文件内测试；bin crate 下 pub 不豁免 dead_code，测试引用在非 --tests
-// 编译中不可见。接线后删除本 allow。
+//! 形态约定：错误码统一加 `PAGE_` 前缀并 SCREAMING_SNAKE；message 不含
+//! 冗余的 `code:` 前缀（code 已是独立字段）；`KeyPress.vk` 为 `Option<u16>`
+//! （标点键无 vk，dispatch 时必须整体省略该字段而非置 0）；
+//! `PAGE_WAIT_TIMEOUT` 用 409 而非 504（HTTP 语义：客户端可重试的冲突态）。
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
@@ -43,8 +31,8 @@ use crate::error::AppError;
 // ============================================================================
 
 /// page 控制域错误：code 为对外稳定契约（AGENT-API 披露），status 为 HTTP 映射。
-/// `effect_state` 仅 [`PageControlError::dispatch_failed`] 携带（TS click-native.mjs
-/// §2.7 语义：press 前失败 = "none"——无任何输入已发出；press 后失败 = "unknown"——
+/// `effect_state` 仅 [`PageControlError::dispatch_failed`] 携带（语义：press
+/// 前失败 = "none"——无任何输入已发出；press 后失败 = "unknown"——
 /// mousePressed 已发出、效果不可判定，其余错误均为 None）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageControlError {
@@ -65,7 +53,7 @@ impl PageControlError {
         }
     }
 
-    /// 404：locate / focus 未命中（TS classifyLocate / focusPressTarget）
+    /// 404：locate / focus 未命中
     pub fn element_not_found(selector: &str) -> Self {
         Self::business(
             404,
@@ -74,7 +62,7 @@ impl PageControlError {
         )
     }
 
-    /// 422：locate 可见性四检未过（TS locateExpr 的 not_visible 分支）
+    /// 422：locate 可见性四检未过
     pub fn element_not_visible(selector: &str, why: &str) -> Self {
         let why = if why.is_empty() {
             "unknown reason"
@@ -88,7 +76,7 @@ impl PageControlError {
         )
     }
 
-    /// 409：点击点被遮挡（TS classifyHit 的 covered 分支）
+    /// 409：点击点被遮挡
     pub fn element_blocked_covered(selector: &str, by: &str) -> Self {
         Self::business(
             409,
@@ -97,7 +85,7 @@ impl PageControlError {
         )
     }
 
-    /// 409：点击点无元素（视口外，TS classifyHit 的 nothing-at-point 分支）
+    /// 409：点击点无元素（视口外）
     pub fn element_blocked_nothing(selector: &str) -> Self {
         Self::business(
             409,
@@ -106,7 +94,7 @@ impl PageControlError {
         )
     }
 
-    /// 404：ref 未命中且表未失效（TS refMissError 非 stale 分支）
+    /// 404：ref 未命中且表未失效
     pub fn ref_not_found(raw_ref: &str) -> Self {
         Self::business(
             404,
@@ -115,8 +103,7 @@ impl PageControlError {
         )
     }
 
-    /// 409：ref 表因导航/文档替换整体失效（TS refMissError stale 分支；
-    /// reason 缺省 "document changed"，与 TS invalidate 默认值一致）
+    /// 409：ref 表因导航/文档替换整体失效（reason 缺省 "document changed"）
     pub fn ref_stale(reason: Option<&str>) -> Self {
         Self::business(
             409,
@@ -128,7 +115,7 @@ impl PageControlError {
         )
     }
 
-    /// 409：ref 命中但几何/节点解析失败（TS resolveRefPoint / resolveFillTarget）
+    /// 409：ref 命中但几何/节点解析失败
     pub fn target_moved(detail: &str) -> Self {
         Self::business(
             409,
@@ -152,7 +139,7 @@ impl PageControlError {
         )
     }
 
-    /// 422：fill 目标不可编辑（TS requireFillable）
+    /// 422：fill 目标不可编辑
     pub fn target_not_fillable(target_desc: &str, why: &str) -> Self {
         Self::business(
             422,
@@ -166,19 +153,19 @@ impl PageControlError {
         Self::business(409, "PAGE_FILL_VALUE_MISMATCH", message.into())
     }
 
-    /// 422：元素被禁用（I1b 新码：browser_kit 解析链的 actionability 报告
+    /// 422：元素被禁用（browser_kit 解析链的 actionability 报告
     /// disabled——kit 原文透传，不吞信息）
     pub fn element_disabled(message: impl Into<String>) -> Self {
         Self::business(422, "PAGE_ELEMENT_DISABLED", message.into())
     }
 
-    /// 500：page 工具链未分类失败（I1b 新码：browser_kit String 错误的兜底
+    /// 500：page 工具链未分类失败（browser_kit String 错误的兜底
     /// 归宿——原文透传，保证不吞任何证据）
     pub fn action_failed(message: impl Into<String>) -> Self {
         Self::business(500, "PAGE_ACTION_FAILED", message.into())
     }
 
-    /// 409：record stop 时无运行中录制（I4 新码：从未 start / 已 stop /
+    /// 409：record stop 时无运行中录制（从未 start / 已 stop /
     /// 连接重建或锚点 tab 关闭致运行态废弃——reason 披露具体路径）
     pub fn record_not_running(reason: &str) -> Self {
         Self::business(
@@ -188,13 +175,13 @@ impl PageControlError {
         )
     }
 
-    /// 409：同实例重复 record start（I4 新码：Chrome 每实例同时只允许一路
+    /// 409：同实例重复 record start（Chrome 每实例同时只允许一路
     /// 录制——capture session/编码器均为单实例资源）
     pub fn record_already_active(message: impl Into<String>) -> Self {
         Self::business(409, "PAGE_RECORD_ALREADY_ACTIVE", message.into())
     }
 
-    /// 422：ffmpeg 探测失败（I4 新码：录制编码的前置环境检查，失败先于
+    /// 422：ffmpeg 探测失败（录制编码的前置环境检查，失败先于
     /// 浏览器 attach 暴露；detail = kit check_ffmpeg_available 原文，
     /// 追加具体安装命令）
     pub fn record_no_ffmpeg(detail: impl Into<String>) -> Self {
@@ -208,7 +195,7 @@ impl PageControlError {
         )
     }
 
-    /// 409：wait 超时（504 → 409，任务约定；消息逐字对齐 TS waitStr 超时分支）
+    /// 409：wait 超时（504 → 409，超时文案逐字钉住）
     pub fn wait_timeout(
         selector: &str,
         state: &str,
@@ -239,7 +226,7 @@ impl PageControlError {
         }
     }
 
-    /// 400：键名不识别（TS UNKNOWN_KEY_HINT，去掉了 CLI 专属尾巴 `(see "cdp help")`）
+    /// 400：键名不识别（提示语不带 CLI 专属尾巴 `(see "cdp help")`）
     pub fn key_unknown(input: &str) -> Self {
         Self::business(
             400,
@@ -250,8 +237,8 @@ impl PageControlError {
         )
     }
 
-    /// 404：page 命令族的目标 tab 不存在（应用层路由用，TS 无对应——per-tab daemon
-    /// 架构下由连接失败隐式覆盖）
+    /// 404：page 命令族的目标 tab 不存在（应用层路由用；连接失败由
+    /// 各命令的 CDP 错误路径覆盖，本码只管路由层）
     pub fn tab_not_found(tab: &str) -> Self {
         Self::business(404, "PAGE_TAB_NOT_FOUND", format!("tab not found: {tab}"))
     }
@@ -264,22 +251,22 @@ impl From<PageControlError> for AppError {
 }
 
 // ============================================================================
-// 2. ref 键归一化（TS lib/ref-store.mjs；I1b 起 ref 表本体 = browser_kit
-//    element::RefMap，domain 只保留键归一化）
+// 2. ref 键归一化（ref 表本体 = browser_kit element::RefMap，
+//    domain 只保留键归一化）
 // ============================================================================
 
-/// §3.7 归一化：只剥**恰好一个**前导 '@'（'@e3' → 'e3'，'@@e3' → '@e3'）。
+/// 归一化：只剥**恰好一个**前导 '@'（'@e3' → 'e3'，'@@e3' → '@e3'）。
 /// 大小写敏感是刻意的：'E3'/'@E3' 原样保留、查表必失配 → ref_not_found。
 pub fn normalize_ref(raw: &str) -> &str {
     raw.strip_prefix('@').unwrap_or(raw)
 }
 
 // ============================================================================
-// 3a. 元素截图几何（W-cap：clip 是区域不是点）
+// 3a. 元素截图几何（clip 是区域不是点）
 // ============================================================================
-// 注：点击点几何（largest_quad_centroid / OOPIF 投影 project_point）随 I1b
-// 移交 browser_kit element::resolve_element_center（帧链换算 + scrollIntoView
-// + settle 均在 kit 解析链内），本层不再保留。
+// 注：点击点几何（largest_quad_centroid / OOPIF 投影 project_point）在
+// browser_kit element::resolve_element_center（帧链换算 + scrollIntoView
+// + settle 均在 kit 解析链内），本层不保留。
 
 /// 视口 CSS 像素矩形（Page.captureScreenshot 的 clip 源）
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -343,10 +330,10 @@ pub fn rounded_clip(r: &Rect) -> Rect {
 }
 
 // ============================================================================
-// 4. press 键系统（TS lib/tools/press.mjs + tests/press.test.mjs，SPEC §4.2）
+// 4. press 键系统
 // ============================================================================
 
-/// 修饰键位域（SPEC §2.4/§4.2：alt=1 ctrl=2 meta=4 shift=8）。
+/// 修饰键位域（alt=1 ctrl=2 meta=4 shift=8）。
 /// 数组顺序即规范显示序（alt→ctrl→meta→shift）。
 pub const MODIFIER_BITS: [(&str, u8); 4] = [("alt", 1), ("ctrl", 2), ("meta", 4), ("shift", 8)];
 
@@ -356,7 +343,7 @@ pub const MOD_CTRL: u8 = 2;
 pub const MOD_META: u8 = 4;
 pub const MOD_SHIFT: u8 = 8;
 
-/// 别名折叠（TS MODIFIER_ALIASES：control/option/opt/cmd/command/super）
+/// 别名折叠：control/option/opt/cmd/command/super → 规范名
 fn canonical_modifier(word: &str) -> Option<&'static str> {
     match word {
         "alt" | "option" | "opt" => Some("alt"),
@@ -375,7 +362,7 @@ fn modifier_bit(name: &str) -> u8 {
         .unwrap_or(0)
 }
 
-/// 位域 → 规范序修饰键显示名（TS modifierNames，首字母大写）
+/// 位域 → 规范序修饰键显示名（首字母大写）
 pub fn modifier_names(modifiers: u8) -> Vec<&'static str> {
     MODIFIER_BITS
         .iter()
@@ -389,7 +376,7 @@ pub fn modifier_names(modifiers: u8) -> Vec<&'static str> {
         .collect()
 }
 
-/// 命名键表（SPEC §4.2 SPECIAL_KEYMAP 全表）。text = 该键产生的字符（仅
+/// 命名键表全表。text = 该键产生的字符（仅
 /// Enter/Tab/Space）；vk = windowsVirtualKeyCode——读取 e.keyCode 的旧页面依赖它。
 /// 小写名匹配（'ENTER'/'pageUp' → 规范名）。
 fn named_key(lower: &str) -> Option<(&'static str, &'static str, Option<&'static str>, u16)> {
@@ -425,7 +412,7 @@ fn named_key(lower: &str) -> Option<(&'static str, &'static str, Option<&'static
 }
 
 /// 单字符 → (key, code, text, vk)。标点无标准 code/vk——浏览器从 text 合成
-/// （TS singleCharDescriptor；vk 按 TS：小写取大写码、其余取自身码、标点无）。
+/// （vk：小写取大写码、其余取自身码、标点无）。
 fn single_char_descriptor(ch: char) -> (String, String, Option<String>, Option<u16>) {
     match ch {
         'a'..='z' => (
@@ -455,7 +442,7 @@ fn single_char_descriptor(ch: char) -> (String, String, Option<String>, Option<u
 /// （同上）；`text` None = 不产生字符的键（Escape 等，无 char 事件）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyPress {
-    /// Space 的 key 字面是 " "（TS 同）
+    /// Space 的 key 字面是 " "
     pub key: String,
     pub code: String,
     pub text: Option<String>,
@@ -464,7 +451,7 @@ pub struct KeyPress {
 }
 
 impl KeyPress {
-    /// 显示名（TS displayKey）：规范序修饰键 + 主键，' ' 显示为 Space。
+    /// 显示名：规范序修饰键 + 主键，' ' 显示为 Space。
     pub fn display(&self) -> String {
         let mut parts: Vec<String> = modifier_names(self.modifiers)
             .into_iter()
@@ -478,7 +465,7 @@ impl KeyPress {
         parts.join("+")
     }
 
-    /// rawKeyDown →（可选 char）→ keyUp 三段序列（SPEC §4.2 已验证序列，绝不发
+    /// rawKeyDown →（可选 char）→ keyUp 三段序列（绝不发
     /// 裸 keyDown：char 单独发且不带 vk，文本插入显式且可抑制）。
     /// 文本抑制：ctrl/meta/alt 组合不发 char（Ctrl+A 不能打出 "a"）；shift 不抑制。
     pub fn dispatch_sequence(&self) -> Vec<KeyDispatch> {
@@ -509,7 +496,8 @@ impl KeyPress {
     }
 }
 
-/// Input.dispatchKeyEvent 的参数形态（序列化后字段集与 TS 逐字段一致）
+/// Input.dispatchKeyEvent 的参数形态（char 不带 vk、其余不带 text，
+/// 空 code 整体省略——字段有无即语义）
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyDispatch {
@@ -524,8 +512,8 @@ pub struct KeyDispatch {
     pub modifiers: u8,
 }
 
-/// '<key>' | 'Mod+Mod+Key' → [`KeyPress`]（TS keyDescriptor，SPEC parseKeySpec）。
-/// 解析规则逐字对齐 TS：按 '+' 切分、trim、丢空 token；≤1 个剩余 token 时整个
+/// '<key>' | 'Mod+Mod+Key' → [`KeyPress`]。
+/// 解析规则：按 '+' 切分、trim、丢空 token；≤1 个剩余 token 时整个
 /// 串（trim 后）作主键（"+"/" +" 即主键 '+'）；多 token 时首个非修饰 token 作主键，
 /// 全修饰输入取最后一个 token（随后必败于命名键查找——裸按修饰键不支持）。
 /// 主键为单字符（UTF-16 单元，与 JS length===1 一致）或命名键（大小写不敏感）。
@@ -576,7 +564,7 @@ pub fn parse_key(spec: &str) -> Result<KeyPress, PageControlError> {
 }
 
 // ============================================================================
-// 5. wait 系统（TS lib/tools/wait.mjs + tests/wait.test.mjs）
+// 5. wait 系统
 // ============================================================================
 
 /// --state 白名单（顺序即报错文案顺序：visible|hidden|attached|detached）
@@ -642,9 +630,9 @@ impl ObservedState {
     }
 }
 
-/// 观测是否满足期望（TS satisfied()）。hidden = 已挂载但不可见（detached ≠
-/// hidden）；attached 接受任何**非** detached 观测——TS 逐字是
-/// `observed !== 'detached'`，故 Unknown 也满足 attached（原样保留）。
+/// 观测是否满足期望。hidden = 已挂载但不可见（detached ≠
+/// hidden）；attached 接受任何**非** detached 观测（判定即
+/// `observed !== 'detached'`），故 Unknown 也满足 attached。
 pub fn observed_matches_state(observed: ObservedState, wanted: WaitState) -> bool {
     match wanted {
         WaitState::Visible => observed == ObservedState::Visible,
@@ -656,8 +644,8 @@ pub fn observed_matches_state(observed: ObservedState, wanted: WaitState) -> boo
 
 /// '10s' | '250ms' | '500' → Duration（裸数字 = 毫秒；小数允许）。
 /// 非法输入报 400，文案带 flag 名（`--timeout: invalid duration "abc" — …`）。
-/// TS 对天文数字不做上限；Duration 装不下时（try_from_secs_f64 Err）按非法处理
-/// ——与 TS 的差异仅出现在荒谬量级（>Duration 上限），换来不 panic。
+/// 荒谬量级（>Duration 上限，try_from_secs_f64 Err）按非法处理——只影响
+/// 天文数字输入，换来不 panic。
 pub fn parse_duration(input: &str, what: &str) -> Result<Duration, AppError> {
     let invalid = || {
         AppError::invalid_request(format!(
@@ -727,7 +715,7 @@ pub fn validate_http_url(url: &str) -> Result<(), AppError> {
 // 5c. hover 规则扫描（snap hover 感知，domain 纯函数）
 // ============================================================================
 
-/// hover 扫描预算（任务书口径）：样式表数 / 单表字节 / 提取规则数。任一
+/// hover 扫描预算：样式表数 / 单表字节 / 提取规则数。任一
 /// 超限即停止采集并把 truncated 置位（诚实证据：宁可不完整不静默）。
 pub const MAX_HOVER_SHEETS: usize = 32;
 pub const MAX_HOVER_SHEET_BYTES: usize = 2 * 1024 * 1024;
@@ -1124,17 +1112,17 @@ fn strip_pseudo_element(seg: &str) -> String {
 }
 
 // ============================================================================
-// 6. eval 表达式生成器（TS 内嵌 JS → Rust 字符串生成，语义逐字移植）
+// 6. eval 表达式生成器（内嵌 JS 由本层生成字符串）
 // ============================================================================
 
 /// JSON.stringify 等价（含两侧引号）。所有生成器用它转义 selector 等用户输入，
-/// 转义结果是一个完整 JSON 字符串字面量，页内求值无注入面（TS 同规则）。
+/// 转义结果是一个完整 JSON 字符串字面量，页内求值无注入面。
 pub fn json_escape(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-/// 定位 + 滚动居中 + 可见性检查 + 中心点计算，一个 eval 内原子完成
-/// （TS click-native.mjs locateExpr）。四重可见性检查：display:none、
+/// 定位 + 滚动居中 + 可见性检查 + 中心点计算，一个 eval 内原子完成。
+/// 四重可见性检查：display:none、
 /// visibility:hidden、空 rect、无 offsetParent（fixed/sticky 豁免——它们
 /// offsetParent 为 null 但完全可见）。
 pub fn locate_expr(selector: &str) -> String {
@@ -1160,8 +1148,8 @@ pub fn locate_expr(selector: &str) -> String {
     TEMPLATE.replace("__SEL__", &json_escape(selector))
 }
 
-/// hitTestWalk 源码（TS 同名导出函数的 toString() 形态）：从命中元素沿
-/// parentNode 与 shadow-DOM host 边界上行（§2.5.B），目标自身或其后代算命中。
+/// hitTestWalk：从命中元素沿 parentNode 与 shadow-DOM host 边界上行，
+/// 目标自身或其后代算命中。
 const HIT_TEST_WALK: &str = r#"function hitTestWalk(hit, target) {
   for (let n = hit; n; ) {
     if (n === target || target.contains(n)) return true;
@@ -1171,9 +1159,9 @@ const HIT_TEST_WALK: &str = r#"function hitTestWalk(hit, target) {
   return false;
 }"#;
 
-/// 点击点命中测试：elementFromPoint + 祖先链/shadow 穿透（TS hitTestExpr）。
+/// 点击点命中测试：elementFromPoint + 祖先链/shadow 穿透。
 /// 每次 eval 之间无对象同一性，故重新按 selector 查目标。`x`/`y` 必须是有限数
-/// （调用方先行 classifyLocate 校验，与 TS 同契约）。
+/// （调用方先行 locate 校验，同一契约）。
 pub fn hit_test_expr(selector: &str, x: f64, y: f64) -> String {
     const TEMPLATE: &str = r#"(function() {
   const target = document.querySelector(__SEL__);
@@ -1190,7 +1178,7 @@ pub fn hit_test_expr(selector: &str, x: f64, y: f64) -> String {
         .replace("__WALK__", HIT_TEST_WALK)
 }
 
-/// fill 可填性检查脚本（TS fill.mjs 的 checkFn + fillEditable 内联）。
+/// fill 可填性检查脚本（checkFn + fillEditable 内联）。
 /// 以 `this` = 目标元素运行（Runtime.callFunctionOn on objectId）：
 /// 白名单 text 型 input / textarea / contenteditable **编辑器根**；
 /// readonly/disabled 拒绝；编辑宿内的后代拒绝（要填根）。
@@ -1233,7 +1221,7 @@ pub fn fill_fillable_check_expr() -> String {
     TEMPLATE.to_string()
 }
 
-/// wait 单次观测脚本：detached / visible / hidden 三态判定（TS wait.mjs waitExpr）。
+/// wait 单次观测脚本：detached / visible / hidden 三态判定。
 /// 可见性语义与 locate_expr 的检查同源：非零 rect 且非 display:none /
 /// visibility:hidden（display:none 祖先也会把 rect 归零，查元素自身即够）。
 pub fn wait_observe_expr(selector: &str) -> String {
@@ -1250,7 +1238,7 @@ pub fn wait_observe_expr(selector: &str) -> String {
 }
 
 // ============================================================================
-// 6b. 表格结构化提取——DOM 事实收集脚本（W-ext 两段式的收集段）
+// 6b. 表格结构化提取——DOM 事实收集脚本（两段式的收集段）
 // ============================================================================
 
 /// 收集器主体：`function(t)`，t = 表格元素或 null（null = 主文档最大表格
@@ -1422,14 +1410,14 @@ pub fn extract_call_on_fn() -> String {
 }
 
 // ============================================================================
-// 7. 对话框模型（TS lib/dialogs.mjs + tests/dialogs.test.mjs，BEHAVIOR-SPEC §1）
+// 7. 对话框模型
 // ============================================================================
 
 const MAX_FIELD_LEN: usize = 4096;
-/// 缓冲上限（§1.5：32 条 FIFO，丢最旧、无丢失标记——比游标老的 cursor 只见幸存者）
+/// 缓冲上限：32 条 FIFO，丢最旧、无丢失标记——比游标老的 cursor 只见幸存者
 pub const MAX_DIALOG_BUFFER: usize = 32;
 
-/// Page.javascriptDialogOpening 参数的防御解析结果（§1.3：类型错误降级，不抛）
+/// Page.javascriptDialogOpening 参数的防御解析结果（类型错误降级，不抛）
 #[derive(Debug, Clone, PartialEq)]
 pub struct DialogInfo {
     /// alert | confirm | prompt | beforeunload（未知/缺失 → alert）
@@ -1442,7 +1430,7 @@ pub struct DialogInfo {
 }
 
 /// stringField：非字符串 → None（undefined）；超 4096 → 截断加标记。
-/// 按 chars 截断（TS 按 UTF-16 单元；对有效 str 语义一致，多字节安全）。
+/// 按 chars 截断（与按 UTF-16 单元截断语义一致，多字节安全）。
 fn string_field(value: Option<&Value>) -> Option<String> {
     let s = value.and_then(Value::as_str)?;
     if s.chars().count() > MAX_FIELD_LEN {
@@ -1452,7 +1440,7 @@ fn string_field(value: Option<&Value>) -> Option<String> {
     }
 }
 
-/// §1.3 防御解析：类型校验降级不抛错。beforeunload 在部分 Chrome 上
+/// 防御解析：类型校验降级不抛错。beforeunload 在部分 Chrome 上
 /// message:false ——"仅字符串"规则把它变成 ""（不得进缓冲变成 "false"）。
 pub fn parse_dialog_opening(params: &Value) -> DialogInfo {
     let ty = params
@@ -1472,13 +1460,13 @@ pub fn parse_dialog_opening(params: &Value) -> DialogInfo {
     }
 }
 
-/// 缓冲条目（wire 形态：蛇形字段与 TS 完全一致，可缺省字段省略）
+/// 缓冲条目（wire 形态：蛇形字段，可缺省字段省略）
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DialogEntry {
     pub tab_id: String,
     pub r#type: String,
     pub message: String,
-    /// 固定 "accepted"（本 CLI 无合作模式，§1.4 无条件 accept）
+    /// 固定 "accepted"（本 CLI 无合作模式，无条件 accept）
     pub handled: &'static str,
     pub sequence: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1489,10 +1477,10 @@ pub struct DialogEntry {
     pub has_browser_handler: Option<bool>,
 }
 
-/// per-tab 对话框缓冲（TS DialogTracker）。**协议**：`record` 只允许在
-/// Page.handleJavaScriptDialog **成功后**调用（§1.5）——sequence 只随成功前移，
+/// per-tab 对话框缓冲。**协议**：`record` 只允许在
+/// Page.handleJavaScriptDialog **成功后**调用——sequence 只随成功前移，
 /// 失败路径不得调用本方法，对话框保持打开、CDP 命令继续阻塞直至各自超时
-/// （与上游一致）。游标语义见 [`DialogBuffer::since`]（§1.6）。
+/// （与上游一致）。游标语义见 [`DialogBuffer::since`]。
 pub struct DialogBuffer {
     tab_id: String,
     entries: VecDeque<DialogEntry>,
@@ -1512,7 +1500,7 @@ impl DialogBuffer {
         }
     }
 
-    /// 当前游标（命令入口打标用，§1.6）
+    /// 当前游标（命令入口打标用）
     pub fn cursor(&self) -> u64 {
         self.sequence
     }
@@ -1543,7 +1531,7 @@ impl DialogBuffer {
         self.dropped
     }
 
-    /// sequence 严格大于 cursor 的条目（§1.6）。游标早于缓冲起点时只见幸存者；
+    /// sequence 严格大于 cursor 的条目。游标早于缓冲起点时只见幸存者；
     /// 被逐出的总数由 meta.dropped 累计透出，逐出与查询间的关系可由
     /// entries[0].sequence 与 cursor 的差值推断。
     pub fn since(&self, cursor: u64) -> Vec<&DialogEntry> {
@@ -1562,7 +1550,7 @@ impl DialogBuffer {
     }
 }
 
-/// Page.handleJavaScriptDialog 应答参数（§1.4 无条件 accept；beforeunload 的
+/// Page.handleJavaScriptDialog 应答参数（无条件 accept；beforeunload 的
 /// accept 即"允许离开"）。prompt 必带 promptText = defaultPrompt ?? ""。
 pub fn dialog_accept_params(info: &DialogInfo) -> Value {
     if info.r#type == "prompt" {
@@ -1573,7 +1561,8 @@ pub fn dialog_accept_params(info: &DialogInfo) -> Value {
 }
 
 // ============================================================================
-// 测试：Phase 1 TS 用例全量移植（每条标注来源文件与用例名）
+// 测试：错误码映射、键系统、wait 状态机、表达式生成器、hover 扫描与
+// 对话框模型的全量单测
 // ============================================================================
 
 #[cfg(test)]
@@ -1753,7 +1742,6 @@ mod tests {
         assert!(!r.truncated);
     }
 
-    /// TS "normalizeRef strips exactly one leading @, keeps case"
     #[test]
     fn normalize_ref_strips_exactly_one_leading_at_and_keeps_case() {
         assert_eq!(normalize_ref("@e3"), "e3");
@@ -1763,7 +1751,7 @@ mod tests {
         assert_eq!(normalize_ref("E3"), "E3");
     }
 
-    // ---------------- 元素截图几何（selector 路径 clip 用，I2 再评估）----------    // ---------------- 错误码表 ------------------------------------------------
+    // ---------------- 元素截图几何（selector 路径 clip 用）----------    // ---------------- 错误码表 ------------------------------------------------
 
     /// quads_bbox 取全部 quad 的并集（与点击取最大 quad 的差异是刻意的）：
     /// 跨行 inline 元素两个 quad，clip 必须覆盖两行——取最大 quad 会截丢另一行。
@@ -1837,9 +1825,8 @@ mod tests {
         assert_eq!(rounded_clip(&exact), exact);
     }
 
-    // ---------------- press 键系统（tests/press.test.mjs）--------------------
+    // ---------------- press 键系统 ---------------------------------------------
 
-    /// TS "keyDescriptor: named keys carry key/code/text/vk from the SPEC table"
     #[test]
     fn named_keys_carry_key_code_text_vk() {
         assert_eq!(
@@ -1863,7 +1850,6 @@ mod tests {
         assert_eq!(parse_key("ArrowDown").unwrap().vk, Some(40));
     }
 
-    /// TS "keyDescriptor: named-key lookup is case-insensitive"
     #[test]
     fn named_key_lookup_is_case_insensitive() {
         assert_eq!(parse_key("enter").unwrap().key, "Enter");
@@ -1871,7 +1857,6 @@ mod tests {
         assert_eq!(parse_key("Escape").unwrap().key, "Escape");
     }
 
-    /// TS "keyDescriptor: single characters map to Key*/Digit* codes with text"
     #[test]
     fn single_chars_map_to_key_digit_codes() {
         assert_eq!(
@@ -1899,7 +1884,7 @@ mod tests {
         assert_eq!(seven.vk, Some(55));
     }
 
-    /// TS 同上（标点部分）：无标准 code——text 承载字符；裸 '+' 仍是单键
+    /// 标点：无标准 code——text 承载字符；裸 '+' 仍是单键
     #[test]
     fn punctuation_carries_text_without_code_or_vk() {
         let comma = parse_key(",").unwrap();
@@ -1910,7 +1895,6 @@ mod tests {
         assert_eq!(parse_key("+").unwrap().text, Some("+".into()));
     }
 
-    /// TS "keyDescriptor: modifier combos set the bit field (alt=1 ctrl=2 meta=4 shift=8)"
     #[test]
     fn modifier_combos_set_bitfield() {
         assert_eq!(parse_key("Control+A").unwrap().modifiers, MOD_CTRL);
@@ -1921,7 +1905,7 @@ mod tests {
         assert_eq!(alt_f4.key, "F4");
     }
 
-    /// TS 同上（别名部分）：折叠到规范名、重复塌缩、规范序输出
+    /// 别名：折叠到规范名、重复塌缩、规范序输出
     #[test]
     fn modifier_aliases_fold_canonically_and_duplicates_collapse() {
         assert_eq!(
@@ -1950,7 +1934,6 @@ mod tests {
         assert_eq!(modifier_names(all), vec!["Alt", "Ctrl", "Meta", "Shift"]);
     }
 
-    /// TS "keyDescriptor: unknown keys → key_unknown with the supported-key hint"
     #[test]
     fn unknown_keys_reject_with_hint() {
         for bad in ["Foo", "Control", "Control+Shift", "A+B", ""] {
@@ -1968,7 +1951,7 @@ mod tests {
         }
     }
 
-    /// dispatch 序列的 JSON 形态（= TS pressStr 里 FakeCdp.callsOf 断言的参数）
+    /// dispatch 序列的 JSON 形态
     fn dispatch_json(kp: &KeyPress) -> Vec<Value> {
         kp.dispatch_sequence()
             .iter()
@@ -1976,7 +1959,6 @@ mod tests {
             .collect()
     }
 
-    /// TS "pressStr: Enter = rawKeyDown(vk) → char(text, no vk) → keyUp(vk)"
     #[test]
     fn dispatch_enter_is_rawkeydown_char_keyup() {
         let events = dispatch_json(&parse_key("Enter").unwrap());
@@ -1984,7 +1966,7 @@ mod tests {
             events[0],
             json!({ "type": "rawKeyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "modifiers": 0 })
         );
-        // char 事件带 text、按 SPEC 不带 vk
+        // char 事件带 text、不带 vk
         assert_eq!(
             events[1],
             json!({ "type": "char", "key": "Enter", "code": "Enter", "text": "\r", "modifiers": 0 })
@@ -1995,7 +1977,6 @@ mod tests {
         );
     }
 
-    /// TS "pressStr: keys without text (Escape) skip the char event"
     #[test]
     fn dispatch_keys_without_text_skip_char() {
         let events = dispatch_json(&parse_key("Escape").unwrap());
@@ -2004,7 +1985,6 @@ mod tests {
         assert_eq!(events[1]["type"], "keyUp");
     }
 
-    /// TS "pressStr: ctrl/meta/alt suppress the char; shift does not"
     #[test]
     fn dispatch_ctrl_meta_alt_suppress_char_but_shift_does_not() {
         let ctrl = dispatch_json(&parse_key("Control+A").unwrap());
@@ -2023,7 +2003,7 @@ mod tests {
         );
     }
 
-    /// TS singleCharDescriptor 的 dispatch 形态：标点无 code/vk——字段整体省略
+    /// 标点的 dispatch 形态：无 code/vk——字段整体省略
     #[test]
     fn dispatch_punctuation_omits_code_and_vk_fields() {
         let events = dispatch_json(&parse_key(",").unwrap());
@@ -2041,7 +2021,7 @@ mod tests {
         );
     }
 
-    /// TS displayKey：规范序修饰键 + 主键，' ' 显示为 Space
+    /// 显示名：规范序修饰键 + 主键，' ' 显示为 Space
     #[test]
     fn display_uses_canonical_order_and_space_label() {
         assert_eq!(parse_key("Enter").unwrap().display(), "Enter");
@@ -2054,9 +2034,8 @@ mod tests {
         );
     }
 
-    // ---------------- wait 系统（tests/wait.test.mjs）------------------------
+    // ---------------- wait 系统 -------------------------------------------------
 
-    /// TS "parseDuration: bare numbers are ms; units ms/s/m scale; decimals ok"
     #[test]
     fn parse_duration_units_decimals_and_whitespace() {
         assert_eq!(
@@ -2085,7 +2064,6 @@ mod tests {
         );
     }
 
-    /// TS "parseDuration: garbage and negatives throw with the flag name"
     #[test]
     fn parse_duration_rejects_garbage_and_negatives_with_flag_name() {
         for bad in ["abc", "-5", "10x", "", "s", "NaN", "1.", ".5", "1.5.5"] {
@@ -2097,7 +2075,6 @@ mod tests {
         }
     }
 
-    /// TS "waitExpr observes attachment and the locateExpr visibility semantics"
     #[test]
     fn wait_observe_expr_embeds_selector_and_visibility_semantics() {
         let expr = wait_observe_expr(".x");
@@ -2108,8 +2085,8 @@ mod tests {
         assert!(expr.contains("detached"));
     }
 
-    /// TS satisfied()（waitStr 各状态用例的判定核心）：
-    /// visible 只认可见；detached 只认缺席；attached 认一切已挂载；hidden 认挂载但不可见
+    /// 状态判定矩阵：visible 只认可见；detached 只认缺席；attached 认一切已挂载；
+    /// hidden 认挂载但不可见
     #[test]
     fn observed_matches_state_matrix() {
         use ObservedState as O;
@@ -2132,8 +2109,8 @@ mod tests {
         assert!(!observed_matches_state(O::Detached, W::Hidden));
     }
 
-    /// TS satisfied 的 unknown 边界：eval 返回垃圾 → unknown；对 attached 依然满足
-    /// （TS 逐字 `observed !== 'detached'`，原样保留）
+    /// unknown 边界：eval 返回垃圾 → unknown；对 attached 依然满足
+    /// （判定即 `observed !== 'detached'`）
     #[test]
     fn observed_unknown_satisfies_only_attached() {
         use ObservedState as O;
@@ -2146,7 +2123,7 @@ mod tests {
         assert_eq!(ObservedState::parse("garbage"), O::Unknown);
     }
 
-    /// TS waitStr 校验 "--state must be one of visible|hidden|attached|detached"
+    /// --state 白名单：visible|hidden|attached|detached
     #[test]
     fn wait_state_parse_is_whitelisted() {
         for s in WAIT_STATES {
@@ -2155,7 +2132,7 @@ mod tests {
         assert_eq!(WaitState::parse("bogus"), None);
     }
 
-    // ---------------- 表达式生成器（click-native / fill / 防注入）------------
+    // ---------------- 表达式生成器（locate / hit-test / fill / 防注入）--------
 
     /// json_escape = JSON.stringify 等价（防注入基线：引号/反斜杠/控制字符全转义）
     #[test]
@@ -2167,7 +2144,6 @@ mod tests {
         assert_eq!(json_escape(""), "\"\"");
     }
 
-    /// TS click-native.mjs locateExpr：四重可见性检查 + fixed/sticky 豁免 + 中心点
     #[test]
     fn locate_expr_contains_visibility_checks_and_exemptions() {
         let expr = locate_expr("#submit");
@@ -2182,7 +2158,7 @@ mod tests {
         assert!(expr.contains("rect.left + rect.width / 2"), "视口中心点");
     }
 
-    /// 防注入（TS 用 JSON.stringify，此处等价）：恶意 selector 只能成为转义后的
+    /// 防注入：恶意 selector 只能成为转义后的
     /// 字符串字面量——selector 内引号一律以 \" 形态出现，无裸引号注入面
     #[test]
     fn locate_expr_escapes_hostile_selectors() {
@@ -2195,7 +2171,6 @@ mod tests {
         );
     }
 
-    /// TS hitTestExpr + hitTestWalk 内联：elementFromPoint + 祖先链/shadow 穿透
     #[test]
     fn hit_test_expr_embeds_point_and_walk() {
         let expr = hit_test_expr(".btn", 150.0, 130.5);
@@ -2210,7 +2185,6 @@ mod tests {
         assert!(expr.contains("root.host"));
     }
 
-    /// TS fill.mjs fillEditable + checkFn：白名单/readonly/disabled/编辑器根语义
     #[test]
     fn fill_check_expr_contains_fillability_gate() {
         let expr = fill_fillable_check_expr();
@@ -2229,9 +2203,8 @@ mod tests {
         assert!(expr.contains("kind: check.kind"));
     }
 
-    // ---------------- 对话框（tests/dialogs.test.mjs）------------------------
+    // ---------------- 对话框 ------------------------------------------------------
 
-    /// TS "parse: known types pass through, unknown types normalize to alert"
     #[test]
     fn parse_dialog_known_types_pass_through() {
         for ty in ["alert", "confirm", "prompt", "beforeunload"] {
@@ -2245,7 +2218,6 @@ mod tests {
         assert_eq!(parse_dialog_opening(&json!({})).r#type, "alert");
     }
 
-    /// TS "parse: message keeps strings only (beforeunload boolean false becomes "")"
     #[test]
     fn parse_dialog_message_keeps_strings_only() {
         // 部分 Chrome 对 beforeunload 发 message:false——不得进缓冲变成 "false"
@@ -2263,7 +2235,6 @@ mod tests {
         );
     }
 
-    /// TS "parse: fields longer than 4096 chars are truncated with a marker"
     #[test]
     fn parse_dialog_truncates_long_fields_with_marker() {
         let exact = "a".repeat(4096);
@@ -2285,7 +2256,6 @@ mod tests {
         );
     }
 
-    /// TS "parse: url/defaultPrompt non-strings drop to undefined, hasBrowserHandler keeps booleans only"
     #[test]
     fn parse_dialog_optional_fields_are_type_guarded() {
         let p = parse_dialog_opening(
@@ -2303,7 +2273,6 @@ mod tests {
         assert_eq!(q.has_browser_handler, Some(false));
     }
 
-    /// TS "tracker: record assigns monotonically increasing sequence and builds the wire entry"
     #[test]
     fn dialog_buffer_record_builds_wire_entry_with_sequence() {
         let mut buf = DialogBuffer::new("AAAABBBBCCCCDDDD0000");
@@ -2313,7 +2282,7 @@ mod tests {
         let e2 = buf.record(parse_dialog_opening(
             &json!({ "type": "alert", "message": "hey" }),
         ));
-        // wire 形态与 TS 深比较一致：可缺省字段在 JSON 中省略
+        // wire 形态：可缺省字段在 JSON 中省略
         assert_eq!(
             serde_json::to_value(&e1).unwrap(),
             json!({
@@ -2331,7 +2300,7 @@ mod tests {
         assert_eq!(buf.cursor(), 2);
     }
 
-    /// TS "tracker: buffer holds at most 32 entries, FIFO drops the oldest"；
+    /// 缓冲至多 32 条，FIFO 丢最旧；
     /// 逐出不再静默：dropped 累计计数随 dialogs 响应 meta 透出（证据边界契约）
     #[test]
     fn dialog_buffer_fifo_cap_counts_dropped() {
@@ -2360,7 +2329,6 @@ mod tests {
         assert_eq!(buf.since(0)[0].sequence, 11, "游标推断：幸存者起点后移");
     }
 
-    /// TS "tracker: since() is strictly greater-than"
     #[test]
     fn dialog_buffer_since_is_strictly_greater() {
         let mut buf = DialogBuffer::new("T");
@@ -2375,7 +2343,6 @@ mod tests {
         assert_eq!(buf.since(0).len(), 3);
     }
 
-    /// TS "handle: alert/confirm/beforeunload send {accept:true} without promptText"
     #[test]
     fn dialog_accept_params_non_prompt_is_accept_only() {
         for ty in ["alert", "confirm", "beforeunload"] {
@@ -2388,7 +2355,6 @@ mod tests {
         }
     }
 
-    /// TS "handle: prompt sends promptText = defaultPrompt ?? \"\""
     #[test]
     fn dialog_accept_params_prompt_uses_default_prompt_or_empty() {
         let with = parse_dialog_opening(
@@ -2406,8 +2372,8 @@ mod tests {
         );
     }
 
-    /// TS "handle: failed handle … does not advance the cursor"：失败路径不
-    /// 触碰 record（域层协议：record 仅在 handle 成功后调用），游标纹丝不动
+    /// 失败路径不触碰 record（域层协议：record 仅在 handle 成功后调用），
+    /// 游标纹丝不动
     #[test]
     fn dialog_sequence_moves_only_on_successful_record() {
         let mut buf = DialogBuffer::new("T");
@@ -2422,7 +2388,7 @@ mod tests {
 
     // ---------------- 错误码表 ------------------------------------------------
 
-    /// 任务 §1：code/status/effect_state 映射全表 + 消息抽查（文案对齐 TS）
+    /// code/status/effect_state 映射全表 + 消息抽查
     #[test]
     fn page_error_codes_map_to_status_without_effect_state() {
         let cases: Vec<(PageControlError, &str, u16)> = vec![
@@ -2498,7 +2464,7 @@ mod tests {
             assert_eq!(e.status, status);
             assert_eq!(e.effect_state, None, "仅 dispatch_failed 携带 effect_state");
         }
-        // 消息形态抽查：TS 文案逐字保留
+        // 消息形态抽查：文案逐字钉住
         assert!(PageControlError::element_not_visible("#a", "")
             .message
             .contains("unknown reason"));
@@ -2511,7 +2477,7 @@ mod tests {
             .contains("document changed"));
     }
 
-    /// TS click-native.mjs §2.7：press 前失败 effect_state=none，press 后=unknown
+    /// press 前失败 effect_state=none，press 后=unknown
     #[test]
     fn dispatch_failed_carries_effect_state_wording() {
         let post = PageControlError::dispatch_failed("boom", true);

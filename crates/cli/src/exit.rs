@@ -1,11 +1,11 @@
-//! CliError → ExitCode 的唯一映射点（PRD cli.md §18 × 服务端现有错误码，计划 §2.4 全表）。
+//! CliError → ExitCode 的唯一映射点（exit code 契约 × 服务端现有错误码全表）。
 //!
 //! 规矩：服务端新增错误码时必须同步本文件的映射规则，并在
 //! `tests::exit_code_mapping_table` 中补一行断言（与 client.rs 模块注释的同步义务对应）。
 
 use crate::error::CliError;
 
-/// 进程退出码（PRD cli.md §18 冻结的 0–9 契约值，改值即破坏对外契约）。
+/// 进程退出码（冻结的 0–9 契约值，改值即破坏对外契约）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitCode(pub u8);
 
@@ -34,7 +34,7 @@ impl ExitCode {
     pub const TIMEOUT: ExitCode = ExitCode(9);
     /// 未授权（401 UNAUTHORIZED）：远程接入令牌缺失/错误。**隧道与应用均在线**，
     /// 仅凭证问题——与 exit 8（不可达）形成三态诊断。0–9 冻结契约的**追加**项，
-    /// 不改变既有语义（v2 远程接入方案 §8）。
+    /// 不改变既有语义。
     pub const UNAUTHORIZED: ExitCode = ExitCode(10);
 
     pub fn as_u8(self) -> u8 {
@@ -50,14 +50,14 @@ const RUNTIME_ERROR_CODES: &[&str] = &[
     "CDP_PORT_UNAVAILABLE",
     "CDP_CONNECTION_FAILED",
     "HOSTS_FETCH_FAILED",
-    // page 控制族（P2-B/P2-C）：Input 派发失败 / 工具预算超时 / 页内 eval 失败 /
+    // page 控制族：Input 派发失败 / 工具预算超时 / 页内 eval 失败 /
     // CDP 发送失败——均为已知运行时故障，不落入 GENERAL 兜底；导航失败
     //（Page.navigate errorText，net::ERR_*）同为运行时故障
     "PAGE_DISPATCH_FAILED",
     "PAGE_TOOL_TIMEOUT",
     "PAGE_EVAL_FAILED",
     "PAGE_NAV_FAILED",
-    // W-file：下载已开始但终态失败/取消（与 PAGE_DOWNLOAD_TIMEOUT 超时=无
+    // 下载已开始但终态失败/取消（与 PAGE_DOWNLOAD_TIMEOUT 超时=无
     // 终态严格区分；后者 409 走 status 分支 → 5，无需入表）
     "PAGE_DOWNLOAD_FAILED",
     "CDP_COMMAND_FAILED",
@@ -67,7 +67,7 @@ const RUNTIME_ERROR_CODES: &[&str] = &[
 /// （当前服务端无此码；规则先行，服务端加入后 CLI 无需改映射）。
 const ALREADY_EXISTS_SUFFIX: &str = "_ALREADY_EXISTS";
 
-/// CliError → ExitCode 唯一入口。映射规则见计划 §2.4：
+/// CliError → ExitCode 唯一入口。映射规则：
 /// 未知 4xx → 7、未知 5xx → 1 兜底，保证服务端加码时 CLI 不崩、语义不错得离谱。
 pub fn from_cli_error(e: &CliError) -> ExitCode {
     match e {
@@ -250,7 +250,7 @@ mod tests {
                 api(500, "HOSTS_FETCH_FAILED"),
                 ExitCode::RUNTIME,
             ),
-            // —— page 控制族（P2-C）：按 status 归类（404→3 / 409→5 / 400·422→7）——
+            // —— page 控制族：按 status 归类（404→3 / 409→5 / 400·422→7）——
             (
                 "404 PAGE_TAB_NOT_FOUND（tab 路由未命中）",
                 api(404, "PAGE_TAB_NOT_FOUND"),
@@ -326,7 +326,7 @@ mod tests {
                 api(422, "PAGE_EXTRACT_NOT_A_TABLE"),
                 ExitCode::VALIDATION,
             ),
-            // —— W-file：上传校验族（422/404）+ 下载超时/失败 ——
+            // —— 上传校验族（422/404）+ 下载超时/失败 ——
             (
                 "422 PAGE_TARGET_NOT_FILE_INPUT（upload 目标非 file input）",
                 api(422, "PAGE_TARGET_NOT_FILE_INPUT"),
@@ -403,7 +403,7 @@ mod tests {
         }
     }
 
-    /// 0–9 契约值冻结（PRD cli.md §18）：防止无意改动破坏对外承诺。
+    /// 0–9 契约值冻结：防止无意改动破坏对外承诺。
     #[test]
     fn exit_code_values_match_prd() {
         assert_eq!(ExitCode::SUCCESS.as_u8(), 0);

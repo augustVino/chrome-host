@@ -45,7 +45,7 @@ pub struct CdpEndpoint {
     pub web_socket_url: Option<String>,
 }
 
-/// 全量实例视图：Instance 平铺 + environmentName（PRD cli.md §7.2 契约）。
+/// 全量实例视图：Instance 平铺 + environmentName（对外契约）。
 /// 视图结构放服务层（同 CdpEndpoint 先例），api 层只做 Json 包装。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,7 +66,7 @@ pub struct InstanceService {
     activity: Arc<Activity>,
     keep_alive: Arc<KeepAliveWatcher>,
     extensions: Arc<ExtensionService>,
-    /// 常驻诊断（M6）：置 running 后 spawn watcher，不阻塞启动路径
+    /// 常驻诊断：置 running 后 spawn watcher，不阻塞启动路径
     diagnostics: Arc<DiagnosticsService>,
     /// 扩展运行时配置装配（resolve_for_runtime 入参；读失败按空 map 降级）
     extension_configs: Arc<ExtensionConfigRepository>,
@@ -381,7 +381,7 @@ impl InstanceService {
                         stale.display()
                     ),
                 }
-                // 常驻诊断 watcher（M6）：置 running 后 spawn，不阻塞启动返回路径；
+                // 常驻诊断 watcher：置 running 后 spawn，不阻塞启动返回路径；
                 // 只订阅不操作，与外部 agent 的 CDP 会话共存
                 self.diagnostics
                     .spawn(&ins.id, ins.cdp_port.unwrap_or_default());
@@ -512,9 +512,9 @@ impl InstanceService {
         self.start(id).await
     }
 
-    /// 页面诊断查询（M5）：对第一个 http(s) page target 做一次短连接 evaluate，
-    /// 透传页面扩展挂载的 __chromeHostDiagnostics 快照。连接即用即弃（M1 形态，
-    /// 常驻 console/network 订阅是 M6 范围）。
+    /// 页面诊断查询：对第一个 http(s) page target 做一次短连接 evaluate，
+    /// 透传页面扩展挂载的 __chromeHostDiagnostics 快照。连接即用即弃，
+    /// 常驻 console/network 订阅走常驻诊断 watcher。
     /// 409 DIAGNOSTICS_UNAVAILABLE：实例未运行，或无 http(s) 页面目标；
     /// diagnostics: null = 页面未注入（实例启动早于扩展加载，或目标页不运行
     /// content script）。
@@ -987,7 +987,7 @@ mod tests {
         );
     }
 
-    /// InstanceView 序列化契约：flatten 平铺 + environmentName camelCase（PRD cli.md §7.2）
+    /// InstanceView 序列化契约：flatten 平铺 + environmentName camelCase
     #[test]
     fn instance_view_serializes_flat_camel_case() {
         let view = InstanceView {

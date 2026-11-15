@@ -1,11 +1,11 @@
-//! page 控制端点（P2-C + W-cap）：`/api/v1/instances/{id}/page/*`。
+//! page 控制端点：`/api/v1/instances/{id}/page/*`。
 //!
 //! handler 只做参数解包与透传——tab 路由（targetId / 唯一前缀）、错误分类、
-//! 对话框游标、超时预算全部在 [`crate::application::page_service::PageService`]
-//! （P2-B）。响应体为 service 返回原样（与 console/network/screenshot 等
+//! 对话框游标、超时预算全部在 [`crate::application::page_service::PageService`]。
+//! 响应体为 service 返回原样（与 console/network/screenshot 等
 //! 既有端点一致，无额外包裹层）。
 //!
-//! `tab` 缺省语义（service 侧 `resolve_target("")`，P2-F F1）：唯一 page
+//! `tab` 缺省语义（service 侧 `resolve_target("")`）：唯一 page
 //! target 时自动选中；多 target → 409 `PAGE_TAB_AMBIGUOUS`，message 列出全部
 //! targetId 供显式指定（不猜活跃 tab，避免取错页面）。
 
@@ -40,7 +40,7 @@ pub struct SnapBody {
     pub selector: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/click —— 原生输入点击（I2：kit
+/// POST /api/v1/instances/{id}/page/click —— 原生输入点击（kit
 /// interaction 内核；双击/右键经 ClickSpec 透传）。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,7 +54,7 @@ pub struct ClickBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/hover —— 悬停（I2 新命令：mouseMoved）。
+/// POST /api/v1/instances/{id}/page/hover —— 悬停（mouseMoved）。
 #[derive(Deserialize)]
 pub struct HoverBody {
     /// 悬停目标：@eN ref 或 CSS 选择器
@@ -62,7 +62,7 @@ pub struct HoverBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/scroll —— 滚动（I2 新命令：有 target
+/// POST /api/v1/instances/{id}/page/scroll —— 滚动（有 target
 /// 滚元素、无 target 滚页面；dx/dy 单位 CSS 像素，可负）。
 #[derive(Deserialize)]
 pub struct ScrollBody {
@@ -73,7 +73,7 @@ pub struct ScrollBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/drag —— 拖拽（I2 新命令：轨迹插值链，
+/// POST /api/v1/instances/{id}/page/drag —— 拖拽（轨迹插值链，
 /// LCG 弧线 + smoothstep，人类化轨迹）。
 #[derive(Deserialize)]
 pub struct DragBody {
@@ -84,7 +84,7 @@ pub struct DragBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/select —— 下拉选择（I2 新命令：按
+/// POST /api/v1/instances/{id}/page/select —— 下拉选择（按
 /// value 或可见文本匹配；原生 select 与 role=combobox/listbox 控件）。
 #[derive(Deserialize)]
 pub struct SelectBody {
@@ -95,8 +95,8 @@ pub struct SelectBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/check —— 勾选/取消勾选（I2 新命令；
-/// 已处于目标态 = no-op 成功）。复选框/单选钮与关联 label 控件。
+/// POST /api/v1/instances/{id}/page/check —— 勾选/取消勾选
+///（已处于目标态 = no-op 成功）。复选框/单选钮与关联 label 控件。
 #[derive(Deserialize)]
 pub struct CheckBody {
     /// 勾选目标：@eN ref 或 CSS 选择器（input 或关联 label）
@@ -106,8 +106,8 @@ pub struct CheckBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/tap —— 触摸轻点（I2 新命令：
-/// touchStart/touchEnd，移动端仿真页面用 tap 而非 click）。
+/// POST /api/v1/instances/{id}/page/tap —— 触摸轻点
+///（touchStart/touchEnd，移动端仿真页面用 tap 而非 click）。
 #[derive(Deserialize)]
 pub struct TapBody {
     /// 轻点目标：@eN ref 或 CSS 选择器
@@ -154,8 +154,8 @@ pub struct DialogsQuery {
     pub since: Option<u64>,
 }
 
-/// POST /api/v1/instances/{id}/page/eval —— 任意 JS 求值（P2-G）。
-/// ⚠ 高权限：可执行任意 JS（与退役前 cdp.mjs 同权限），仅在 page 原语
+/// POST /api/v1/instances/{id}/page/eval —— 任意 JS 求值。
+/// ⚠ 高权限：可执行任意 JS，仅在 page 原语
 /// 不够用时使用（契约文档已披露）。
 #[derive(Deserialize)]
 pub struct EvalBody {
@@ -163,7 +163,7 @@ pub struct EvalBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/html —— 读 outerHTML（P2-G）。
+/// POST /api/v1/instances/{id}/page/html —— 读 outerHTML。
 #[derive(Deserialize)]
 pub struct HtmlBody {
     /// CSS 选择器；缺省 = 整文档 documentElement.outerHTML。未命中 → 404
@@ -171,7 +171,7 @@ pub struct HtmlBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/clickxy —— 视口坐标点击（P2-G）。
+/// POST /api/v1/instances/{id}/page/clickxy —— 视口坐标点击。
 #[derive(Deserialize)]
 pub struct ClickxyBody {
     /// 视口 CSS 像素横/纵坐标（无 locate/hit-test，坐标即意图）
@@ -180,7 +180,7 @@ pub struct ClickxyBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/loadall —— 循环点击直到选择器消失（P2-G）。
+/// POST /api/v1/instances/{id}/page/loadall —— 循环点击直到选择器消失。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadallBody {
@@ -192,7 +192,7 @@ pub struct LoadallBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/type —— 向当前焦点元素输入文本（P2-G）。
+/// POST /api/v1/instances/{id}/page/type —— 向当前焦点元素输入文本。
 /// 跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达跨域 frame）。
 #[derive(Deserialize)]
 pub struct TypeBody {
@@ -227,23 +227,23 @@ pub struct ReloadBody {
 }
 
 /// POST /api/v1/instances/{id}/page/screenshot —— 元素/视口/全页 png 截图
-/// （W-cap；full 形态 W-shot）。
+/// （full 形态即全页截图）。
 #[derive(Deserialize)]
 pub struct ScreenshotBody {
     /// 截图目标：@eN ref（上次 snap 产生）或 CSS 选择器；缺省 = 当前视口整幅。
-    /// 元素路径（I3 起 = kit screenshot.rs）：不滚动页面，clip 文档坐标 +
+    /// 元素路径（kit screenshot.rs）：不滚动页面，clip 文档坐标 +
     /// captureBeyondViewport（可截屏外元素）
     pub target: Option<String>,
     /// true = 全页截图：截发起时刻的整文档（clip 全文档 + captureBeyondViewport，
     /// 不滚动页面）；与 target 互斥（同给 → 400）。单边超限截断并标 truncated
     /// （上限 = 16384 设备像素 ÷ DPR，Retina DPR2 = 8192 CSS px）；响应带
     /// width/height/documentWidth/documentHeight（尺寸源 = getLayoutMetrics
-    /// cssContentSize，I3 起与 kit clip 同源）。
+    /// cssContentSize，与 kit clip 同源）。
     pub full: Option<bool>,
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/pdf —— 整页 PDF（W-cap）。
+/// POST /api/v1/instances/{id}/page/pdf —— 整页 PDF。
 /// 蛇形纸张参数（paperWidth/paperHeight 英寸），缺省 Letter 8.5×11。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -268,7 +268,7 @@ pub struct ViewportBody {
     pub height: i64,
 }
 
-/// POST /api/v1/instances/{id}/page/emulate —— 设备仿真（W-cap）。
+/// POST /api/v1/instances/{id}/page/emulate —— 设备仿真。
 /// 三形态互斥：preset（预设名，未知 → 422 PAGE_EMULATE_UNKNOWN_PRESET）/
 /// viewport+可选 userAgent/mobile/touch / off=true 清除。仿真只作用于
 /// 指定 tab 的 page session（与实例级无关）；重复 emulate = 覆盖。
@@ -287,8 +287,8 @@ pub struct EmulateBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/download-wait —— 等待下一次下载完成
-///（W-file）。命令式等待：先调本端点再触发点击。
+/// POST /api/v1/instances/{id}/page/download-wait —— 等待下一次下载完成。
+/// 命令式等待：先调本端点再触发点击。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadWaitBody {
@@ -297,13 +297,13 @@ pub struct DownloadWaitBody {
     pub tab: Option<String>,
 }
 
-/// GET /api/v1/instances/{id}/page/downloads —— 下载终态记录环查询（W-file）。
+/// GET /api/v1/instances/{id}/page/downloads —— 下载终态记录环查询。
 #[derive(Deserialize)]
 pub struct DownloadsQuery {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/upload —— 主机文件设入 file input（W-file）。
+/// POST /api/v1/instances/{id}/page/upload —— 主机文件设入 file input。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadBody {
@@ -314,7 +314,7 @@ pub struct UploadBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/diff —— 快照文本 diff（I3）：当前
+/// POST /api/v1/instances/{id}/page/diff —— 快照文本 diff：当前
 /// snap ↔ 基线的行级 unified diff。无 baseline = 与 per-tab 滚动基线
 ///（上次无显式 baseline 的 diff 快照）比较并更新之；有 baseline = 显式
 /// 基线文本，只比较不更新。
@@ -333,7 +333,7 @@ pub struct DiffBody {
     pub baseline: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/diff-shot —— 像素 diff（I3）：base64
+/// POST /api/v1/instances/{id}/page/diff-shot —— 像素 diff：base64
 /// png 基线 ↔ 服务端当前截图 → kit 像素 diff。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -346,7 +346,7 @@ pub struct DiffShotBody {
     pub baseline: String,
 }
 
-/// POST /api/v1/instances/{id}/page/profiler/start —— 启动性能采样（I3）。
+/// POST /api/v1/instances/{id}/page/profiler/start —— 启动性能采样。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfilerStartBody {
@@ -355,7 +355,7 @@ pub struct ProfilerStartBody {
     pub categories: Option<Vec<String>>,
 }
 
-/// POST /api/v1/instances/{id}/page/profiler/stop —— 停止采样并落盘（I3）。
+/// POST /api/v1/instances/{id}/page/profiler/stop —— 停止采样并落盘。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfilerStopBody {
@@ -363,7 +363,7 @@ pub struct ProfilerStopBody {
     pub out: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/record/start —— 启动页录屏（I4）。
+/// POST /api/v1/instances/{id}/page/record/start —— 启动页录屏。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordStartBody {
@@ -377,7 +377,7 @@ pub struct RecordStartBody {
     pub tab: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/record/stop —— 停止录屏并结算产物（I4）。
+/// POST /api/v1/instances/{id}/page/record/stop —— 停止录屏并结算产物。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordStopBody {
@@ -594,9 +594,9 @@ pub async fn eval(
     Ok(Json(resp))
 }
 
-/// POST /api/v1/instances/{id}/page/raw —— 任意 CDP 命令透传（D5 逃生舱）。
+/// POST /api/v1/instances/{id}/page/raw —— 任意 CDP 命令透传（逃生舱）。
 /// ⚠ 最高权限：可发任意 CDP 命令（含 Input/Emulation 等域），仅排查未覆盖
-/// 场景时使用；与退役前 cdp.mjs evalraw 同权限。
+/// 场景时使用。
 #[derive(Deserialize)]
 pub struct RawBody {
     /// CDP 方法名（如 "Emulation.setDeviceMetricsOverride"）
@@ -794,7 +794,7 @@ pub async fn pdf(
     Ok(Json(resp))
 }
 
-/// POST /api/v1/instances/{id}/page/diff —— 快照文本 diff（I3）。
+/// POST /api/v1/instances/{id}/page/diff —— 快照文本 diff。
 pub async fn diff(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -819,7 +819,7 @@ pub async fn diff(
     Ok(Json(resp))
 }
 
-/// POST /api/v1/instances/{id}/page/diff-shot —— 像素 diff（I3）。
+/// POST /api/v1/instances/{id}/page/diff-shot —— 像素 diff。
 pub async fn diff_shot(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -837,7 +837,7 @@ pub async fn diff_shot(
     Ok(Json(resp))
 }
 
-/// POST /api/v1/instances/{id}/page/profiler/start —— 启动性能采样（I3）。
+/// POST /api/v1/instances/{id}/page/profiler/start —— 启动性能采样。
 pub async fn profiler_start(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -850,7 +850,7 @@ pub async fn profiler_start(
     Ok(Json(resp))
 }
 
-/// POST /api/v1/instances/{id}/page/profiler/stop —— 停止采样并落盘（I3）。
+/// POST /api/v1/instances/{id}/page/profiler/stop —— 停止采样并落盘。
 pub async fn profiler_stop(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -860,7 +860,7 @@ pub async fn profiler_stop(
     Ok(Json(resp))
 }
 
-/// POST /api/v1/instances/{id}/page/record/start —— 启动页录屏（I4）。
+/// POST /api/v1/instances/{id}/page/record/start —— 启动页录屏。
 pub async fn record_start(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -879,7 +879,7 @@ pub async fn record_start(
     Ok(Json(resp))
 }
 
-/// POST /api/v1/instances/{id}/page/record/stop —— 停止录屏并结算产物（I4）。
+/// POST /api/v1/instances/{id}/page/record/stop —— 停止录屏并结算产物。
 pub async fn record_stop(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -909,7 +909,7 @@ pub async fn reload(
     Ok(Json(resp))
 }
 
-/// POST /api/v1/instances/{id}/page/extract —— 表格结构化提取（W-ext）。
+/// POST /api/v1/instances/{id}/page/extract —— 表格结构化提取。
 #[derive(Deserialize)]
 pub struct ExtractBody {
     /// 表格目标：@eN 引用或 CSS 选择器；缺省 = 主文档内最大表格自动发现。

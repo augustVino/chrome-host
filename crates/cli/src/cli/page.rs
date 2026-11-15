@@ -1,13 +1,10 @@
-//! page 命令组 —— 页面控制（P2-C/P2-G + 导航族）：snap / click / fill /
-//! press / wait / dialogs / eval / html / clickxy / loadall / type /
-//! navigate / back / forward / reload。
-//! page 命令组 —— 页面控制（P2-C/P2-G/W-cap）：snap / click / fill / press /
-//! wait / dialogs / eval / html / clickxy / loadall / type / screenshot / pdf /
-//! emulate。
+//! page 命令组 —— 页面控制：snap / click / fill / press / wait / dialogs /
+//! eval / html / clickxy / loadall / type / navigate / back / forward /
+//! reload / screenshot / pdf / emulate。
 //!
-//! 行为语义全部在服务层 page_service（P2-B）：本组只做参数透传 + 渲染。
+//! 行为语义全部在服务层 page_service：本组只做参数透传 + 渲染。
 //! 核心循环（对齐 SKILL.md 教学）：`snap` 拿 @eN 引用 → `click`/`fill`/
-//! `press --target` 用引用操作 → 页面变化后重新 `snap`。I1b 起引用是
+//! `press --target` 用引用操作 → 页面变化后重新 `snap`。引用是
 //! durable 的：SPA 同文档更新后旧 @eN 仍可用；收到 PAGE_REF_STALE 时重
 //! snap（而非对旧引用重试）。
 //!
@@ -16,20 +13,20 @@
 //! - click/fill/press/wait/eval/clickxy/loadall/type：一行 `result`（服务端
 //!   人性化结果串，如 `Clicked <BUTTON> "Save" (native input @150,130)`）；
 //!   命令期间自动应答了对话框时追加一行提示（dialogs_seen）；
-//! - html：主产物在 `html` 字段（可能很大），text/quiet 原样到 stdout（与
-//!   cdp.mjs 一致，不加元信息——dialogs_seen 只在 --json 里可见）；
+//! - html：主产物在 `html` 字段（可能很大），text/quiet 原样到 stdout
+//!   （不加元信息——dialogs_seen 只在 --json 里可见）；
 //! - dialogs：SEQ TYPE MESSAGE 表 + cursor 行（增量拉取的 --since 值）；
 //! - screenshot/pdf：解码 base64 落盘（--out，缺省 <实例id>.png/.pdf；
 //!   screenshot --full 缺省 <实例id>-full.png，文本输出附 size 与截断标注），
 //!   quiet 输出路径（与 instance screenshot/har 同先例）；emulate：一行 result；
-//! - diff（I3）：摘要行（changed + counts）+ unified diff 文本，quiet =
+//! - diff：摘要行（changed + counts）+ unified diff 文本，quiet =
 //!   changed 布尔串；diff-shot：differing/ratio 行 + --out 落差异图，quiet =
 //!   differing；profiler start/stop：result 型（stop 附 path/eventCount，
 //!   quiet = 落盘路径）。
-//! - 三态：`--json` 响应原样透传（P2-F F3 修复：snap 与 result 型命令的
-//!   shell 此前缺 --json 分支，文本树直接打到 stdout，管道侧拿不到合法
-//!   JSON；分流收敛在 [`snap_out`]/[`result_out`] 纯函数）；`--quiet` 输出
-//!   单行主结果（snap = targetId，其余 = result 行），供 `$(...)` 捕获。
+//! - 三态：`--json` 响应原样透传（分流收敛在 [`snap_out`]/[`result_out`]
+//!   纯函数——文本树不得直接打到 stdout，管道侧要拿到合法 JSON）；
+//!   `--quiet` 输出单行主结果（snap = targetId，其余 = result 行），
+//!   供 `$(...)` 捕获。
 
 use clap::Subcommand;
 
@@ -40,7 +37,7 @@ use crate::error::CliError;
 
 /// page 子命令树。tab 参数（targetId 或唯一前缀）缺省 = 唯一页面标签自动
 /// 选中，多标签 → 409 PAGE_TAB_AMBIGUOUS 且 message 列出全部 targetId
-///（P2-F F1；显式前缀仍是无匹配 404 / 多匹配 409）。
+///（显式前缀仍是无匹配 404 / 多匹配 409）。
 #[derive(Debug, Subcommand)]
 pub enum PageCommands {
     /// 可访问性树快照 + @eN 引用（操作循环起点；引用 durable：报
@@ -377,7 +374,7 @@ pub enum PageCommands {
         tab: Option<String>,
     },
 
-    /// 元素/视口 png 截图（W-cap）
+    /// 元素/视口 png 截图
     #[command(
         about = "png 截图：[sel|@eN] 缺省 = 当前视口；--out 写文件（缺省 <实例id>.png），quiet 输出路径"
     )]
@@ -397,7 +394,7 @@ pub enum PageCommands {
         out: Option<String>,
     },
 
-    /// 整页 PDF（W-cap）
+    /// 整页 PDF
     #[command(
         about = "整页 PDF：--out 写文件（缺省 <实例id>.pdf）；--landscape 横向；--no-print-background 去背景；--paper-width/--paper-height 英寸（缺省 Letter 8.5×11）"
     )]
@@ -424,7 +421,7 @@ pub enum PageCommands {
         out: Option<String>,
     },
 
-    /// 快照文本 diff（I3）：当前 snap ↔ 基线的行级 diff
+    /// 快照文本 diff：当前 snap ↔ 基线的行级 diff
     #[command(
         about = "快照 diff：[TAB]（当前 snap ↔ 上次基线；无变化 quiet 输出 false；快照超 2MiB 不入基线标 baselineCleared）"
     )]
@@ -448,7 +445,7 @@ pub enum PageCommands {
         baseline_file: Option<String>,
     },
 
-    /// 像素 diff（I3）：基线 png ↔ 当前截图
+    /// 像素 diff：基线 png ↔ 当前截图
     #[command(
         about = "像素 diff：<--baseline-file PNG>（必填）↔ 当前截图；--full 当前侧全页；--out 写差异图"
     )]
@@ -469,7 +466,7 @@ pub enum PageCommands {
         out: Option<String>,
     },
 
-    /// 启动性能采样（I3；常驻，不占实例串行锁）
+    /// 启动性能采样（常驻，不占实例串行锁）
     #[command(
         about = "启动性能采样：[TAB] [--categories \"a,b\"]（缺省全家桶；重复 start → 409；stop 落盘）"
     )]
@@ -484,7 +481,7 @@ pub enum PageCommands {
         categories: Option<String>,
     },
 
-    /// 停止采样并落盘（I3；按 start 锚点路由，无需 tab）
+    /// 停止采样并落盘（按 start 锚点路由，无需 tab）
     #[command(about = "停止采样并落盘：[--out F]（缺省 <实例id>-trace.json；traceEvents JSON）")]
     ProfilerStop {
         /// 实例 id
@@ -494,7 +491,7 @@ pub enum PageCommands {
         out: Option<String>,
     },
 
-    /// 启动页录屏（I4；常驻，不占实例串行锁）
+    /// 启动页录屏（常驻，不占实例串行锁）
     #[command(
         about = "启动页录屏：<FILE> [--fps N] [--cursor]（扩展名定容器；重复 start → 409；无 ffmpeg → 422；stop 结算）"
     )]
@@ -515,7 +512,7 @@ pub enum PageCommands {
         tab: Option<String>,
     },
 
-    /// 停止录屏并结算产物（I4；按 start 锚点路由，无需 tab）
+    /// 停止录屏并结算产物（按 start 锚点路由，无需 tab）
     #[command(
         about = "停止录屏：[--status]（编码收尾可能数秒；quiet = 产物路径；无运行中 → 409）"
     )]
@@ -527,7 +524,7 @@ pub enum PageCommands {
         status: bool,
     },
 
-    /// 表格结构化提取（W-ext：表格/网格 → JSON；CSV 未做）
+    /// 表格结构化提取（表格/网格 → JSON；CSV 未做）
     #[command(
         about = "表格提取：[sel|@eN] 缺省 = 主文档最大表格；输出 { columns, rows, coverage, meta }；--out 写 JSON 文件"
     )]
@@ -545,7 +542,7 @@ pub enum PageCommands {
         out: Option<String>,
     },
 
-    /// 设备仿真（W-cap）
+    /// 设备仿真
     #[command(
         about = "设备仿真：--preset 预设（iphone-14 等）| --viewport WxH [--user-agent UA] [--mobile] [--touch] | --off 恢复；仅作用该 tab"
     )]
@@ -578,7 +575,7 @@ pub enum PageCommands {
         tab: Option<String>,
     },
 
-    /// 等待下一次下载完成（W-file；命令式等待：先调它再 click 触发）
+    /// 等待下一次下载完成（命令式等待：先调它再 click 触发）
     #[command(
         about = "等待下载完成：[--timeout-ms 30000]（命令式：先调本命令，再另行 click 触发下载；落盘在实例 profile 的 downloads/ 目录）"
     )]
@@ -593,7 +590,7 @@ pub enum PageCommands {
         tab: Option<String>,
     },
 
-    /// 下载终态记录环查询（W-file；最近 20 条，含已消费）
+    /// 下载终态记录环查询（最近 20 条，含已消费）
     #[command(about = "下载记录：最近 20 条终态（完成/取消/中断，含已消费——matched 列区分）")]
     Downloads {
         /// 实例 id
@@ -603,7 +600,7 @@ pub enum PageCommands {
         tab: Option<String>,
     },
 
-    /// 上传：主机文件设入 file input（W-file）
+    /// 上传：主机文件设入 file input
     #[command(
         about = "上传：<sel|@eN> <主机绝对路径>（设入 input[type=file]；路径拒符号链接；≤100MB）"
     )]
@@ -1091,7 +1088,7 @@ fn eval(
 }
 
 /// `page raw <ID> <method> [json] [--tab T] [--browser]`：CDP 透传，result
-/// 原样 pretty JSON。params 非法 JSON 在本地报参数错（对齐 cdp.mjs evalraw）。
+/// 原样 pretty JSON。params 非法 JSON 在本地报参数错。
 fn raw(
     globals: &GlobalArgs,
     client: &AgentClient,
@@ -1111,8 +1108,8 @@ fn raw(
     Ok(())
 }
 
-/// `page html <ID> [selector] [--tab T]`：html 原样到 stdout（主产物即输出物，
-/// 与 cdp.mjs 一致）；--json 响应原样（dialogs_seen 只在该分支可见）。
+/// `page html <ID> [selector] [--tab T]`：html 原样到 stdout（主产物即输出物）；
+/// --json 响应原样（dialogs_seen 只在该分支可见）。
 fn html(
     globals: &GlobalArgs,
     client: &AgentClient,
@@ -1313,7 +1310,7 @@ fn pdf(
     Ok(())
 }
 
-/// `page diff <ID> [TAB] [-s SEL] [-c] [-d N] [--baseline-file F]`（I3）：
+/// `page diff <ID> [TAB] [-s SEL] [-c] [-d N] [--baseline-file F]`：
 /// 当前 snap ↔ 基线的行级 diff。--baseline-file 读文本文件（缺本地文件
 /// → exit 1，不建连）；无则用服务端滚动基线。table = 摘要行 + diff 文本
 //（无变化时省略）；quiet = changed 布尔串；json 原样。
@@ -1343,7 +1340,7 @@ fn diff(
 }
 
 /// `page diff-shot <ID> --baseline-file <png> [--full] [--tab T] [--out F]`
-//（I3）：像素 diff。CLI 读 png 转 base64 上行；--out 在 differing 时写
+//：像素 diff。CLI 读 png 转 base64 上行；--out 在 differing 时写
 /// 差异图（quiet = 路径）；无 --out 的 quiet = differing 布尔串。
 fn diff_shot(
     globals: &GlobalArgs,
@@ -1382,7 +1379,7 @@ fn diff_shot(
     Ok(())
 }
 
-/// `page profiler start <ID> [TAB] [--categories "a,b"]`（I3）：result 型
+/// `page profiler start <ID> [TAB] [--categories "a,b"]`：result 型
 /// 渲染。categories 逗号分割（trim 空项）。
 fn profiler_start(
     globals: &GlobalArgs,
@@ -1407,7 +1404,7 @@ fn profiler_start(
     Ok(())
 }
 
-/// `page profiler stop <ID> [--out F]`（I3）：result 行含落盘路径；
+/// `page profiler stop <ID> [--out F]`：result 行含落盘路径；
 /// --out 缺省本地拼 <id>-trace.json（与 screenshot 缺省名同风格，CLI cwd）；
 /// quiet = 落盘路径。
 fn profiler_stop(
@@ -1442,7 +1439,7 @@ fn profiler_stop(
     Ok(())
 }
 
-/// `page record start <ID> <FILE> [--fps N] [--cursor] [--tab T]`（I4）：
+/// `page record start <ID> <FILE> [--fps N] [--cursor] [--tab T]`：
 /// result 型渲染（path/fps/cursor 详情行）。FILE 必填（app 主机路径，
 /// 扩展名定容器——不设缺省名，静默写 <id>.webm 到未知位置比报 400 差）。
 fn record_start(
@@ -1487,7 +1484,7 @@ fn record_start(
     Ok(())
 }
 
-/// `page record stop <ID> [--status]`（I4）：quiet = 产物路径；table =
+/// `page record stop <ID> [--status]`：quiet = 产物路径；table =
 /// result + path/frames 详情行（--status 时 json 分支自然携带完整终态）。
 fn record_stop(
     globals: &GlobalArgs,
@@ -1566,7 +1563,7 @@ fn emulate(
     Ok(())
 }
 
-/// `page download-wait <ID> [--timeout-ms N] [--tab T]`（W-file）：命令式等待
+/// `page download-wait <ID> [--timeout-ms N] [--tab T]`：命令式等待
 /// 下一次下载完成。quiet = filePath；table = 文件行 + 落盘路径（未核证时
 /// 标注）；json 原样。
 fn download_wait(
@@ -1590,7 +1587,7 @@ fn download_wait(
     Ok(())
 }
 
-/// `page downloads <ID> [--tab T]`（W-file）：终态记录环。
+/// `page downloads <ID> [--tab T]`：终态记录环。
 fn downloads(
     globals: &GlobalArgs,
     client: &AgentClient,
@@ -1610,7 +1607,7 @@ fn downloads(
     Ok(())
 }
 
-/// `page upload <ID> <sel|@eN> <绝对路径> [--tab T]`（W-file）：result 型渲染。
+/// `page upload <ID> <sel|@eN> <绝对路径> [--tab T]`：result 型渲染。
 fn upload(
     globals: &GlobalArgs,
     client: &AgentClient,
@@ -1782,8 +1779,8 @@ fn result_out(resp: &serde_json::Value, out: &OutputCtx) -> PageOut {
     PageOut::Text(text)
 }
 
-/// html 三态：text/quiet = html 字段原样到 stdout（html 本身就是主产物，与
-/// cdp.mjs 一致——不加元信息行；dialogs_seen 只在 json 分支可见）；json =
+/// html 三态：text/quiet = html 字段原样到 stdout（html 本身就是主产物，
+/// 不加元信息行；dialogs_seen 只在 json 分支可见）；json =
 /// 响应原样。缺字段时不装作成功（空串落 stdout 便于发现契约漂移）。
 fn html_out(resp: &serde_json::Value, out: &OutputCtx) -> PageOut {
     let html = || {
@@ -2171,7 +2168,7 @@ mod tests {
         );
     }
 
-    /// I1b：removedRefs 非空 → meta 行后附 `removed: @e2, @e5` 行（文本模式）
+    /// removedRefs 非空 → meta 行后附 `removed: @e2, @e5` 行（文本模式）
     #[test]
     fn snap_text_appends_removed_line_when_refs_dropped() {
         let resp = json!({
@@ -2420,7 +2417,7 @@ mod tests {
     }
 
     /// html 三态：text/quiet = html 字段原样（不加元信息行——html 本身就是
-    /// 输出物，与 cdp.mjs 一致，$(...) 捕获不受污染）；json = 响应原样。
+    /// 输出物，$(...) 捕获不受污染）；json = 响应原样。
     #[test]
     fn html_out_routes_three_modes_pure_payload() {
         let payload = "<!DOCTYPE html><html><body>hi</body></html>";

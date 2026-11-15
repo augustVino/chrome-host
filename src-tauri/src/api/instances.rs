@@ -291,7 +291,7 @@ pub async fn delete(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// POST /api/v1/instances/{id}/cdp/sessions —— 发放 CDP 会话（方案 §7.1）。
+/// POST /api/v1/instances/{id}/cdp/sessions —— 发放 CDP 会话。
 /// 17891 上需 Bearer token；会话 key 是 token 的下级凭证（单实例作用域 + 30 分钟），
 /// 用于 /cdp/{ins}/{sid}/* 代理路径（含 WS，无法携带 header）。
 pub async fn create_cdp_session(

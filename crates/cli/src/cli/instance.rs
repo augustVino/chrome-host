@@ -358,7 +358,7 @@ fn list(globals: &GlobalArgs, client: &AgentClient, env: Option<&str>) -> Result
 /// table 六列单元格（ID NAME ENVIRONMENT STATUS PID CDP）。ENVIRONMENT 列取值由调用方注入
 /// （理由见 [`list`]）；name 可空显示 `-`（同 PID/CDP 占位约定，json 原样保留 null）；
 /// PID/CDP 空值显示 `-` —— 仅 table 占位，json 原样保留 null
-/// （两模式无信息差，PRD §39）。
+/// （两模式无信息差）。
 fn instance_cells(instance: &Instance, environment: &str) -> Vec<String> {
     vec![
         instance.id.clone(),
@@ -399,7 +399,7 @@ fn get(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliEr
 }
 
 /// instance get/create/start/stop/restart 共用的单对象 key: value 对，键名与
-/// JSON 字段一致（PRD §39 两模式无信息差）。字段集：
+/// JSON 字段一致（两模式无信息差）。字段集：
 /// id/name/status/pid/cdpPort/browserVersion/profileDir/createdAt/updatedAt
 /// （name 随实例命名能力 v0.6+ 加入，与 json 字段同步——不进 kv 会造成两模式信息差）。
 /// 时间戳输出原始 epoch 毫秒（同 env_kv_pairs：不为本地格式化加 chrono 依赖）；
@@ -745,7 +745,7 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{cut}…")
     }
 }
-/// `chrome-host instance diagnostics <ID>`：页面诊断快照（M5 短连接透传）。
+/// `chrome-host instance diagnostics <ID>`：页面诊断快照（短连接透传）。
 /// 响应是服务端透传的自由形状 JSON（页面扩展挂载的快照），不建 DTO ——
 /// 诊断面随扩展演进，CLI 只做摘要提取 + 原样透传（json 模式完整保留）。
 /// quiet：输出 targetUrl（供脚本捕获定位被诊断页面）。

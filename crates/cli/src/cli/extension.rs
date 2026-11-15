@@ -225,7 +225,7 @@ fn get(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliEr
     Ok(())
 }
 
-/// 单对象 key: value 对，键名与 JSON 字段一致（PRD §39 两模式无信息差）。
+/// 单对象 key: value 对，键名与 JSON 字段一致（两模式无信息差）。
 /// 冻结字段集：id/name/type/status/version/manifestVersion/
 /// sourcePath/enabled/configDocsUrl/createdAt/updatedAt。description 不进 kv（同
 /// instance get 省略 hostRules 等字段的先例：kv 是面向人的精选子集，json 模式始终

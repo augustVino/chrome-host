@@ -42,7 +42,7 @@ pub async fn put(
         body.remote_access_enabled,
         body.remote_access_ssh_target,
     )?;
-    // 编排点（方案 §4.1）：全项目唯一 settings 写路径，PUT 成功即收敛隧道。
+    // 编排点：全项目唯一 settings 写路径，PUT 成功即收敛隧道。
     // 薄壳编排两个服务，不引入 SettingsService → TunnelService 依赖
     state
         .tunnel

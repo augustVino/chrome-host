@@ -97,9 +97,9 @@ pub enum SettledBody {
 
 /// body 结算重活管线（纯函数：无 `&mut self`、无锁，可在任意线程执行）：
 /// base64 解码 → UTF-8 校验 → 脱敏 → 单条上限截断。mime 取目标条目快照
-/// （决定 JSON tokenizer / 文本模式）。此前整条管线内联在 [`DiagBuffer::store_body`]
-/// 的 Mutex 临界区内——大 body 的解码/脱敏会串行卡死事件泵 `apply()` 与
-/// console/network/har 全部查询（W-fix2 外移；锁内只剩提交入账与预算驱逐）。
+/// （决定 JSON tokenizer / 文本模式）。重活必须留在锁外——若在
+/// [`DiagBuffer::store_body`] 的 Mutex 临界区内做解码/脱敏，会串行卡死事件泵
+/// `apply()` 与 console/network/har 全部查询（锁内只做提交入账与预算驱逐）。
 pub fn settle_body(mime: Option<&str>, payload: BodyPayload) -> SettledBody {
     match payload {
         BodyPayload::Unavailable { reason } => SettledBody::Unavailable { reason },
@@ -734,7 +734,7 @@ impl DiagBuffer {
         }
     }
 
-    /// 截图目标选择：第一个 http(s) 页面 session（与 M5 查询端点同语义）
+    /// 截图目标选择：第一个 http(s) 页面 session（与查询端点同语义）
     pub fn pick_page_session(&self) -> Option<String> {
         self.sessions
             .iter()

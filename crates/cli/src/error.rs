@@ -1,6 +1,6 @@
 //! CLI 侧统一错误模型。
 //!
-//! 四个变体对应四类失败面，与 PRD cli.md §18 exit code 契约挂钩：
+//! 四个变体对应四类失败面，与 exit code 契约挂钩：
 //! 映射逻辑集中在 exit.rs（唯一映射点），本文件只描述错误、不做任何映射。
 
 use thiserror::Error;

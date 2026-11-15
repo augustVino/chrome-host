@@ -1,13 +1,13 @@
-//! CDP 反向代理技术设施（方案 §7.2）：HTTP JSON 端点转发 + webSocketDebuggerUrl
+//! CDP 反向代理技术设施：HTTP JSON 端点转发 + webSocketDebuggerUrl
 //! 改写 + WS 帧级桥。
 //!
-//! 帧级桥选型（附录 D.1）：axum ws（server 侧，握手完成后得 Message 帧）↔
+//! 帧级桥选型：axum ws（server 侧，握手完成后得 Message 帧）↔
 //! tokio-tungstenite `connect_async`（client 侧，向 Chrome 完成握手）——两端都说
 //! WS 协议，「桥到裸 TcpStream」不可行（axum 已消费握手字节）。
 //!
-//! 代理端点覆盖（显式边界，方案 §7.2）：GET /json、/json/list、/json/version
-//! 与 WS /devtools/*；变更类 HTTP 端点（/json/new 等）不代理——cdp.mjs 全部经
-//! browser WS + Target 域完成，远程开新页走 REST open_tab。
+//! 代理端点覆盖（显式边界）：GET /json、/json/list、/json/version
+//! 与 WS /devtools/*；变更类 HTTP 端点（/json/new 等）不代理——变更类操作
+//! 全部经 browser WS + Target 域完成，远程开新页走 REST open_tab。
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -44,7 +44,7 @@ pub fn classify_proxy_path(rest: &str) -> ProxyKind {
 /// 改写 JSON 值中全部 `webSocketDebuggerUrl`（含 /json/version 的 browser 级）：
 /// `ws://127.0.0.1:<port>/devtools/...` → `ws://<host>/cdp/<ins>/<sid>/devtools/...`。
 /// host 取请求 Host 头 → 客户端拿到的 URL 自动指向自己可达的地址。
-/// devtoolsFrontendUrl 不迁移（客户端不用，方案 §7.2）。纯函数便于单测。
+/// devtoolsFrontendUrl 不迁移（客户端不用）。纯函数便于单测。
 pub fn rewrite_ws_urls(
     value: &mut serde_json::Value,
     instance_port: u16,
@@ -204,7 +204,7 @@ mod tests {
             classify_proxy_path("devtools/browser/xyz"),
             ProxyKind::DevToolsWs("/devtools/browser/xyz".into())
         );
-        // 变更类端点与未知路径一律拒绝（方案 §7.2 显式边界）
+        // 变更类端点与未知路径一律拒绝（显式边界）
         assert_eq!(classify_proxy_path("json/new"), ProxyKind::Rejected);
         assert_eq!(classify_proxy_path("json/activate/ABC"), ProxyKind::Rejected);
         assert_eq!(classify_proxy_path("json/close/ABC"), ProxyKind::Rejected);

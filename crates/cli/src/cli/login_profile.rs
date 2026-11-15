@@ -5,7 +5,7 @@
 //! （可选）`capture --from` 显式固化
 //! 捕获快照 → 之后 `instance create` 的实例自动克隆该快照。
 //!
-//! 命名：组名 `login-profile`，不采用 PRD cli.md 的
+//! 命名：组名 `login-profile`，不采用裸的
 //! `profile` —— 实例域已有 profile_dir（浏览器用户数据目录）概念，裸 `profile`
 //! 会在命令面与它混淆；API 路径本就是 /api/v1/login-profiles，CLI 跟随资源命名。
 //!
