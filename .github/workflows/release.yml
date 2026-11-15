@@ -213,6 +213,48 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
 
+  # 独立 CLI 产物（远程接入场景：云桌面/CI 只装 CLI，无桌面 app——
+  # release.yml 此前仅以 sidecar 形态编 CLI 进 .app，独立安装无产物可下）
+  cli-binaries:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl 静态链接：无 glibc 版本依赖，任意 Linux 发行版直接可跑
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+          prefix-key: v2-cli
+
+      - name: Build CLI
+        run: cargo build --release -p chrome-host-cli --target ${{ matrix.target }}
+
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ASSET="chrome-host-cli-${VERSION}.${{ matrix.target }}.tar.gz"
+          tar -czf "$ASSET" -C "target/${{ matrix.target }}/release" chrome-host
+          shasum -a 256 "$ASSET" > "${ASSET}.sha256" 2>/dev/null || sha256sum "$ASSET" > "${ASSET}.sha256"
+          gh release upload "${GITHUB_REF_NAME}" "$ASSET" "${ASSET}.sha256" --clobber
+          echo "Uploaded: $ASSET"
+
   # 末尾校验：latest.json 必须含四平台键（PRD v2 §1.5 DoD-5，缺键告警失败）
   verify-latest:
     needs: [create-release, build]

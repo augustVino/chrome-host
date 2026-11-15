@@ -39,7 +39,7 @@ SSH 隧道转发的请求到达 app 时，来源地址恒为 `127.0.0.1`（本�
 
 | 云桌面上的 Agent 形态 | 需要安装 | 说明 |
 |---|---|---|
-| 用 `chrome-host` CLI 命令 | **装 CLI**（`cargo install --path crates/cli`，或本地交叉编译后 scp） | 与本地同构体验，`CHROME_HOST_TOKEN` 注入令牌 |
+| 用 `chrome-host` CLI 命令 | **装 CLI**（Release 下载独立产物，见下方安装方法） | 与本地同构体验，`CHROME_HOST_TOKEN` 注入令牌 |
 | MCP 客户端（Claude Code / Cursor 等） | **不装 CLI** | `claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-host http://127.0.0.1:17890/mcp` 直接接 |
 | 自研脚本 / curl 直调 REST | **什么都不装** | `curl -H "Authorization: Bearer <token>" http://127.0.0.1:17890/api/v1/...` |
 | 外部 CDP 客户端（Playwright 等） | 不装 CLI | 经会话代理 URL 接入（`instance cdp-session` 需由控制面下发——REST 调用即可） |
@@ -92,6 +92,26 @@ Host yun
 - 轮换：换私钥后重跑 `ssh-copy-id` 并在设置页关闭再打开远程接入开关即可，隧道自动以新密钥重建；访问令牌的轮换在 Settings 页独立进行（轮换令牌会即时清空全部远程 CDP 会话，隧道不受影响）。
 
 **故障对照**：状态行/`doctor` 的 remote_access 项 + stderr 环形缓冲会给出 `Permission denied (publickey)`（密钥/口令问题）、`remote port forwarding failed`（云桌面 17891 被 stale 进程占用，app 会自动一次性清理）等原文特征。
+
+### CLI 独立安装（无桌面 app 的机器）
+
+Release 附带独立 CLI 产物（v0.7.5 起，每个版本三平台）：
+
+| 产物 | 适用 |
+|---|---|
+| `chrome-host-cli-<版本>.x86_64-unknown-linux-musl.tar.gz` | **任意 Linux x86_64**（静态链接，无 glibc 版本依赖，Ubuntu/CentOS/Alpine 通吃） |
+| `chrome-host-cli-<版本>.aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+| `chrome-host-cli-<版本>.x86_64-apple-darwin.tar.gz` | macOS Intel |
+
+```bash
+# Linux 云桌面为例（VERSION 替换为实际版本，如 0.7.5）
+curl -LO https://github.com/augustVino/chrome-host/releases/latest/download/chrome-host-cli-<VERSION>.x86_64-unknown-linux-musl.tar.gz
+tar -xzf chrome-host-cli-*.tar.gz
+install -m 755 chrome-host ~/.cargo/bin/   # 或任意 PATH 目录
+chrome-host --version                       # 验证
+```
+
+> macOS 产物同样解包后放 PATH 即可。源码编译（`cargo install --path crates/cli`）仍可用，但 Release 产物免工具链。
 
 ## 远程机器配置（一次性）
 
