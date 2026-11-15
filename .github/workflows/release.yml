@@ -144,6 +144,7 @@ jobs:
 
       # sidecar 旧产物防御性清理 + 诊断（若仍存在则暴露文件 flags/xattr 供排查）
       - name: Purge stale sidecar artifacts from restored cache
+        shell: bash
         run: |
           find target -type f -name 'chrome-host-cli*' -print -delete 2>/dev/null || true
           find target -type d -name 'chrome-host-cli*' -print -exec rm -rf {} + 2>/dev/null || true

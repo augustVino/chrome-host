@@ -8,3 +8,9 @@ resolver = "2"
 [profile.release]
 strip = true
 lto = true
+
+# vendored tauri-build：上游 2.6.3 copy_binaries 对已存在 sidecar 目标
+# remove_file().unwrap() 在部分 CI 环境 EPERM panic（详见 vendor/tauri-build/src/lib.rs 内注）。
+# 版本与上游锁定一致（2.6.3），升级 tauri 时需同步重打此补丁。
+[patch.crates-io]
+tauri-build = { path = "vendor/tauri-build" }

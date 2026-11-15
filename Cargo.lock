@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "chrome-host"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "chrome-host-cli"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5258,8 +5258,6 @@ dependencies = [
 [[package]]
 name = "tauri-build"
 version = "2.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc9ce40b16101cb6ea63d3e221567affd1c3a9205f95d7bc574941a10636b632"
 dependencies = [
  "anyhow",
  "cargo_toml",
