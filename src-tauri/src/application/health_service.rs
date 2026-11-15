@@ -221,7 +221,7 @@ impl HealthService {
 
     /// 远程接入：disabled → ok（未启用）；connected → ok（含目标）；
     /// 其余（connecting / reconnecting）→ 不 ok 并给出排查建议，
-    /// 使 `chrome-host doctor` 能报出隧道故障（方案 §4.5）
+    /// 使 `chrome-host doctor` 能报出隧道故障
     fn check_remote_access(&self) -> HealthCheck {
         let st = self.tunnel.status();
         if !st.enabled {

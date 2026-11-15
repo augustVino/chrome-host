@@ -76,7 +76,7 @@ pub fn run(
 }
 
 /// get / update 共用的单对象 key: value 对，键名与 JSON 字段一致（camelCase
-/// 原样，两模式无信息差，PRD §39）。
+/// 原样，两模式无信息差）。
 fn settings_kv_pairs(s: &AppSettingsView) -> Vec<(String, String)> {
     vec![
         ("developerMode".into(), s.developer_mode.to_string()),

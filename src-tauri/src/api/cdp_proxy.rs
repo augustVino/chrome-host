@@ -1,4 +1,4 @@
-//! CDP 会话代理路由（方案 §7.2）：`/cdp/{ins}/{sid}/{*rest}`。
+//! CDP 会话代理路由：`/cdp/{ins}/{sid}/{*rest}`。
 //!
 //! 凭证语义：`/cdp/` 前缀已在 auth 中间件豁免 Bearer（WS 升级无法携带 header），
 //! **会话 key 即该层凭证**——每个请求（含 WS 升级前握手）都过 validate。

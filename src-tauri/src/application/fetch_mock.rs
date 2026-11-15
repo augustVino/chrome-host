@@ -1,6 +1,6 @@
 //! mock 上游：Fetch 会话层拦截的 mock 响应回源（application 组件）。
 //!
-//! 为什么需要它（spike 真机定案，结论见任务报告）：CfT 131.0.6778.204 的
+//! 为什么需要它（真机实测定案）：CfT 131.0.6778.204 的
 //! `Fetch.fulfillRequest` 接受 `binaryBody` 但**不交付响应体**（两条独立
 //! 链路 + Request/Response 两阶段实测 bytes=0）；`continueRequest` 改写到
 //! `data:` URL 被 Chrome 拒绝。mock 的可行路径 = **本地 loopback HTTP 上游**：
@@ -10,7 +10,7 @@
 //! CORS 是跨源改写的必过关卡（页面源 ≠ 127.0.0.1 上游源）：缺省注入
 //! `Access-Control-Allow-Origin`（回显请求 Origin，无 Origin 头回 `*`），
 //! OPTIONS preflight 统一 204 放行——真机验证页面 fetch 可完整读取 mock
-//! body。I5 起规则可选 `allowOrigin` 收紧：声明则仅请求 Origin 精确匹配
+//! body。规则可选 `allowOrigin` 收紧：声明则仅请求 Origin 精确匹配
 //! （尾 `/` 归一）才注入 ACAO + `Access-Control-Allow-Credentials: true`
 //! （对齐上游 mocked_response 语义），不匹配则不注入（浏览器拒读）；
 //! Content-Type 缺省推断（body 是合法 JSON → application/json，规则显式
@@ -31,7 +31,7 @@ pub struct MockSpec {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub delay_ms: u64,
-    /// CORS 收紧（I5）：Some(origin) = 仅请求 Origin 精确匹配才注入 ACAO；
+    /// CORS 收紧：Some(origin) = 仅请求 Origin 精确匹配才注入 ACAO；
     /// None = 缺省宽松回显（见模块文档）。语义对齐上游参考 mocked_response
     /// 的 allowOrigin（vercel-labs/agent-browser，Apache-2.0）。
     pub allow_origin: Option<String>,
@@ -109,7 +109,7 @@ impl MockUpstream {
     }
 
     /// 只读查询 token 在册 spec 的 allowOrigin（不消费——preflight OPTIONS
-    /// 不吃掉 token，真实请求到达时才 take；I5 CORS 收紧需要 preflight
+    /// 不吃掉 token，真实请求到达时才 take；CORS 收紧需要 preflight
     /// 与正式响应同一口径）。
     fn peek_allow_origin(&self, token: &str) -> Option<Option<String>> {
         self.specs
@@ -120,11 +120,11 @@ impl MockUpstream {
     }
 }
 
-/// CORS ACAO 值决策（纯函数，I5）：
+/// CORS ACAO 值决策（纯函数）：
 /// - 规则声明 `allowOrigin`：请求 Origin 精确匹配（尾 `/` 归一）才回显
 ///   该 Origin；不匹配 → None（不注入，浏览器拒读——收紧语义）。
 /// - 未声明：宽松回显（请求 Origin，无 Origin 头用 `*`——loopback 跨源
-///   改写的可读性契约，spike 真机定案保持不变）。
+///   改写的可读性契约，真机实测定案保持不变）。
 fn acao_value(allow_origin: Option<&str>, req_origin: Option<&str>) -> Option<String> {
     fn norm(s: &str) -> &str {
         s.trim_end_matches('/')
@@ -137,7 +137,7 @@ fn acao_value(allow_origin: Option<&str>, req_origin: Option<&str>) -> Option<St
     }
 }
 
-/// Content-Type 缺省推断（纯函数，I5，对齐上游 mocked_response）：规则
+/// Content-Type 缺省推断（纯函数，对齐上游 mocked_response）：规则
 /// 未显式设置 Content-Type 且 body 是合法 JSON → application/json（页面
 /// 与 HAR 捕获读到 JSON 形态而非默认 text/plain）；规则显式设置优先，
 /// 非 JSON body / 空 body 不推断。
@@ -198,7 +198,7 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, upstream: Arc<MockUpstre
     let token = path.strip_prefix("/m/").unwrap_or_default().to_string();
     let (status, headers, body, delay_ms) = if method == "OPTIONS" {
         // CORS preflight 统一 204 空体放行（跨源改写 + 自定义请求头必经）；
-        // I5：token 在册且声明 allowOrigin 时同口径收紧（Origin 不匹配则
+        // token 在册且声明 allowOrigin 时同口径收紧（Origin 不匹配则
         // 不带 ACAO → 浏览器预检失败，收紧在 preflight 阶段即生效）
         let allow = upstream.peek_allow_origin(&token).flatten();
         let mut preflight = vec![
@@ -227,7 +227,7 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, upstream: Arc<MockUpstre
             Some(spec) => {
                 // CORS 注入与规则头合并：规则同名覆盖注入（规则显式设置
                 // CORS 头优先——黑名单不含响应侧 CORS 头，允许规则自控）。
-                // I5：Content-Type 缺省推断（JSON body）；allowOrigin 声明
+                // Content-Type 缺省推断（JSON body）；allowOrigin 声明
                 // 时 ACAO 精确匹配才注入 + 附 ACAC: true（对齐上游）
                 let mut headers = vec![("Content-Length".to_string(), spec.body.len().to_string())];
                 if let Some(ct) = inferred_content_type(&spec.headers, &spec.body) {
@@ -456,7 +456,7 @@ mod tests {
         assert!(!head.contains("\r\nX-Injected:"), "无独立注入头行");
     }
 
-    // ---------------- I5：allowOrigin 收紧 / Content-Type 推断 ----------------
+    // ---------------- allowOrigin 收紧 / Content-Type 推断 ----------------
 
     /// acao_value 纯函数矩阵：声明精确匹配（尾 / 归一）/ 不匹配拒 / 缺省宽松。
     #[test]

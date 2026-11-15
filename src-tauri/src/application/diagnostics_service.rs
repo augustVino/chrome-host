@@ -49,7 +49,7 @@ fn unavailable(message: impl Into<String>) -> AppError {
 struct Watched {
     buffer: Arc<Mutex<DiagBuffer>>,
     /// 当前代连接（断线置 None，重连整体替换）；截图查询复用它发命令。
-    /// send 已 &self 并发化（P2-F 根治），裸 Arc 直发、无锁包裹。
+    /// send 为 &self 并发安全，裸 Arc 直发、无锁包裹。
     conn: Mutex<Option<Arc<CdpConnection>>>,
     /// body 拉取并发闸门（≤4 in-flight；排队 = acquire 等待）
     body_gate: Arc<tokio::sync::Semaphore>,
@@ -297,7 +297,7 @@ impl DiagnosticsService {
     }
 
     /// GET screenshot：复用常驻连接对第一个 http(s) 页面 session 截图（png base64）。
-    /// 连接未就绪/无页面 → 409 DIAGNOSTICS_UNAVAILABLE（与 M5 同码同语义）。
+    /// 连接未就绪/无页面 → 409 DIAGNOSTICS_UNAVAILABLE（与查询端点同码同语义）。
     pub async fn screenshot(&self, ins_id: &str) -> Result<Value, AppError> {
         let watched = self
             .require(ins_id)?
@@ -384,7 +384,7 @@ fn dispatch_body_fetch(watched: &Arc<Watched>, session_id: String, request_id: S
         // 排队等待 permit（≤4 并发）；拿到 permit 即退出排队计数
         let _permit = gate.acquire().await;
         backlog.fetch_sub(1, Ordering::Relaxed);
-        // 两段式结算（W-fix2 锁外化）：① 锁内 mime 快照（短锁）——目标条目
+        // 两段式结算（重活锁外化）：① 锁内 mime 快照（短锁）——目标条目
         // 已被并发结算/环溢出挤出则诚实丢弃，网络拉取与解码脱敏全部跳过
         let Some(mime) = buffer.lock().unwrap().pending_body_mime(&request_id) else {
             return;
@@ -409,7 +409,7 @@ fn dispatch_body_fetch(watched: &Arc<Watched>, session_id: String, request_id: S
 
 /// 单条拉取：getResponseBody（per-session）+ 2.5s 超时预算 → 归因映射。
 /// 外层 timeout drop 掉 send future 是取消安全的：ws.rs send 以 Drop guard
-/// 即时清理 pending 表项（W-fix2），悬挂请求不再滞留至内层 15s 超时或连接
+/// 即时清理 pending 表项，悬挂请求不再滞留至内层 15s 超时或连接
 /// 关闭。timeout 参数化仅为单测提速（生产恒为 [`BODY_FETCH_TIMEOUT`]）。
 async fn fetch_response_body(
     conn: &CdpConnection,

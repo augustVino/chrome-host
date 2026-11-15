@@ -1,6 +1,6 @@
 //! 远程接入隧道监督器：单条静态 SSH 反向转发（目标机 17890 → 本机 17891）。
 //!
-//! 设计依据 REMOTE-ACCESS-PLAN.md §5：
+//! 设计要点：
 //! - **守尸包裹**：ssh 经 `/bin/sh` 包裹 spawn，stdin 是 socketpair（app 持另一端）。
 //!   app 无论怎么死（含 SIGKILL），内核关闭其 fd → 包裹层 `cat` 读到 EOF → kill ssh
 //!   → 孤儿不产生。这是内核 fd 生命周期保证，与信号、清理代码无关。
@@ -28,13 +28,13 @@ pub const LOCAL_LANDING_PORT: u16 = 17891;
 /// `-R` 转发规格：既是 ssh 参数，也是孤儿对账的 pgrep 特征串。
 pub const FORWARD_SPEC: &str = "17890:127.0.0.1:17891";
 
-/// ssh 命令行参数（除 `-R` 与 target 外的全部），逐条依据见方案 §5.1。
+/// ssh 命令行参数（除 `-R` 与 target 外的全部），逐条依据见下。
 ///
 /// `-F <净化配置>`：指向应用数据目录里剔除转发行后的用户配置副本——
 /// ① 用户 ~/.ssh/config 的 RemoteForward（如代理转发 7890）不进入应用隧道，
-///    其 bind 失败不会在 ExitOnForwardFailure 下杀死本隧道（实测踩坑 A）；
+///    其 bind 失败不会在 ExitOnForwardFailure 下杀死本隧道（真机实测）；
 /// ② 别名/HostName/IdentityFile/ProxyJump 解析完整保留，目标仍可写 "vino@yun"。
-/// 注意不能用 ClearAllForwardings：它连命令行 -R 一并清除（实测踩坑 B），
+/// 注意不能用 ClearAllForwardings：它连命令行 -R 一并清除（真机实测），
 /// 隧道会零转发却零报错地"假活"。
 pub const SSH_OPTIONS: &[&str] = &[
     "-N",
@@ -52,7 +52,7 @@ pub const SSH_OPTIONS: &[&str] = &[
     "StrictHostKeyChecking=accept-new",
 ];
 
-/// 子进程存活该时长即判 established（2×ConnectTimeout 裕量，方案 §5.1 判活推理）。
+/// 子进程存活该时长即判 established（2×ConnectTimeout 裕量，配合判活推理）。
 const CONNECTED_GRACE_MS: i64 = 20_000;
 /// 监控轮询间隔。
 const MONITOR_TICK: Duration = Duration::from_millis(500);
@@ -185,7 +185,7 @@ fn strip_forward_lines(text: &str) -> String {
 /// 生成/刷新净化配置副本（每次 spawn 前调用，跟进用户编辑）：
 /// ~/.ssh/config → <data_dir>/ssh-tunnel-config（0600）。
 /// 无用户配置或写入失败 → None（降级直用用户配置：仅当其中无冲突转发时可用，
-/// 记 warn）。Include 指令引入的转发不在此净化范围（已知边界，方案 §11）。
+/// 记 warn）。Include 指令引入的转发不在此净化范围（已知边界）。
 fn refresh_tunnel_config(data_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     let dir = data_dir?;
     let home = std::env::var("HOME").ok()?;
@@ -564,7 +564,7 @@ fn take_stderr_tail(shared: &Shared) -> String {
 }
 
 /// 启动对账：清理特征串命中的孤儿 ssh（守尸包裹之外的人祸兜底）。
-/// 逐个校验进程名为 ssh 后才杀——防 cmdline 撞车的无辜进程误杀（方案 §5.4）。
+/// 逐个校验进程名为 ssh 后才杀——防 cmdline 撞车的无辜进程误杀。
 fn reconcile_orphans(shared: &Shared) {
     let _ = shared; // 当前不读 shared；保留参数为将来留痕（事件走 on_event）
     let Ok(out) = std::process::Command::new("pgrep").arg("-f").arg(FORWARD_SPEC).output() else {
@@ -619,7 +619,7 @@ fn alive(pid: u32) -> bool {
     }
 }
 
-/// stale listener 自愈（方案 §5.4，仅 bind 失败特征触发）：
+/// stale listener 自愈（仅 bind 失败特征触发）：
 /// 经一次性 ssh 会话在远端定位占用 17890 的进程，**确证为 sshd 才杀**，
 /// 否则不乱动（占用者可能是目标机上的真实服务）。不引入常驻远端组件。
 fn remote_stale_cleanup(target: &str) {
@@ -773,8 +773,8 @@ mod tests {
         assert!(child.try_wait().unwrap().is_some(), "EOF 后子进程应死亡（无孤儿）");
     }
 
-    /// 监督可见性（实测踩坑回归）：子进程自然死亡 → 包裹层应随之退出，
-    /// 否则 try_wait 盲区导致状态机停在 connected（旧版脚本 cat 前台阻塞的缺陷）。
+    /// 监督可见性回归（真机实测）：子进程自然死亡 → 包裹层应随之退出，
+    /// 否则 try_wait 盲区导致状态机停在 connected（包裹层 cat 前台阻塞即此形态）。
     #[test]
     fn wrapper_exits_when_child_dies() {
         let shared = new_shared("sleep");

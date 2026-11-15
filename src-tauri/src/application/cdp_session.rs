@@ -1,5 +1,4 @@
-//! CDP 会话服务：token 的下级凭证——**单实例作用域 + TTL** 的代理访问 key
-//! （REMOTE-ACCESS-PLAN.md §7.1）。
+//! CDP 会话服务：token 的下级凭证——**单实例作用域 + TTL** 的代理访问 key。
 //!
 //! 凭证层级：token（控制面全权）> session（数据面，仅 `/cdp/{ins}/{sid}/*`
 //! 代理路径，30 分钟）。发放时的实例 running 校验由 api 薄壳先行完成
@@ -13,7 +12,7 @@ use serde::Serialize;
 
 use crate::error::AppError;
 
-/// 会话有效期：固定 30 分钟（过期重取，无刷新/吊销端点——方案 §12 非目标）。
+/// 会话有效期：固定 30 分钟（过期重取，无刷新/吊销端点——非目标）。
 pub const SESSION_TTL_MS: i64 = 30 * 60 * 1000;
 
 /// 审计回调（level, event, target_id, message）：生产落 Activity，测试注入收集器。
@@ -37,7 +36,7 @@ struct Entry {
 }
 
 pub struct CdpSessionService {
-    /// 会话表：进程内运行态（app 重启即清空——方案 §11 已知边界，客户端重取即恢复）
+    /// 会话表：进程内运行态（app 重启即清空——已知边界，客户端重取即恢复）
     sessions: Mutex<HashMap<String, Entry>>,
     audit: AuditSink,
     sweeper_started: AtomicBool,

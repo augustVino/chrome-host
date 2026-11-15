@@ -6,7 +6,7 @@
 //! - stderr 合法出口清单（全 crate 当前全集，新增出口须在此登记）：
 //!   ① 错误渲染（[`OutputCtx::print_error`] 非 json 分支，eprintln!，本文件）；
 //!   ② 危险操作确认提示（cli/mod.rs `confirm_with_reader`，eprint!）；
-//!   ③ verbose 请求摘要（client.rs `send`，eprintln!，PRD cli.md §22.3 只含
+//!   ③ verbose 请求摘要（client.rs `send`，eprintln!，只含
 //!     method/path/耗时，不含 query 与 body）；
 //!   ④ runtime install 轮询进度与终态提示（cli/runtime.rs，eprintln!；--json 模式
 //!     stderr 静默，stdout 只输出最终 CftStatus）。
@@ -14,7 +14,7 @@
 //! # 可测性取舍（纯函数 + 薄壳，why）
 //! 所有渲染逻辑收敛为「输入 → String」的纯函数（`*_string` 后缀），单测直接断言
 //! 返回值，不起子进程、不劫持真 stdout —— 用 `std::process::Command` 测打印既慢又脆，
-//! 还要把 CLI 拆成可执行测试靶子，得不偿失（计划 §2.8 第 1 层单测的定位）。
+//! 还要把 CLI 拆成可执行测试靶子，得不偿失（单测只测纯函数，不测打印）。
 //! [`OutputCtx`] 的公开方法只是「按模式选择纯函数 + 打印」的薄壳。
 
 use comfy_table::Table;
@@ -23,7 +23,7 @@ use crate::cli::GlobalArgs;
 use crate::error::CliError;
 
 /// 输出上下文：三态中的两态开关（`--json` 与 `--quiet` 互斥，clap 已 conflicts_with）。
-/// `no_color` 不建模：MVP 不输出任何 ANSI 颜色（计划 §2.5），该 flag 仅为契约保留。
+/// `no_color` 不建模：MVP 不输出任何 ANSI 颜色，该 flag 仅为契约保留。
 #[derive(Debug, Clone, Copy)]
 pub struct OutputCtx {
     pub json: bool,
@@ -39,7 +39,7 @@ impl From<&GlobalArgs> for OutputCtx {
     }
 }
 
-/// 一行列表数据，三字段对应三态、信息不得互相矛盾（PRD §39：两模式无信息差）：
+/// 一行列表数据，三字段对应三态、信息不得互相矛盾（两模式无信息差）：
 /// - `cells`：table 模式的单元格（列集与 JSON 字段一一对应）；
 /// - `json`：该行完整 JSON（服务端原样，含 CJK 原文与 null），json 模式逐行收集成数组；
 /// - `id`：quiet 模式每行输出的主实体 id。
@@ -74,7 +74,7 @@ impl OutputCtx {
 
     /// 单对象渲染薄壳（env get / instance cdp / runtime / status 共用）。
     /// json：值整体 pretty；缺省 table：`key: value` 逐行。
-    /// quiet 对单对象无冻结语义（§2.5 的 quiet 只给列表与变更类命令），按缺省 kv 输出。
+    /// quiet 对单对象无冻结语义（quiet 只给列表与变更类命令），按缺省 kv 输出。
     pub fn render_kv(&self, pairs: &[(String, String)], json: serde_json::Value) {
         if self.json {
             println!(
@@ -96,13 +96,13 @@ impl OutputCtx {
         println!("{s}");
     }
 
-    /// Quiet 契约（计划 §2.5）：变更类命令（create/delete 等）仅输出主实体 id,
+    /// Quiet 契约：变更类命令（create/delete 等）仅输出主实体 id,
     /// 供 `$(...)` 捕获。调用方负责先判 quiet 分支；本方法是「单行 id」的唯一 stdout 出口。
     pub fn print_id(&self, id: &str) {
         println!("{id}");
     }
 
-    /// 顶层错误出口（main.rs 唯一调用）：json 模式错误体走 **stdout**（PRD §19：
+    /// 顶层错误出口（main.rs 唯一调用）：json 模式错误体走 **stdout**（
     /// 管道另一侧永远拿到合法 JSON），非 json 走 stderr。exit code 由 main 按
     /// `exit::from_cli_error` 统一附加，本方法不退出进程。
     pub fn print_error(&self, err: &CliError) {

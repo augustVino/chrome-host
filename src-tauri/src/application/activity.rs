@@ -2,7 +2,7 @@
 //!
 //! 铁律：emit 与落库走同一入口（防双写遗漏）——服务层禁止直接调 app.emit，
 //! 统一经 `Activity::record`。target 为实例时 environment_id 自动回填（查 instances 表）。
-//! M7-B 起 record 同点旁挂 SSE broadcast（[`SSE_CHANNEL_CAP`]）：REST `/api/v1/events`
+//! record 同点旁挂 SSE broadcast（[`SSE_CHANNEL_CAP`]）：REST `/api/v1/events`
 //! 订阅者收到落库行同款富事件；无订阅者时 send 为 no-op，满 256 滞后仅丢该订阅者
 //!（SSE 语义可接受，订阅侧以 lagged 注释行感知）。
 

@@ -1,4 +1,4 @@
-//! 设备仿真预设表与请求解析（纯函数，无 IO；W-cap）。
+//! 设备仿真预设表与请求解析（纯函数，无 IO）。
 //!
 //! [`PRESETS`] 为名称 → 宽高/UA/mobile/touch 的静态表（常见设备 6 款，
 //! `iphone-14` 必有；UA 用真实 Chrome iOS/Android 模板）。[`resolve`] 把

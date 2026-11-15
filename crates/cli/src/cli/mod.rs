@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::error::CliError;
 
-/// output.rs 文件位于 src/ 根（计划 §2.3 的四层结构：cli/ → client → model → output → exit），
+/// output.rs 文件位于 src/ 根（四层结构：cli/ → client → model → output → exit），
 /// 但在此经 `#[path]` 挂载为 `cli::output` 子模块。why：tests/contract.rs 以 `#[path]`
 /// 挂载本文件构建契约测试 crate，而该文件按「不得触碰」约束不挂载 output 模块 ——
 /// 若 output.rs 改由 main.rs 顶层 `mod` 声明，env.rs 的 `crate::output` 引用在契约
@@ -30,7 +30,7 @@ pub mod settings;
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:17890";
 
 /// `--api-url` 缺省时的环境变量回退名。
-/// headless daemon 与集成测试的预留接入点（计划 §2.1）。
+/// headless daemon 与集成测试的预留接入点。
 pub const ENV_API_URL: &str = "CHROME_HOST_API_URL";
 
 /// `--token` 缺省时的环境变量回退名：远程接入（经隧道连 17891 监听器）时的
@@ -107,20 +107,20 @@ pub enum Commands {
     },
     /// 健康摘要（应用版本 / 内核 / 资源计数）
     Status,
-    /// 全面诊断（逐项检查 + 修复建议；存在失败项时退出码 1，计划 §2.4）
+    /// 全面诊断（逐项检查 + 修复建议；存在失败项时退出码 1）
     Doctor,
 }
 
-/// 全局 flag 集（PRD cli.md §16/§19/§22 契约）。
+/// 全局 flag 集（对外契约冻结：flag 定义、json 输出、verbose 纪律）。
 ///
 /// 设计为独立 `Args` 结构以便子命令 `#[command(flatten)]` 复用；flag 语义只在此定义一次。
 /// 输出/行为类 flag 加 `global = true`：既可放在子命令前（`chrome-host --json env list`），
-/// 也可跟在子命令后（`chrome-host env list --json`，PRD 的管道用例范式）。
+/// 也可跟在子命令后（`chrome-host env list --json`，管道友好）。
 /// 注意 `--yes` **不加** global：env delete 有自己的子命令级 `--yes`，同名全局传播
 /// 会触发 clap 重复参数冲突；且 delete 级 flag 已覆盖「命令后置」的常用位。
 #[derive(Debug, Args)]
 pub struct GlobalArgs {
-    /// 机器可读输出：stdout 输出纯 JSON，错误体也走 stdout（PRD §19）
+    /// 机器可读输出：stdout 输出纯 JSON，错误体也走 stdout（管道侧恒拿合法 JSON）
     #[arg(long, global = true, conflicts_with = "quiet")]
     pub json: bool,
 
@@ -128,11 +128,11 @@ pub struct GlobalArgs {
     #[arg(long, global = true)]
     pub quiet: bool,
 
-    /// 诊断模式：向 stderr 追加请求方法/路径/耗时（不含 query 与敏感内容，PRD §22）
+    /// 诊断模式：向 stderr 追加请求方法/路径/耗时（不含 query 与敏感内容）
     #[arg(long, global = true)]
     pub verbose: bool,
 
-    /// 禁用 ANSI 颜色。MVP 本就不输出颜色（纯文本表格），保留 flag 以兼容 PRD
+    /// 禁用 ANSI 颜色。MVP 本就不输出颜色（纯文本表格），保留 flag 以兼容
     /// 契约与未来上色后的管道场景
     #[arg(long, global = true)]
     pub no_color: bool,
@@ -157,7 +157,7 @@ impl GlobalArgs {
     /// 解析最终 API 基地址：flag > 环境变量 > 默认值。
     ///
     /// 不用 clap 内建 `env` 特性：那需要给 clap 加 "env" feature，
-    /// 计划 §2.2 的依赖清单已冻结，不为单一参数加计划外 feature。
+    /// 依赖清单已冻结，不为单一参数加额外 feature。
     pub fn api_url(&self) -> String {
         self.api_url
             .clone()
@@ -176,7 +176,7 @@ impl GlobalArgs {
 }
 
 // ---------------------------------------------------------------------------
-// 危险操作确认流（计划 §2.7）
+// 危险操作确认流
 // ---------------------------------------------------------------------------
 
 /// 危险操作统一确认入口：`--yes` 放行；非交互（stdin 非 TTY）且无 `--yes` 直接拒绝
@@ -203,7 +203,7 @@ fn confirm_with_reader<R: std::io::BufRead>(
         return Ok(());
     }
     if !is_tty {
-        // 非交互环境绝不静默执行危险操作（PRD DoD 4）：失败发生在请求发出之前
+        // 非交互环境绝不静默执行危险操作：失败发生在请求发出之前
         return Err(CliError::Local(format!(
             "非交互环境执行危险操作需要 --yes：{msg}"
         )));
@@ -291,5 +291,5 @@ mod tests {
     }
 
     // 真实 TTY 的端到端交互（eprint 提示 + 终端读行）不自动化：依赖真终端，
-    // 留给 scripts/smoke-cli.sh 人工 smoke（计划 §2.8 第 4 层）。
+    // 留给 scripts/smoke-cli.sh 人工 smoke。
 }

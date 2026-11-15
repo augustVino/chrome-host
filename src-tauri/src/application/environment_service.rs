@@ -189,7 +189,7 @@ impl EnvironmentService {
 
         // 级联清理：先删 profile 目录（best effort），再删记录
         for ins in self.instances.list_by_env(id)? {
-            // 竞争复查（复审 P2-1）：上方 count 检查与目录删除之间可能插入并发
+            // 竞争复查：上方 count 检查与目录删除之间可能插入并发
             // create（starting 也计入存活）——逐例行级复查，出现存活实例即中止。
             // 已删目录不恢复（停止实例的目录可由 Chrome 重建，数据一致性以 DB
             // 为准），用户停止实例后重试删除即收敛；并发 create 落在循环之后的

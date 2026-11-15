@@ -249,10 +249,10 @@ struct SetExtensionEnabledArgs {
     enabled: bool,
 }
 
-// ---------- page 控制参数（P2-C，与 REST /instances/{id}/page/* 对齐） ----------
+// ---------- page 控制参数（与 REST /instances/{id}/page/* 对齐） ----------
 
 /// tab 路由参数的统一描述：targetId 或唯一前缀；省略 = 唯一 page target
-/// 自动选中，多 target 409 并在 message 列出全部 targetId（P2-F F1，不猜
+/// 自动选中，多 target 409 并在 message 列出全部 targetId（不猜
 /// 活跃 tab）。targetId 由 list_tabs 获得。
 const TAB_ARG_DESC: &str =
     "目标标签页（targetId 或唯一前缀，由 list_tabs 获得）；省略 = 唯一页面标签自动选中，多标签时报错列出全部";
@@ -453,7 +453,7 @@ struct PageEvalArgs {
     #[schemars(description = "实例 id（ins_ 前缀）")]
     instance_id: String,
     #[schemars(
-        description = "任意 JS 表达式（Runtime.evaluate，returnByValue + awaitPromise）。⚠ 高权限：可执行任意 JS，与退役前的 cdp.mjs 同权限——仅在 page 原语（snap/click/fill/press/wait/html）不够用时使用"
+        description = "任意 JS 表达式（Runtime.evaluate，returnByValue + awaitPromise）。⚠ 高权限：可执行任意 JS——仅在 page 原语（snap/click/fill/press/wait/html）不够用时使用"
     )]
     expression: String,
     #[schemars(description = TAB_ARG_DESC)]
@@ -1207,7 +1207,7 @@ impl ChromeHostMcp {
         })
     }
 
-    // ── 页面控制（P2-C）───────────────────────────────────────
+    // ── 页面控制 ─────────────────────────────────────────────
 
     #[tool(
         description = "可访问性树快照（上游风格文本树：- role \"name\" @eN，可交互节点带 @e1..@eN 引用）+ refs_count + generation + hoverScan + removedRefs（本次快照消失的旧引用）。引用是 durable 的：SPA 同文档更新后旧 @eN 仍可用（同 backendNodeId 或按 role/name 唯一匹配恢复）；导航/文档替换后旧引用报 409 PAGE_REF_STALE 时重 snap。跨域 iframe 内容内嵌在 Iframe 节点行下（kit 帧递归，@eN 跨帧连续）；CSS 选择器仍只查主 frame。操作循环：snap → 用 @eN 引用 click/fill/press → 页面变化后重 snap（或旧引用报 STALE 时再 snap）"
@@ -1424,7 +1424,7 @@ impl ChromeHostMcp {
     }
 
     #[tool(
-        description = "任意 JS 求值（Runtime.evaluate，returnByValue + awaitPromise）：对象/数组 → pretty JSON 字符串，字符串原样，undefined/null → \"undefined\"/\"null\"，数字/布尔 → JS String 形态；页面抛错 → 500 PAGE_EVAL_FAILED。⚠ 高权限：可执行任意 JS（与退役前的 cdp.mjs 同权限）——仅在 page 原语（snap/click/fill/press/wait/html）不够用时使用，优先用专用原语"
+        description = "任意 JS 求值（Runtime.evaluate，returnByValue + awaitPromise）：对象/数组 → pretty JSON 字符串，字符串原样，undefined/null → \"undefined\"/\"null\"，数字/布尔 → JS String 形态；页面抛错 → 500 PAGE_EVAL_FAILED。⚠ 高权限：可执行任意 JS——仅在 page 原语（snap/click/fill/press/wait/html）不够用时使用，优先用专用原语"
     )]
     async fn page_eval(
         &self,

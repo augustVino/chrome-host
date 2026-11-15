@@ -1,16 +1,16 @@
-//! PageCdp：CdpConnection 的 dyn 化适配（P2-B）。
+//! PageCdp：CdpConnection 的 dyn 化适配。
 //!
 //! application/page_service.rs 需要把「发一条 CDP 命令」抽象成 trait 对象，
 //! 以便测试注入 fake（不依赖真 Chrome）。ws.rs 的 `CdpConnection::send` 是
 //! 泛型方法（`T: DeserializeOwned`），无法直接 dyn 化；本文件把它收敛为
 //! 「参数 Value、返回 Value」的最小形态并给出实现——生产路径零行为差异，
-//! ws.rs 本体不动（P2-B 约束：只加新文件）。
+//! ws.rs 本体不动。
 //!
-//! 并发模型随 P2-F 根治：`CdpConnection::send` 已 &self 化，共享形态就是裸
+//! 并发模型：`CdpConnection::send` 为 &self，共享形态就是裸
 //! `Arc<dyn PageCdp>`（无锁包裹）——多条命令并发 in-flight，对话框 handle
-//! 不再被 in-flight 工具命令阻塞。
+//! 不会被 in-flight 工具命令阻塞。
 //!
-//! 事件流不经本 trait：连接建立时经 [`EventSink`] 接出（与 M6 常驻诊断
+//! 事件流不经本 trait：连接建立时经 [`EventSink`] 接出（与常驻诊断
 //! 同一机制），命令与事件两条路径在 CdpConnection 内部天然分流。
 //!
 //! 约束：不引入 async-trait crate，手写 boxed future（`Box::pin`）。
@@ -66,8 +66,8 @@ pub type PageCdpRawFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, AppError>> + Send + 'a>>;
 
 /// 共享连接形态：裸 `Arc<dyn PageCdp>`（生产 = CdpConnection，测试 = fake）。
-/// send &self 并发化后无需锁包裹（P2-F 根治前是 `Arc<tokio::sync::Mutex<...>>`，
-/// 命令串行导致对话框 handle 被 in-flight 命令阻塞）。
+/// send 为 &self，无需锁包裹（若用 `Arc<tokio::sync::Mutex<...>>` 包裹，
+/// 命令串行会导致对话框 handle 被 in-flight 命令阻塞）。
 pub type SharedPageConn = Arc<dyn PageCdp>;
 
 impl PageCdp for CdpConnection {

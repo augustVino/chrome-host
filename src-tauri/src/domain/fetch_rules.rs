@@ -1,6 +1,6 @@
 //! CDP Fetch 会话层拦截规则（domain 纯函数层）。
 //!
-//! 与 net-rules 扩展（DNR 持久层）的分工（TODO.md 第 6 项分层决策）：
+//! 与 net-rules 扩展（DNR 持久层）的分工：
 //! net-rules 管**跨任务持久**的 block/redirect/headers；本模块管 **agent
 //! 任务内动态**规则——mock 响应、修改请求头、按需 block。规则一次性下发
 //! （`POST /instances/{id}/page/intercept` 整表替换），应用层本地决策
@@ -14,7 +14,7 @@
 //! glob 语义（对外契约，AGENT-API.md 同步）：与 net-rules 同源的 `*`
 //! 通配（`*` = 任意字符序列含空），但独立实现（两层的匹配目标不同：
 //! net-rules 生成 DNR urlFilter，这里直接字符串匹配 + 透传 CDP
-//! Fetch urlPattern——spike 真机实测 CDP pattern 同为 `*` 通配）。
+//! Fetch urlPattern——真机实测 CDP pattern 同为 `*` 通配）。
 //! 连续 `*` 在编译期折叠为单个（`**` ≡ `*`，对齐上游参考实现
 //! `collapse_wildcards`——CDP urlPattern 收到 `**` 的行为未定义，折叠后
 //! 下发与本地二次匹配口径一致）。
@@ -79,11 +79,11 @@ pub enum Action {
         body: Vec<u8>,
         /// 0-10000ms（mock 上游侧延迟）
         delay_ms: u64,
-        /// CORS 收紧（I5）：声明则仅当请求 Origin 精确匹配（尾 `/` 归一）
+        /// CORS 收紧：声明则仅当请求 Origin 精确匹配（尾 `/` 归一）
         /// 才由 mock 上游注入 `Access-Control-Allow-Origin`（回显请求
         /// Origin）+ `Access-Control-Allow-Credentials: true`；不匹配则
         /// 不注入（浏览器侧拒读）。None = 缺省宽松（回显任意 Origin——
-        /// loopback 改写的跨源可读契约，spike 真机定案，保持不变）。
+        /// loopback 改写的跨源可读契约，真机实测定案，保持不变）。
         /// 对齐上游参考 mocked_response 的 allowOrigin 语义（见
         /// [`collapse_wildcards`] 来源注）。
         allow_origin: Option<String>,
@@ -154,7 +154,7 @@ pub fn compile_rules(rules: &[Value]) -> Result<Vec<InterceptRule>, AppError> {
                         invalid(format!("{at}.match.resourceTypes 须为字符串数组"))
                     })?;
                     // 输入大小写不敏感，存储 CDP 规范形态（大小写敏感：小写会被
-                    // Fetch.enable 拒 -32602——真机实测，owner 复测打回根因）
+                    // Fetch.enable 拒 -32602——真机实测，复测打回根因）
                     let Some(canonical) = RESOURCE_TYPES.iter().find(|c| c.eq_ignore_ascii_case(s))
                     else {
                         return Err(invalid(format!(
@@ -374,7 +374,7 @@ pub fn first_live_match<'a>(
     })
 }
 
-/// 放行原因诊断（journal 披露用，I5）：无命中时返回"最接近命中"的失败
+/// 放行原因诊断（journal 披露用）：无命中时返回"最接近命中"的失败
 /// 维度，与 [`first_live_match`] 同口径（三条件 glob × resourceType ×
 /// times）。优先级：url+类型均过但次数耗尽 > url 过但类型被滤 > url 未中。
 /// 有命中返回 None（调用方不该走到——防御性保留）。
@@ -526,7 +526,7 @@ mod tests {
         assert!(glob_match("a*", "a"));
     }
 
-    /// 连续 `*` 折叠（I5，上游 collapse_wildcards 同款）：`**` ≡ `*`，
+    /// 连续 `*` 折叠（上游 collapse_wildcards 同款）：`**` ≡ `*`，
     /// 编译期规范化存储 + cdp_patterns 下发折叠后形态。
     #[test]
     fn collapse_wildcards_folds_runs() {
@@ -609,7 +609,7 @@ mod tests {
         assert!(compile_rules(&[]).unwrap().is_empty());
     }
 
-    /// allowOrigin（I5）：可选字符串，编译进 Mock action；非法类型 400。
+    /// allowOrigin：可选字符串，编译进 Mock action；非法类型 400。
     #[test]
     fn compile_mock_allow_origin() {
         let rules = compile_rules(
@@ -823,7 +823,7 @@ mod tests {
         assert!(first_live_match(&rules, &used, "https://api.foo.com/x", "XHR").is_none());
     }
 
-    /// 放行原因诊断（I5）：无命中时按最接近维度披露——耗尽 > 类型被滤
+    /// 放行原因诊断：无命中时按最接近维度披露——耗尽 > 类型被滤
     /// > url 未中；有命中返回空串。journal detail 消费。
     #[test]
     fn pass_reason_reports_closest_dimension() {

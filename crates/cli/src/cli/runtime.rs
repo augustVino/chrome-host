@@ -2,8 +2,8 @@
 //!
 //! 数据源唯一：GET /api/v1/kernel/status（client::kernel_status）；写操作为
 //! POST kernel/download 与 kernel/cancel。
-//! 内核为 pinned 单版本策略（CFT_VERSION 锁定），PRD
-//! cli.md §14 的多版本表不适用 —— `runtime list` 渲染单行版本信息，与
+//! 内核为 pinned 单版本策略（CFT_VERSION 锁定），无多版本表
+//! —— `runtime list` 渲染单行版本信息，与
 //! `runtime version` 同源同形，差别仅在命令语义位（about 文案），共享同一实现。
 //!
 //! 退出码契约：install 轮询超过
@@ -81,7 +81,7 @@ pub fn run(
 /// `chrome-host runtime version`（及 `runtime list`）。
 ///
 /// table 模式 key: value，键名用 JSON 字段的 camelCase 原样 —— 「两模式无信息差」
-/// （PRD §39）的字面执行：table 键即 json 键，零翻译。冻结五键：
+/// 的字面执行：table 键即 json 键，零翻译。冻结五键：
 /// pinnedVersion/version/installed/downloading/binaryPath。json 模式输出 CftStatus
 /// 服务端原样（含 upgradeAvailable 全部字段）。quiet 对只读单对象无冻结语义，
 /// 按缺省 kv 输出（output.rs 的既定取舍）。

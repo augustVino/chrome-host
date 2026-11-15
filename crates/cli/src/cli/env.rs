@@ -248,7 +248,7 @@ fn list(globals: &GlobalArgs, client: &AgentClient) -> Result<(), CliError> {
                 s.total_instances.to_string(),
             ],
             // json 字段 = 该行完整 JSON：DTO 的 serde 属性两侧一致，序列化是恒等往返，
-            // 即服务端原样（含 CJK 原文，PRD §39）
+            // 即服务端原样（含 CJK 原文）
             json: serde_json::to_value(s).expect("纯数据 DTO 的序列化不会失败"),
         })
         .collect();
@@ -269,7 +269,7 @@ fn get(globals: &GlobalArgs, client: &AgentClient, id: &str) -> Result<(), CliEr
 }
 
 /// env get / create / update 共用的单对象 key: value 对，键名与 JSON 字段一致
-/// （PRD §39 两模式无信息差）。
+/// （两模式无信息差）。
 /// 时间戳输出原始 epoch 毫秒：chrono 不在依赖清单（不为本地格式化加依赖），
 /// 且服务端 created_at/updated_at 本就是毫秒值（domain/environment.rs）。
 fn env_kv_pairs(env: &Environment) -> Vec<(String, String)> {

@@ -18,7 +18,7 @@ use crate::exit::ExitCode;
 use crate::model::HealthReport;
 
 // diag 命令在 clap 树中的形态：Status / Doctor 是 main.rs `Commands` 的独立无载荷臂
-// （PRD 命令面就是裸的 `chrome-host status` / `chrome-host doctor`），本文件只提供
+// （命令面就是裸的 `chrome-host status` / `chrome-host doctor`），本文件只提供
 // 两个 handler，不需要组内子命令枚举（也就不需要 clap::Subcommand 导入）。
 
 /// `chrome-host status`：健康摘要（table 模式 kv 块；json 模式 HealthReport 原样）。

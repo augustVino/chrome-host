@@ -19,7 +19,7 @@ use crate::error::AppError;
 pub const MAX_GENERATIONS: usize = 5;
 
 /// CDP Cookie 记录（Storage.getCookies 返回项的最小子集；
-/// 字段与 Storage.setCookies 入参同构，M3 注入时原样回传）
+/// 字段与 Storage.setCookies 入参同构，注入时原样回传）
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CookieRecord {
@@ -70,7 +70,7 @@ pub fn parse_cdp_cookies(result: &serde_json::Value) -> Vec<CookieRecord> {
 }
 
 /// CookieRecord → Storage.setCookies 的 CookieParam（纯函数）。
-/// 两个协议差异（实测踩坑）：
+/// 两个协议差异（真机实测）：
 /// - `session` 是 getCookies 的输出字段，CookieParam 不接受，必须剔除；
 /// - 会话 cookie（expires ≤ 0）应**省略 expires 字段**，传 -1 会被拒 -32602；
 /// - sameSite "Unspecified" 不在 CookieParam 枚举内，剔除。

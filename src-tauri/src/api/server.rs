@@ -53,9 +53,9 @@ pub struct ApiState {
     pub session_service: Arc<SessionService>,
     pub settings_service: Arc<SettingsService>,
     pub extension_service: Arc<ExtensionService>,
-    /// 常驻诊断（M6）：console/network/screenshot/har 查询面
+    /// 常驻诊断：console/network/screenshot/har 查询面
     pub diagnostics: Arc<DiagnosticsService>,
-    /// page 控制（P2-C）：snap/click/fill/press/wait/dialogs 工具面
+    /// page 控制：snap/click/fill/press/wait/dialogs 工具面
     pub page: Arc<PageService>,
     pub activity: Arc<Activity>,
     pub health: Arc<HealthService>,
@@ -194,7 +194,7 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/navigate",
             post(crate::api::instances::navigate),
         )
-        // page 控制命令族（P2-C）：handler 薄透传，语义全在 page_service
+        // page 控制命令族：handler 薄透传，语义全在 page_service
         .route(
             "/api/v1/instances/{id}/page/snap",
             post(crate::api::pages::snap),
@@ -203,7 +203,7 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/click",
             post(crate::api::pages::click),
         )
-        // I2 新命令：hover/scroll/drag/select/check/tap（input 族 kit 化随行）
+        // hover/scroll/drag/select/check/tap（input 族 kit 化随行）
         .route(
             "/api/v1/instances/{id}/page/hover",
             post(crate::api::pages::hover),
@@ -244,8 +244,7 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/dialogs",
             get(crate::api::pages::dialogs),
         )
-        // page 控制命令族（P2-G）：eval/html/clickxy/loadall/type——cdp.mjs
-        // 退役前置补齐，handler 同样薄透传
+        // page 控制命令族：eval/html/clickxy/loadall/type——handler 薄透传
         .route(
             "/api/v1/instances/{id}/page/eval",
             post(crate::api::pages::eval),
@@ -295,8 +294,8 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/intercept",
             post(crate::api::pages::intercept_set).get(crate::api::pages::intercept_get),
         )
-        // page 控制命令族（W-cap）：元素截图 / PDF / 设备仿真——仍为薄透传
-        //（screenshot 内核自 I3 换 browser_kit screenshot.rs，详见任务报告）
+        // page 控制命令族：元素截图 / PDF / 设备仿真——薄透传
+        //（screenshot 内核为 browser_kit screenshot.rs）
         .route(
             "/api/v1/instances/{id}/page/screenshot",
             post(crate::api::pages::screenshot),
@@ -305,7 +304,7 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/pdf",
             post(crate::api::pages::pdf),
         )
-        // page 控制命令族（I3）：快照/像素 diff + profiler——薄透传，
+        // page 控制命令族：快照/像素 diff + profiler——薄透传，
         // 语义在 page_service（diff_tool / profiler）
         .route(
             "/api/v1/instances/{id}/page/diff",
@@ -323,7 +322,7 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/profiler/stop",
             post(crate::api::pages::profiler_stop),
         )
-        // page 控制命令族（I4）：页录屏 start/stop——薄透传，语义在
+        // page 控制命令族：页录屏 start/stop——薄透传，语义在
         // page_service（recording_tool）
         .route(
             "/api/v1/instances/{id}/page/record/start",
@@ -337,7 +336,7 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/emulate",
             post(crate::api::pages::emulate),
         )
-        // 文件传输（W-file）：下载等待（命令式，browser 级事件）+ 终态环查询
+        // 文件传输：下载等待（命令式，browser 级事件）+ 终态环查询
         // + 主机文件设入 file input
         .route(
             "/api/v1/instances/{id}/page/download-wait",

@@ -200,7 +200,7 @@ pub fn compile(config: &Value) -> Result<Value, AppError> {
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| invalid("redirect 条目缺少非空 to"))?;
-            // 引用校验（复审 P3-2）：$N 必须指向存在的捕获组（from 的 * 数），
+            // 引用校验：$N 必须指向存在的捕获组（from 的 * 数），
             // 契约支持 $1–$9。悬空引用在 Chrome 侧行为未定义——若 updateDynamicRules
             // 判非法会整批失败，该实例全部 net-rules 静默失效，故编译期拦截
             let groups = from.matches('*').count().min(9);
@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(arr[2]["action"]["requestHeaders"][0]["value"], "42");
     }
 
-    /// 引用校验（复审 P3-2）：$N 越界 / $0 / 超出 $1–$9 契约 → 编译期拒绝；
+    /// 引用校验：$N 越界 / $0 / 超出 $1–$9 契约 → 编译期拒绝；
     /// 合法引用与字面量 `$` 不受影响。悬空引用若流入 Chrome，
     /// updateDynamicRules 可能整批失败致该实例全部 net-rules 静默失效
     #[test]

@@ -1,4 +1,4 @@
-//! 远程接入端点：隧道状态与令牌轮换（方案 §8）。
+//! 远程接入端点：隧道状态与令牌轮换。
 
 use axum::extract::State;
 use axum::Json;
@@ -15,7 +15,7 @@ pub async fn status(State(state): State<ApiState>) -> Json<serde_json::Value> {
 
 /// POST /api/v1/remote-access/token —— 轮换访问令牌（旧令牌立即失效）。
 /// 17890（本地）直接可调；17891（隧道）需持旧令牌——中间件统一拦截，此处不区分。
-/// 轮换同时清空全部活跃 CDP 会话（方案 §6：旧凭证体系整体作废）。
+/// 轮换同时清空全部活跃 CDP 会话（旧凭证体系整体作废）。
 pub async fn rotate_token(
     State(state): State<ApiState>,
 ) -> Result<Json<serde_json::Value>, AppError> {

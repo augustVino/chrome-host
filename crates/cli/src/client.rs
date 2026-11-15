@@ -10,7 +10,7 @@
 //! 暂未被命令层调用的方法用逐方法的 `#[allow(dead_code)]` 抑制，不用 struct/impl
 //! 级整块 `#[allow]`，避免掩盖真实死代码。
 //!
-//! # verbose 纪律（PRD cli.md §22.3：敏感信息不落日志）
+//! # verbose 纪律（敏感信息不落日志）
 //! `--verbose` 时 [`AgentClient::send`] 向 stderr 输出一行请求摘要：
 //! `→ GET /api/v1/instances (23ms)` —— 只含 method、path、耗时三要素，
 //! **不含 URL query、不含请求/响应 body**。path 由字面路由常量拼出，唯一例外是
@@ -58,7 +58,7 @@ impl AgentClient {
     /// 基础构造：同时准备「常规 30s 总超时」与「长操作无总超时」两个底层客户端。
     ///
     /// 为什么长操作不能设总超时：`instance create` 是「创建即启动」的复合语义，
-    /// 首次调用可能在服务端阻塞于 Chrome for Testing 内核下载（~150MB，见计划 §1.1），
+    /// 首次调用可能在服务端阻塞于 Chrome for Testing 内核下载（~150MB），
     /// 30s 总超时会把正常下载误判为失败。是否用长超时由每次调用的 `long` 参数决定。
     ///
     /// 基地址由调用方传入（main.rs 用 `GlobalArgs::api_url()` 解析：flag > env > 默认）。
@@ -156,7 +156,7 @@ impl AgentClient {
         let start = std::time::Instant::now();
         let response = request.send();
         if self.verbose {
-            // stderr 纪律（PRD cli.md §22.3）：只输出 method/path/耗时，不含 query 与
+            // stderr 纪律：只输出 method/path/耗时，不含 query 与
             // body —— 敏感信息（hosts 源、扩展路径等）不落日志。query 剥离在
             // verbose_line 内做（本行传入的 path 可能是 activity 的带 query 版本）。
             let elapsed = start.elapsed();
@@ -232,7 +232,7 @@ fn join_query(parts: [Option<String>; 3]) -> String {
 /// 抽成纯函数以便单测（stderr 是进程级全局资源，打印薄壳不测 —— 与 output.rs 同一取舍）。
 /// path 带过 query 的调用（activity 的 `?limit=N`、extension config 的 `?environmentId=`
 /// 均非敏感）：打印前剥离 `?` 及之后内容，守住「verbose 不含 query」承诺（limit
-/// 虽非敏感但纪律不开口子，PRD cli.md §22.3）；本函数签名只收 method/path/elapsed，
+/// 虽非敏感但纪律不开口子）；本函数签名只收 method/path/elapsed，
 /// body 从类型上就进不来。
 fn verbose_line(method: &str, path: &str, elapsed: Duration) -> String {
     let path = path.split('?').next().unwrap_or(path);
@@ -333,7 +333,7 @@ impl AgentClient {
     }
 
     /// POST /api/v1/environments/{id}/stop-all —— 响应 `{environmentId, stopped: [instanceId]}`，
-    /// CLI 只消费 `stopped`（env delete 409 编排流用，计划 §2.7）。
+    /// CLI 只消费 `stopped`（env delete 409 编排流用）。
     pub fn env_stop_all(&self, id: &str) -> Result<Vec<String>, CliError> {
         let value = self.send(
             Method::POST,
@@ -417,7 +417,7 @@ impl AgentClient {
         ))
     }
 
-    /// DELETE /api/v1/instances/{id} —— 运行中实例服务端返回 409（409 编排流见计划 §2.7）。
+    /// DELETE /api/v1/instances/{id} —— 运行中实例服务端返回 409（env delete 编排流据此先 stop 再 delete）。
     pub fn instance_delete(&self, id: &str) -> Result<(), CliError> {
         self.send(
             Method::DELETE,
@@ -821,7 +821,7 @@ impl AgentClient {
     }
 
     // -----------------------------------------------------------------------
-    // page 命令组（P2-C）
+    // page 命令组
     // -----------------------------------------------------------------------
 
     /// page 命令族统一 **long = true（无总超时）**，why：服务端有自己的预算
@@ -831,7 +831,7 @@ impl AgentClient {
     /// 连接超时 3s 仍保护真正的「应用未运行」场景。
     ///
     /// tab 缺省（None → 服务端空串）= 唯一页面标签时自动选中；多标签 → 409
-    /// PAGE_TAB_AMBIGUOUS（message 列出全部 targetId 供显式指定，P2-F F1；
+    /// PAGE_TAB_AMBIGUOUS（message 列出全部 targetId 供显式指定；
     /// 显式前缀仍是无匹配 404 / 多匹配 409）。响应为服务端
     /// 原样 JSON（result/instanceId/targetId，snap 另含 text/refs_count/generation）。
     fn page_path(id: &str, tool: &str) -> String {
@@ -1371,7 +1371,7 @@ impl AgentClient {
     }
 
     /// POST /api/v1/instances/{id}/page/record/start —— body `{file, fps?, cursor?, tab?}`
-    ///（I4 录屏：常驻不占实例串行锁；重复 start → 409；无 ffmpeg → 422）
+    ///（录屏常驻不占实例串行锁；重复 start → 409；无 ffmpeg → 422）
     pub fn page_record_start(
         &self,
         id: &str,
@@ -1390,7 +1390,7 @@ impl AgentClient {
     }
 
     /// POST /api/v1/instances/{id}/page/record/stop —— body `{status?}`
-    ///（I4：编码收尾可能数秒；响应 { result, path, frames, capturedFrames, fps }）
+    ///（编码收尾可能数秒；响应 { result, path, frames, capturedFrames, fps }）
     pub fn page_record_stop(&self, id: &str, status: bool) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "status": status });
         Self::decode(self.send(

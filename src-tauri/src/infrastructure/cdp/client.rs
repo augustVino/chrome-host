@@ -3,7 +3,7 @@
 //!
 //! 变更类目标操作不走 HTTP 的原因：CfT pinned 131 忽略 /json/new 的 url
 //! 参数（返回的 target 停在 about:blank），/json/close 亦不生效——WS 的
-//! Target.createTarget/closeTarget 行为确定（cdp.mjs 同路径已验证）。
+//! Target.createTarget/closeTarget 行为确定（真机验证）。
 
 use std::time::{Duration, Instant};
 

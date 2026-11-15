@@ -2,14 +2,15 @@
 //! 订阅（连上 → 事件透传 → 断线由调用方重连）两种形态同一实现：无 id 帧是否
 //! 有消费方由 [`EventSink`] 决定，命令路径完全一致。
 //!
-//! 并发模型（P2-F 根治）：`send` 为 `&self`——多条命令可同时 in-flight（写帧
-//! 短锁 + id 关联的响应路由）。&mut self 时代「发送+等响应」全程独占连接，
-//! in-flight 长命令（如 click 卡在被 alert 阻塞的页面至 15s 超时）会阻塞同
-//! 连接上的对话框 handle 等一切并发命令，真机冒烟实测错过对话框黄金窗口。
+//! 并发模型：`send` 为 `&self`——多条命令可同时 in-flight（写帧
+//! 短锁 + id 关联的响应路由）。若「发送+等响应」全程独占连接（&mut self
+//! 形态），in-flight 长命令（如 click 卡在被 alert 阻塞的页面至 15s 超时）
+//! 会阻塞同连接上的对话框 handle 等一切并发命令（真机冒烟实测错过对话框
+//! 黄金窗口）。
 //!
 //! 与 proxy.rs 的帧级桥共用 tokio-tungstenite；短连接面向 chrome-host 侧的
 //! 一次性主动命令（Cookie 导出/注入、diagnostics evaluate），常驻形态面向
-//! M6 诊断订阅（console/network 事件）。
+//! 诊断订阅（console/network 事件）。
 //!
 //! 纪律：
 //! - 目标恒为本机回环的 CDP 端口，connect_async 直连 TCP、不经系统代理——
@@ -75,7 +76,7 @@ impl Drop for RawPendingGuard {
 /// 一次性 CDP 命令连接（可共享：`Arc<CdpConnection>` 直接发命令，无锁包裹）。
 pub struct CdpConnection {
     /// 写半部短锁：只覆盖「写一帧」，不等响应——若把等响应也留在锁内，
-    /// in-flight 长命令会重新串行化整条连接（P2-F 根治的关键点）。
+    /// in-flight 长命令会重新串行化整条连接。
     write: tokio::sync::Mutex<SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>,
     next_id: AtomicU64,
     pending: Pending,
@@ -86,7 +87,7 @@ pub struct CdpConnection {
 
 impl CdpConnection {
     /// 连接实例的 browser 级 WS（经 /json/version 拿 webSocketDebuggerUrl）。
-    /// M2（实例 Cookie 导出）起接入生产路径。
+    /// 实例 Cookie 导出等生产路径使用。
     #[allow(dead_code)]
     pub async fn connect(port: u16) -> Result<Self, AppError> {
         let v = super::client::version(port).await?;
@@ -105,8 +106,8 @@ impl CdpConnection {
         Self::connect_ws_eventing(ws_url, timeout, None).await
     }
 
-    /// 连接实例 browser 级 WS 并把事件帧透传给 `events`（常驻订阅形态，M6 起
-    /// 接入生产路径）：无 id 帧路由到事件通道，命令路径与短连接完全一致。
+    /// 连接实例 browser 级 WS 并把事件帧透传给 `events`（常驻订阅形态）：
+    /// 无 id 帧路由到事件通道，命令路径与短连接完全一致。
     pub async fn connect_eventing(port: u16, events: EventSink) -> Result<Self, AppError> {
         let v = super::client::version(port).await?;
         let url = v.web_socket_url.ok_or_else(|| {
@@ -211,7 +212,7 @@ impl CdpConnection {
     /// - `session_id` 供 flatten 模式的 per-target 命令；browser 级命令传 None；
     /// - Chrome 侧返回 error、命令超时、连接中断统一归为
     ///   `CDP_COMMAND_FAILED`（调用方按可降级路径处理，区分码无消费方）；
-    /// - 取消安全（W-fix2）：future 在任意 await 点被 drop 时 pending 表项由
+    /// - 取消安全：future 在任意 await 点被 drop 时 pending 表项由
     ///   [`PendingGuard`] 即时移除——外层包 timeout 取消不再依赖内层超时兜底。
     pub async fn send<T: serde::de::DeserializeOwned>(
         &self,
@@ -283,7 +284,7 @@ impl CdpConnection {
 }
 
 /// 读循环：响应（带 id）路由回 pending 等待者；事件（无 id）——短连接无消费方
-/// 丢弃，常驻连接（M6 起）透传给事件通道。事件通道随 reader 结束而 drop，
+/// 丢弃，常驻连接透传给事件通道。事件通道随 reader 结束而 drop，
 /// 消费侧 recv 返回 None 即连接已死的信号。
 async fn reader_loop(
     read: SplitStream<WsStream>,
@@ -308,7 +309,7 @@ async fn reader_loop(
                 };
                 let Some(id) = v.get("id").and_then(|x| x.as_u64()) else {
                     if let Some(tx) = &events {
-                        // unbounded 是权衡后的选择（复审 P3-3）：诊断消费端是纯内存
+                        // unbounded 是权衡后的选择：诊断消费端是纯内存
                         // 解析 + 定长环形，速率远高于事件到达；连接断开 reader 结束、
                         // 通道整体 drop，无累积泄漏路径。若未来接重消费者再改
                         // bounded + try_send 丢弃计数（诊断数据可丢，连接保活优先）
@@ -472,9 +473,9 @@ mod tests {
         assert!(err.to_string().contains("超时"));
     }
 
-    /// 取消安全回归（W-fix2）：外层 timeout drop 掉 send future 时，pending
-    /// 表项必须被 Drop guard 即时移除——此前只有内层超时或响应到达才清理，
-    /// 悬挂请求会滞留 pending 表直到连接关闭
+    /// 取消安全回归：外层 timeout drop 掉 send future 时，pending
+    /// 表项必须被 Drop guard 即时移除——否则悬挂请求会滞留 pending 表
+    /// 直到连接关闭（只有内层超时或响应到达才清理）
     #[tokio::test]
     async fn dropped_send_removes_pending_entry() {
         let url = spawn_mock().await;
@@ -526,9 +527,9 @@ mod tests {
         assert!(err.to_string().contains("关闭"));
     }
 
-    /// P2-F 根治回归：send 并发 in-flight——gated 命令响应被服务端扣住期间，
-    /// 同连接另一条命令必须能正常完成。&mut self 时代（或任何把「等响应」
-    /// 留在锁内的实现）第二条要等第一条超时（15s），500ms 预算直接判负。
+    /// send 并发 in-flight 回归：gated 命令响应被服务端扣住期间，
+    /// 同连接另一条命令必须能正常完成。任何把「等响应」留在锁内的实现，
+    /// 第二条要等第一条超时（15s），500ms 预算直接判负。
     #[tokio::test]
     async fn concurrent_sends_do_not_serialize_on_inflight_response() {
         // mock：Echo.gated 扣住响应；Echo.release 到达后补发 gated 的响应

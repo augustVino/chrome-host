@@ -5,7 +5,7 @@
 //! 2. 每个结构体镜像 src-tauri 服务端的真实 serde 线上形态（来源文件见各条注释），
 //!    服务端改字段时必须同步本文件，否则 tests/contract.rs 契约测试先红（防静默错解）；
 //! 3. CLI 只消费响应，理论上只需 Deserialize；同时派生 Serialize 供
-//!    output.rs 的 `--json` 模式把 DTO「服务端原样」回写 stdout（计划 §2.5：两种模式无信息差），
+//!    output.rs 的 `--json` 模式把 DTO「服务端原样」回写 stdout（两种模式无信息差），
 //!    serde 属性两侧一致时序列化是恒等往返，不会引入形状漂移。
 
 use serde::{Deserialize, Serialize};
