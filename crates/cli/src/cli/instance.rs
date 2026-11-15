@@ -17,7 +17,7 @@ use super::GlobalArgs;
 use crate::client::AgentClient;
 use crate::error::CliError;
 use crate::model::{
-    CdpEndpoint, CdpSessionView, CdpTarget, Instance, InstanceStatus, InstanceStatusView,
+    CdpEndpoint, CdpTarget, Instance, InstanceStatus, InstanceStatusView,
     InstanceView,
 };
 

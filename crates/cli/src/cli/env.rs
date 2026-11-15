@@ -301,7 +301,7 @@ fn create(
     session_capture: Option<&str>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let env = client.env_create(name, hosts_source_url, icon, session_capture)?;;
+    let env = client.env_create(name, hosts_source_url, icon, session_capture)?;
     if out.quiet {
         out.print_id(&env.id);
         return Ok(());

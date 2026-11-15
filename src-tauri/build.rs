@@ -34,5 +34,29 @@ fn main() {
     .expect("写出 builtin_extensions.rs 失败");
     println!("cargo:rerun-if-changed=extensions");
 
+    // tauri-build 的 copy_binaries 对已存在的 sidecar 目标会先 remove_file().unwrap()——
+    // 部分环境（GitHub macOS runner 实测）对已存在产物执行删除时报 EPERM（Operation
+    // not permitted），unwrap 直接 panic 掉整个构建。此处先尽力删除可能的旧目标
+    // （忽略一切错误），让 tauri-build 恒走纯创建路径，绕开环境相关删除失败。
+    let target_dir = std::path::Path::new(&out_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .expect("OUT_DIR 层级异常")
+        .to_path_buf()
+        .to_string_lossy()
+        .to_string();
+    let triple = std::env::var("TARGET").expect("TARGET 缺失");
+    let exe = if triple.contains("windows") { "chrome-host-cli.exe" } else { "chrome-host-cli" };
+    for layout in [
+        format!("{target_dir}/{triple}/release/{exe}"),
+        format!("{target_dir}/{triple}/debug/{exe}"),
+        format!("{target_dir}/release/{exe}"),
+        format!("{target_dir}/debug/{exe}"),
+    ] {
+        let _ = std::fs::remove_file(&layout);
+    }
+
     tauri_build::build()
 }

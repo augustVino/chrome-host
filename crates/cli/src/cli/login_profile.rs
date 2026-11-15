@@ -230,7 +230,7 @@ fn capture(
         return Ok(());
     }
 
-    let current = client.login_profile_get(env_id)?;;
+    let current = client.login_profile_get(env_id)?;
     if !yes && current.snapshot_version > 0 {
         confirm_or_yes(
             globals,
