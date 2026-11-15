@@ -54,6 +54,14 @@ chrome-host page upload <insId> <sel|@eN> /private/tmp/f.png  # 文件设入 inp
 - **跨域 iframe（OOPIF）**：snap 以 `[frame]` 段内嵌帧内容，@eN 跨帧连续编号，帧内引用直接 click/fill/press（点击走坐标投影、输入走帧会话）；CSS 选择器仍只查主 frame，帧内定位一律用 @eN；`clickxy` 点入 + `type` 输入仍是坐标级兜底；
 - **表格/查询结果导出**用 `page extract`（不要 eval 手拼 innerText）：合并单元格被覆盖位是 `null`（空串才是真实空单元格）；`coverage.datasetComplete` 只有 unknown/incomplete——看到 incomplete 与 reasons 先处理归因（虚拟化未加载完就先 `page wait` 行出现），绝不当作取全。
 
+## v0.7 新增能力速览（skill 同步可用）
+
+- **输入面六件**：`page hover / scroll / drag / select / check / tap`（拖拽带人类化弧线轨迹；select 支持 combobox 组件；tap 面向移动端仿真页）+ click `--double` / `--right`；
+- **回归比对**：`page diff`（快照文本 diff，自动滚动基线）/ `page diff-shot --baseline-file`（像素级，差异图红标）；
+- **性能取证**：`page profiler-start / profiler-stop --out trace.json`（Chrome tracing，Perfetto 可开）；
+- **录屏**：`page record-start <id> <file.webm> --cursor` → 操作 → `page record-stop`（screencast→ffmpeg；合成光标轨迹随 click/drag 移动）；
+- **拦截增强**：urlPattern `*` 通配、resourceTypes 过滤、mock `allowOrigin` CORS 收紧。
+
 ## hover 提示：snap 的 `[hover]` / `[hover-reveal]` 标记
 
 `page snap` 会静态扫描页面 CSS 的 `:hover` 规则，在节点行内打两类标记：

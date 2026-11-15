@@ -35,4 +35,13 @@ features:
   - icon: 🧩
     title: 内核自管理
     details: 首次启动自动下载 pinned 版 Chrome for Testing（双镜像），随应用管理，无需手工维护浏览器。
+  - icon: 🖱️
+    title: 页面操控（page 命令族）
+    details: snap 可访问性树快照（@eN 引用 durable、[hover] 提示）→ 点击/双击/右键、hover/滚动/拖拽/下拉/勾选/触摸、fill/press/wait 全输入面，跨域 iframe 直达；元素遮挡/可见性前置校验，对话框自动接管。
+  - icon: 🎬
+    title: 截图 · 录屏 · 性能取证
+    details: 视口/元素/全页截图与 PDF；page record 录屏（screencast→ffmpeg，合成光标轨迹）；page profiler Chrome tracing 采样；page diff / diff-shot 快照与像素级回归比对。
+  - icon: 🛡️
+    title: 网络拦截与诊断
+    details: 会话级 Fetch 拦截（glob 匹配 mock/改头/block、CORS 收紧、resourceType 过滤）；console/请求历史/HAR 常驻采集，响应体脱敏读取。
 ---

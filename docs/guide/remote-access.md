@@ -35,11 +35,63 @@ SSH 隧道转发的请求到达 app 时，来源地址恒为 `127.0.0.1`（本�
 | **访问令牌**（token） | 全部控制面 API 与 MCP | 单用户全权凭证，可随时在 Settings 页轮换（轮换立即清空全部远程 CDP 会话） |
 | **会话 key**（session） | 单个实例的 CDP 代理路径，TTL 30 分钟 | WebSocket 无法携带自定义 header，故凭证嵌在 URL 路径中，作用域收到最小 |
 
+## 云桌面要不要装 CLI？（按接入方式选）
+
+| 云桌面上的 Agent 形态 | 需要安装 | 说明 |
+|---|---|---|
+| 用 `chrome-host` CLI 命令 | **装 CLI**（`cargo install --path crates/cli`，或本地交叉编译后 scp） | 与本地同构体验，`CHROME_HOST_TOKEN` 注入令牌 |
+| MCP 客户端（Claude Code / Cursor 等） | **不装 CLI** | `claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-host http://127.0.0.1:17890/mcp` 直接接 |
+| 自研脚本 / curl 直调 REST | **什么都不装** | `curl -H "Authorization: Bearer <token>" http://127.0.0.1:17890/api/v1/...` |
+| 外部 CDP 客户端（Playwright 等） | 不装 CLI | 经会话代理 URL 接入（`instance cdp-session` 需由控制面下发——REST 调用即可） |
+
+> 三种形态的共同前提只有一条：云桌面的 `127.0.0.1:17890` 能通（隧道落地）。
+
 ## 主机侧配置（一次性）
+
+**本地电脑清单**：
+
+1. chrome-host 桌面应用已运行（隧道由 app 守护，app 退出隧道即断）；
+2. 本机能以 SSH **主动连出**到云桌面（方向是本地 → 云桌面，`ssh -R` 反向隧道；云桌面需运行 sshd 且网络可达，见下节）；
+3. 一把**可免交互使用**的 SSH 私钥（见「SSH 密钥的配置与管理」）。
+
+**操作**：
 
 1. chrome-host → **设置 → 远程接入**；
 2. 填 SSH 目标（`user@host` 或 `~/.ssh/config` 别名）→ 保存 → 打开开关；
 3. 状态行变绿（约 20 秒内）→ **复制访问令牌**。
+
+## SSH 密钥的配置与管理
+
+app 用系统 `ssh` 建 `-R` 隧道，密钥体系完全复用你本机的 ssh 环境——app 不存任何私钥。
+
+**本地（发起方）**：
+
+- 隧道以 `BatchMode=yes` 运行（禁止任何交互提示）——私钥要么**无口令**（`ssh-keygen -t ed25519 -N ""`），要么**已加入 ssh-agent**（macOS：`ssh-add --apple-use-keychain ~/.ssh/id_ed25519` 并在 `~/.ssh/config` 写 `UseKeychain yes`）。带口令且未入 agent 的密钥会让隧道静默起不来；
+- 默认密钥发现顺序与 ssh 一致（`~/.ssh/id_ed25519` 等）；也可在 `~/.ssh/config` 里给目标显式指定 `IdentityFile`——app 会解析你的 config（别名 / HostName / Port / User / IdentityFile / ProxyJump 均生效），仅剔除其中的转发指令行（防止用户自有转发干扰隧道）；
+- 推荐给云桌面起个别名：
+
+```sshconfig
+# ~/.ssh/config（本地）
+Host yun
+  HostName cloud-desktop.internal   # 云桌面地址（IP 或域名）
+  Port 22
+  User agent
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+设置页的 SSH 目标直接填 `yun` 即可。
+
+**云桌面（sshd 侧）**：
+
+- 把本地公钥加入 `~/.ssh/authorized_keys`（`ssh-copy-id agent@cloud-desktop.internal` 一步完成）；
+- 保持 sshd 可达 + 允许 TCP 转发（`AllowTcpForwarding yes`，多数发行版默认开）。
+
+**主机密钥（中间人防护）**：
+
+- 隧道用 `StrictHostKeyChecking=accept-new`：**首次**连接自动信任并记录云桌面主机密钥，之后密钥变化会拒绝连接（防中间人）。建议先手工 `ssh yun` 一次完成首次确认与指纹留档；
+- 轮换：换私钥后重跑 `ssh-copy-id` 并在设置页关闭再打开远程接入开关即可，隧道自动以新密钥重建；访问令牌的轮换在 Settings 页独立进行（轮换令牌会即时清空全部远程 CDP 会话，隧道不受影响）。
+
+**故障对照**：状态行/`doctor` 的 remote_access 项 + stderr 环形缓冲会给出 `Permission denied (publickey)`（密钥/口令问题）、`remote port forwarding failed`（云桌面 17891 被 stale 进程占用，app 会自动一次性清理）等原文特征。
 
 ## 远程机器配置（一次性）
 
