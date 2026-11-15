@@ -41,7 +41,29 @@ pub trait PageCdp: Send + Sync {
         params: Value,
         session_id: Option<&'a str>,
     ) -> PageCdpFuture<'a>;
+
+    /// raw 响应帧文本通道（browser_kit typed_raw 用：MB 级响应单次反序列
+    /// 化，防 Value 中间树双份内存）。默认实现报不支持——测试 fake 无需
+    /// 覆写；CdpConnection 原生实现。
+    fn send_raw<'a>(
+        &'a self,
+        _method: &'a str,
+        _params: Value,
+        _session_id: Option<&'a str>,
+    ) -> PageCdpRawFuture<'a> {
+        Box::pin(async {
+            Err(AppError::business(
+                500,
+                "CDP_COMMAND_FAILED",
+                "raw 通道不可用（该连接形态不支持）",
+            ))
+        })
+    }
 }
+
+/// raw 通道的 future 形态（与 PageCdpFuture 同构，输出为帧文本）。
+pub type PageCdpRawFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, AppError>> + Send + 'a>>;
 
 /// 共享连接形态：裸 `Arc<dyn PageCdp>`（生产 = CdpConnection，测试 = fake）。
 /// send &self 并发化后无需锁包裹（P2-F 根治前是 `Arc<tokio::sync::Mutex<...>>`，
@@ -57,6 +79,17 @@ impl PageCdp for CdpConnection {
     ) -> PageCdpFuture<'a> {
         // 显式走固有方法（inherent 优先于 trait），仅收敛泛型为 Value
         Box::pin(CdpConnection::send::<Value>(
+            self, method, params, session_id,
+        ))
+    }
+
+    fn send_raw<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+        session_id: Option<&'a str>,
+    ) -> PageCdpRawFuture<'a> {
+        Box::pin(CdpConnection::send_raw(
             self, method, params, session_id,
         ))
     }

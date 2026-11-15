@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod browser_kit;
 pub mod cdp_session;
 pub mod diagnostics_service;
 pub mod environment_service;

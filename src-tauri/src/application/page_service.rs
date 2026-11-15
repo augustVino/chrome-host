@@ -341,7 +341,16 @@ struct Watched {
     /// 代际计数：每次建连 +1。旧代 watch_loop 在清理点核对代际，新一代已
     /// 接管时不动登记表/连接槽（防僵尸 loop 误删新代状态）。
     generation: AtomicU64,
+    /// 事件总线（browser_kit 能力层的订阅面）：watch_loop 在 handle_event
+    /// 后逐事件转发广播。生命周期与 Watched 相同（跨建连代存活：新一代
+    /// loop 接管后继续转发）；订阅者需容忍重连间隙——旧连接的 sessionId
+    /// 随连接死亡失效，能力层的会话态本就该随之重建。
+    event_bus: tokio::sync::broadcast::Sender<super::browser_kit::CdpEvent>,
 }
+
+/// 事件总线容量：鎴屏帧流（~30fps）+常规事件并发的安全余量。
+/// broadcast 慢订阅者收 Lagged 丢旧帧（能力层语义容忍，如 screencast）。
+const EVENT_BUS_CAPACITY: usize = 4096;
 
 impl Watched {
     fn new() -> Self {
@@ -359,6 +368,7 @@ impl Watched {
             intercept: Mutex::new(HashMap::new()),
             downloads: Mutex::new(DownloadState::default()),
             generation: AtomicU64::new(0),
+            event_bus: tokio::sync::broadcast::channel(EVENT_BUS_CAPACITY).0,
         }
     }
 }
@@ -1249,6 +1259,11 @@ async fn watch_loop(
             return;
         }
         handle_event(&watched, &event).await;
+        // 事件总线转发（browser_kit 订阅面）：在本代自己的事件处理后广播。
+        // 无订阅者时 send 是廉价 no-op；Lagged 由订阅者自行消化
+        if let Some(ev) = super::browser_kit::cdp_event_from_frame(&event) {
+            let _ = watched.event_bus.send(ev);
+        }
     }
     let mut slot = watched.conn.lock().unwrap();
     if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, &my_conn)) {

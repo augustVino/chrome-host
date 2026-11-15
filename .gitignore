@@ -34,3 +34,5 @@ docs/.vitepress/cache
 docs/reference/
 
 .agents
+# 多 worktree 并行开发（hc agent 工作区）
+.wt/
