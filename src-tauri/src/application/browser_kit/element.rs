@@ -2,6 +2,14 @@
 // Upstream: https://github.com/vercel-labs/agent-browser @e0c121a96d3a5412e2078e0c8eba3f4d2db2b616 cli/src/native/element.rs
 // License text: LICENSES/Apache-2.0-agent-browser.txt
 // CHROME-HOST ADAPTATIONS (M0 机械 vendor): import 路径改写到 browser_kit 模块布局，其余未改。
+// CHROME-HOST ADAPTATIONS (V1): 移除上游的 ACTIVE_FRAME 进程级全局态（static OnceLock<Mutex>）。
+//   what: active_frame 改存 CdpClient 字段（构造期注入、只读），本文件两个 CSS 选择器
+//         解析点（resolve_element_center / resolve_element_object_id 的 fallback 分支）
+//         从 free fn active_frame() 改读 client.active_frame()；删除 static 与
+//         set_active_frame/free fn active_frame。
+//   why: 上游 daemon 单 session 单浏览器、命令前由 state lock 镜像会话态，全局态安全；
+//        chrome-host 多实例并发，同一进程跑多个浏览器实例，进程级 static 会跨实例
+//        串态（A 实例的 frame 选择泄漏到 B 实例）。
 // 后续适配改动须在本文件继续登记。
 
 use std::collections::HashMap;
@@ -271,25 +279,6 @@ pub fn parse_ref(input: &str) -> Option<String> {
     None
 }
 
-/// Mirror of DaemonState.active_frame_id, refreshed before every command
-/// (commands are serialized by the daemon's state lock, so this cannot
-/// race). It lets CSS-selector resolution honor `frame <sel>` without
-/// threading a parameter through every interaction signature; snapshot refs
-/// already carry their frame through the ref map.
-static ACTIVE_FRAME: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
-    std::sync::OnceLock::new();
-
-pub fn set_active_frame(frame_id: Option<&str>) {
-    *ACTIVE_FRAME
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .unwrap() = frame_id.map(String::from);
-}
-
-fn active_frame() -> Option<String> {
-    ACTIVE_FRAME.get().and_then(|m| m.lock().unwrap().clone())
-}
-
 /// Object handle for the <iframe> element that owns a frame, resolved on the
 /// parent session. Works for same-process frames where no dedicated CDP
 /// session exists.
@@ -484,11 +473,12 @@ pub async fn resolve_element_center(
         return Ok((x, y, effective_session_id.to_string()));
     }
 
-    // CSS selector: honor an active `frame <sel>` selection.
-    if let Some(frame_id) = active_frame() {
+    // CSS selector: honor an active `frame <sel>` selection. active_frame
+    // 随 CdpClient 构造注入（会话级，多实例互不串扰）。
+    if let Some(frame_id) = client.active_frame() {
         // Cross-process iframe: its dedicated session's main frame IS the
         // iframe, so plain document-rooted resolution works there.
-        if let Some(frame_session) = iframe_sessions.get(&frame_id) {
+        if let Some(frame_session) = iframe_sessions.get(frame_id) {
             let (x, y) =
                 resolve_by_selector(client, frame_session, selector_or_ref, require_actionable)
                     .await?;
@@ -497,7 +487,7 @@ pub async fn resolve_element_center(
         let (x, y) = resolve_center_in_same_process_frame(
             client,
             session_id,
-            &frame_id,
+            frame_id,
             selector_or_ref,
             require_actionable,
         )
@@ -734,8 +724,8 @@ pub async fn resolve_element_object_id(
     }
 
     // Selector fallback (CSS or XPath): honor an active `frame <sel>` selection.
-    if let Some(frame_id) = active_frame() {
-        if let Some(frame_session) = iframe_sessions.get(&frame_id) {
+    if let Some(frame_id) = client.active_frame() {
+        if let Some(frame_session) = iframe_sessions.get(frame_id) {
             let js = build_find_element_js(selector_or_ref);
             let result: EvaluateResult = client
                 .send_command_typed(
@@ -755,7 +745,7 @@ pub async fn resolve_element_object_id(
             return Ok((object_id, frame_session.clone()));
         }
         let object_id =
-            resolve_object_in_same_process_frame(client, session_id, &frame_id, selector_or_ref)
+            resolve_object_in_same_process_frame(client, session_id, frame_id, selector_or_ref)
                 .await?;
         return Ok((object_id, session_id.to_string()));
     }
