@@ -116,6 +116,10 @@ jobs:
         with:
           workspaces: ./src-tauri -> ./target
           key: ${{ matrix.rust_target }}
+          # v2：隔离 v0.7.x 前的旧缓存——旧缓存携带的 sidecar 产物
+          # （chrome-host-cli，不匹配任何 workspace bin，rust-cache 不会剔除）
+          # 在新版 runner 上 unlink 报 EPERM，令 tauri-build panic
+          prefix-key: v2-clean
 
       # pnpm 版本取 package.json 的 packageManager 字段（与 docs.yml 一致，勿再写 version 输入）
       - name: Setup pnpm
@@ -137,6 +141,14 @@ jobs:
 
       - name: Install frontend dependencies
         run: pnpm install
+
+      # sidecar 旧产物防御性清理 + 诊断（若仍存在则暴露文件 flags/xattr 供排查）
+      - name: Purge stale sidecar artifacts from restored cache
+        run: |
+          find target -type f -name 'chrome-host-cli*' -print -delete 2>/dev/null || true
+          find target -type d -name 'chrome-host-cli*' -print -exec rm -rf {} + 2>/dev/null || true
+          echo "--- 残留检查（应为空）："
+          find target -name 'chrome-host-cli*' -exec ls -laO {} \; 2>/dev/null || echo "（无残留）"
 
       # 版本号从 tag 同步三处（node 跨平台，规避 GNU/BSD sed 差异）
       - name: Update version from tag
