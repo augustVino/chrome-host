@@ -304,7 +304,7 @@ PAGE_SERVICE_UNAVAILABLE`）。
 
 | 端点 | 说明 |
 |---|---|
-| `POST /api/v1/instances/{id}/page/snap` | AX 树快照 + @eN ref 整表替换 + hover 感知标记（行内 `[hover]` / `[hover-reveal]`，meta `hoverScan`）。body `{ "tab?": ... }`；跨域 iframe 内容以 `[frame]` 段内嵌（@eN 跨 frame 连续编号，v0.7+） |
+| `POST /api/v1/instances/{id}/page/snap` | kit 快照管线 + durable @eN refs + hover 感知标记（行尾 `[hover]` / `[hover-reveal]`，meta `hoverScan`）。body `{ "tab?", "compact?", "interactive?", "depth?", "urls?", "selector?" }`（全缺省 = 完整树）；跨域 iframe 内容内嵌在 Iframe 节点行下（@eN 跨 frame 连续编号）；响应含 `removedRefs`（本次快照消失的旧引用，非空时才有） |
 | `POST /api/v1/instances/{id}/page/click` | 原生输入点击（三段鼠标事件，非 `el.click()`）。body `{ "target", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/fill` | 聚焦→全选清空→insertText→回读校验。body `{ "target", "value", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/press` | 键盘三段序列。body `{ "key", "target?", "tab?" }` |
@@ -347,15 +347,16 @@ PAGE_SERVICE_UNAVAILABLE`）。
   `display:none` 隐藏的 reveal 目标不在 AX 树（hover 后出现，重新 snap 可见）；
   CSS 解析为启发式（`@keyframes`/注释/`:not(:hover)` 已排除，误报由 DOM
   求值兜底——查不到元素的选择器自然无标记）。
-- **`target`**：`@eN` 引用（上次 snap 产生；导航/文档替换后整表失效 → `PAGE_REF_STALE`，
-  需重新 snap 而非对旧引用重试）或 CSS 选择器两种形态。
+- **`target`**：`@eN` 引用（durable，v0.8+/I1b：SPA 同文档更新后旧引用仍可用
+  ——同节点直接命中，失联时按 role/name 唯一匹配恢复；导航/文档替换后节点死亡
+  → `PAGE_REF_STALE`，重 snap 而非对旧引用重试）或 CSS 选择器两种形态。
 - **跨域 iframe（OOPIF）**：snap 的 AX 树包含跨域 iframe 内的可交互元素
-  （挂接点下 `[frame]` 段，@eN 连续编号）；@eN 指向帧内元素时 click 走
-  坐标投影（帧内 quad → owner iframe 元素 quad 逐级上投 → 根视口，
-  Input 派发发根 target），fill/press 的 DOM/Runtime 命令路由到帧会话。
-  **CSS 选择器仍只查主 frame**（与 BrowserSkill 一致）；帧内导航/移除只
-  使该帧的 ref 失效（`PAGE_REF_STALE`，主 frame ref 不受影响）；帧内 hover
-  标记不适用（后续迭代边界）。同源 iframe 内容本就在主树中，无需特殊处理。
+  （Iframe 节点行下的缩进子树，@eN 连续编号）；@eN 指向帧内元素时 kit 解析链
+  自动路由到帧会话（click 的 Input 派发发帧会话，坐标为帧本地；fill/press 的
+  DOM/Runtime 命令同路由）。**CSS 选择器仍只查主 frame**（与 BrowserSkill 一致）；
+  帧内容换掉后旧帧内 ref 解析失败报 `PAGE_REF_STALE`（durable：不整表失效，
+  重 snap）；帧内 hover 标记不适用（后续迭代边界）。同源 iframe 内容本就在
+  主树中，无需特殊处理。
 - **`state`**：`visible`（缺省）/ `hidden` / `attached` / `detached`；非法 → `400 INVALID_REQUEST`。
 - **`timeout`**：时长字符串（`"10s"` / `"250ms"`，裸数字 = 毫秒），缺省 10s；工具级
   预算 = timeout + 5s。
@@ -431,10 +432,11 @@ block/redirect/headers，intercept 管任务内 mock/改头/按需 block）。**
 | `GET /api/v1/instances/{id}/page/intercept?tab=` | 拦截状态：各规则命中计数/剩余/活跃 + 干预记录环（最近 200 条，url 已脱敏）+ `liveSince` |
 
 ```json
-// POST .../page/snap 响应（蛇形键对齐 TS wire 字段；hoverScan 见下）
+// POST .../page/snap 响应（v0.8+ 上游风格行 + @eN 后处理；hoverScan 见下；
+// removedRefs 仅在本次快照有旧引用消失时出现）
 { "instanceId": "ins_...", "targetId": "ABC123",
-  "text": "[WebArea] Example Domain\n  @e1 [link] [hover] More information...",
-  "refs_count": 1, "generation": 1, "hoverScan": "ok" }
+  "text": "- link \"More information...\" @e1 [hover]\n- heading \"Example Domain\"",
+  "refs_count": 1, "generation": 2, "hoverScan": "ok", "removedRefs": ["@e3"] }
 
 // POST .../page/click 响应（fill/press/wait 同为 result 单行形态）
 { "result": "Clicked <BUTTON> \"Save\" (native input @150,130)",
@@ -679,11 +681,12 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 400 | `PAGE_KEY_UNKNOWN` | page press 键名不认识（支持命名键/单字符/组合键） |
 | 404 | `PAGE_TAB_NOT_FOUND` / `PAGE_REF_NOT_FOUND` / `PAGE_ELEMENT_NOT_FOUND` | page 族：tab 路由未命中 / @eN 引用不在上次 snap 表 / 选择器未命中 |
 | 409 | `PAGE_TAB_AMBIGUOUS` / `PAGE_SERVICE_UNAVAILABLE` | page 族：tab 前缀多匹配，或省略 tab 且存在多个页面标签（message 列出全部 targetId）/ 实例未运行或无 CDP 端口 |
-| 409 | `PAGE_REF_STALE` / `PAGE_TARGET_MOVED` | @eN 引用已因导航/文档替换失效（重 snap）/ 引用节点不再可解析 |
+| 409 | `PAGE_REF_STALE` / `PAGE_TARGET_MOVED` | @eN 引用节点死亡且恢复无果（durable 语义，重 snap）/ 引用节点不再可解析 |
 | 409 | `PAGE_ELEMENT_BLOCKED` / `PAGE_FILL_VALUE_MISMATCH` / `PAGE_WAIT_TIMEOUT` | 点击点被遮挡 / fill 回读不一致（写入可能已部分生效，先观察再决定）/ 等待超时 |
 | 409 | `PAGE_NAV_NO_HISTORY` | page back/forward 已在导航历史边界（无更早/更晚条目） |
 | 409 | `PAGE_FOCUS_FAILED` / `PAGE_FILL_FOCUS_LOST` | page press/fill 焦点失败 / 页面在 fill 过程中抢走焦点 |
-| 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / fill 目标不可编辑 |
+| 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_ELEMENT_DISABLED` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / 元素被禁用（v0.8+ kit 解析链） / fill 目标不可编辑 |
+| 500 | `PAGE_ACTION_FAILED` | page 工具链未分类失败（v0.8+ kit String 错误兜底，message 原文透传） |
 | 422 | `PAGE_EMULATE_UNKNOWN_PRESET` / `PAGE_EXTRACT_NOT_A_TABLE` | 未知仿真预设 / extract 目标非表格（仅接受 table/[role=table\|grid\|treegrid]） |
 | 422 | `PAGE_TARGET_NOT_FILE_INPUT` / `PAGE_UPLOAD_PATH_INVALID` / `PAGE_UPLOAD_FILE_TOO_LARGE` | upload 目标非 input[type=file] / filePath 非绝对路径或经符号链接或非普通文件 / 超 100MB 上限（W-file） |
 | 404 | `PAGE_UPLOAD_FILE_NOT_FOUND` | upload 的主机文件不存在（W-file） |
