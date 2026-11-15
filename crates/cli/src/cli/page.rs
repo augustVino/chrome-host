@@ -69,13 +69,21 @@ pub enum PageCommands {
         selector: Option<String>,
     },
 
-    /// 原生输入点击（选择器或 @eN 引用）
-    #[command(about = "原生输入点击：<sel|@eN>（三段鼠标事件，非 el.click()）")]
+    /// 原生输入点击（选择器或 @eN 引用；双击/右键经 ClickSpec 透传）
+    #[command(
+        about = "原生输入点击：<sel|@eN>（kit ClickPhase 三段，settle + 可见/遮挡校验；--double 双击 / --right 右键）"
+    )]
     Click {
         /// 实例 id
         id: String,
         /// 点击目标：@eN 引用（上次 snap 产生）或 CSS 选择器
         target: String,
+        /// 双击（clickCount=2）
+        #[arg(long)]
+        double: bool,
+        /// 右键（button=right）
+        #[arg(long)]
+        right: bool,
         /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
@@ -107,6 +115,86 @@ pub enum PageCommands {
         /// 可选聚焦目标：@eN 引用或 CSS 选择器
         #[arg(long, value_name = "SEL|@eN")]
         target: Option<String>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 悬停（菜单展开类页面的 hover 触发）
+    #[command(about = "悬停：<sel|@eN>（mouseMoved；展开后重 snap 拿新引用）")]
+    Hover {
+        /// 实例 id
+        id: String,
+        /// 悬停目标：@eN 引用或 CSS 选择器
+        target: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 滚动（有目标滚元素、无目标滚页面）
+    #[command(about = "滚动：[sel|@eN] <dx> <dy>（有目标滚元素，无目标滚页面；像素可负）")]
+    Scroll {
+        /// 实例 id
+        id: String,
+        /// 可选滚动目标 + 滚动量：`<dx> <dy>`（滚页面）或 `<sel|@eN> <dx> <dy>`（滚元素）
+        #[arg(value_name = "[SEL|@eN] DX DY", num_args = 2..=3, allow_negative_numbers = true)]
+        args: Vec<String>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 拖拽（滑块/排序/拖放；人类化轨迹）
+    #[command(about = "拖拽：<from> <to>（弧线缓动轨迹；两端点同帧）")]
+    Drag {
+        /// 实例 id
+        id: String,
+        /// 拖拽起点：@eN 引用或 CSS 选择器
+        from: String,
+        /// 拖拽终点：@eN 引用或 CSS 选择器
+        to: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 下拉选择（原生 select 与 combobox 组件）
+    #[command(about = "下拉选择：<sel|@eN> <value>（按 value 或可见文本匹配）")]
+    Select {
+        /// 实例 id
+        id: String,
+        /// 选择目标：@eN 引用或 CSS 选择器
+        target: String,
+        /// 选项 value 或可见文本（label）
+        value: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 勾选/取消勾选复选框或单选钮
+    #[command(about = "勾选：<sel|@eN> [--uncheck 取消勾选]（已处于目标态 = no-op 成功）")]
+    Check {
+        /// 实例 id
+        id: String,
+        /// 勾选目标：@eN 引用或 CSS 选择器（input 或关联 label）
+        target: String,
+        /// 取消勾选（缺省 = 勾选）
+        #[arg(long)]
+        uncheck: bool,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 触摸轻点（移动端仿真页面）
+    #[command(about = "触摸轻点：<sel|@eN>（touchStart/touchEnd，仿真页专用）")]
+    Tap {
+        /// 实例 id
+        id: String,
+        /// 轻点目标：@eN 引用或 CSS 选择器
+        target: String,
         /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
@@ -523,9 +611,13 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
                 selector: selector.as_deref(),
             },
         ),
-        PageCommands::Click { id, target, tab } => {
-            click(globals, client, id, target, tab.as_deref())
-        }
+        PageCommands::Click {
+            id,
+            target,
+            double,
+            right,
+            tab,
+        } => click(globals, client, id, target, *double, *right, tab.as_deref()),
         PageCommands::Fill {
             id,
             target,
@@ -538,6 +630,26 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             target,
             tab,
         } => press(globals, client, id, key, target.as_deref(), tab.as_deref()),
+        PageCommands::Hover { id, target, tab } => {
+            hover(globals, client, id, target, tab.as_deref())
+        }
+        PageCommands::Scroll { id, args, tab } => scroll(globals, client, id, args, tab.as_deref()),
+        PageCommands::Drag { id, from, to, tab } => {
+            drag(globals, client, id, from, to, tab.as_deref())
+        }
+        PageCommands::Select {
+            id,
+            target,
+            value,
+            tab,
+        } => select(globals, client, id, target, value, tab.as_deref()),
+        PageCommands::Check {
+            id,
+            target,
+            uncheck,
+            tab,
+        } => check(globals, client, id, target, *uncheck, tab.as_deref()),
+        PageCommands::Tap { id, target, tab } => tap(globals, client, id, target, tab.as_deref()),
         PageCommands::Wait {
             id,
             selector,
@@ -770,15 +882,17 @@ fn render_result(out: &OutputCtx, resp: &serde_json::Value) {
     print_page_out(out, result_out(resp, out));
 }
 
-/// `page click <ID> <sel|@eN> [--tab T]`
+/// `page click <ID> <sel|@eN> [--double] [--right] [--tab T]`
 fn click(
     globals: &GlobalArgs,
     client: &AgentClient,
     id: &str,
     target: &str,
+    double: bool,
+    right: bool,
     tab: Option<&str>,
 ) -> Result<(), CliError> {
-    let resp = client.page_click(id, target, tab)?;
+    let resp = client.page_click(id, target, double, right, tab)?;
     render_result(&OutputCtx::from(globals), &resp);
     Ok(())
 }
@@ -807,6 +921,101 @@ fn press(
     tab: Option<&str>,
 ) -> Result<(), CliError> {
     let resp = client.page_press(id, key, target, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page hover <ID> <sel|@eN> [--tab T]`
+fn hover(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_hover(id, target, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page scroll <ID> [sel|@eN] <dx> <dy> [--tab T]`：位置参数 2 或 3 个
+///（负数被 clap 当 flag，故整组收集后本地解析定形）。非法形态/非数字
+/// 本地 exit 2。
+fn scroll(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    args: &[String],
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let (target, dx_s, dy_s) = match args {
+        [dx, dy] => (None, dx, dy),
+        [t, dx, dy] => (Some(t.as_str()), dx, dy),
+        _ => {
+            return Err(CliError::Local(
+                "scroll 参数为 <dx> <dy> 或 <sel|@eN> <dx> <dy>（像素可负）".into(),
+            ))
+        }
+    };
+    let bad = |what: &str| CliError::Local(format!("scroll {what} 必须为数字（CSS 像素，可负）"));
+    let dx: f64 = dx_s.parse().map_err(|_| bad("dx"))?;
+    let dy: f64 = dy_s.parse().map_err(|_| bad("dy"))?;
+    let resp = client.page_scroll(id, target, dx, dy, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page drag <ID> <from> <to> [--tab T]`
+fn drag(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    from: &str,
+    to: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_drag(id, from, to, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page select <ID> <sel|@eN> <value> [--tab T]`
+fn select(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: &str,
+    value: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_select(id, target, value, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page check <ID> <sel|@eN> [--uncheck] [--tab T]`
+fn check(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: &str,
+    uncheck: bool,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_check(id, target, uncheck, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page tap <ID> <sel|@eN> [--tab T]`
+fn tap(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_tap(id, target, tab)?;
     render_result(&OutputCtx::from(globals), &resp);
     Ok(())
 }

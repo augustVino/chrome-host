@@ -59,6 +59,27 @@ pub(crate) fn map_kit_error(raw: &str, tool: &str) -> AppError {
         AppError::business(422, "PAGE_TARGET_NOT_FILLABLE", raw.to_string())
     } else if m.contains("unknown ref") {
         PageControlError::ref_not_found(raw).into()
+    } else if m.contains("no option matched") || m.contains("no visible role=option") {
+        // I2 select：选项未命中（kit 原文列出可用项，透传不吞）；combobox
+        // 展开但无可选项同码
+        AppError::business(422, "PAGE_SELECT_NO_OPTION", raw.to_string())
+    } else if m.contains("multiple options matched") {
+        AppError::business(409, "PAGE_SELECT_AMBIGUOUS", raw.to_string())
+    } else if m.contains("is not a <select>") {
+        AppError::business(422, "PAGE_SELECT_NOT_SELECT", raw.to_string())
+    } else if m.contains("input.dispatchmouseevent") {
+        // I2 click/drag 的 Input 派发失败（真实链路错误文案含方法名，如
+        // "CDP 命令 Input.dispatchMouseEvent 被拒绝: …"）。kit 不外露失败
+        // 相位——effect 语义按保守 unknown 处理（绝不标 none：盲目重试 =
+        // 二次点击）。
+        AppError::business(
+            500,
+            "PAGE_DISPATCH_FAILED",
+            format!(
+                "{tool}: input dispatch failed mid-sequence: {raw} \
+                 (effect_state: unknown — an input event may have been dispatched; observe the page before retrying)"
+            ),
+        )
     } else if m.contains("not found") {
         AppError::business(404, "PAGE_ELEMENT_NOT_FOUND", raw.to_string())
     } else {
@@ -150,6 +171,58 @@ mod tests {
         assert_eq!(code_ref(&e), ("PAGE_ACTION_FAILED".to_string(), 500));
         assert!(e.to_string().contains("snap"), "tool 上下文在前缀");
         assert!(e.to_string().contains("boom"), "原文不吞");
+    }
+
+    /// I2 新增规则：select 族（选项未命中/多匹配/非 select 目标）与 Input
+    /// 派发失败（保守 unknown）
+    #[test]
+    fn map_kit_error_covers_i2_select_and_dispatch_rules() {
+        // select：选项未命中（kit 原文含可用项列表，透传不吞）
+        let e = map_kit_error(
+            "No option matched [\"2\"]. Available options: 1 (\"一\"), 2x (\"二\")",
+            "select",
+        );
+        assert_eq!(code_ref(&e), ("PAGE_SELECT_NO_OPTION".to_string(), 422));
+        assert!(e.to_string().contains("Available options"));
+        // combobox 展开但无可选项
+        assert_eq!(
+            code_ref(&map_kit_error(
+                "combobox opened but no visible role=option elements were found",
+                "select"
+            )),
+            ("PAGE_SELECT_NO_OPTION".to_string(), 422)
+        );
+        // 多匹配（归一化后仍多候选）
+        assert_eq!(
+            code_ref(&map_kit_error(
+                "Multiple options matched \"a\" after whitespace normalization",
+                "select"
+            )),
+            ("PAGE_SELECT_AMBIGUOUS".to_string(), 409)
+        );
+        // 非 select/combobox/listbox 目标
+        assert_eq!(
+            code_ref(&map_kit_error(
+                "select target <div> is not a <select> or a role=combobox/listbox element",
+                "select"
+            )),
+            ("PAGE_SELECT_NOT_SELECT".to_string(), 422)
+        );
+        // 禁用选项：命中既有 disabled 规则（422 PAGE_ELEMENT_DISABLED，不落
+        // select 新规则——次序验证）
+        assert_eq!(
+            code_ref(&map_kit_error("Option \"b\" is disabled", "select")),
+            ("PAGE_ELEMENT_DISABLED".to_string(), 422)
+        );
+        // Input 派发失败：真实链路文案含方法名 → 保守 unknown 的
+        // PAGE_DISPATCH_FAILED（绝不标 none——盲重试 = 二次点击）
+        let e = map_kit_error(
+            "CDP 命令 Input.dispatchMouseEvent 被拒绝: bad target",
+            "click",
+        );
+        assert_eq!(code_ref(&e), ("PAGE_DISPATCH_FAILED".to_string(), 500));
+        assert!(e.to_string().contains("effect_state: unknown"));
+        assert!(!e.to_string().contains("effect_state: none"));
     }
 
     /// 规则次序不误伤：stale 优先于 not found（恢复不可判定文案里同时含两类关键词）

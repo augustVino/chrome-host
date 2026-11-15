@@ -190,6 +190,34 @@ fn armed() -> (PageService, Arc<Watched>, Calls, Script) {
     (svc, watched, calls, script)
 }
 
+/// armed 变体：暴露闸门表（对话框竞速等需要挂起单次 CDP 发送的场景）。
+fn armed_with_gates() -> (PageService, Arc<Watched>, Calls, Script, Gates) {
+    let (calls, script, _tap, connector) = fake_connector();
+    let svc = PageService::with_connector(setup_running(), connector);
+    let gates: Gates = Arc::default();
+    let watched = Arc::new(Watched::new());
+    *watched.conn.lock().unwrap() = Some(fake_conn(&calls, &script, None, &gates));
+    watched.tabs.lock().unwrap().attach("T1", "S1");
+    watched.tabs.lock().unwrap().attach("TAB2", "S2");
+    svc.watched
+        .lock()
+        .unwrap()
+        .insert(INS.into(), Arc::clone(&watched));
+    (svc, watched, calls, script, gates)
+}
+
+/// kit selector 链的 Runtime.evaluate 响应（returnByValue=true：RemoteObject
+/// .value 即页内脚本返回对象——定位 + actionability + 遮挡一体）
+fn eval_obj_response(payload: Value) -> Result<Value, String> {
+    Ok(json!({ "result": { "type": "object", "value": payload } }))
+}
+
+/// kit 对象解析链的 Runtime.evaluate 响应（returnByValue=false：RemoteObject
+/// .objectId——fill/select/check 等对目标元素的句柄解析）
+fn resolve_obj_eval(object_id: &str) -> Result<Value, String> {
+    Ok(json!({ "result": { "type": "object", "objectId": object_id } }))
+}
+
 /// 测试 ref 预种子（S5：RefMap::add_with_frame 构造，替代旧 RefStore JSON 形态）。
 /// role/name 是 kit stale 恢复链的输入，默认 button/OK；frame 传 Some 时帧内条目。
 fn seed_ref(watched: &Watched, tid: &str, ref_id: &str, bni: i64, frame: Option<&str>) {
@@ -369,48 +397,8 @@ fn is_ref_target_matches_ts_routing() {
 }
 
 // ---------------- 纯逻辑：locate / hit 分类 -----------------------------
-
-#[test]
-fn classify_locate_and_hit_matrices() {
-    // locate：not_found / not_visible / 非有限坐标 / 正常
-    let e = classify_locate(&json!({ "error": "not_found" }), "#a").unwrap_err();
-    assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
-    let e = classify_locate(
-        &json!({ "error": "not_visible", "why": "display:none" }),
-        "#a",
-    )
-    .unwrap_err();
-    assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_VISIBLE", 422));
-    assert!(e.to_string().contains("display:none"));
-    let e = classify_locate(&json!({ "x": "oops", "y": 3.0 }), "#a").unwrap_err();
-    assert_eq!(
-        e.code(),
-        "INTERNAL_ERROR",
-        "垃圾坐标是防御性 500（TS 同为无码错误）"
-    );
-    let ok = classify_locate(
-        &json!({ "x": 1.0, "y": 2.5, "tag": "DIV", "text": "t" }),
-        "#a",
-    )
-    .unwrap();
-    assert_eq!(ok, (1.0, 2.5, "DIV".into(), "t".into()));
-
-    // hit：命中 / target-gone / covered / nothing / 垃圾
-    assert!(classify_hit(&json!({ "hit": true }), "#a").is_ok());
-    let e = classify_hit(&json!({ "reason": "target-gone" }), "#a").unwrap_err();
-    assert_eq!(e.code(), "PAGE_ELEMENT_NOT_FOUND");
-    let e = classify_hit(&json!({ "reason": "covered", "by": "DIV.overlay" }), "#a").unwrap_err();
-    assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_BLOCKED", 409));
-    assert!(e.to_string().contains("<DIV.overlay>"));
-    let e = classify_hit(&json!({ "reason": "nothing-at-point" }), "#a").unwrap_err();
-    assert_eq!(e.code(), "PAGE_ELEMENT_BLOCKED");
-    assert!(
-        classify_hit(&json!({ "hit": false }), "#a")
-            .unwrap_err()
-            .code()
-            == "INTERNAL_ERROR"
-    );
-}
+// （I2 已删：locate/hit-test JS 分类随 click 换 kit 解析链退役，矩阵由 kit
+// element.rs 自带测试 + click_selector_classifies_visibility_and_coverage 覆盖）
 
 // ---------------- ensure：门卫 / 幂等 -----------------------------------
 
@@ -1680,11 +1668,11 @@ async fn click_ref_path_resolves_center_and_dispatches() {
         )],
     );
 
-    let resp = svc.click(INS, "T1", "@e1").await.unwrap();
+    let resp = svc.click(INS, "T1", "@e1", false, false).await.unwrap();
     assert_eq!(
         resp["result"],
         json!("Clicked @e1 \"OK\" at CSS (100, 50)"),
-        "坐标 = kit 解析链返回的点击点，JS 数字形态"
+        "坐标 = kit 解析链返回的点击点（同会话 = 顶层视口坐标）"
     );
     let resolve = calls_of(&calls, "DOM.resolveNode");
     assert_eq!(
@@ -1699,15 +1687,163 @@ async fn click_ref_path_resolves_center_and_dispatches() {
             json!("mousePressed"),
             json!("mouseReleased")
         ],
-        "我方三段派发保留"
+        "kit ClickPhase 序列（Move → Press → Release）"
+    );
+    // kit 事件形态：Move 无 button 字段；Press buttons=1；Release buttons=0
+    assert!(mouse[0].params.get("button").is_none());
+    assert_eq!(
+        (
+            mouse[1].param("button"),
+            mouse[1].param("buttons"),
+            mouse[1].param("clickCount")
+        ),
+        (json!("left"), json!(1), json!(1))
+    );
+    assert_eq!(
+        (
+            mouse[2].param("button"),
+            mouse[2].param("buttons"),
+            mouse[2].param("clickCount")
+        ),
+        (json!("left"), json!(0), json!(1))
     );
     for c in &mouse {
         assert_eq!(c.param("x"), json!(100.0));
         assert_eq!(c.param("y"), json!(50.0));
-        assert_eq!(c.param("button"), json!("left"));
-        assert_eq!(c.param("clickCount"), json!(1));
         assert_eq!(c.session.as_deref(), Some("S1"));
     }
+}
+
+/// 双击（count=2）与右键（button=right）的 ClickSpec 透传：Press/Release
+/// 两轮、clickCount 递增；右键 button/buttons 换位掩码
+#[tokio::test]
+async fn click_double_and_right_specs_pass_through() {
+    let (svc, watched, calls, script) = armed();
+    seed_ref(&watched, "T1", "e1", 101, None);
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj101")]);
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!({ "connected": true, "x": 1.0, "y": 2.0 }))],
+    );
+    let resp = svc.click(INS, "T1", "@e1", true, false).await.unwrap();
+    assert!(resp["result"]
+        .as_str()
+        .unwrap()
+        .starts_with("Double-clicked @e1 \"OK\""));
+    let mouse = calls_of(&calls, "Input.dispatchMouseEvent");
+    assert_eq!(
+        mouse.iter().map(|c| c.param("type")).collect::<Vec<_>>(),
+        vec![
+            json!("mouseMoved"),
+            json!("mousePressed"),
+            json!("mouseReleased"),
+            json!("mousePressed"),
+            json!("mouseReleased")
+        ],
+        "count=2：Press/Release 两轮"
+    );
+    assert_eq!(
+        (mouse[3].param("clickCount"), mouse[4].param("clickCount")),
+        (json!(2), json!(2))
+    );
+
+    // 右键：button=right、buttons 位掩码 2
+    let (svc2, watched2, calls2, script2) = armed();
+    seed_ref(&watched2, "T1", "e1", 101, None);
+    given(&script2, "DOM.resolveNode", vec![resolve_node_ok("obj101")]);
+    given(
+        &script2,
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!({ "connected": true, "x": 1.0, "y": 2.0 }))],
+    );
+    let resp2 = svc2.click(INS, "T1", "@e1", false, true).await.unwrap();
+    assert!(resp2["result"]
+        .as_str()
+        .unwrap()
+        .starts_with("Right-clicked @e1 \"OK\""));
+    let m2 = calls_of(&calls2, "Input.dispatchMouseEvent");
+    assert_eq!(
+        (m2[1].param("button"), m2[1].param("buttons")),
+        (json!("right"), json!(2))
+    );
+}
+
+/// 对话框竞速：press 挂起期间对话框事件到达 bus → kit 中止序列返回
+/// pending_release → 我方补发 release。生产时序中 watch_loop 的
+/// on_dialog_opening 先 accept 对话框再把事件转发到 bus，补发 release 落
+/// 在已解锁的渲染进程上；本测试直接向 bus 注入事件（watch_loop 未跑）。
+#[tokio::test]
+async fn click_dialog_mid_sequence_compensates_pending_release() {
+    let (svc, watched, calls, script, gates) = armed_with_gates();
+    seed_ref(&watched, "T1", "e1", 101, None);
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj101")]);
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!({ "connected": true, "x": 10.0, "y": 20.0 }))],
+    );
+    // 两道闸门：mouseMoved 与 mousePressed 依次挂起（FakeCdp 按调用序弹
+    // 闸门）；测试在 press 挂起窗口注入对话框事件
+    let (release_move, gate_move) = tokio::sync::oneshot::channel::<()>();
+    let (_release_press, gate_press) = tokio::sync::oneshot::channel::<()>();
+    gates.lock().unwrap().insert(
+        "Input.dispatchMouseEvent".into(),
+        VecDeque::from([gate_move, gate_press]),
+    );
+
+    let click_fut = svc.click(INS, "T1", "@e1", false, false);
+    tokio::pin!(click_fut);
+    // select 同时驱动 click 与轮询（pin 后不 poll 不推进）
+    let waits = |n: usize| {
+        let calls = Arc::clone(&calls);
+        async move {
+            loop {
+                if calls_of(&calls, "Input.dispatchMouseEvent").len() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
+    tokio::select! {
+        _ = &mut click_fut => panic!("click 不应在 move 闸门前完成"),
+        _ = waits(1) => {}
+    }
+    release_move.send(()).unwrap();
+    tokio::select! {
+        _ = &mut click_fut => panic!("click 不应在 press 闸门前完成"),
+        _ = waits(2) => {}
+    }
+    let _ = watched.event_bus.send(
+        crate::application::browser_kit::cdp_event_from_frame(&json!({
+            "method": "Page.javascriptDialogOpening", "sessionId": "S1",
+            "params": { "type": "alert", "message": "hi" }
+        }))
+        .expect("bus 事件构造"),
+    );
+    // 竞速胜出：click 不等被对话框阻塞的 press ack，立即返回
+    let resp = tokio::time::timeout(Duration::from_secs(2), &mut click_fut)
+        .await
+        .expect("对话框竞速必须在 ack 前返回")
+        .unwrap();
+    let text = resp["result"].as_str().unwrap();
+    assert!(
+        text.contains("a dialog opened and was auto-accepted"),
+        "{text}"
+    );
+    let _ = _release_press.send(()); // 清理挂起的 press（发送端 drop 也无妨）
+    let mouse = calls_of(&calls, "Input.dispatchMouseEvent");
+    assert_eq!(
+        mouse.iter().map(|c| c.param("type")).collect::<Vec<_>>(),
+        vec![
+            json!("mouseMoved"),
+            json!("mousePressed"),
+            json!("mouseReleased")
+        ],
+        "补偿 release 已发出（按钮不滞留按下态）"
+    );
+    assert_eq!(mouse[2].session.as_deref(), Some("S1"));
 }
 
 /// kit 解析链的 stale 恢复（durable 核心）：旧节点脱离文档（connected:false）
@@ -1738,7 +1874,7 @@ async fn click_stale_ref_recovers_by_unique_role_name_match() {
             { "nodeId": "1", "role": axv("button".into()), "name": axv("OK".into()), "backendDOMNodeId": 205 },
         ]}))],
     );
-    let resp = svc.click(INS, "T1", "@e1").await.unwrap();
+    let resp = svc.click(INS, "T1", "@e1", false, false).await.unwrap();
     assert_eq!(resp["result"], json!("Clicked @e1 \"OK\" at CSS (80, 60)"));
 }
 
@@ -1748,7 +1884,7 @@ async fn click_stale_ref_recovers_by_unique_role_name_match() {
 async fn click_ref_miss_and_stale_errors() {
     let (svc, _w, _calls, _script) = armed();
     for t in ["@e9", "@E3"] {
-        let miss = svc.click(INS, "T1", t).await.unwrap_err();
+        let miss = svc.click(INS, "T1", t, false, false).await.unwrap_err();
         assert_eq!(
             (miss.code(), miss.status()),
             ("PAGE_REF_NOT_FOUND", 404),
@@ -1771,7 +1907,10 @@ async fn click_ref_miss_and_stale_errors() {
         "Accessibility.getFullAXTree",
         vec![Ok(json!({ "nodes": [] }))],
     );
-    let stale = svc2.click(INS, "T1", "@e1").await.unwrap_err();
+    let stale = svc2
+        .click(INS, "T1", "@e1", false, false)
+        .await
+        .unwrap_err();
     assert_eq!((stale.code(), stale.status()), ("PAGE_REF_STALE", 409));
     assert!(
         stale.to_string().contains("Could not locate element"),
@@ -1795,7 +1934,10 @@ async fn click_ref_miss_and_stale_errors() {
             { "nodeId": "2", "role": axv("button".into()), "name": axv("OK".into()), "backendDOMNodeId": 3 },
         ]}))],
     );
-    let ambiguous = svc3.click(INS, "T1", "@e1").await.unwrap_err();
+    let ambiguous = svc3
+        .click(INS, "T1", "@e1", false, false)
+        .await
+        .unwrap_err();
     assert_eq!(
         (ambiguous.code(), ambiguous.status()),
         ("PAGE_REF_STALE", 409)
@@ -1808,143 +1950,113 @@ async fn click_selector_path_locates_hit_tests_and_dispatches() {
     given(
         &script,
         "Runtime.evaluate",
-        vec![
-            eval_response(json!({ "x": 150.0, "y": 130.0, "tag": "BUTTON", "text": "Save" })),
-            eval_response(json!({ "hit": true })),
-        ],
+        vec![eval_obj_response(json!({ "x": 150.0, "y": 130.0 }))],
     );
 
-    let resp = svc.click(INS, "TA", "#save").await.unwrap();
+    let resp = svc.click(INS, "TA", "#save", false, false).await.unwrap();
     // 前缀 "TA" 唯一解析到 TAB2 → 全链带 session S2
     assert_eq!(resp["targetId"], json!("TAB2"));
-    assert_eq!(
-        resp["result"],
-        json!("Clicked <BUTTON> \"Save\" (native input @150,130)")
-    );
+    assert_eq!(resp["result"], json!("Clicked \"#save\" at CSS (150, 130)"));
     let evals = calls_of(&calls, "Runtime.evaluate");
-    assert_eq!(evals.len(), 2);
-    assert!(
-        evals[0]
-            .param("expression")
-            .as_str()
-            .unwrap()
-            .contains(r##"querySelector("#save")"##),
-        "第一次 eval = locate"
+    assert_eq!(
+        evals.len(),
+        1,
+        "kit selector 链单次 evaluate（定位 + actionability + 遮挡一体）"
     );
+    let expr = evals[0].param("expression");
+    let expr = expr.as_str().unwrap();
     assert!(
-        evals[1]
-            .param("expression")
-            .as_str()
-            .unwrap()
-            .contains("elementFromPoint(150, 130)"),
-        "第二次 eval = hit-test（注入命中点）"
+        expr.contains("querySelector") && expr.contains("elementFromPoint"),
+        "定位 + 遮挡检查在同一页内脚本: {expr}"
     );
-    for c in &evals {
+    assert_eq!(evals[0].session.as_deref(), Some("S2"));
+    let mouse = calls_of(&calls, "Input.dispatchMouseEvent");
+    assert_eq!(mouse.len(), 3);
+    for c in &mouse {
         assert_eq!(c.session.as_deref(), Some("S2"));
     }
-    assert_eq!(
-        calls_of(&calls, "Runtime.enable").len(),
-        2,
-        "evalStr 每次先 enable（TS 同）"
-    );
-    assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 3);
 }
 
-/// 可见性 / 遮挡分类：locate not_visible → 422；hit covered → 409，且零派发
+/// 可见性 / 遮挡分类（kit 文案）：reason not visible → 422；blocker → 409，
+/// 且零派发（错误码不变；文案从旧 locate/hit 自有文案换 kit 文案）
 #[tokio::test]
 async fn click_selector_classifies_visibility_and_coverage() {
     let (svc, _w, calls, script) = armed();
     given(
         &script,
         "Runtime.evaluate",
-        vec![eval_response(
-            json!({ "error": "not_visible", "why": "display:none" }),
+        vec![eval_obj_response(
+            json!({ "x": 5.0, "y": 5.0, "reason": "not visible" }),
         )],
     );
-    let e = svc.click(INS, "T1", ".x").await.unwrap_err();
+    let e = svc.click(INS, "T1", ".x", false, false).await.unwrap_err();
     assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_VISIBLE", 422));
+    assert!(e.to_string().contains("not visible"), "kit 文案透传");
     assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 0);
 
     let (svc2, _w2, _c2, script2) = armed();
     given(
         &script2,
         "Runtime.evaluate",
-        vec![
-            eval_response(json!({ "x": 5.0, "y": 5.0, "tag": "A", "text": "t" })),
-            eval_response(json!({ "hit": false, "reason": "covered", "by": "DIV.overlay" })),
-        ],
+        vec![eval_obj_response(
+            json!({ "x": 5.0, "y": 5.0, "blocker": "div.overlay" }),
+        )],
     );
-    let e2 = svc2.click(INS, "T1", ".x").await.unwrap_err();
+    let e2 = svc2.click(INS, "T1", ".x", false, false).await.unwrap_err();
     assert_eq!((e2.code(), e2.status()), ("PAGE_ELEMENT_BLOCKED", 409));
-    assert!(e2.to_string().contains("<DIV.overlay>"));
+    assert!(e2.to_string().contains("<div.overlay>"), "kit 遮挡文案");
 }
 
-/// press 后失败：补一发 release，effect_state=unknown（§2.7）
+/// kit 派发失败：错误码保持 PAGE_DISPATCH_FAILED，effect 语义保守 unknown
+///（kit 不外露失败相位；绝不标 none——盲重试 = 二次点击）。kit 链无补偿
+/// release（相位未知）——与 clickxy 旧链的「补一发 release」差异点，提交
+/// 信息已披露。
 #[tokio::test]
-async fn click_press_failure_compensates_release_with_effect_state() {
+async fn click_dispatch_failure_maps_to_conservative_dispatch_failed() {
+    let (svc, _w, calls, script) = armed();
+    given(
+        &script,
+        "Runtime.evaluate",
+        vec![eval_obj_response(json!({ "x": 1.0, "y": 2.0 }))],
+    );
+    given(
+        &script,
+        "Input.dispatchMouseEvent",
+        vec![Err("CDP 命令 Input.dispatchMouseEvent 被拒绝: boom".into())],
+    );
+
+    let e = svc.click(INS, "T1", ".x", false, false).await.unwrap_err();
+    assert_eq!((e.code(), e.status()), ("PAGE_DISPATCH_FAILED", 500));
+    let msg = e.to_string();
+    assert!(msg.contains("effect_state: unknown"), "{msg}");
+    assert!(!msg.contains("effect_state: none"), "{msg}");
+    let mouse = calls_of(&calls, "Input.dispatchMouseEvent");
+    assert_eq!(mouse.len(), 1, "首个事件失败即中止（相位未知，不补发）");
+}
+
+// ---------------- 工具：fill ---------------------------------------------
+
+/// I2 fill 链：可填前置检查（我方）→ kit fill（focus + select/value 清空
+/// + insertText）→ 回读校验追加（我方）。成功路径结果串与旧链同构。
+#[tokio::test]
+async fn fill_check_kit_fill_and_readback_verify() {
     let (svc, _w, calls, script) = armed();
     given(
         &script,
         "Runtime.evaluate",
         vec![
-            eval_response(json!({ "x": 1.0, "y": 2.0, "tag": "A", "text": "t" })),
-            eval_response(json!({ "hit": true })),
+            resolve_obj_eval("obj9"),  // 我方解析（预检查/回读的句柄锚点）
+            resolve_obj_eval("obj9b"), // kit fill 内部解析
         ],
-    );
-    given(
-        &script,
-        "Input.dispatchMouseEvent",
-        vec![Ok(json!({})), Ok(json!({})), Err("boom".into())],
-    );
-
-    let e = svc.click(INS, "T1", ".x").await.unwrap_err();
-    assert_eq!((e.code(), e.status()), ("PAGE_DISPATCH_FAILED", 500));
-    assert!(e.to_string().contains("effect_state: unknown"));
-    assert!(e
-        .to_string()
-        .contains("mousePressed was already dispatched"));
-    let mouse = calls_of(&calls, "Input.dispatchMouseEvent");
-    assert_eq!(
-        mouse.iter().map(|c| c.param("type")).collect::<Vec<_>>(),
-        vec![
-            json!("mouseMoved"),
-            json!("mousePressed"),
-            json!("mouseReleased"),
-            json!("mouseReleased")
-        ],
-        "失败后的补偿 release 也已发出"
-    );
-}
-
-// ---------------- 工具：fill ---------------------------------------------
-
-#[tokio::test]
-async fn fill_pipeline_focus_clear_inserts_and_verifies() {
-    let (svc, _w, calls, script) = armed();
-    given(
-        &script,
-        "DOM.getDocument",
-        vec![Ok(json!({ "root": { "nodeId": 5 } }))],
-    );
-    given(
-        &script,
-        "DOM.querySelector",
-        vec![Ok(json!({ "nodeId": 9 }))],
-    );
-    given(
-        &script,
-        "DOM.resolveNode",
-        vec![Ok(json!({ "object": { "objectId": "obj9" } }))],
     );
     given(
         &script,
         "Runtime.callFunctionOn",
         vec![
-            Ok(
-                json!({ "result": { "value": { "tag": "INPUT", "kind": "native", "label": "q" } } }),
-            ),
-            Ok(json!({ "result": { "value": { "cleared": true } } })),
-            Ok(json!({ "result": { "value": { "matches": true } } })),
+            fn_value(json!({ "tag": "INPUT", "kind": "native", "label": "q" })), // ① 可填检查
+            Ok(json!({ "result": { "type": "object" } })),                       // ③ kit focus
+            Ok(json!({ "result": { "type": "object" } })),                       // ③ kit clear
+            fn_value(json!({ "matches": true })),                                // ④ 回读校验
         ],
     );
 
@@ -1954,50 +2066,90 @@ async fn fill_pipeline_focus_clear_inserts_and_verifies() {
         json!("Filled <INPUT> \"q\" with \"hello\" (5 chars)")
     );
 
-    let focus = calls_of(&calls, "DOM.focus");
-    assert_eq!(
-        (focus.len(), focus[0].param("objectId")),
-        (1, json!("obj9"))
-    );
     let insert = calls_of(&calls, "Input.insertText");
     assert_eq!((insert.len(), insert[0].param("text")), (1, json!("hello")));
+    assert_eq!(
+        insert[0].session.as_deref(),
+        Some("S1"),
+        "kit fill 的 insertText 发 page 级会话（渲染进程按焦点路由）"
+    );
     let release = calls_of(&calls, "Runtime.releaseObject");
     assert_eq!(
         (release.len(), release[0].param("objectId")),
-        (1, json!("obj9"))
+        (1, json!("obj9")),
+        "finally 归还（我方解析的句柄，发解析会话）"
     );
     let call_fns = calls_of(&calls, "Runtime.callFunctionOn");
-    assert_eq!(call_fns.len(), 3, "check → clear → verify");
+    assert_eq!(call_fns.len(), 4, "check → kit focus → kit clear → verify");
     // verify 参数预计算两形态（multiLine / singleLine）
     assert_eq!(
-        call_fns[2].param("arguments"),
+        call_fns[3].param("arguments"),
         json!([{ "value": "hello" }, { "value": "hello" }])
+    );
+    assert!(
+        call_fns[2]
+            .param("functionDeclaration")
+            .as_str()
+            .unwrap()
+            .contains("this.select"),
+        "kit 清空 = select() + value 赋空（表单控件路径）"
+    );
+}
+
+/// contenteditable 目标：kit 清空覆盖不了编辑根，我方预清空补位（回读
+/// 期望 multiLine 口径）
+#[tokio::test]
+async fn fill_preclears_contenteditable_before_kit_fill() {
+    let (svc, _w, calls, script) = armed();
+    given(
+        &script,
+        "Runtime.evaluate",
+        vec![resolve_obj_eval("objE"), resolve_obj_eval("objE2")],
+    );
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![
+            fn_value(json!({ "tag": "DIV", "kind": "editable", "label": "" })),
+            fn_value(json!({ "precleared": true })), // ② 预清空（textContent）
+            Ok(json!({ "result": { "type": "object" } })),
+            Ok(json!({ "result": { "type": "object" } })),
+            fn_value(json!({ "matches": true })),
+        ],
+    );
+    let resp = svc
+        .fill(INS, "T1", "[contenteditable]", "line1\nline2")
+        .await
+        .unwrap();
+    assert_eq!(
+        resp["result"],
+        json!("Filled <DIV> with \"line1\nline2\" (11 chars)")
+    );
+    let call_fns = calls_of(&calls, "Runtime.callFunctionOn");
+    assert_eq!(
+        call_fns.len(),
+        5,
+        "check → preclear → kit focus → kit clear → verify"
+    );
+    assert!(
+        call_fns[1]
+            .param("functionDeclaration")
+            .as_str()
+            .unwrap()
+            .contains("textContent"),
+        "预清空脚本对编辑根清 textContent"
     );
 }
 
 #[tokio::test]
 async fn fill_rejects_not_fillable_and_reports_mismatch() {
     let (svc, _w, calls, script) = armed();
-    given(
-        &script,
-        "DOM.getDocument",
-        vec![Ok(json!({ "root": { "nodeId": 5 } }))],
-    );
-    given(
-        &script,
-        "DOM.querySelector",
-        vec![Ok(json!({ "nodeId": 9 }))],
-    );
-    given(
-        &script,
-        "DOM.resolveNode",
-        vec![Ok(json!({ "object": { "objectId": "obj9" } }))],
-    );
+    given(&script, "Runtime.evaluate", vec![resolve_obj_eval("obj9")]);
     given(
         &script,
         "Runtime.callFunctionOn",
         vec![Ok(
-            json!({ "result": { "value": { "not_fillable": "disabled" } } }),
+            json!({ "result": { "type": "object", "value": { "not_fillable": "disabled" } } }),
         )],
     );
     let e = svc.fill(INS, "T1", "#q", "x").await.unwrap_err();
@@ -2013,28 +2165,17 @@ async fn fill_rejects_not_fillable_and_reports_mismatch() {
     let (svc2, _w2, _c2, script2) = armed();
     given(
         &script2,
-        "DOM.getDocument",
-        vec![Ok(json!({ "root": { "nodeId": 5 } }))],
-    );
-    given(
-        &script2,
-        "DOM.querySelector",
-        vec![Ok(json!({ "nodeId": 9 }))],
-    );
-    given(
-        &script2,
-        "DOM.resolveNode",
-        vec![Ok(json!({ "object": { "objectId": "obj9" } }))],
+        "Runtime.evaluate",
+        vec![resolve_obj_eval("obj9"), resolve_obj_eval("obj9b")],
     );
     given(
         &script2,
         "Runtime.callFunctionOn",
         vec![
-            Ok(json!({ "result": { "value": { "tag": "INPUT", "kind": "native", "label": "" } } })),
-            Ok(json!({ "result": { "value": { "cleared": true } } })),
-            Ok(
-                json!({ "result": { "value": { "matches": false, "actual": "hell", "expected": "hello" } } }),
-            ),
+            fn_value(json!({ "tag": "INPUT", "kind": "native", "label": "" })),
+            Ok(json!({ "result": { "type": "object" } })),
+            Ok(json!({ "result": { "type": "object" } })),
+            fn_value(json!({ "matches": false, "actual": "hell", "expected": "hello" })),
         ],
     );
     let e2 = svc2.fill(INS, "T1", "#q", "hello").await.unwrap_err();
@@ -2046,31 +2187,25 @@ async fn fill_rejects_not_fillable_and_reports_mismatch() {
     );
 }
 
-/// clear 阶段 focus_lost：页面在 focus 后抢走了焦点 → 409 fill_focus_lost
+/// 回读阶段 focus_lost：值不一致且焦点不在目标上（页面抢焦点——
+/// insertText 可能落到别处）→ 409 PAGE_FILL_FOCUS_LOST（码与状态不变，
+/// 触发点从旧链的清空阶段移到回读阶段）
 #[tokio::test]
 async fn fill_reports_focus_lost_when_page_steals_focus() {
     let (svc, _w, _calls, script) = armed();
     given(
         &script,
-        "DOM.getDocument",
-        vec![Ok(json!({ "root": { "nodeId": 5 } }))],
-    );
-    given(
-        &script,
-        "DOM.querySelector",
-        vec![Ok(json!({ "nodeId": 9 }))],
-    );
-    given(
-        &script,
-        "DOM.resolveNode",
-        vec![Ok(json!({ "object": { "objectId": "obj9" } }))],
+        "Runtime.evaluate",
+        vec![resolve_obj_eval("obj9"), resolve_obj_eval("obj9b")],
     );
     given(
         &script,
         "Runtime.callFunctionOn",
         vec![
-            Ok(json!({ "result": { "value": { "tag": "INPUT", "kind": "native", "label": "" } } })),
-            Ok(json!({ "result": { "value": { "focus_lost": true } } })),
+            fn_value(json!({ "tag": "INPUT", "kind": "native", "label": "" })),
+            Ok(json!({ "result": { "type": "object" } })),
+            Ok(json!({ "result": { "type": "object" } })),
+            fn_value(json!({ "focus_lost": true })),
         ],
     );
     let e = svc.fill(INS, "T1", "#q", "x").await.unwrap_err();
@@ -2079,35 +2214,54 @@ async fn fill_reports_focus_lost_when_page_steals_focus() {
 
 // ---------------- 工具：press --------------------------------------------
 
+/// kit 按键序列：keyDown（带 text）+ keyUp 两段；Ctrl 组合抑制 text
+///（旧链 rawKeyDown/char/keyUp 三段退役——行为差异已在提交信息披露）
 #[tokio::test]
-async fn press_dispatches_three_part_sequence_and_suppresses_combo_text() {
+async fn press_dispatches_keydown_keyup_and_suppresses_combo_text() {
     let (svc, _w, calls, _script) = armed();
     let resp = svc.press(INS, "T1", "Enter", None).await.unwrap();
     assert_eq!(resp["result"], json!("Pressed Enter"));
     let events = calls_of(&calls, "Input.dispatchKeyEvent");
+    assert_eq!(events.len(), 2, "kit keyDown + keyUp 两段");
     assert_eq!(
         events[0].params,
-        json!({ "type": "rawKeyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "modifiers": 0 })
+        json!({ "type": "keyDown", "key": "Enter", "code": "Enter", "text": "\r", "unmodifiedText": "\r", "windowsVirtualKeyCode": 13 })
     );
     assert_eq!(
         events[1].params,
-        json!({ "type": "char", "key": "Enter", "code": "Enter", "text": "\r", "modifiers": 0 }),
-        "char 带 text 不带 vk"
+        json!({ "type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13 }),
+        "keyUp 不带 text"
     );
-    assert_eq!(events[2].param("type"), json!("keyUp"));
 
-    // Ctrl+A：char 被抑制（不能打出 "a"）
+    // Ctrl+A：组合键 text 被抑制（不能打出 "a"），modifiers=2 透传
     let (svc2, _w2, calls2, _s2) = armed();
     svc2.press(INS, "T1", "Control+A", None).await.unwrap();
     let events2 = calls_of(&calls2, "Input.dispatchKeyEvent");
     assert_eq!(events2.len(), 2);
     for e in &events2 {
         assert_eq!(e.param("modifiers"), json!(2));
+        assert!(
+            e.params.get("text").is_none(),
+            "命令和弦不带 text: {:?}",
+            e.params
+        );
+    }
+
+    // Shift+ArrowDown：shift 不抑制（非命令和弦），但 ArrowDown 无 text
+    let (svc3, _w3, calls3, _s3) = armed();
+    let resp3 = svc3
+        .press(INS, "T1", "Shift+ArrowDown", None)
+        .await
+        .unwrap();
+    assert_eq!(resp3["result"], json!("Pressed Shift+ArrowDown"));
+    let events3 = calls_of(&calls3, "Input.dispatchKeyEvent");
+    for e in &events3 {
+        assert_eq!(e.param("modifiers"), json!(8));
     }
 }
 
-/// --target ref：I1b kit 对象解析（isConnected 检查）→ DOM.focus(objectId)
-/// → 键序；对象归还到解析它的同一会话
+/// --target ref：kit 对象解析（isConnected 检查）→ DOM.focus(objectId)
+/// → 键序（帧会话）；对象归还到解析它的同一会话
 #[tokio::test]
 async fn press_focuses_ref_target_before_dispatch() {
     let (svc, watched, calls, script) = armed();
@@ -2125,12 +2279,43 @@ async fn press_focuses_ref_target_before_dispatch() {
         (focus.len(), focus[0].param("objectId")),
         (1, json!("obj42"))
     );
-    assert_eq!(calls_of(&calls, "Input.dispatchKeyEvent").len(), 3);
+    assert_eq!(
+        calls_of(&calls, "Input.dispatchKeyEvent").len(),
+        2,
+        "kit keyDown + keyUp"
+    );
     assert_eq!(
         calls_of(&calls, "Runtime.releaseObject")[0].param("objectId"),
         json!("obj42"),
         "对象句柄归还（fill 同构）"
     );
+}
+
+/// --target selector：统一 kit 解析链（旧链页内 eval focus 脚本退役），
+/// 未命中 → 404 PAGE_ELEMENT_NOT_FOUND（与 click 同码）
+#[tokio::test]
+async fn press_target_selector_via_kit_resolve() {
+    let (svc, _w, calls, script) = armed();
+    given(&script, "Runtime.evaluate", vec![resolve_obj_eval("objQ")]);
+    let resp = svc.press(INS, "T1", "Enter", Some("#q")).await.unwrap();
+    assert_eq!(resp["result"], json!("Pressed Enter on #q"));
+    assert_eq!(
+        calls_of(&calls, "DOM.focus")[0].param("objectId"),
+        json!("objQ")
+    );
+
+    let (svc2, _w2, calls2, script2) = armed();
+    given(
+        &script2,
+        "Runtime.evaluate",
+        vec![Ok(json!({ "result": { "type": "object" } }))], // 无 objectId
+    );
+    let e = svc2
+        .press(INS, "T1", "Enter", Some("#gone"))
+        .await
+        .unwrap_err();
+    assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
+    assert_eq!(calls_of(&calls2, "Input.dispatchKeyEvent").len(), 0);
 }
 
 // ---------------- 工具：wait ---------------------------------------------
@@ -2301,7 +2486,10 @@ async fn within_budget_times_out_stalled_tools() {
 #[tokio::test]
 async fn unknown_tab_errors_through_tool_entry() {
     let (svc, _w, _calls, _script) = armed();
-    let e = svc.click(INS, "NOPE", "@e1").await.unwrap_err();
+    let e = svc
+        .click(INS, "NOPE", "@e1", false, false)
+        .await
+        .unwrap_err();
     assert_eq!((e.code(), e.status()), ("PAGE_TAB_NOT_FOUND", 404));
 }
 
@@ -2626,16 +2814,31 @@ async fn clickxy_rejects_non_finite_coordinates() {
 
 // ---------------- 工具：type（P2-G，owner 补充）---------------------------
 
-/// 对焦点元素直接 insertText（带 session），无任何定位/校验 eval
+/// kit type_text_into_active_context：对焦点元素逐字符派发（可打印字符
+/// insertText，\n/\t 走真按键事件），无任何定位/校验 eval
 #[tokio::test]
 async fn type_inserts_text_into_focused_element() {
     let (svc, _w, calls, _script) = armed();
     let resp = svc.r#type(INS, "T1", "hello").await.unwrap();
     assert_eq!(resp["result"], json!("Typed 5 characters"));
     let insert = calls_of(&calls, "Input.insertText");
-    assert_eq!(insert.len(), 1);
-    assert_eq!(insert[0].param("text"), json!("hello"));
+    assert_eq!(
+        insert.iter().map(|c| c.param("text")).collect::<Vec<_>>(),
+        vec![json!("h"), json!("e"), json!("l"), json!("l"), json!("o")],
+        "逐字符 insertText"
+    );
     assert_eq!(insert[0].session.as_deref(), Some("S1"));
+
+    // 换行走真按键（keyDown+keyUp）而非字面插入——表单提交语义可达
+    let (svc2, _w2, calls2, _s2) = armed();
+    svc2.r#type(INS, "T1", "a\nb").await.unwrap();
+    let keys = calls_of(&calls2, "Input.dispatchKeyEvent");
+    assert_eq!(
+        (keys.len(), keys[0].param("type"), keys[0].param("key")),
+        (2, json!("keyDown"), json!("Enter")),
+        "\\n = Enter keyDown/keyUp"
+    );
+    assert_eq!(calls_of(&calls2, "Input.insertText").len(), 2);
 }
 
 /// 空文本 → 400（对齐 TS typeStr 的 'text required'）
@@ -2653,12 +2856,13 @@ fn rt_bool(b: bool) -> Result<Value, String> {
     Ok(json!({ "result": { "type": "boolean", "value": b } }))
 }
 
+/// kit click selector 路径的定位响应（定位 + actionability + 遮挡一体）
 fn located_ok() -> Result<Value, String> {
-    eval_response(json!({ "x": 10.0, "y": 20.0, "tag": "BUTTON", "text": "More" }))
+    eval_obj_response(json!({ "x": 10.0, "y": 20.0 }))
 }
 
 /// 分支一：存在 → 原生点击一次 → 下一轮探针消失 → 'until it disappeared'
-///（点击链 = locate/hit/三段派发，非 TS 的页内 el.click()）
+///（I2：点击层 = kit click selector 路径，定位与派发一体）
 #[tokio::test]
 async fn loadall_clicks_until_selector_disappears() {
     let (svc, _w, calls, script) = armed();
@@ -2666,10 +2870,9 @@ async fn loadall_clicks_until_selector_disappears() {
         &script,
         "Runtime.evaluate",
         vec![
-            rt_bool(true),
-            located_ok(),
-            eval_response(json!({ "hit": true })),
-            rt_bool(false),
+            rt_bool(true),  // 探针：存在
+            located_ok(),   // kit click 定位
+            rt_bool(false), // 探针：已消失
         ],
     );
     let resp = svc
@@ -2683,7 +2886,7 @@ async fn loadall_clicks_until_selector_disappears() {
     assert_eq!(
         calls_of(&calls, "Input.dispatchMouseEvent").len(),
         3,
-        "每次存活轮次一次原生点击"
+        "每次存活轮次一次原生点击（Move/Press/Release）"
     );
 }
 
@@ -2713,10 +2916,8 @@ async fn loadall_cap_reached_reports_still_present() {
         vec![
             rt_bool(true),
             located_ok(),
-            eval_response(json!({ "hit": true })),
             rt_bool(true),
             located_ok(),
-            eval_response(json!({ "hit": true })),
             rt_bool(true), // 达上限后的复查：仍在
         ],
     );
@@ -2741,7 +2942,6 @@ async fn loadall_cap_exit_rechecked_and_found_gone() {
         vec![
             rt_bool(true),
             located_ok(),
-            eval_response(json!({ "hit": true })),
             rt_bool(false), // 达上限后的复查：已消失
         ],
     );
@@ -2768,6 +2968,371 @@ async fn loadall_rejects_bad_interval_and_empty_selector() {
     let e2 = svc.loadall(INS, "T1", "", None, None).await.unwrap_err();
     assert_eq!(e2.code(), "INVALID_REQUEST");
     assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 0);
+}
+
+// ---------------- 工具：hover / scroll / drag / select / check / tap（I2）--
+
+/// hover：ref 路径解析链 + 单发 mouseMoved；结果坐标 = 顶层视口
+#[tokio::test]
+async fn hover_moves_pointer_to_element_center() {
+    let (svc, watched, calls, script) = armed();
+    seed_ref(&watched, "T1", "e1", 101, None);
+    given(&script, "DOM.resolveNode", vec![resolve_node_ok("obj101")]);
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!({ "connected": true, "x": 42.0, "y": 24.0 }))],
+    );
+    let resp = svc.hover(INS, "T1", "@e1").await.unwrap();
+    assert_eq!(resp["result"], json!("Hovered @e1 \"OK\" at CSS (42, 24)"));
+    let mouse = calls_of(&calls, "Input.dispatchMouseEvent");
+    assert_eq!(
+        (
+            mouse.len(),
+            mouse[0].param("type"),
+            mouse[0].param("x"),
+            mouse[0].param("y")
+        ),
+        (1, json!("mouseMoved"), json!(42.0), json!(24.0)),
+        "单发 mouseMoved，无 press/release"
+    );
+    assert!(mouse[0].params.get("button").is_none());
+}
+
+/// hover 错误路径：遮挡（kit 解析链 blocker 检查；require_actionable=false
+///——hover 不要求可见性，但遮挡仍拦）→ 409
+#[tokio::test]
+async fn hover_reports_blocked_element() {
+    let (svc, _w, calls, script) = armed();
+    given(
+        &script,
+        "Runtime.evaluate",
+        vec![eval_obj_response(
+            json!({ "x": 1.0, "y": 2.0, "blocker": "div.mask" }),
+        )],
+    );
+    let e = svc.hover(INS, "T1", "#menu").await.unwrap_err();
+    assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_BLOCKED", 409));
+    assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 0);
+}
+
+/// scroll：有目标滚元素（callFunctionOn scrollBy），无目标滚页面
+///（window.scrollBy）
+#[tokio::test]
+async fn scroll_element_and_page_paths() {
+    let (svc, _w, calls, script) = armed();
+    given(
+        &script,
+        "Runtime.evaluate",
+        vec![resolve_obj_eval("objFeed")],
+    );
+    let resp = svc
+        .scroll(INS, "T1", Some("#feed"), 0.0, -300.0)
+        .await
+        .unwrap();
+    assert_eq!(resp["result"], json!("Scrolled \"#feed\" by (0, -300)"));
+    let fns = calls_of(&calls, "Runtime.callFunctionOn");
+    assert_eq!((fns.len(), fns[0].param("objectId")), (1, json!("objFeed")));
+    assert_eq!(
+        fns[0].param("arguments"),
+        json!([{ "value": 0.0 }, { "value": -300.0 }]),
+        "scrollBy(dx, dy) 透传"
+    );
+
+    // 无目标：window.scrollBy
+    let (svc2, _w2, calls2, script2) = armed();
+    given(
+        &script2,
+        "Runtime.evaluate",
+        vec![Ok(json!({ "result": { "type": "undefined" } }))],
+    );
+    let resp2 = svc2.scroll(INS, "T1", None, 0.0, 500.0).await.unwrap();
+    assert_eq!(resp2["result"], json!("Scrolled page by (0, 500)"));
+    let evals = calls_of(&calls2, "Runtime.evaluate");
+    assert_eq!(
+        evals[0].param("expression"),
+        json!("window.scrollBy(0, 500)")
+    );
+}
+
+/// scroll 错误路径：非有限 delta 建连前 400（拦 CLI/本地调用方的 inf/nan）
+#[tokio::test]
+async fn scroll_rejects_non_finite_deltas() {
+    let (svc, _w, calls, _script) = armed();
+    let e = svc
+        .scroll(INS, "T1", None, f64::INFINITY, 5.0)
+        .await
+        .unwrap_err();
+    assert_eq!((e.code(), e.status()), ("INVALID_REQUEST", 400));
+    assert!(calls_of(&calls, "Runtime.evaluate").is_empty());
+}
+
+/// drag 轨迹（纯逻辑）：端点精确、步数 clamp(dist/12, 1, 60)、smoothstep
+/// 单调（相邻步距先增后减）、短距最小 1 步、确定性（同端点同轨迹）
+#[test]
+fn drag_trajectory_shape_and_clamp() {
+    let from = (10.0, 20.0);
+    let to = (110.0, 80.0); // dist = √(100²+60²) ≈ 116.6 → 10 步
+    let pts = drag_trajectory(from, to);
+    assert_eq!(pts.len(), 11, "116.6px / 12 → 10 步 = 11 点");
+    assert_eq!(pts.first().unwrap(), &from, "首点 = 起点（贝塞尔 t=0）");
+    let last = pts.last().unwrap();
+    assert!((last.0 - to.0).abs() < 1e-9 && (last.1 - to.1).abs() < 1e-9);
+    // smoothstep 缓动：相邻步距先增后减（非匀速直线）
+    let dists: Vec<f64> = pts
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+        .collect();
+    let mid = dists.len() / 2;
+    assert!(
+        dists[mid] > dists[0] && dists[mid] > *dists.last().unwrap(),
+        "中段步距大于首尾（缓动形态）: {dists:?}"
+    );
+    // 弧线：非共线（LCG 垂直扰动至少把部分点推离直线）
+    let collinear = pts
+        .iter()
+        .all(|&(x, y)| ((y - 20.0) * 100.0 - (x - 10.0) * 60.0).abs() < 1e-9);
+    assert!(!collinear, "轨迹带弧线（非直线插值）");
+    // 短距：最小 1 步（2 点）；同端点确定性
+    let short = drag_trajectory((0.0, 0.0), (5.0, 0.0));
+    assert_eq!(short.len(), 2);
+    assert_eq!(drag_trajectory(from, to), pts, "同端点同轨迹（无时钟依赖）");
+}
+
+/// drag 集成：两端点同帧 → 初始 move → press → 插值 moves（buttons=1）
+/// → release；步数随距离
+#[tokio::test]
+async fn drag_interpolates_between_endpoints() {
+    let (svc, _w, calls, script) = armed();
+    given(
+        &script,
+        "Runtime.evaluate",
+        vec![
+            eval_obj_response(json!({ "x": 10.0, "y": 20.0 })), // from
+            eval_obj_response(json!({ "x": 110.0, "y": 80.0 })), // to
+        ],
+    );
+    let resp = svc.drag(INS, "T1", "#thumb", "#drop").await.unwrap();
+    assert_eq!(
+        resp["result"],
+        json!("Dragged \"#thumb\" to \"#drop\" (10 steps)")
+    );
+    let mouse = calls_of(&calls, "Input.dispatchMouseEvent");
+    // 1 初始 move + 1 press + 10 插值 move + 1 release = 13
+    assert_eq!(mouse.len(), 13);
+    assert_eq!(mouse[0].param("type"), json!("mouseMoved"));
+    assert_eq!(
+        (mouse[0].param("x"), mouse[0].param("y")),
+        (json!(10.0), json!(20.0)),
+        "初始 move 到起点"
+    );
+    assert_eq!(
+        (
+            mouse[1].param("type"),
+            mouse[1].param("buttons"),
+            mouse[1].param("clickCount")
+        ),
+        (json!("mousePressed"), json!(1), json!(1))
+    );
+    let last = mouse.last().unwrap();
+    assert_eq!(
+        (last.param("type"), last.param("x"), last.param("y")),
+        (json!("mouseReleased"), json!(110.0), json!(80.0)),
+        "release 在终点"
+    );
+    // 插值 moves 携带 buttons=1（按住态）
+    for m in &mouse[2..mouse.len() - 1] {
+        assert_eq!(m.param("type"), json!("mouseMoved"));
+        assert_eq!(m.param("buttons"), json!(1));
+    }
+}
+
+/// drag 错误路径：两端点在不同帧 → 422 PAGE_DRAG_CROSS_FRAME，零派发
+#[tokio::test]
+async fn drag_across_frames_is_rejected() {
+    let (svc, watched, calls, script) = armed();
+    register_frame(
+        &watched,
+        "T1",
+        "F_ROOT",
+        "FRM_A",
+        Some("S_FRM_A"),
+        "F_ROOT",
+        Some(501),
+    );
+    register_frame(
+        &watched,
+        "T1",
+        "F_ROOT",
+        "FRM_B",
+        Some("S_FRM_B"),
+        "F_ROOT",
+        Some(502),
+    );
+    seed_ref(&watched, "T1", "e1", 601, Some("FRM_A"));
+    seed_ref(&watched, "T1", "e2", 602, Some("FRM_B"));
+    given(
+        &script,
+        "DOM.resolveNode",
+        vec![resolve_node_ok("objA"), resolve_node_ok("objB")],
+    );
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![
+            fn_value(json!({ "connected": true, "x": 1.0, "y": 1.0 })),
+            fn_value(json!({ "connected": true, "x": 2.0, "y": 2.0 })),
+        ],
+    );
+    let e = svc.drag(INS, "T1", "@e1", "@e2").await.unwrap_err();
+    assert_eq!((e.code(), e.status()), ("PAGE_DRAG_CROSS_FRAME", 422));
+    assert_eq!(
+        calls_of(&calls, "Input.dispatchMouseEvent").len(),
+        0,
+        "跨帧拖拽零派发"
+    );
+}
+
+/// select 成功：原生 select 按 value/label 匹配
+#[tokio::test]
+async fn select_matches_option_and_reports() {
+    let (svc, _w, calls, script) = armed();
+    given(&script, "Runtime.evaluate", vec![resolve_obj_eval("objS")]);
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!({ "matched": 1 }))],
+    );
+    let resp = svc.select(INS, "T1", "#state", "2").await.unwrap();
+    assert_eq!(resp["result"], json!("Selected \"2\" on \"#state\""));
+    let fns = calls_of(&calls, "Runtime.callFunctionOn");
+    assert_eq!(fns.len(), 1);
+    assert_eq!(
+        fns[0].param("arguments"),
+        json!([{ "value": ["2"] }]),
+        "values 数组透传（单选 = 单元素）"
+    );
+    assert_eq!(
+        fns[0].param("awaitPromise"),
+        json!(true),
+        "combobox 路径需要 await"
+    );
+}
+
+/// select 错误路径：选项未命中 → 422（kit 原文列出可用项，透传不吞）
+#[tokio::test]
+async fn select_reports_available_options_on_miss() {
+    let (svc, _w, _calls, script) = armed();
+    given(&script, "Runtime.evaluate", vec![resolve_obj_eval("objS")]);
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![fn_value(json!({
+            "error": "No option matched [\"9\"]. Available options: 1 (\"一\"), 2 (\"二\")"
+        }))],
+    );
+    let e = svc.select(INS, "T1", "#state", "9").await.unwrap_err();
+    assert_eq!((e.code(), e.status()), ("PAGE_SELECT_NO_OPTION", 422));
+    assert!(e.to_string().contains("Available options"));
+}
+
+/// check：未勾选 → kit 坐标点击（is_checked false → click → 复查 true）
+#[tokio::test]
+async fn check_clicks_unchecked_box_and_verifies() {
+    let (svc, _w, calls, script) = armed();
+    given(
+        &script,
+        "Runtime.evaluate",
+        vec![
+            resolve_obj_eval("objC"),                         // is_checked 解析
+            eval_obj_response(json!({ "x": 8.0, "y": 9.0 })), // click 定位
+            resolve_obj_eval("objC2"),                        // 复查解析
+        ],
+    );
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![
+            Ok(json!({ "result": { "type": "boolean", "value": false } })), // 初始未勾
+            Ok(json!({ "result": { "type": "boolean", "value": true } })),  // 点击后已勾
+        ],
+    );
+    let resp = svc.check(INS, "T1", "#cb", false).await.unwrap();
+    assert_eq!(resp["result"], json!("Checked \"#cb\""));
+    assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 3);
+}
+
+/// check 错误路径 + 已勾选 no-op：未命中 → 404；已勾选 → 文案明示 already
+#[tokio::test]
+async fn check_already_checked_is_noop_and_reports_missing() {
+    let (svc, _w, calls, script) = armed();
+    given(&script, "Runtime.evaluate", vec![resolve_obj_eval("objC")]);
+    given(
+        &script,
+        "Runtime.callFunctionOn",
+        vec![Ok(
+            json!({ "result": { "type": "boolean", "value": true } }),
+        )],
+    );
+    let resp = svc.check(INS, "T1", "#cb", false).await.unwrap();
+    assert_eq!(
+        resp["result"],
+        json!("Checked \"#cb\" (already checked)"),
+        "已勾选 = no-op 成功，文案诚实"
+    );
+    assert_eq!(
+        calls_of(&calls, "Input.dispatchMouseEvent").len(),
+        0,
+        "已勾选不派发"
+    );
+
+    // 未命中 → 404
+    let (svc2, _w2, calls2, script2) = armed();
+    given(
+        &script2,
+        "Runtime.evaluate",
+        vec![Ok(json!({ "result": { "type": "object" } }))], // 无 objectId
+    );
+    let e = svc2.check(INS, "T1", "#gone", false).await.unwrap_err();
+    assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
+    assert_eq!(calls_of(&calls2, "Input.dispatchMouseEvent").len(), 0);
+}
+
+/// tap：resolve + touchStart/touchEnd（无鼠标事件）
+#[tokio::test]
+async fn tap_dispatches_touch_sequence() {
+    let (svc, _w, calls, script) = armed();
+    given(
+        &script,
+        "Runtime.evaluate",
+        vec![eval_obj_response(json!({ "x": 30.0, "y": 40.0 }))],
+    );
+    let resp = svc.tap(INS, "T1", "#btn").await.unwrap();
+    assert_eq!(resp["result"], json!("Tapped \"#btn\""));
+    let touch = calls_of(&calls, "Input.dispatchTouchEvent");
+    assert_eq!(
+        (touch.len(), touch[0].param("type"), touch[1].param("type")),
+        (2, json!("touchStart"), json!("touchEnd"))
+    );
+    assert_eq!(
+        touch[0].param("touchPoints"),
+        json!([{ "x": 30.0, "y": 40.0 }])
+    );
+    assert!(calls_of(&calls, "Input.dispatchMouseEvent").is_empty());
+}
+
+/// tap 错误路径：未命中 → 404，零触摸派发
+#[tokio::test]
+async fn tap_reports_element_not_found() {
+    let (svc, _w, calls, script) = armed();
+    given(
+        &script,
+        "Runtime.evaluate",
+        vec![Ok(json!({ "result": { "type": "object" } }))], // 无坐标 = 未命中
+    );
+    let e = svc.tap(INS, "T1", "#gone").await.unwrap_err();
+    assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
+    assert!(calls_of(&calls, "Input.dispatchTouchEvent").is_empty());
 }
 
 // ---------------- 工具：navigate / back / forward / reload ---------------
@@ -4388,9 +4953,26 @@ async fn click_ref_in_frame_resolves_and_dispatches_on_frame_session() {
         "Runtime.callFunctionOn",
         vec![fn_value(json!({ "connected": true, "x": 60.0, "y": 40.0 }))],
     );
+    // kit click 的顶层坐标投影：帧内容 quad 首点 (10, 20) = 帧偏移
+    given(
+        &script,
+        "DOM.getFrameOwner",
+        vec![Ok(json!({ "backendNodeId": 501 }))],
+    );
+    given(
+        &script,
+        "DOM.getBoxModel",
+        vec![Ok(
+            json!({ "model": { "content": [10.0, 20.0, 110.0, 20.0, 110.0, 60.0, 10.0, 60.0] } }),
+        )],
+    );
 
-    let resp = svc.click(INS, "T1", "@e1").await.unwrap();
-    assert_eq!(resp["result"], json!("Clicked @e1 \"OK\" at CSS (60, 40)"));
+    let resp = svc.click(INS, "T1", "@e1", false, false).await.unwrap();
+    assert_eq!(
+        resp["result"],
+        json!("Clicked @e1 \"OK\" at CSS (70, 60)"),
+        "结果坐标 = 帧本地 (60, 40) + 帧偏移 (10, 20)（I2：文案坐标基准改为顶层视口）"
+    );
     let resolve = calls_of(&_calls, "DOM.resolveNode");
     assert_eq!(
         resolve[0].session.as_deref(),
@@ -4398,7 +4980,12 @@ async fn click_ref_in_frame_resolves_and_dispatches_on_frame_session() {
         "resolveNode 在帧会话（kit 帧路由）"
     );
     let inputs = calls_of(&_calls, "Input.dispatchMouseEvent");
-    assert_eq!(inputs.len(), 3, "三段鼠标事件");
+    assert_eq!(inputs.len(), 3, "kit ClickPhase 三事件");
+    assert_eq!(
+        inputs[0].param("x"),
+        json!(60.0),
+        "Input 坐标 = 帧本地（发帧会话）"
+    );
     assert!(
         inputs
             .iter()
@@ -4436,8 +5023,21 @@ async fn click_frame_ref_via_event_path_registered_frame() {
         "Runtime.callFunctionOn",
         vec![fn_value(json!({ "connected": true, "x": 30.0, "y": 20.0 }))],
     );
+    // 投影链走查：owner 未登记在帧表 → getFrameOwner 探测（quad 首点 0,0）
+    given(
+        &script,
+        "DOM.getFrameOwner",
+        vec![Ok(json!({ "backendNodeId": 602 }))],
+    );
+    given(
+        &script,
+        "DOM.getBoxModel",
+        vec![Ok(
+            json!({ "model": { "content": [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0] } }),
+        )],
+    );
 
-    let resp = svc.click(INS, "T1", "@e2").await.unwrap();
+    let resp = svc.click(INS, "T1", "@e2", false, false).await.unwrap();
     assert_eq!(
         resp["result"],
         json!("Clicked @e2 \"OK\" at CSS (30, 20)"),
@@ -4445,8 +5045,8 @@ async fn click_frame_ref_via_event_path_registered_frame() {
     );
 }
 
-/// fill 帧内 ref：DOM/Runtime 命令（resolveNode/focus/callFunctionOn/
-/// callFunctionOn/insertText/releaseObject）全部路由到 frame session
+/// fill 帧内 ref：解析/检查/回读（DOM/Runtime 命令）路由到 frame session；
+/// kit fill 的 insertText 发 page 级会话（渲染进程按焦点路由——I2 语义）
 #[tokio::test]
 async fn fill_ref_in_frame_runs_on_frame_session() {
     let (svc, watched, _calls, script) = armed();
@@ -4468,15 +5068,22 @@ async fn fill_ref_in_frame_runs_on_frame_session() {
         "textbox",
         "用户名",
     );
-    given(&script, "DOM.resolveNode", vec![resolve_node_ok("objF")]);
+    // 我方解析 + kit fill 内部解析（各一次 resolveNode + isConnected）
+    given(
+        &script,
+        "DOM.resolveNode",
+        vec![resolve_node_ok("objF"), resolve_node_ok("objF2")],
+    );
     given(
         &script,
         "Runtime.callFunctionOn",
         vec![
-            fn_value(json!(true)), // kit isConnected
-            fn_value(json!({ "tag": "INPUT", "kind": "native", "label": "用户名" })),
-            fn_value(json!({ "cleared": true })),
-            fn_value(json!({ "matches": true })),
+            fn_value(json!(true)), // 我方解析的 isConnected
+            fn_value(json!({ "tag": "INPUT", "kind": "native", "label": "用户名" })), // 可填检查
+            fn_value(json!(true)), // kit fill 解析的 isConnected
+            Ok(json!({ "result": { "type": "object" } })), // kit focus
+            Ok(json!({ "result": { "type": "object" } })), // kit clear
+            fn_value(json!({ "matches": true })), // 回读校验
         ],
     );
 
@@ -4486,31 +5093,25 @@ async fn fill_ref_in_frame_runs_on_frame_session() {
         json!("Filled <INPUT> \"用户名\" with \"vincent\" (7 chars)")
     );
     let resolve = calls_of(&_calls, "DOM.resolveNode");
-    assert_eq!(resolve.len(), 1);
+    assert_eq!(resolve.len(), 2, "我方解析 + kit fill 内部解析各一次");
     assert_eq!(
         resolve[0].session.as_deref(),
         Some("S_FRM_A"),
         "resolveNode 在帧会话"
     );
-    for r in calls_of(&_calls, "Runtime.callFunctionOn") {
-        assert_eq!(
-            r.session.as_deref(),
-            Some("S_FRM_A"),
-            "callFunctionOn 在帧会话"
-        );
-    }
-    let insert = calls_of(&_calls, "Input.insertText");
-    assert_eq!(insert.len(), 1);
+    // 我方 call_fn（检查/回读）在帧会话；kit focus/clear 同样（effective
+    // session）；唯 insertText 在 page 级会话
+    let inserts = calls_of(&_calls, "Input.insertText");
+    assert_eq!(inserts.len(), 1);
     assert_eq!(
-        insert[0].session.as_deref(),
-        Some("S_FRM_A"),
-        "insertText 在帧会话"
+        inserts[0].session.as_deref(),
+        Some("S1"),
+        "kit fill 的 insertText 发 page 级会话（I2 语义差异，提交信息披露）"
     );
+    let release = calls_of(&_calls, "Runtime.releaseObject");
     assert_eq!(
-        calls_of(&_calls, "Runtime.releaseObject")[0]
-            .session
-            .as_deref(),
-        Some("S_FRM_A"),
+        (release.len(), release[0].session.as_deref()),
+        (1, Some("S_FRM_A")),
         "对象归还到解析它的同一会话"
     );
 }
@@ -4541,10 +5142,13 @@ async fn stale_frame_ref_reports_ref_stale() {
         "Accessibility.getFullAXTree",
         vec![Ok(json!({ "nodes": [] }))],
     );
-    let err = svc.click(INS, "T1", "@e2").await.unwrap_err();
+    let err = svc.click(INS, "T1", "@e2", false, false).await.unwrap_err();
     assert_eq!((err.status(), err.code()), (409, "PAGE_REF_STALE"));
     // 未知 ref 仍 404（NOT_FOUND 与 STALE 的区分保留）
-    let err2 = svc.click(INS, "T1", "@e99").await.unwrap_err();
+    let err2 = svc
+        .click(INS, "T1", "@e99", false, false)
+        .await
+        .unwrap_err();
     assert_eq!(err2.code(), "PAGE_REF_NOT_FOUND", "未知 ref 仍 404");
 }
 

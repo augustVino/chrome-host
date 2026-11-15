@@ -1,6 +1,6 @@
 ---
 name: chrome-host
-description: chrome-host 桌面应用的完整 agent 技能：编排多环境隔离 Chrome 实例（查/建环境、实例命名锚定、启停实例、开标签页、登录态快照、hosts 注入、扩展与内核管理），并用 chrome-host page 命令族直接做页面操控（snap @eN 引用与 hover 提示、原生点击、表单填写 fill/press、元素等待 wait、页内导航与历史回退、元素/视口截图、PDF 导出、设备仿真、eval、坐标点击、弹窗自动接管），以及排障取证（console/请求历史、脱敏响应体读取、HAR 导出）。只要用户提到"用 XX 环境打开/排查/测试"（qa、sandbox 等环境名）、需要独立 profile / hosts 注入 / 免登录的浏览器、在隔离浏览器里点按钮/填表单/提交/截图/读 DOM/看接口返回、或管理 chrome-host 的环境实例，就必须使用本 skill。与本机手动以 --remote-debugging-port 启动、与 chrome-host 无关的调试 Chrome 相关的纯页面操作不走本 skill。
+description: chrome-host 桌面应用的完整 agent 技能：编排多环境隔离 Chrome 实例（查/建环境、实例命名锚定、启停实例、开标签页、登录态快照、hosts 注入、扩展与内核管理），并用 chrome-host page 命令族直接做页面操控（snap @eN 引用与 hover 提示、原生点击、表单填写 fill/press、hover/scroll/drag/select/check/tap 输入面、元素等待 wait、页内导航与历史回退、元素/视口截图、PDF 导出、设备仿真、eval、坐标点击、弹窗自动接管），以及排障取证（console/请求历史、脱敏响应体读取、HAR 导出）。只要用户提到"用 XX 环境打开/排查/测试"（qa、sandbox 等环境名）、需要独立 profile / hosts 注入 / 免登录的浏览器、在隔离浏览器里点按钮/填表单/提交/截图/读 DOM/看接口返回、或管理 chrome-host 的环境实例，就必须使用本 skill。与本机手动以 --remote-debugging-port 启动、与 chrome-host 无关的调试 Chrome 相关的纯页面操作不走本 skill。
 ---
 
 # Chrome Host — 隔离 Chrome 编排 + 页面自动化
@@ -103,9 +103,15 @@ URL 必须 http:// 或 https:// 开头（本地校验，非法 exit 2 且请求�
 
 ```bash
 chrome-host page snap    <id> [tab] [-c|-i|-d N|-u|-s sel]  # 可访问性树 + @eN 引用 + [hover] 提示（操作循环起点；flags：-c 压缩 / -i 只看可交互 / -d 深度 / -u 链接 url / -s 只快照某选择器子树）
-chrome-host page click   <id> <sel|@eN> [--tab t]      # 原生输入点击（非 el.click()）
+chrome-host page click   <id> <sel|@eN> [--double|--right] [--tab t]  # 原生输入点击（非 el.click()；--double 双击 / --right 右键）
 chrome-host page fill    <id> <sel|@eN> <value> [--tab t]  # 聚焦+清空+输入+回读校验（表单用它，别 eval 手写）
 chrome-host page press   <id> <key> [--target <sel|@eN>] [--tab t]  # Enter/Tab/箭头/F1-F12/Control+A 组合键
+chrome-host page hover   <id> <sel|@eN> [--tab t]      # 悬停（mouseMoved；展开后重 snap 拿新引用）
+chrome-host page scroll  <id> [sel|@eN] <dx> <dy> [--tab t]  # 滚动：有目标滚元素，无目标滚页面（像素可负）
+chrome-host page drag    <id> <from> <to> [--tab t]   # 拖拽（滑块/排序/拖放；弧线轨迹；两端点同帧）
+chrome-host page select  <id> <sel|@eN> <value> [--tab t]  # 下拉选择（按 value 或可见文本；原生 select 与 combobox 组件）
+chrome-host page check   <id> <sel|@eN> [--uncheck] [--tab t]  # 勾选/取消勾选（已处于目标态 no-op 成功）
+chrome-host page tap     <id> <sel|@eN> [--tab t]     # 触摸轻点（移动端仿真页专用）
 chrome-host page wait    <id> <sel> [--state visible|hidden|attached|detached] [--timeout 10s] [--tab t]  # SPA 渲染等待用它，别 sleep
 chrome-host page navigate <id> <url> [--tab t]         # 页内导航（保留历史；等 load 至多 25s，未证实 → loaded:false）
 chrome-host page back    <id> [--tab t]                # 历史后退（边界 → 409 PAGE_NAV_NO_HISTORY）
@@ -135,10 +141,10 @@ chrome-host page upload <id> <sel|@eN> <主机绝对路径> [--tab t]  # 文件�
 关键约定（断链几乎都出在这里）：
 
 - **元素定位优先 @eN 引用**：snap 给可交互节点（button/link/textbox/checkbox…）编号输出 `- button "提交" @e3`，click/fill/press 直接吃引用，比 CSS 选择器稳（不受 CSS-in-JS hash、动态列表位移影响）。引用是 **durable** 的：SPA 同文档局部刷新/pushState 后旧 @eN 仍可用（同节点直接命中，节点换新时按 role/name 唯一匹配恢复）；只有报 `PAGE_REF_STALE`（节点已随导航/替换死亡且恢复无果）才需要重新 snap——此时重 snap 再操作，不要对旧引用重试。快照 meta 有 `removedRefs`（本次消失的旧引用）时说明页面删了节点，旧引用需对表。
-- **[hover] / [hover-reveal] 提示（菜单类页面必看）**：snap 会静态扫描页面 CSS 的 :hover 规则，在行尾标记两类元素——`- button "菜单" @e1 [hover]` = 悬停它有反应（先 `page press`/无直接命令时用 `page raw` 发 Input.dispatchMouseEvent 悬停，或用 clickxy 悬停坐标），`- button "子项" @e2 [hover-reveal]` = 它藏在某 hover 展开区里（先悬停触发器再重 snap 拿展开后的新引用）。没有标记 ≠ 确认无 hover（响应 meta 的 hoverScan: ok|truncated|skipped|error 披露扫描完整性，truncated=可能漏看）。
+- **[hover] / [hover-reveal] 提示（菜单类页面必看）**：snap 会静态扫描页面 CSS 的 :hover 规则，在行尾标记两类元素——`- button "菜单" @e1 [hover]` = 悬停它有反应（用 `page hover @e1` 悬停），`- button "子项" @e2 [hover-reveal]` = 它藏在某 hover 展开区里（先 `page hover` 触发器再重 snap 拿展开后的新引用）。没有标记 ≠ 确认无 hover（响应 meta 的 hoverScan: ok|truncated|skipped|error 披露扫描完整性，truncated=可能漏看）。
 - **截图/PDF/仿真/diff/profiler**：`page screenshot` 带选择器或 @eN 截该元素（不滚动页面，跨行元素取完整包围盒），不带截当前视口；`page pdf` 整页导出（默认 Letter 纵向带背景）；`page emulate --preset iphone-14` 模拟设备视口+UA+触控（仅该 tab，`--off` 恢复，重复 emulate=覆盖）。回归比对用 diff 族：`page diff` 比较两次访问的快照文本（无 --baseline-file 时自动滚基线，@eN 记号漂移也算变化），`page diff-shot --baseline-file png.png` 做像素级比对（尺寸不一致会披露 dimensionMismatch）。页面卡顿排查用 `page profiler start` → 操作页面 → `page profiler stop --out trace.json`（Perfetto 可打开；采样期间其他命令正常可用）。
 - **弹窗已自动接管**：页面 alert/confirm/prompt/beforeunload 由应用自动 accept（beforeunload=放行离开，prompt 提交默认文本），不阻塞命令；命令期间弹过的窗以 `dialogs_seen` 附在输出里，`page dialogs` 查历史。
-- **错误看 [PAGE_*] 前缀分支处置**，不解析文案：`PAGE_ELEMENT_BLOCKED`（被浮层遮挡，先处理遮挡）/ `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_REF_NOT_FOUND`·`PAGE_REF_STALE`（重 snap）/ `PAGE_TARGET_NOT_FILLABLE` / `PAGE_FILL_VALUE_MISMATCH`（写入可能部分生效，先观察再重试）/ `PAGE_WAIT_TIMEOUT` / `PAGE_DISPATCH_FAILED`（附 effect_state：none=未发出可重试，unknown=已发出禁盲目重试）/ `PAGE_TAB_AMBIGUOUS`（多 tab，带列表重选）。
+- **错误看 [PAGE_*] 前缀分支处置**，不解析文案：`PAGE_ELEMENT_BLOCKED`（被浮层遮挡，先处理遮挡）/ `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_REF_NOT_FOUND`·`PAGE_REF_STALE`（重 snap）/ `PAGE_TARGET_NOT_FILLABLE` / `PAGE_FILL_VALUE_MISMATCH`（写入可能部分生效，先观察再重试）/ `PAGE_WAIT_TIMEOUT` / `PAGE_DISPATCH_FAILED`（附 effect_state：none=未发出可重试，unknown=已发出禁盲目重试；click/drag 链一律保守 unknown）/ `PAGE_SELECT_NO_OPTION`（检查选项拼写，message 列出可用项）/ `PAGE_DRAG_CROSS_FRAME`（drag 两端点改同帧目标）/ `PAGE_TAB_AMBIGUOUS`（多 tab，带列表重选）。
 - **跨域 iframe（OOPIF）**：snap 已内嵌帧内容（Iframe 节点行下的缩进子树，@eN 跨帧连续编号），click/fill/press 对帧内 @eN 直接可用（kit 解析链自动路由到帧会话）；CSS 选择器仍只查主 frame，帧内 selector 找不到时改用 @eN；帧内容换掉后旧帧内 ref 解析失败报 `PAGE_REF_STALE`（重新 snap）；坐标级兑底（clickxy+type）仍可用。
 - **文件下载/上传（W-file）**：下载是**命令式等待**——先 `page download-wait` 挂住，再另行 `page click` 点下载链接（等待不阻塞 click），返回落盘路径/大小（目录 = 实例 profile 的 `downloads/`，随实例删除清理）；`page downloads` 查终态记录环（失败/已消费都在）。上传 `page upload` 吃 @eN 或选择器，主机路径**必须物理绝对路径**（macOS 的 /tmp、/var 是软链会被拒，改传 /private/tmp/... 形态）；非 input[type=file] → 422。超时（409 PAGE_DOWNLOAD_TIMEOUT）= 无下载发生，与失败（500 PAGE_DOWNLOAD_FAILED）严格区分；drop 拖拽上传不支持。
 - **无主对话框卡死（罕见）**：对话框在应用无连接期间弹出（如应用重启前埋的 setTimeout alert）时，CDP 通道不认识它——命令大面积超时但 `page dialogs` 无记录。恢复：`chrome-host page raw <id> "Page.navigate" '{"url":"<当前页>"}' --tab <t>`（强制导航丢弃对话框），或让用户在浏览器窗口点掉。

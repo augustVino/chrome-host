@@ -466,21 +466,31 @@ impl PageService {
         .await
     }
 
-    /// click <tab> <@eN | selector>：ref 路径走几何链（quads 质心 + rect 回退），
-    /// selector 路径走 locate → hit-test → 三段 Input 派发（§2）。
-    pub async fn click(&self, ins_id: &str, tab: &str, target: &str) -> Result<Value, AppError> {
+    /// click <tab> <@eN | selector> [--double] [--right]（I2：内核换 kit
+    /// interaction::click——resolve 链 + ClickPhase 派发 + settle +
+    /// actionability 全开：可见/启用/遮挡 + 对话框竞速；双击/右键经
+    /// ClickSpec 透传）。
+    pub async fn click(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        target: &str,
+        double: bool,
+        right: bool,
+    ) -> Result<Value, AppError> {
         self.command(
             TOOL_TIMEOUT,
             "click",
             ins_id,
             tab,
-            |w, tid, sid| async move { click_tool(&w, &tid, &sid, target).await },
+            |w, tid, sid| async move { click_tool(&w, &tid, &sid, target, double, right).await },
         )
         .await
     }
 
-    /// fill <tab> <@eN | selector> <value>：可填检查 → focus → 清空 →
-    /// insertText → 回读校验（§4.1）。value 为空串 = 仅清空。
+    /// fill <tab> <@eN | selector> <value>（I2：主链换 kit interaction::fill
+    ///——focus + select/value 清空 + insertText；可填前置检查、contenteditable
+    /// 预清空与回读校验为我方契约保全层）。value 为空串 = 仅清空。
     pub async fn fill(
         &self,
         ins_id: &str,
@@ -498,8 +508,9 @@ impl PageService {
         .await
     }
 
-    /// press <tab> <key> [--target]：键名 → rawKeyDown(+char)/keyUp 序列；
-    /// --target 先 focus（ref: DOM.focus；selector: 页内 eval）。
+    /// press <tab> <key> [--target]（I2：按键序列换 kit press_key(_with_modifiers)
+    ///——keyDown+keyUp 两段，Ctrl/Meta 组合抑制 text；--target 先聚焦
+    ///（ref 与 selector 两路径统一 kit resolve）。
     pub async fn press(
         &self,
         ins_id: &str,
@@ -779,7 +790,8 @@ impl PageService {
     }
 
     /// loadall <tab> <sel> [--interval] [--max-clicks]：循环点击直到选择器
-    /// 消失或达上限（P2-G）。预算 = interval × max-clicks + 工具兑底
+    /// 消失或达上限（P2-G；I2：点击层换 kit click selector 路径）。预算 =
+    /// interval × max-clicks + 工具兑底
     /// （默认 200 × 1500ms = 5min + 30s，对齐 TS 的 5min 硬顶量级）。
     pub async fn loadall(
         &self,
@@ -810,9 +822,11 @@ impl PageService {
         .await
     }
 
-    /// type <tab> <text>：对当前焦点元素直接 Input.insertText（无定位、无
-    /// 校验）——跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达
-    /// 跨域 frame，先 clickxy 点入获得焦点）（P2-G，owner 补充）。空文本 →
+    /// type <tab> <text>：对当前焦点元素输入（I2：换 kit
+    /// type_text_into_active_context——逐字符派发，\n/\t 走真按键事件；
+    /// 无定位、无校验语义不变）——跨域 iframe 输入的唯一路径（eval/fill 的
+    /// selector 均不可达跨域 frame，先 clickxy 点入获得焦点）（P2-G，owner
+    /// 补充）。空文本 →
     /// 400（对齐 TS typeStr）。
     pub async fn r#type(&self, ins_id: &str, tab: &str, text: &str) -> Result<Value, AppError> {
         if text.is_empty() {
