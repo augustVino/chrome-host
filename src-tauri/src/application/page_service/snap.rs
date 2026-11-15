@@ -1,168 +1,218 @@
-use super::{cdp_send, require_conn, HOVER_SETTLE_POLL, HOVER_SETTLE_WINDOW, MAX_HOVER_QUERY_HITS};
-use crate::application::page_service::ax::{
-    ax_field, collect_ax_tree_multi, FrameSubtree, HoverMarks,
+use super::{
+    cdp_send, kit_client, require_conn, HoverMarks, SnapParams, HOVER_SETTLE_POLL,
+    HOVER_SETTLE_WINDOW, MAX_HOVER_QUERY_HITS,
 };
+use crate::application::browser_kit::element::RefMap;
+use crate::application::browser_kit::snapshot::{take_snapshot, SnapshotOptions};
 use crate::application::page_service::events::enable_session_domains;
+use crate::application::page_service::frames::iframe_sessions_view;
+use crate::application::page_service::refs::map_kit_error;
 use crate::application::page_service::state::Watched;
 use crate::domain::page_control::{scan_hover_rules, HoverRules, MAX_HOVER_SHEETS};
 use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::SharedPageConn;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 // ============================================================================
 // 6. 工具编排（每个 = 一个内部 async fn，公开入口在 PageService 上）
 // ============================================================================
 
-pub(crate) async fn snap_tool(watched: &Watched, _tid: &str, sid: &str) -> Result<Value, AppError> {
+/// I1b：snap 管线 = kit take_snapshot（durable refs + 上游快照引擎）+ 我方
+/// hover_scan 与 meta 契约。锁纪律（任务书附录决策 1）：refs 的 Mutex 锁内
+/// 禁止 await——RefMap 先 clone 出、take_snapshot 完成后整表写回；resolve
+/// 路径只读 clone。begin_snapshot 是 kit 的调用方契约（清 map、保留
+/// documents 桶与编号计数：同文档 @eN 稳定复用，消失的 ref 不僵尸残留）。
+pub(crate) async fn snap_tool(
+    watched: &Watched,
+    tid: &str,
+    sid: &str,
+    params: &SnapParams,
+) -> Result<Value, AppError> {
     let conn = require_conn(watched)?;
-    let resp = cdp_send(&conn, "Accessibility.getFullAXTree", json!({}), Some(sid)).await?;
-    let nodes = resp
-        .get("nodes")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    // W-oopif：已 attach 的 OOPIF 帧逐个拉 AX 树 + 解析 owner 挂接点；
-    // 同源 iframe 不是独立 target（无 session），内容已在主树中——天然跳过。
-    // 主树 nodes 传入 sync：owner 探测命中后校验宿主文档中该 bni 确为 iframe
-    // 元素（防已销毁文档的残留 target 污染——getFrameOwner 对死帧返回的
-    // 节点不可信，真机实测撞上 button 的 bni）
-    let (arena, main_attaches) = collect_frame_subtrees(watched, &conn, _tid, sid, &nodes).await;
-    // 两遍渲染：第一遍只取 refs（backendNodeId 全集，hover 桥接的输入——
-    // 仅主树条目参与，帧内 backendNodeId 属另一 DOM agent 无法在主会话桥接），
-    // hover 扫描后第二遍带标记渲染文本树（纯内存重入，代价可忽略）
-    let (_, refs) = collect_ax_tree_multi(&nodes, &HoverMarks::default(), &main_attaches, &arena);
-    let main_refs: Vec<Value> = refs
-        .iter()
-        .filter(|r| r.get("frameTargetId").is_none())
-        .cloned()
-        .collect();
-    // hover 感知（增强项：任何失败不阻断 snap 主体，状态如实上报）
-    let hover = hover_scan(watched, &conn, _tid, sid, &main_refs).await;
-    let (text, refs) = collect_ax_tree_multi(&nodes, &hover.marks, &main_attaches, &arena);
-    let refs_count = refs.len();
-    // 整表替换 + generation+1 + 清 stale（§3.5）：refs 只描述最后一次 snap
-    let generation = {
-        let mut tabs = watched.refs.lock().unwrap();
-        let store = tabs.entry(_tid.to_string()).or_default();
-        store.replace(&Value::Array(refs));
-        store.generation()
+    // 帧登记同步（W-oopif 保留路径）：事件流只覆盖增量，早于命令连接存在的
+    // OOPIF 靠 target 面探测补登记——iframe_sessions 的完备性前提
+    sync_frame_tree(watched, &conn, tid, sid).await;
+    // 锁窗口内取 clone（不跨 await）
+    let mut ref_map: RefMap = watched
+        .refs
+        .lock()
+        .unwrap()
+        .entry(tid.to_string())
+        .or_insert_with(RefMap::new)
+        .clone();
+    let iframe_sessions = iframe_sessions_view(watched, tid);
+    let pre_ids = ref_map.ref_ids();
+    ref_map.begin_snapshot();
+    let client = kit_client(watched)?;
+    let kit_opts = SnapshotOptions {
+        selector: params.selector.clone(),
+        interactive: params.interactive,
+        compact: params.compact,
+        depth: params.depth,
+        urls: params.urls,
     };
-    Ok(
-        json!({ "text": text, "refs_count": refs_count, "generation": generation, "hoverScan": hover.status }),
+    // frame_id 恒 None（主文档；任务书附录决策 2）：OOPIF 由 kit 经
+    // iframe_sessions 自递归，同源 iframe 由 kit 内部 frameId 参数处理
+    let mut text = take_snapshot(
+        &client,
+        sid,
+        &kit_opts,
+        &mut ref_map,
+        None,
+        &iframe_sessions,
     )
+    .await
+    .map_err(|e| map_kit_error(&e, "snap"))?;
+    // hover 感知（增强项：任何失败不阻断 snap 主体，状态如实上报）。主树
+    // bni 集合从 RefMap 主桶取（frame=None 条目；帧内行不加标记——语义保持）
+    let main_bnis: Vec<i64> = ref_map
+        .entries_sorted()
+        .iter()
+        .filter(|(_, e)| e.frame_id.is_none())
+        .filter_map(|(_, e)| e.backend_node_id)
+        .collect();
+    let hover = hover_scan(watched, &conn, tid, sid, &main_bnis).await;
+    // 文本后处理（纯函数）：[ref=eN] → @eN + hover 标记追加行尾
+    let marked = marked_ref_ids(&ref_map, &hover.marks);
+    text = postprocess_snapshot_text(&text, &marked);
+    // 整表写回 + snap 计数 +1（锁窗口内，无 await）
+    let refs_count = {
+        let mut tabs = watched.refs.lock().unwrap();
+        let slot = tabs.entry(tid.to_string()).or_insert_with(RefMap::new);
+        *slot = ref_map;
+        slot.ref_ids().len()
+    };
+    let generation = {
+        let mut gens = watched.snap_gen.lock().unwrap();
+        let g = gens.entry(tid.to_string()).or_insert(0);
+        *g += 1;
+        *g
+    };
+    // 消失的 ref（pre - post，@eN 形态；非空才进响应——任务书红线 1）
+    let removed: Vec<String> = {
+        let post = watched.refs.lock().unwrap();
+        let post = post.get(tid).map(|m| m.ref_ids()).unwrap_or_default();
+        let mut removed: Vec<String> = pre_ids
+            .difference(&post)
+            .map(|id| format!("@{id}"))
+            .collect();
+        removed.sort_by_key(|r| {
+            r.trim_start_matches('@')
+                .trim_start_matches('e')
+                .parse::<u64>()
+                .unwrap_or(u64::MAX)
+        });
+        removed
+    };
+    let mut resp = json!({
+        "text": text,
+        "refs_count": refs_count,
+        "generation": generation,
+        "hoverScan": hover.status,
+    });
+    if !removed.is_empty() {
+        resp["removedRefs"] = json!(removed);
+    }
+    Ok(resp)
 }
 
-/// OOPIF 帧子树采集（W-oopif）：对 tab 已 attach 的每个帧 target 拉
-/// getFullAXTree，解析 owner 元素 backendNodeId（DOM.getFrameOwner，父文档
-/// session），组装 arena（支持嵌套：帧内 iframe 挂接在其父帧树下）。
-/// 单帧失败（导航中/会话死）跳过不阻断——该帧内容缺席于快照，主树完整。
-async fn collect_frame_subtrees(
-    watched: &Watched,
-    conn: &SharedPageConn,
-    tab_tid: &str,
-    main_sid: &str,
-    main_nodes: &[Value],
-) -> (Vec<FrameSubtree>, HashMap<i64, usize>) {
-    // 帧树主动同步（W-oopif）：frameAttached/attachedToTarget 只覆盖**增量**——
-    // 页面早于命令连接存在的帧拿不到事件（Page 域不回放历史帧树）。snap 前
-    // getFrameTree 全量同步结构 + attachToTarget 主动认领会话（同源帧非
-    // target，attach 报错即天然过滤）；与事件路径合流（幂等）。
-    sync_frame_tree(watched, conn, tab_tid, main_sid, main_nodes).await;
-    // 帧快照（锁内一次性取，避免跨 await 持锁）
-    let snapshot: Vec<(String, String, Option<String>)> = {
-        let tables = watched.frames.lock().unwrap();
-        let Some(table) = tables.get(tab_tid) else {
-            return (Vec::new(), HashMap::new());
-        };
-        table
-            .frames
-            .iter()
-            .filter_map(|(fid, info)| {
-                info.session_id
-                    .as_ref()
-                    .map(|sid| (fid.clone(), sid.clone(), info.parent_frame_id.clone()))
-            })
-            .collect()
+/// hover 命中 bni → 该 ref 的标记（仅主桶条目；帧内 bni 属另一 DOM agent，
+/// 不参与主会话桥接，误标即假阳性——帧行无标记语义保持）
+fn marked_ref_ids(ref_map: &RefMap, marks: &HoverMarks) -> HashMap<String, &'static str> {
+    let mut out = HashMap::new();
+    for (ref_id, entry) in ref_map.entries_sorted() {
+        if entry.frame_id.is_some() {
+            continue;
+        }
+        if let Some(mark) = entry
+            .backend_node_id
+            .and_then(|bni| marks.get(&bni))
+            .copied()
+        {
+            out.insert(ref_id, mark);
+        }
+    }
+    out
+}
+
+/// 快照文本行内替换：`ref=eN` 记号 → `@eN`（含组合属性形态
+/// `[checked=false, ref=e2]` → `[checked=false, @e2]`）。记号边界严格判定
+///（前导 '['/空格/逗号 + 尾随 ']'/逗号/空格/行尾），防止 name/url 属性里
+/// 恰含 `ref=eN` 字面量被误改。hover 标记（" [hover]" / " [hover-reveal]"）
+/// 追加行尾。纯函数，单测覆盖。
+pub(crate) fn postprocess_snapshot_text(
+    text: &str,
+    marked: &HashMap<String, &'static str>,
+) -> String {
+    text.lines()
+        .map(|line| {
+            let (rewritten, refs) = rewrite_ref_tokens(line);
+            match refs.iter().find_map(|r| marked.get(r.as_str()).copied()) {
+                Some(mark) => format!("{rewritten} [{mark}]"),
+                None => rewritten,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 单行后处理：`[ref=eN]`（唯一属性）→ `@eN`（去括号）；组合属性形态
+/// `[checked=false, ref=e2]` → `[checked=false, @e2]`（保留括号）。记号边界
+/// 严格判定（前导 '['/空格/逗号 + 尾随 ']'/逗号/空格/行尾），防止
+/// name/url 属性里恰含 `ref=eN` 字面量被误改。返回命中的 ref id（“eN”）。
+fn rewrite_ref_tokens(line: &str) -> (String, Vec<String>) {
+    let mut out = String::with_capacity(line.len());
+    let mut refs = Vec::new();
+    let chars: Vec<char> = line.chars().collect();
+    let ascii_at = |chars: &[char], i: usize| -> u8 {
+        // 仅用于 ASCII 边界判定：非 ASCII 位置返回 b'.'（永不匹配边界集）
+        let c = chars[i];
+        if c.is_ascii() {
+            c as u8
+        } else {
+            b'.'
+        }
     };
-    if snapshot.is_empty() {
-        return (Vec::new(), HashMap::new());
-    }
-    let root = {
-        let tables = watched.frames.lock().unwrap();
-        tables.get(tab_tid).and_then(|t| t.root.clone())
-    };
-    // 逐帧拉树（失败跳过）+ owner 解析
-    struct Raw {
-        tid: String,
-        sid: String,
-        parent: Option<String>,
-        owner: i64,
-        nodes: Vec<Value>,
-        label: String,
-    }
-    let mut raws: Vec<Raw> = Vec::new();
-    for (fid, fsid, parent) in snapshot {
-        let nodes = fetch_frame_ax(conn, &fsid).await;
-        // owner：getFrameOwner 在父文档 session（父帧 OOPIF 用父帧会话，其余主会话）
-        let parent_sid = match parent.as_deref() {
-            Some(p) if !p.is_empty() && Some(p.to_string()) != root => {
-                let tables = watched.frames.lock().unwrap();
-                tables
-                    .get(tab_tid)
-                    .and_then(|t| t.frames.get(p))
-                    .and_then(|i| i.session_id.clone())
-                    .unwrap_or_else(|| main_sid.to_string())
+    let mut i = 0usize;
+    'outer: while i < chars.len() {
+        if chars[i] == 'r'
+            && i + 4 < chars.len()
+            && chars[i + 1] == 'e'
+            && chars[i + 2] == 'f'
+            && chars[i + 3] == '='
+            && chars[i + 4] == 'e'
+        {
+            let before_ok = i == 0 || matches!(ascii_at(&chars, i - 1), b'[' | b' ' | b',');
+            let mut j = i + 5;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
             }
-            _ => main_sid.to_string(),
-        };
-        let owner = resolve_frame_owner(watched, conn, tab_tid, &fid, &parent, &parent_sid).await;
-        let Some(owner_bni) = owner else { continue };
-        let label = nodes
-            .first()
-            .and_then(|n| ax_field(n, "name"))
-            .filter(|n| !n.is_empty())
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| fid.clone());
-        raws.push(Raw {
-            tid: fid,
-            sid: fsid,
-            parent,
-            owner: owner_bni,
-            nodes,
-            label,
-        });
-    }
-    // 组 arena：按父子关系挂接（父帧是 OOPIF → 挂到父帧树；否则挂主树）
-    let mut arena: Vec<FrameSubtree> = Vec::new();
-    let mut main_attaches: HashMap<i64, usize> = HashMap::new();
-    // 两轮：先全部入 arena（下标稳定），再连挂接点（引用后入的帧）
-    for r in &raws {
-        arena.push(FrameSubtree {
-            frame_tid: r.tid.clone(),
-            frame_sid: r.sid.clone(),
-            label: r.label.clone(),
-            nodes: r.nodes.clone(),
-            attaches: HashMap::new(),
-        });
-    }
-    for (i, r) in raws.iter().enumerate() {
-        let host = match r.parent.as_deref() {
-            Some(p) if !p.is_empty() && Some(p.to_string()) != root => {
-                arena.iter().position(|s| s.frame_tid == p)
+            let after_ok = j >= chars.len() || matches!(ascii_at(&chars, j), b']' | b',' | b' ');
+            if before_ok && j > i + 5 && after_ok {
+                let id: String = chars[i + 4..j].iter().collect();
+                // 唯一属性：前导 '[' 紧邻 + 尾随 ']' 紧邻 → 连括号一起换成 @eN
+                let lone = i > 0 && chars[i - 1] == '[' && j < chars.len() && chars[j] == ']';
+                if lone {
+                    // 回退掉已写入的 '['
+                    out.pop();
+                    out.push('@');
+                    out.push_str(&id);
+                    refs.push(id);
+                    i = j + 1;
+                    continue 'outer;
+                }
+                out.push('@');
+                out.push_str(&id);
+                refs.push(id);
+                i = j;
+                continue 'outer;
             }
-            _ => None,
-        };
-        match host {
-            Some(h) => {
-                arena[h].attaches.insert(r.owner, i);
-            }
-            None => {
-                main_attaches.insert(r.owner, i);
-            }
-        };
+        }
+        out.push(chars[i]);
+        i += 1;
     }
-    (arena, main_attaches)
+    (out, refs)
 }
 
 /// 帧树主动同步（W-oopif，幂等，每次 snap 前跑）：事件路径
@@ -173,16 +223,14 @@ async fn collect_frame_subtrees(
 ///    同源 iframe 不是 target，天然排除）；
 /// 2. 逐帧归属探测：DOM.getFrameOwner 发到各候选 session（page 会话优先、
 ///    已知帧会话次之），成功者即宿主（owner 元素所在文档），响应的
-///    backendNodeId 顺手缓存（挂接点与投影共用）；
+///    backendNodeId 顺手缓存；
 /// 3. 无会话帧 → orphan 认领或 browser 级 attachToTarget 主动建会话 + 补域
 ///    enable。任何失败不阻断 snap（该帧缺席，主树完整）。
-async fn sync_frame_tree(
-    watched: &Watched,
-    conn: &SharedPageConn,
-    tab_tid: &str,
-    main_sid: &str,
-    main_nodes: &[Value],
-) {
+/// I1b：原「宿主主树 AX 校验（owner bni 必须是 iframe 类节点，防死帧残留）」
+/// 随 AX 中间树移交 kit 而失去数据源，删除——kit 管线对死帧天然容忍（快照
+/// 递归按 AX 树中的 Iframe 节点发起，死帧不在树中即不会被请求；解析链的
+/// frame_id 只来自快照条目），脏登记表现为惰性残留（targetDestroyed 摘除）。
+async fn sync_frame_tree(watched: &Watched, conn: &SharedPageConn, tab_tid: &str, main_sid: &str) {
     let Ok(resp) = cdp_send(conn, "Target.getTargets", json!({}), None).await else {
         return;
     };
@@ -258,26 +306,6 @@ async fn sync_frame_tree(
         let Some((host_frame, owner_bni)) = hit else {
             continue; // 宿主不明（探测期页面导航等）：留待事件路径/下轮 sync
         };
-        // owner 校验（顶层帧）：宿主文档（主树）AX 中该 bni 的节点必须是
-        // iframe/容器类——死帧（旧文档残留 target）的 getFrameOwner 返回值
-        // 不可信（真机实测指向无关元素）。嵌套帧的宿主树本轮未拉，跳过校验。
-        if host_frame.is_none() {
-            let is_iframe_node = main_nodes.iter().any(|n| {
-                n.get("backendDOMNodeId").and_then(Value::as_i64) == Some(owner_bni)
-                    && ax_field(n, "role")
-                        .map(|r| {
-                            let r = r.to_lowercase();
-                            r == "iframe" || r == "document" || r.contains("frame")
-                        })
-                        .unwrap_or(false)
-            });
-            if !is_iframe_node {
-                tracing::debug!(
-                    "[page] OOPIF {fid} owner bni {owner_bni} 非当前文档 iframe 元素（死帧残留？），拒绝登记"
-                );
-                continue;
-            }
-        }
         // 会话：已有 > orphan > 主动 attach
         let sid = if has_session {
             None
@@ -324,79 +352,9 @@ async fn sync_frame_tree(
     }
 }
 
-/// 帧内 AX 树拉取（带就绪重试）：OOPIF session 刚 attach 时 AX agent 可能
-/// 尚未构建（返回仅根节点/空）——短退避重试至出现内容或预算（~1s）耗尽。
-/// 这是真机实测的时序窗口：首轮 snap 恰逢 attach 即空，事件无从感知。
-async fn fetch_frame_ax(conn: &SharedPageConn, fsid: &str) -> Vec<Value> {
-    for attempt in 0..7 {
-        if let Ok(resp) = cdp_send(conn, "Accessibility.getFullAXTree", json!({}), Some(fsid)).await
-        {
-            let nodes = resp
-                .get("nodes")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            // 仅根（或空）= 未就绪；有 2+ 节点即认为内容可见
-            if nodes.len() >= 2 {
-                return nodes;
-            }
-            if attempt == 6 {
-                return nodes; // 末轮：有多少给多少（诚实缺席好过假等待）
-            }
-        } else {
-            return Vec::new(); // 会话已死：立即放弃
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-    Vec::new()
-}
-
-/// 帧 owner 元素解析（缓存优先；miss 时在指定父文档 session 发
-/// DOM.getFrameOwner 并回写登记表）。None = 解析失败（帧正死/导航中）。
-pub(crate) async fn resolve_frame_owner(
-    watched: &Watched,
-    conn: &SharedPageConn,
-    tab_tid: &str,
-    frame_tid: &str,
-    parent_frame_id: &Option<String>,
-    parent_sid: &str,
-) -> Option<i64> {
-    {
-        let tables = watched.frames.lock().unwrap();
-        if let Some(bni) = tables
-            .get(tab_tid)
-            .and_then(|t| t.frames.get(frame_tid))
-            .and_then(|i| i.owner_backend_node_id)
-        {
-            return Some(bni);
-        }
-    }
-    let resp = cdp_send(
-        conn,
-        "DOM.getFrameOwner",
-        json!({ "frameId": frame_tid }),
-        Some(parent_sid),
-    )
-    .await;
-    let bni = resp
-        .ok()
-        .and_then(|r| r.get("backendNodeId").and_then(Value::as_i64));
-    if let Some(bni) = bni {
-        let mut tables = watched.frames.lock().unwrap();
-        if let Some(info) = tables
-            .get_mut(tab_tid)
-            .and_then(|t| t.frames.get_mut(frame_tid))
-        {
-            info.owner_backend_node_id = Some(bni);
-        }
-    }
-    let _ = parent_frame_id; // 仅文档语义提示：owner 查询本就发往父文档 session
-    bni
-}
-
 /// snap hover 感知的扫描结果：ref 行标记 + meta 状态。
 struct HoverOutcome {
-    /// backendNodeId → "hover" | "hover-reveal"（collect_ax_tree 第二遍入参）
+    /// backendNodeId → "hover" | "hover-reveal"（后处理入参）
     marks: HoverMarks,
     /// "ok" | "truncated" | "skipped" | "error"——任务书三值外增加 error
     ///（桥接等基础设施故障，诚实区分「没扫出」与「扫不了」），报告披露
@@ -411,12 +369,14 @@ struct HoverOutcome {
 /// 一次批量桥 backendNodeId → nodeId → 命中映射 ref 行标记。
 /// 失败语义（诚实证据）：单表/单选择器失败 → 截断标记继续（部分数据优于
 /// 无数据）；桥接失败 → status error（标记无法落到 ref，snap 主体不受影响）。
+/// I1b：入参从 AX refs JSON 改为主树 bni 集合（RefMap 主桶）——kit 快照不
+/// 再产出 AX 中间树，桥接语义不变。
 async fn hover_scan(
     watched: &Watched,
     conn: &SharedPageConn,
     tid: &str,
     sid: &str,
-    refs: &[Value],
+    main_bnis: &[i64],
 ) -> HoverOutcome {
     // 登记为空时短等回放窗口（attach 后 CSS.enable 的 styleSheetAdded 在途）
     wait_sheets(watched, tid).await;
@@ -493,11 +453,8 @@ async fn hover_scan(
     for sel in &rules.reveals {
         hover_query_hits(conn, sid, root, sel, &mut reveal_hits, &mut truncated).await;
     }
-    // 桥接：ref 的 backendNodeId 全集 → nodeId（一次批量，spike 验证逐位对齐）
-    let backends: Vec<i64> = refs
-        .iter()
-        .filter_map(|e| e.get("backendNodeId").and_then(Value::as_i64))
-        .collect();
+    // 桥接：主树 backendNodeId 集合 → nodeId（一次批量，spike 验证逐位对齐）
+    let backends: Vec<i64> = main_bnis.to_vec();
     let node_ids: Vec<i64> = match cdp_send(
         conn,
         "DOM.pushNodesByBackendIdsToFrontend",
@@ -604,7 +561,7 @@ pub(crate) fn reset_sheet_registry(watched: &Watched, tid: &str) {
 /// 登记为空时短等 styleSheetAdded 回放：仅当 CSS.enable 刚发出（css_since
 /// 在窗口内）时生效——窗口起点是 enable 时刻而非本次 snap（无表页只有首个
 /// 窗口期内的 snap 付等待，之后即时返回）。到点放行，空登记按无表处理。
-async fn wait_sheets(watched: &Watched, tid: &str) {
+pub(crate) async fn wait_sheets(watched: &Watched, tid: &str) {
     let since = watched.css_since.lock().unwrap().get(tid).copied();
     let Some(t0) = since else { return };
     let deadline = t0 + HOVER_SETTLE_WINDOW;
@@ -619,5 +576,55 @@ async fn wait_sheets(watched: &Watched, tid: &str) {
             return;
         }
         tokio::time::sleep(HOVER_SETTLE_POLL).await;
+    }
+}
+
+// ---------------- 后处理纯函数单测 ----------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 记号改写：单一属性、组合属性、多记号行；边界外（name/url 值域）不动
+    #[test]
+    fn rewrite_ref_tokens_rewrites_only_attr_positions() {
+        assert_eq!(
+            rewrite_ref_tokens("- button \"Buy\" [ref=e1]"),
+            ("- button \"Buy\" @e1".to_string(), vec!["e1".to_string()])
+        );
+        assert_eq!(
+            rewrite_ref_tokens("  - radio \"x\" [checked=false, ref=e2, url=https://a]"),
+            (
+                "  - radio \"x\" [checked=false, @e2, url=https://a]".to_string(),
+                vec!["e2".to_string()]
+            )
+        );
+        // name 里恰含 ref=e1（前导是引号）与 url 查询串（前导是 ?）都不动
+        let (out, refs) = rewrite_ref_tokens("- link \"ref=e1\" [ref=e2] [url=https://x?ref=e3]");
+        assert_eq!(out, "- link \"ref=e1\" @e2 [url=https://x?ref=e3]");
+        assert_eq!(refs, vec!["e2".to_string()]);
+        // e1 是 e12 的前缀：数字贪婪到边界，互不误伤；唯一属性去括号、
+        // 组合属性保留括号
+        let (out, refs) = rewrite_ref_tokens("- a [ref=e12] [ref=e1, selected]");
+        assert_eq!(out, "- a @e12 [@e1, selected]");
+        assert_eq!(refs, vec!["e12".to_string(), "e1".to_string()]);
+        // 非 ASCII 前后（CJK 名）不炸、不改写
+        assert_eq!(
+            rewrite_ref_tokens("- button \"购买\" [ref=e5]"),
+            ("- button \"购买\" @e5".to_string(), vec!["e5".to_string()])
+        );
+    }
+
+    /// hover 标记：命中行尾追加、未命中行原样；帧内行（标记表不含其 ref）不动
+    #[test]
+    fn postprocess_appends_hover_marks_at_line_end() {
+        let mut marked = HashMap::new();
+        marked.insert("e1".to_string(), "hover");
+        marked.insert("e2".to_string(), "hover-reveal");
+        let text = "- button \"Menu\" [ref=e1]\n- link \"Item\" [ref=e2]\n- textbox \"Q\" [ref=e3]";
+        assert_eq!(
+            postprocess_snapshot_text(text, &marked),
+            "- button \"Menu\" @e1 [hover]\n- link \"Item\" @e2 [hover-reveal]\n- textbox \"Q\" @e3"
+        );
     }
 }

@@ -7,8 +7,9 @@
 //!
 //! 行为语义全部在服务层 page_service（P2-B）：本组只做参数透传 + 渲染。
 //! 核心循环（对齐 SKILL.md 教学）：`snap` 拿 @eN 引用 → `click`/`fill`/
-//! `press --target` 用引用操作 → 页面变化后重新 `snap`（旧引用报
-//! PAGE_REF_STALE / PAGE_REF_NOT_FOUND，重 snap 而非对旧引用重试）。
+//! `press --target` 用引用操作 → 页面变化后重新 `snap`。I1b 起引用是
+//! durable 的：SPA 同文档更新后旧 @eN 仍可用；收到 PAGE_REF_STALE 时重
+//! snap（而非对旧引用重试）。
 //!
 //! 渲染约定：
 //! - snap：文本树（@eN 内联在行内，本身就是主产物）+ 一行元信息；
@@ -38,7 +39,8 @@ use crate::error::CliError;
 ///（P2-F F1；显式前缀仍是无匹配 404 / 多匹配 409）。
 #[derive(Debug, Subcommand)]
 pub enum PageCommands {
-    /// 可访问性树快照 + @eN 引用（操作循环起点；导航后引用整表失效）
+    /// 可访问性树快照 + @eN 引用（操作循环起点；引用 durable：报
+    /// PAGE_REF_STALE 时重 snap，SPA 同文档更新后旧引用仍可用）
     #[command(about = "可访问性树快照：可交互节点带 @e1..@eN 引用（操作循环起点）")]
     Snap {
         /// 实例 id
@@ -46,6 +48,21 @@ pub enum PageCommands {
         /// 目标标签页（targetId 或唯一前缀，由 instance tabs 获得；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(value_name = "TAB_ID")]
         tab: Option<String>,
+        /// 压缩输出（去掉空行/冗余层级）
+        #[arg(short = 'c', long)]
+        compact: bool,
+        /// 只保留可交互节点（带 @eN 引用的行）
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// 渲染深度上限（缩进层级）
+        #[arg(short = 'd', long, value_name = "N")]
+        depth: Option<usize>,
+        /// link 节点附 url= 属性
+        #[arg(short = 'u', long)]
+        urls: bool,
+        /// 只快照该 CSS 选择器命中的子树
+        #[arg(short = 's', long, value_name = "SEL")]
+        selector: Option<String>,
     },
 
     /// 原生输入点击（选择器或 @eN 引用）
@@ -254,7 +271,9 @@ pub enum PageCommands {
     },
 
     /// 重载当前页（--ignore-cache 跳过缓存）
-    #[command(about = "重载当前页（--ignore-cache 跳过缓存；等 load 至多 25s，未证实 → loaded:false）")]
+    #[command(
+        about = "重载当前页（--ignore-cache 跳过缓存；等 load 至多 25s，未证实 → loaded:false）"
+    )]
     Reload {
         /// 实例 id
         id: String,
@@ -409,7 +428,27 @@ pub enum PageCommands {
 /// page 组分发入口（main.rs dispatch 的唯一调用点）。
 pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Result<(), CliError> {
     match cmd {
-        PageCommands::Snap { id, tab } => snap(globals, client, id, tab.as_deref()),
+        PageCommands::Snap {
+            id,
+            tab,
+            compact,
+            interactive,
+            depth,
+            urls,
+            selector,
+        } => snap(
+            globals,
+            client,
+            id,
+            tab.as_deref(),
+            &SnapFlags {
+                compact: *compact,
+                interactive: *interactive,
+                depth: *depth,
+                urls: *urls,
+                selector: selector.as_deref(),
+            },
+        ),
         PageCommands::Click { id, target, tab } => {
             click(globals, client, id, target, tab.as_deref())
         }
@@ -563,9 +602,11 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             *off,
             tab.as_deref(),
         ),
-        PageCommands::DownloadWait { id, timeout_ms, tab } => {
-            download_wait(globals, client, id, *timeout_ms, tab.as_deref())
-        }
+        PageCommands::DownloadWait {
+            id,
+            timeout_ms,
+            tab,
+        } => download_wait(globals, client, id, *timeout_ms, tab.as_deref()),
         PageCommands::Downloads { id, tab } => downloads(globals, client, id, tab.as_deref()),
         PageCommands::Upload {
             id,
@@ -576,16 +617,28 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
     }
 }
 
-/// `page snap <ID> [TAB_ID]`：文本树 + 元信息行。quiet 输出 targetId
-/// （后续命令 `--tab $(...)` 的取值源）；json 响应原样透传（F3）。
+/// snap 的选项集（CLI 解析 → client body；与 API/MCP 的 SnapParams 同源）
+#[derive(Default)]
+pub(crate) struct SnapFlags<'a> {
+    pub(crate) compact: bool,
+    pub(crate) interactive: bool,
+    pub(crate) depth: Option<usize>,
+    pub(crate) urls: bool,
+    pub(crate) selector: Option<&'a str>,
+}
+
+/// `page snap <ID> [TAB_ID]`：文本树 + 元信息行（非空时附 removed: 行）。
+/// quiet 输出 targetId（后续命令 `--tab $(...)` 的取值源）；json 响应原样
+/// 透传（F3）。
 fn snap(
     globals: &GlobalArgs,
     client: &AgentClient,
     id: &str,
     tab: Option<&str>,
+    flags: &SnapFlags,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.page_snap(id, tab)?;
+    let resp = client.page_snap(id, tab, flags)?;
     print_page_out(&out, snap_out(&resp, &out));
     Ok(())
 }
@@ -814,7 +867,8 @@ fn screenshot(
                 ("file".into(), path.clone()),
                 ("bytes".into(), bytes.len().to_string()),
             ];
-            let mut payload = serde_json::json!({ "file": path, "bytes": bytes.len(), "format": "png" });
+            let mut payload =
+                serde_json::json!({ "file": path, "bytes": bytes.len(), "format": "png" });
             if full {
                 let size = format!(
                     "{}x{}",
@@ -823,7 +877,11 @@ fn screenshot(
                 );
                 rows.push(("size".into(), size.clone()));
                 payload["size"] = serde_json::json!(size);
-                if resp.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if resp
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     rows.push(("truncated".into(), "true".into()));
                     payload["truncated"] = serde_json::json!(true);
                 }
@@ -852,7 +910,14 @@ fn pdf(
     out_path: Option<&str>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.page_pdf(id, tab, landscape, print_background, paper_width, paper_height)?;
+    let resp = client.page_pdf(
+        id,
+        tab,
+        landscape,
+        print_background,
+        paper_width,
+        paper_height,
+    )?;
     let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
     let bytes = decode_base64(data, PDF_MAGIC, "PDF")?;
     if !out.json {
@@ -932,11 +997,7 @@ fn download_wait(
     let out = OutputCtx::from(globals);
     let resp = client.page_download_wait(id, timeout_ms, tab)?;
     if out.quiet {
-        out.print_id(
-            resp.get("filePath")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-        );
+        out.print_id(resp.get("filePath").and_then(|v| v.as_str()).unwrap_or(""));
         return Ok(());
     }
     if out.json {
@@ -1042,7 +1103,9 @@ fn decode_base64(data: &str, magic: &[u8], label: &str) -> Result<Vec<u8>, CliEr
         .decode(data)
         .map_err(|e| CliError::Local(format!("{label} base64 解码失败: {e}")))?;
     if !bytes.starts_with(magic) {
-        return Err(CliError::Protocol(format!("{label} 数据格式不符（魔数校验失败）")));
+        return Err(CliError::Protocol(format!(
+            "{label} 数据格式不符（魔数校验失败）"
+        )));
     }
     Ok(bytes)
 }
@@ -1164,13 +1227,28 @@ fn snap_text(resp: &serde_json::Value) -> String {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "?".into())
     };
-    format!(
-        "targetId: {} · refs: {} · generation: {}\n{}",
+    let removed = resp
+        .get("removedRefs")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let meta = format!(
+        "targetId: {} · refs: {} · generation: {}",
         str_or("targetId"),
         str_or("refs_count"),
-        str_or("generation"),
-        resp.get("text").and_then(|v| v.as_str()).unwrap_or("")
-    )
+        str_or("generation")
+    );
+    let tree = resp.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if removed.is_empty() {
+        format!("{meta}\n{tree}")
+    } else {
+        format!("{meta}\nremoved: {removed}\n{tree}")
+    }
 }
 
 /// click/fill/press/wait/eval/clickxy/loadall/type 的主结果行（服务端 result
@@ -1214,11 +1292,7 @@ fn dialogs_seen_note(resp: &serde_json::Value) -> Option<String> {
 
 /// extract 三态：quiet = 行数（--out 时路径，供 $(...) 捕获）；json = 响应
 /// 原样（--out 已另落文件）；table = 摘要行 + 数据表。
-fn extract_out(
-    resp: &serde_json::Value,
-    out: &OutputCtx,
-    out_path: Option<&str>,
-) -> PageOut {
+fn extract_out(resp: &serde_json::Value, out: &OutputCtx, out_path: Option<&str>) -> PageOut {
     if out.quiet {
         return PageOut::Quiet(match out_path {
             Some(p) => p.to_string(),
@@ -1347,10 +1421,7 @@ fn dialogs_rows(resp: &serde_json::Value) -> Vec<TableRow> {
 fn download_wait_text(resp: &serde_json::Value) -> String {
     let name = resp.get("fileName").and_then(|v| v.as_str()).unwrap_or("?");
     let bytes = resp.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-    let path = resp
-        .get("filePath")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let path = resp.get("filePath").and_then(|v| v.as_str()).unwrap_or("");
     let mut line = format!("Downloaded \"{name}\" ({bytes} bytes) → {path}");
     if !resp
         .get("verified")
@@ -1375,9 +1446,15 @@ fn downloads_rows(resp: &serde_json::Value) -> Vec<TableRow> {
                         .unwrap_or("")
                         .to_string(),
                     cells: vec![
-                        e.get("state").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                        e.get("state")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string(),
                         truncate(e.get("fileName").and_then(|v| v.as_str()).unwrap_or(""), 40),
-                        e.get("bytes").and_then(|v| v.as_u64()).unwrap_or_default().to_string(),
+                        e.get("bytes")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or_default()
+                            .to_string(),
                         e.get("matched")
                             .and_then(|v| v.as_bool())
                             .map(|b| if b { "yes" } else { "no" })
@@ -1414,7 +1491,7 @@ mod tests {
         let resp = json!({
             "instanceId": "ins_1",
             "targetId": "TAB9F",
-            "text": "[WebArea] Home\n  @e1 [button] OK",
+            "text": "- button \"OK\" @e1",
             "refs_count": 2,
             "generation": 1
         });
@@ -1423,7 +1500,32 @@ mod tests {
             text.starts_with("targetId: \"TAB9F\" · refs: 2 · generation: 1"),
             "{text}"
         );
-        assert!(text.contains("@e1 [button] OK"), "树体必须原样保留: {text}");
+        assert!(
+            !text.contains("removed:"),
+            "无 removedRefs 不输出 removed 行: {text}"
+        );
+        assert!(
+            text.contains("- button \"OK\" @e1"),
+            "树体必须原样保留: {text}"
+        );
+    }
+
+    /// I1b：removedRefs 非空 → meta 行后附 `removed: @e2, @e5` 行（文本模式）
+    #[test]
+    fn snap_text_appends_removed_line_when_refs_dropped() {
+        let resp = json!({
+            "instanceId": "ins_1",
+            "targetId": "TAB9F",
+            "text": "- button \"OK\" @e1",
+            "refs_count": 1,
+            "generation": 2,
+            "removedRefs": ["@e2", "@e5"]
+        });
+        let text = snap_text(&resp);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "targetId: \"TAB9F\" · refs: 1 · generation: 2");
+        assert_eq!(lines[1], "removed: @e2, @e5");
+        assert_eq!(lines[2], "- button \"OK\" @e1");
     }
 
     /// F3（真机冒烟修复）：snap 三态分流——json 模式必须是响应原样 JSON
@@ -1554,7 +1656,10 @@ mod tests {
         });
         match extract_out(
             &resp,
-            &OutputCtx { json: false, quiet: true },
+            &OutputCtx {
+                json: false,
+                quiet: true,
+            },
             None,
         ) {
             PageOut::Quiet(n) => assert_eq!(n, "2", "quiet = 行数"),
@@ -1562,7 +1667,10 @@ mod tests {
         }
         match extract_out(
             &resp,
-            &OutputCtx { json: false, quiet: true },
+            &OutputCtx {
+                json: false,
+                quiet: true,
+            },
             Some("t.json"),
         ) {
             PageOut::Quiet(p) => assert_eq!(p, "t.json", "--out + quiet = 路径"),
@@ -1570,7 +1678,10 @@ mod tests {
         }
         match extract_out(
             &resp,
-            &OutputCtx { json: true, quiet: false },
+            &OutputCtx {
+                json: true,
+                quiet: false,
+            },
             None,
         ) {
             PageOut::Json(v) => assert_eq!(v, resp),
@@ -1578,7 +1689,10 @@ mod tests {
         }
         match extract_out(
             &resp,
-            &OutputCtx { json: false, quiet: false },
+            &OutputCtx {
+                json: false,
+                quiet: false,
+            },
             None,
         ) {
             PageOut::Text(t) => {

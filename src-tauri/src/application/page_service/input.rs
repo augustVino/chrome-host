@@ -1,10 +1,14 @@
 use super::{
-    cdp_send, fill_focus_lost, focus_failed, require_conn, CLICK_RELEASE_DELAY, WAIT_POLL_INTERVAL,
+    cdp_send, fill_focus_lost, focus_failed, kit_client, require_conn, CLICK_RELEASE_DELAY,
+    WAIT_POLL_INTERVAL,
+};
+use crate::application::browser_kit::element::{
+    resolve_element_center, resolve_element_object_id, RefMap,
 };
 use crate::application::page_service::capture::selector_exists;
 use crate::application::page_service::eval::{call_fn, eval_json, js_num, truncate40};
-use crate::application::page_service::frames::{live_frame_session, project_frame_point};
-use crate::application::page_service::refs::{is_ref_target, resolve_ref_entry, resolve_ref_point};
+use crate::application::page_service::frames::iframe_sessions_view;
+use crate::application::page_service::refs::{is_ref_target, map_kit_error, require_ref};
 use crate::application::page_service::state::Watched;
 use crate::domain::page_control::{
     fill_fillable_check_expr, hit_test_expr, locate_expr, normalize_ref, observed_matches_state,
@@ -221,32 +225,37 @@ pub(crate) async fn click_tool(
     }
     let conn = require_conn(watched)?;
     let text = if is_ref_target(target) {
-        // ref 路径：查表 → 几何 → 原生坐标点击（refs 永远走原生输入）。
-        // W-oopif：帧内 ref 的 quad 是帧本地坐标——逐级投影到根视口后，
-        // Input.dispatchMouseEvent 发根 target（浏览器按命中测试路由进 OOPIF）
-        let entry = resolve_ref_entry(watched, tid, target)?;
-        let p = match &entry.frame_target_id {
-            None => resolve_ref_point(&conn, sid, entry.backend_node_id).await?,
-            Some(fid) => {
-                let Some(fsid) =
-                    live_frame_session(watched, tid, fid, entry.frame_session_id.as_deref())
-                else {
-                    return Err(PageControlError::target_moved(
-                        "owning iframe session is gone (frame detached?) — re-snap",
-                    )
-                    .into());
-                };
-                let local = resolve_ref_point(&conn, &fsid, entry.backend_node_id).await?;
-                project_frame_point(watched, &conn, tid, sid, fid, local).await?
-            }
+        // ref 路径（I1b：kit resolve_element_center 解析链——帧路由 + stale 恢复
+        // + scrollIntoView/settle 都在 kit 内；require_actionable=false：可见性/
+        // 禁用检查是 I2 范畴，遮挡检查 kit 无条件执行，错误映射走 map_kit_error）。
+        // 返回的 (x, y) 与返回的 session 同坐标系：同源帧由 kit 页内 JS 投影到
+        // 顶层，OOPIF 则是帧会话本地坐标——Input 三段派发必须发返回的那个
+        // session（保留我方三段派发，原根投影链已删）。
+        let entry = require_ref(watched, tid, target)?;
+        let client = kit_client(watched)?;
+        let iframe_sessions = iframe_sessions_view(watched, tid);
+        let ref_map = watched
+            .refs
+            .lock()
+            .unwrap()
+            .get(tid)
+            .cloned()
+            .unwrap_or_else(RefMap::new);
+        let (x, y, click_sid) =
+            resolve_element_center(&client, sid, &ref_map, target, &iframe_sessions, false)
+                .await
+                .map_err(|e| map_kit_error(&e, "click"))?;
+        dispatch_click(&conn, &click_sid, x, y).await?;
+        let label = if entry.name.is_empty() {
+            String::new()
+        } else {
+            format!(" \"{}\"", entry.name)
         };
-        dispatch_click(&conn, sid, p.x, p.y).await?;
-        let label = entry.name.map(|n| format!(" \"{n}\"")).unwrap_or_default();
         format!(
             "Clicked @{}{label} at CSS ({}, {})",
             normalize_ref(target),
-            js_num(p.x),
-            js_num(p.y)
+            js_num(x),
+            js_num(y)
         )
     } else {
         // selector 路径：locate → hit-test → 三段派发（TS clickSelectorStr）
@@ -257,9 +266,10 @@ pub(crate) async fn click_tool(
 
 /// fill 目标解析 → (稳定 objectId, ref 名, 描述, **执行会话**)（SPEC
 /// DOM-script 原则：两次 eval 之间选择器可能命中不同元素，对象句柄跨调用
-/// 稳定）。ref 路径失败 = target_moved；selector 路径 nodeId 0 =
-/// element_not_found（与 click 同码）。W-oopif：帧内 ref 的 DOM/Runtime
-/// 命令全部路由到 frame session（backendNodeId 属帧自己的 DOM agent）。
+/// 稳定）。ref 路径 = I1b kit resolve_element_object_id（帧路由 + stale 恢复
+/// 在 kit 内，含 is_detached 判定）；selector 路径 nodeId 0 =
+/// element_not_found（与 click 同码）不变。执行会话 = kit 返回的 effective
+/// session（帧内 ref 的 DOM/Runtime 命令路由到 frame session）。
 #[allow(clippy::type_complexity)]
 async fn resolve_fill_target(
     watched: &Watched,
@@ -269,36 +279,26 @@ async fn resolve_fill_target(
     target: &str,
 ) -> Result<(String, Option<String>, String, String), AppError> {
     if is_ref_target(target) {
-        let entry = resolve_ref_entry(watched, tid, target)?;
-        let esid = match &entry.frame_target_id {
-            None => sid.to_string(),
-            Some(fid) => live_frame_session(watched, tid, fid, entry.frame_session_id.as_deref())
-                .ok_or_else(|| {
-                PageControlError::target_moved(
-                    "owning iframe session is gone (frame detached?) — re-snap",
-                )
-            })?,
+        let entry = require_ref(watched, tid, target)?;
+        let client = kit_client(watched)?;
+        let iframe_sessions = iframe_sessions_view(watched, tid);
+        let ref_map = watched
+            .refs
+            .lock()
+            .unwrap()
+            .get(tid)
+            .cloned()
+            .unwrap_or_else(RefMap::new);
+        let (object_id, esid) =
+            resolve_element_object_id(&client, sid, &ref_map, target, &iframe_sessions)
+                .await
+                .map_err(|e| map_kit_error(&e, "fill"))?;
+        let name = if entry.name.is_empty() {
+            None
+        } else {
+            Some(entry.name.clone())
         };
-        let resp = match cdp_send(
-            conn,
-            "DOM.resolveNode",
-            json!({ "backendNodeId": entry.backend_node_id }),
-            Some(&esid),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => return Err(PageControlError::target_moved(&e.to_string()).into()),
-        };
-        let Some(object_id) = resp.pointer("/object/objectId").and_then(Value::as_str) else {
-            return Err(PageControlError::target_moved("no objectId").into());
-        };
-        Ok((
-            object_id.to_string(),
-            entry.name,
-            format!("@{}", normalize_ref(target)),
-            esid,
-        ))
+        Ok((object_id, name, format!("@{}", normalize_ref(target)), esid))
     } else {
         if target.is_empty() {
             return Err(AppError::invalid_request(
@@ -489,8 +489,10 @@ async fn fill_pipeline(
     ))
 }
 
-/// press 的 --target focus（TS focusPressTarget）：ref 走 DOM.focus
-/// （backendNodeId），selector 走页内 eval（scrollIntoView + focus + 复查）。
+/// press 的 --target focus（TS focusPressTarget）：ref 走 I1b kit
+/// resolve_element_object_id（帧路由在 kit 内）→ DOM.focus(objectId)
+/// （焦点链与 fill 同构）；selector 走页内 eval（scrollIntoView + focus +
+/// 复查）不变。
 #[allow(clippy::type_complexity)]
 async fn focus_press_target(
     watched: &Watched,
@@ -500,28 +502,32 @@ async fn focus_press_target(
     target: &str,
 ) -> Result<(String, String), AppError> {
     if is_ref_target(target) {
-        let entry = resolve_ref_entry(watched, tid, target)?;
-        // W-oopif：帧内 ref 的滚动/聚焦在 frame session 上做
-        let esid = match &entry.frame_target_id {
-            None => sid.to_string(),
-            Some(fid) => live_frame_session(watched, tid, fid, entry.frame_session_id.as_deref())
-                .ok_or_else(|| {
-                PageControlError::target_moved(
-                    "owning iframe session is gone (frame detached?) — re-snap",
-                )
-            })?,
-        };
+        let entry = require_ref(watched, tid, target)?;
+        let client = kit_client(watched)?;
+        let iframe_sessions = iframe_sessions_view(watched, tid);
+        let ref_map = watched
+            .refs
+            .lock()
+            .unwrap()
+            .get(tid)
+            .cloned()
+            .unwrap_or_else(RefMap::new);
+        let (object_id, esid) =
+            resolve_element_object_id(&client, sid, &ref_map, target, &iframe_sessions)
+                .await
+                .map_err(|e| map_kit_error(&e, "press"))?;
+        // focus 前滚动 best-effort（fill 同构）
         let _ = cdp_send(
             conn,
             "DOM.scrollIntoViewIfNeeded",
-            json!({ "backendNodeId": entry.backend_node_id }),
+            json!({ "objectId": object_id }),
             Some(&esid),
         )
         .await;
         if let Err(e) = cdp_send(
             conn,
             "DOM.focus",
-            json!({ "backendNodeId": entry.backend_node_id }),
+            json!({ "objectId": object_id }),
             Some(&esid),
         )
         .await
@@ -530,12 +536,21 @@ async fn focus_press_target(
                 "press --target {target} could not be focused ({e})"
             )));
         }
+        // 对象句柄归还（fill 同构的 finally 语义，best-effort）
+        let _ = cdp_send(
+            conn,
+            "Runtime.releaseObject",
+            json!({ "objectId": object_id }),
+            Some(&esid),
+        )
+        .await;
         let key = normalize_ref(target);
         Ok((
-            entry
-                .name
-                .map(|n| format!("@{key} \"{n}\""))
-                .unwrap_or(format!("@{key}")),
+            if entry.name.is_empty() {
+                format!("@{key}")
+            } else {
+                format!("@{key} \"{}\"", entry.name)
+            },
             esid,
         ))
     } else {

@@ -39,6 +39,7 @@ use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde_json::json;
 
+use crate::cli::page::SnapFlags;
 use crate::client::AgentClient;
 use crate::error::CliError;
 use crate::model::{ExtensionStatus, ExtensionType, InstanceStatus, LoginProfileStatus};
@@ -624,10 +625,19 @@ fn fixture_router() -> Router {
                 Json(json!({
                     "instanceId": "ins_x",
                     "targetId": "TAB9F",
-                    "text": "[WebArea] Home\n  @e1 [button] OK\n  @e2 [textbox] q",
+                    "text": "- button \"OK\" @e1\n- textbox \"q\" @e2",
                     "refs_count": 2,
-                    "generation": 1
+                    "generation": 1,
+                    "hoverScan": "skipped",
+                    "removedRefs": ["@e9"]
                 }))
+            }),
+        )
+        // snap 参数透传（echo 路由）：flags 全集进 body
+        .route(
+            "/api/v1/instances/ins_pg/page/snap",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                Json(json!({ "echo": body }))
             }),
         )
         .route(
@@ -962,7 +972,11 @@ fn instance_endpoints_full_surface() {
     assert_eq!(views.len(), 1);
     assert_eq!(views[0].environment_name, "测试环境");
     assert_eq!(views[0].instance.id, "ins_1");
-    assert_eq!(views[0].instance.name.as_deref(), Some("e2e-42"), "name 字段解码");
+    assert_eq!(
+        views[0].instance.name.as_deref(),
+        Some("e2e-42"),
+        "name 字段解码"
+    );
     assert_eq!(views[0].instance.status, InstanceStatus::Running);
     assert_eq!(views[0].instance.cdp_port, Some(9333));
     assert_eq!(views[0].instance.pid, Some(4321));
@@ -1029,8 +1043,8 @@ fn instance_ref_resolution_by_name() {
     let client = test_client();
 
     // name 唯一命中 → 解析为 ins_1（内部走 GET /api/v1/instances）
-    let resolved = cli::instance::resolve_instance_ref(&client, "e2e-42")
-        .expect("name 唯一命中应解析成功");
+    let resolved =
+        cli::instance::resolve_instance_ref(&client, "e2e-42").expect("name 唯一命中应解析成功");
     assert_eq!(resolved, "ins_1");
 
     // 零命中 → 404 INSTANCE_NOT_FOUND（exit 3，与服务端 id 语义同构）
@@ -1502,12 +1516,44 @@ fn kernel_download_and_cancel_decode() {
 fn page_endpoints_contract() {
     let client = test_client();
 
-    // snap：文本树 + 引用计数 + 代次（@eN 操作循环的起点）
-    let snap = client.page_snap("ins_x", None).expect("snap 应成功");
+    // snap：文本树 + 引用计数 + 代次（@eN 操作循环的起点）+ removedRefs
+    let snap = client
+        .page_snap("ins_x", None, &SnapFlags::default())
+        .expect("snap 应成功");
     assert_eq!(snap["targetId"], "TAB9F");
     assert_eq!(snap["refs_count"], 2);
     assert_eq!(snap["generation"], 1);
-    assert!(snap["text"].as_str().unwrap().contains("@e1 [button] OK"));
+    assert!(snap["text"]
+        .as_str()
+        .unwrap()
+        .contains("- button \"OK\" @e1"));
+    assert_eq!(snap["removedRefs"], json!(["@e9"]));
+
+    // snap flags 透传（全开形态：-c -i -d 3 -u -s "#main"）
+    let echo = client
+        .page_snap(
+            "ins_pg",
+            Some("TAB"),
+            &SnapFlags {
+                compact: true,
+                interactive: true,
+                depth: Some(3),
+                urls: true,
+                selector: Some("#main"),
+            },
+        )
+        .expect("snap echo 应成功");
+    assert_eq!(
+        echo["echo"],
+        json!({
+            "tab": "TAB",
+            "compact": true,
+            "interactive": true,
+            "depth": 3,
+            "urls": true,
+            "selector": "#main",
+        })
+    );
 
     // click：result 行 + 参数透传（target 与显式 tab 均进 body）
     let click = client
@@ -1601,7 +1647,11 @@ fn page_endpoints_contract() {
         .expect("extract 应成功");
     assert_eq!(extract["targetId"], "TAB9F");
     assert_eq!(extract["columns"][0]["name"], "订单号");
-    assert_eq!(extract["rows"][1][0], serde_json::json!(null), "null 保留（被合并覆盖）");
+    assert_eq!(
+        extract["rows"][1][0],
+        serde_json::json!(null),
+        "null 保留（被合并覆盖）"
+    );
     assert_eq!(extract["coverage"]["datasetComplete"], "incomplete");
     assert_eq!(extract["meta"]["spans"][0]["row"], 1);
     let echo = client
@@ -1609,7 +1659,9 @@ fn page_endpoints_contract() {
         .expect("extract echo 应成功");
     assert_eq!(echo["echo"]["target"], "@e3");
     assert_eq!(echo["echo"]["tab"], "TAB");
-    let echo = client.page_extract("ins_pg", None, None).expect("echo2 应成功");
+    let echo = client
+        .page_extract("ins_pg", None, None)
+        .expect("echo2 应成功");
     assert_eq!(
         echo["echo"]["target"],
         serde_json::json!(null),

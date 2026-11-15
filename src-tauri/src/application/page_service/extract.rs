@@ -1,7 +1,8 @@
-use super::{cdp_send, require_conn};
+use super::{cdp_send, kit_client, require_conn};
+use crate::application::browser_kit::element::{resolve_element_object_id, RefMap};
 use crate::application::page_service::eval::eval_json;
-use crate::application::page_service::frames::live_frame_session;
-use crate::application::page_service::refs::{is_ref_target, resolve_ref_entry};
+use crate::application::page_service::frames::iframe_sessions_view;
+use crate::application::page_service::refs::{is_ref_target, map_kit_error, require_ref};
 use crate::application::page_service::state::Watched;
 use crate::domain::page_control::PageControlError;
 use crate::error::AppError;
@@ -33,31 +34,22 @@ pub(crate) async fn extract_tool(
             (v, "(auto-discovered)".to_string())
         }
         Some(t) if is_ref_target(t) => {
-            let entry = resolve_ref_entry(watched, tid, t)?;
-            // 帧内 ref（W-oopif）：收集在 frame session 上做（press --target 同链）
-            let esid = match &entry.frame_target_id {
-                None => sid.to_string(),
-                Some(fid) => {
-                    live_frame_session(watched, tid, fid, entry.frame_session_id.as_deref())
-                        .ok_or_else(|| {
-                            PageControlError::target_moved(
-                                "owning iframe session is gone (frame detached?) — re-snap",
-                            )
-                        })?
-                }
-            };
-            let resp = cdp_send(
-                &conn,
-                "DOM.resolveNode",
-                json!({ "backendNodeId": entry.backend_node_id }),
-                Some(&esid),
-            )
-            .await
-            .map_err(|e| PageControlError::target_moved(&e.to_string()))?;
-            let object_id = resp
-                .pointer("/object/objectId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| PageControlError::target_moved("no objectId"))?;
+            // I1b：kit resolve_element_object_id（帧路由 + stale 恢复在 kit 内）
+            // → 收集器 callFunctionOn 在 effective session 上执行
+            require_ref(watched, tid, t)?;
+            let client = kit_client(watched)?;
+            let iframe_sessions = iframe_sessions_view(watched, tid);
+            let ref_map = watched
+                .refs
+                .lock()
+                .unwrap()
+                .get(tid)
+                .cloned()
+                .unwrap_or_else(RefMap::new);
+            let (object_id, esid) =
+                resolve_element_object_id(&client, sid, &ref_map, t, &iframe_sessions)
+                    .await
+                    .map_err(|e| map_kit_error(&e, "extract"))?;
             let resp = cdp_send(
                 &conn,
                 "Runtime.callFunctionOn",
@@ -69,8 +61,15 @@ pub(crate) async fn extract_tool(
                 }),
                 Some(&esid),
             )
-            .await
-            .map_err(|e| PageControlError::target_moved(&e.to_string()))?;
+            .await?;
+            // 对象句柄归还（fill 同构的 finally 语义，best-effort）
+            let _ = cdp_send(
+                &conn,
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(&esid),
+            )
+            .await;
             if let Some(d) = resp.get("exceptionDetails") {
                 let text = d
                     .get("text")

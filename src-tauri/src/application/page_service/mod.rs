@@ -17,7 +17,8 @@
 //! - **per-instance 命令串行**（决策 3）：一条 tokio Mutex 串行整实例的全部
 //!   page 命令（含建连），正确性优先；并发需求出现后可演进为 per-tab 锁。
 //! - **per-tab RefStore / DialogBuffer**（决策 4）：snap 整表替换，导航/文档
-//!   替换事件按 targetId 定向失效（§3.5/§3.6）。
+//!   替换事件不再主动失效——I1b 起 ref 表 = browser_kit RefMap（loaderId
+//!   代际 durable refs，stale 由解析时 is_detached/唯一匹配恢复判定产生）。
 //! - **导航命令族**（navigate/back/forward/reload，page 族后补）：同一 page
 //!   session 内 Page.navigate / 导航历史回退 / Page.reload——保留历史（实例级
 //!   navigate 的 new+close 组合近似会丢历史，该端点保留给 GUI，文档已指向
@@ -78,11 +79,11 @@ use tokio::sync::oneshot;
 
 use crate::domain::fetch_rules::{cdp_patterns, compile_rules, Action};
 use crate::domain::instance::InstanceStatus;
+#[cfg(test)]
+use crate::domain::page_control::DialogBuffer;
 use crate::domain::page_control::{
     parse_duration, validate_http_url, PageControlError, WaitState, MAX_DIALOG_BUFFER,
 };
-#[cfg(test)]
-use crate::domain::page_control::{DialogBuffer, RefStore};
 use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::{connect_page, SharedPageConn};
 use crate::infrastructure::cdp::ws::EventSink;
@@ -90,7 +91,6 @@ use crate::infrastructure::db::repositories::instance_repository::InstanceReposi
 
 use super::fetch_mock::MockUpstream;
 
-mod ax;
 mod capture;
 mod dialogs;
 mod downloads;
@@ -106,8 +106,6 @@ mod snap;
 mod state;
 mod upload;
 
-#[cfg(test)]
-use self::ax::*;
 use self::capture::*;
 #[cfg(test)]
 use self::downloads::*;
@@ -122,6 +120,25 @@ use self::refs::*;
 use self::snap::*;
 use self::state::*;
 use self::upload::*;
+
+/// snap hover 感知：backendNodeId → 标记（"hover" = hover 触发器，
+/// "hover-reveal" = hover 后才显示/变化的目标）。原 ax.rs 随 I1b 删除，
+/// 类型随唯一消费者迁入。
+pub(crate) type HoverMarks = HashMap<i64, &'static str>;
+/// per-tab 样式表登记：targetId → { styleSheetId → (origin, disabled) }。
+/// 原 ax.rs 随 I1b 删除，类型随唯一消费者迁入（state.rs 引用）。
+pub(crate) type SheetRegistry = HashMap<String, HashMap<String, (String, bool)>>;
+
+/// snap 的可选参数（CLI -c/-i/-d/-u/-s、API body、MCP 参数三面同源；全缺省
+/// = 现行为语义）。字段语义 = kit SnapshotOptions 逐字透传。
+#[derive(Default, Clone)]
+pub struct SnapParams {
+    pub compact: bool,
+    pub interactive: bool,
+    pub depth: Option<usize>,
+    pub urls: bool,
+    pub selector: Option<String>,
+}
 
 /// 工具级总超时：单条 CDP send 已有内建 15s（ws.rs），这里兜住多命令链与
 /// 无响应页面（wait 例外：用户 timeout + 5s）。
@@ -349,6 +366,7 @@ impl PageService {
         // 分支；CSS.enable 重发后 styleSheetAdded 会重新回放）
         watched.tabs.lock().unwrap().clear();
         watched.refs.lock().unwrap().clear();
+        watched.snap_gen.lock().unwrap().clear();
         watched.frames.lock().unwrap().clear();
         watched.orphan_frame_sessions.lock().unwrap().clear();
         watched.dialogs.lock().unwrap().clear();
@@ -423,15 +441,21 @@ impl PageService {
         .await
     }
 
-    /// snap <tab>：AX 树快照 + @eN ref 整表替换（§3.5）。
-    /// 返回 { text, refs_count, generation }（任务口径，蛇形键对齐 TS wire 字段）。
-    pub async fn snap(&self, ins_id: &str, tab: &str) -> Result<Value, AppError> {
+    /// snap <tab>：kit take_snapshot 管线（durable refs + 上游行格式，我方
+    /// hover_scan 与 meta 契约保留）。返回 { text, refs_count, generation,
+    /// hoverScan, removedRefs? }。
+    pub async fn snap(
+        &self,
+        ins_id: &str,
+        tab: &str,
+        params: SnapParams,
+    ) -> Result<Value, AppError> {
         self.command(
             TOOL_TIMEOUT,
             "snap",
             ins_id,
             tab,
-            |w, tid, sid| async move { snap_tool(&w, &tid, &sid).await },
+            move |w, tid, sid| async move { snap_tool(&w, &tid, &sid, &params).await },
         )
         .await
     }
@@ -1157,6 +1181,18 @@ fn require_conn(watched: &Watched) -> Result<SharedPageConn, AppError> {
         .unwrap()
         .clone()
         .ok_or_else(|| unavailable("page 控制连接未就绪（建立中或已断开），稍后重试"))
+}
+
+/// browser_kit 能力层的 client 构造（I1b：snap 管线与元素解析链的入口）。
+/// active_frame=None（CSS 选择器的 `frame <sel>` 会话态是 I2 范畴；构造期
+/// 定值，见 kit client.rs 的 V1 适配说明）。
+pub(crate) fn kit_client(
+    watched: &Watched,
+) -> Result<crate::application::browser_kit::CdpClient, AppError> {
+    Ok(crate::application::browser_kit::CdpClient::new(
+        require_conn(watched)?,
+        watched.event_bus.clone(),
+    ))
 }
 
 /// 发送：连接 send 已 &self 并发化（P2-F 根治，无锁包裹）——wait 轮询间隔、

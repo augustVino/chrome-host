@@ -839,8 +839,20 @@ impl AgentClient {
     }
 
     /// POST /api/v1/instances/{id}/page/snap —— body `{tab?}`
-    pub fn page_snap(&self, id: &str, tab: Option<&str>) -> Result<serde_json::Value, CliError> {
-        let body = serde_json::json!({ "tab": tab });
+    pub fn page_snap(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+        flags: &crate::cli::page::SnapFlags,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({
+            "tab": tab,
+            "compact": flags.compact,
+            "interactive": flags.interactive,
+            "depth": flags.depth,
+            "urls": flags.urls,
+            "selector": flags.selector,
+        });
         Self::decode(self.send(Method::POST, &Self::page_path(id, "snap"), Some(body), true))
     }
 
@@ -1019,37 +1031,31 @@ impl AgentClient {
         tab: Option<&str>,
     ) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "url": url, "tab": tab });
-        Self::decode(
-            self.send(
-                Method::POST,
-                &Self::page_path(id, "navigate"),
-                Some(body),
-                true,
-            ),
-        )
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "navigate"),
+            Some(body),
+            true,
+        ))
     }
 
     /// POST /api/v1/instances/{id}/page/back —— body `{tab?}`
     /// （历史后退；无更早条目 → 409 PAGE_NAV_NO_HISTORY）
     pub fn page_back(&self, id: &str, tab: Option<&str>) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "tab": tab });
-        Self::decode(
-            self.send(Method::POST, &Self::page_path(id, "back"), Some(body), true),
-        )
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "back"), Some(body), true))
     }
 
     /// POST /api/v1/instances/{id}/page/forward —— body `{tab?}`
     /// （历史前进；无更晚条目 → 409 PAGE_NAV_NO_HISTORY）
     pub fn page_forward(&self, id: &str, tab: Option<&str>) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "tab": tab });
-        Self::decode(
-            self.send(
-                Method::POST,
-                &Self::page_path(id, "forward"),
-                Some(body),
-                true,
-            ),
-        )
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "forward"),
+            Some(body),
+            true,
+        ))
     }
 
     /// POST /api/v1/instances/{id}/page/reload —— body `{ignoreCache?, tab?}`
@@ -1061,14 +1067,12 @@ impl AgentClient {
         tab: Option<&str>,
     ) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "ignoreCache": ignore_cache, "tab": tab });
-        Self::decode(
-            self.send(
-                Method::POST,
-                &Self::page_path(id, "reload"),
-                Some(body),
-                true,
-            ),
-        )
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "reload"),
+            Some(body),
+            true,
+        ))
     }
 
     /// POST /api/v1/instances/{id}/page/screenshot —— body `{target?, full?, tab?}`
@@ -1098,7 +1102,12 @@ impl AgentClient {
         tab: Option<&str>,
     ) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "target": target, "tab": tab });
-        Self::decode(self.send(Method::POST, &Self::page_path(id, "extract"), Some(body), true))
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "extract"),
+            Some(body),
+            true,
+        ))
     }
 
     /// POST /api/v1/instances/{id}/page/pdf —— body `{tab?, landscape?, printBackground?,
@@ -1130,7 +1139,12 @@ impl AgentClient {
         id: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, CliError> {
-        Self::decode(self.send(Method::POST, &Self::page_path(id, "emulate"), Some(body), true))
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "emulate"),
+            Some(body),
+            true,
+        ))
     }
 
     /// POST /api/v1/instances/{id}/page/download-wait —— body `{timeoutMs?, tab?}`

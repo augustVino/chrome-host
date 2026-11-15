@@ -1,7 +1,8 @@
-use crate::application::page_service::ax::SheetRegistry;
+use crate::application::browser_kit::element::RefMap;
 use crate::application::page_service::downloads::DownloadState;
 use crate::application::page_service::intercept::InterceptState;
-use crate::domain::page_control::{DialogBuffer, RefStore};
+use crate::application::page_service::SheetRegistry;
+use crate::domain::page_control::DialogBuffer;
 use crate::infrastructure::cdp::page_cdp::SharedPageConn;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -93,8 +94,15 @@ pub(crate) struct Watched {
     /// autoAttach 维护的 targetId → sessionId（仅 type=page），attach 序
     /// 保序（空 target 唯一性路由用，见 [`TabTable`]）
     pub(crate) tabs: Mutex<TabTable>,
-    /// per-tab @eN ref 表（snap 整表替换，事件定向失效）
-    pub(crate) refs: Mutex<HashMap<String, RefStore>>,
+    /// per-tab @eN ref 表（I1b 起 = browser_kit element::RefMap，loaderId 代际
+    /// durable refs；snap 整表重建、导航不主动失效——stale 由解析时
+    /// is_detached/AX 唯一匹配恢复判定产生）。锁纪律：锁内禁止 await，
+    /// 需跨 await 时先 clone 出、事后整表写回（RefMap: Clone）。
+    pub(crate) refs: Mutex<HashMap<String, RefMap>>,
+    /// per-tab 快照计数（snap 响应 meta 行 generation 的来源；与 refs 同生共死：
+    /// establish 整清、drop_tab 摘除。RefMap 自身的代际是 loaderId 语义，
+    /// 与这个「第几次 snap」计数是两回事）
+    pub(crate) snap_gen: Mutex<HashMap<String, u64>>,
     /// per-tab OOPIF 帧登记（W-oopif）：frameAttached/attachedToTarget 维护
     pub(crate) frames: Mutex<HashMap<String, FrameTable>>,
     /// attach 先于 frameAttached 到达的孤儿 frame 会话（targetId → sessionId；
@@ -147,6 +155,7 @@ impl Watched {
             cmd_lock: Arc::new(tokio::sync::Mutex::new(())),
             tabs: Mutex::new(TabTable::default()),
             refs: Mutex::new(HashMap::new()),
+            snap_gen: Mutex::new(HashMap::new()),
             frames: Mutex::new(HashMap::new()),
             orphan_frame_sessions: Mutex::new(HashMap::new()),
             dialogs: Mutex::new(HashMap::new()),

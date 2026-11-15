@@ -1,6 +1,6 @@
 use super::{cdp_send, require_conn};
-use crate::application::page_service::frames::live_frame_session;
-use crate::application::page_service::refs::{is_ref_target, resolve_ref_entry};
+use crate::application::page_service::frames::iframe_sessions_view;
+use crate::application::page_service::refs::{is_ref_target, require_ref};
 use crate::application::page_service::state::Watched;
 use crate::domain::page_control::{normalize_ref, PageControlError};
 use crate::error::AppError;
@@ -134,21 +134,30 @@ pub(crate) async fn upload_tool(
     size: u64,
 ) -> Result<Value, AppError> {
     let conn = require_conn(watched)?;
-    // 定位：(参数键, 节点 id, 发送会话, 描述)
+    // 定位：(参数键, 节点 id, 发送会话, 描述)。ref 路径 = I1b RefMap 直查
+    //（无 CDP 往返，miss → PAGE_REF_NOT_FOUND 语义对齐现 404）；帧内 ref 经
+    // iframe_sessions 路由（无登记 = 同源帧/会话已死 → 主会话，同 kit 语义）。
+    // selector 路径：nodeId，同 fill 的定位链。
     let (key, node_id, esid, desc) = if is_ref_target(target) {
-        let entry = resolve_ref_entry(watched, tid, target)?;
-        let esid = match &entry.frame_target_id {
-            None => sid.to_string(),
-            Some(fid) => live_frame_session(watched, tid, fid, entry.frame_session_id.as_deref())
-                .ok_or_else(|| {
-                PageControlError::target_moved(
-                    "owning iframe session is gone (frame detached?) — re-snap",
-                )
-            })?,
+        let entry = require_ref(watched, tid, target)?;
+        let Some(bni) = entry.backend_node_id else {
+            return Err(AppError::business(
+                409,
+                "PAGE_TARGET_MOVED",
+                format!(
+                    "ref no longer resolves to a live node (@{} has no backend node) — run \"snap <target>\" again and use fresh @eN refs",
+                    normalize_ref(target)
+                ),
+            ));
         };
+        let esid = entry
+            .frame_id
+            .as_deref()
+            .and_then(|fid| iframe_sessions_view(watched, tid).remove(fid))
+            .unwrap_or_else(|| sid.to_string());
         (
             "backendNodeId",
-            entry.backend_node_id,
+            bni,
             esid,
             format!("@{}", normalize_ref(target)),
         )
