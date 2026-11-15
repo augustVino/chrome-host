@@ -113,6 +113,10 @@ chrome-host page forward <id> [--tab t]               # 历史前进
 chrome-host page reload  <id> [--ignore-cache] [--tab t]  # 重载当前页
 chrome-host page screenshot <id> [sel|@eN] [--full] [--out f] [--tab t]  # 视口/元素/全页截图（--full 截发起时刻整文档，懒加载未加载内容不在图）
 chrome-host page pdf     <id> [--out f] [--landscape] [--paper-width 8.5] [--paper-height 11] [--tab t]  # 整页 PDF
+chrome-host page diff    <id> [t] [-s sel] [-c] [-d n] [--baseline-file f]  # 快照文本 diff：当前 snap ↔ 上次基线（滚动更新）；quiet 输出 changed 布尔
+chrome-host page diff-shot <id> --baseline-file <png> [--full] [--tab t] [--out f]  # 像素 diff：基线 png ↔ 当前截图；--out 落差异图（红标+灰阶）
+chrome-host page profiler start <id> [t] [--categories "a,b"]  # 启动性能采样（Chrome tracing；不占串行锁；重复 → 409）
+chrome-host page profiler stop  <id> [--out f.json]  # 停止采样并落盘 traceEvents JSON（缺省 <id>-trace.json）
 chrome-host page emulate <id> --preset iphone-14|... | --viewport WxH [--user-agent UA] | --off [--tab t]  # 设备仿真（仅作用该 tab）
 chrome-host page eval    <id> <expr> [--tab t]         # 执行 JS（优先用上面的原语，eval 是逃生舱）
 chrome-host page raw     <id> <method> [json] [--tab t] [--browser]  # 任意 CDP 命令透传（最高权限逃生舱，未覆盖场景用）
@@ -132,7 +136,7 @@ chrome-host page upload <id> <sel|@eN> <主机绝对路径> [--tab t]  # 文件�
 
 - **元素定位优先 @eN 引用**：snap 给可交互节点（button/link/textbox/checkbox…）编号输出 `- button "提交" @e3`，click/fill/press 直接吃引用，比 CSS 选择器稳（不受 CSS-in-JS hash、动态列表位移影响）。引用是 **durable** 的：SPA 同文档局部刷新/pushState 后旧 @eN 仍可用（同节点直接命中，节点换新时按 role/name 唯一匹配恢复）；只有报 `PAGE_REF_STALE`（节点已随导航/替换死亡且恢复无果）才需要重新 snap——此时重 snap 再操作，不要对旧引用重试。快照 meta 有 `removedRefs`（本次消失的旧引用）时说明页面删了节点，旧引用需对表。
 - **[hover] / [hover-reveal] 提示（菜单类页面必看）**：snap 会静态扫描页面 CSS 的 :hover 规则，在行尾标记两类元素——`- button "菜单" @e1 [hover]` = 悬停它有反应（先 `page press`/无直接命令时用 `page raw` 发 Input.dispatchMouseEvent 悬停，或用 clickxy 悬停坐标），`- button "子项" @e2 [hover-reveal]` = 它藏在某 hover 展开区里（先悬停触发器再重 snap 拿展开后的新引用）。没有标记 ≠ 确认无 hover（响应 meta 的 hoverScan: ok|truncated|skipped|error 披露扫描完整性，truncated=可能漏看）。
-- **截图/PDF/仿真**：`page screenshot` 带选择器或 @eN 截该元素（跨行元素取完整包围盒），不带截当前视口；`page pdf` 整页导出（默认 Letter 纵向带背景）；`page emulate --preset iphone-14` 模拟设备视口+UA+触控（仅该 tab，`--off` 恢复，重复 emulate=覆盖）。
+- **截图/PDF/仿真/diff/profiler**：`page screenshot` 带选择器或 @eN 截该元素（不滚动页面，跨行元素取完整包围盒），不带截当前视口；`page pdf` 整页导出（默认 Letter 纵向带背景）；`page emulate --preset iphone-14` 模拟设备视口+UA+触控（仅该 tab，`--off` 恢复，重复 emulate=覆盖）。回归比对用 diff 族：`page diff` 比较两次访问的快照文本（无 --baseline-file 时自动滚基线，@eN 记号漂移也算变化），`page diff-shot --baseline-file png.png` 做像素级比对（尺寸不一致会披露 dimensionMismatch）。页面卡顿排查用 `page profiler start` → 操作页面 → `page profiler stop --out trace.json`（Perfetto 可打开；采样期间其他命令正常可用）。
 - **弹窗已自动接管**：页面 alert/confirm/prompt/beforeunload 由应用自动 accept（beforeunload=放行离开，prompt 提交默认文本），不阻塞命令；命令期间弹过的窗以 `dialogs_seen` 附在输出里，`page dialogs` 查历史。
 - **错误看 [PAGE_*] 前缀分支处置**，不解析文案：`PAGE_ELEMENT_BLOCKED`（被浮层遮挡，先处理遮挡）/ `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_REF_NOT_FOUND`·`PAGE_REF_STALE`（重 snap）/ `PAGE_TARGET_NOT_FILLABLE` / `PAGE_FILL_VALUE_MISMATCH`（写入可能部分生效，先观察再重试）/ `PAGE_WAIT_TIMEOUT` / `PAGE_DISPATCH_FAILED`（附 effect_state：none=未发出可重试，unknown=已发出禁盲目重试）/ `PAGE_TAB_AMBIGUOUS`（多 tab，带列表重选）。
 - **跨域 iframe（OOPIF）**：snap 已内嵌帧内容（Iframe 节点行下的缩进子树，@eN 跨帧连续编号），click/fill/press 对帧内 @eN 直接可用（kit 解析链自动路由到帧会话）；CSS 选择器仍只查主 frame，帧内 selector 找不到时改用 @eN；帧内容换掉后旧帧内 ref 解析失败报 `PAGE_REF_STALE`（重新 snap）；坐标级兑底（clickxy+type）仍可用。

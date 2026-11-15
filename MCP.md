@@ -8,7 +8,7 @@
 
 - [连接配置](#连接配置)
 - [通用行为约定](#通用行为约定)
-- [工具总览（57 个）](#工具总览57-个)
+- [工具总览（61 个）](#工具总览61-个)
 - [内核](#内核)
 - [环境](#环境)
 - [实例](#实例)
@@ -66,7 +66,7 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 4. **内核未装时 `create_instance` 会阻塞于首次下载**（约 150MB）——复杂任务先调 `kernel_status` 预判。
 5. 扩展启停只影响**之后启动的实例**；实例创建非幂等（每次新增一个）。可选 `name` 在同环境内唯一——重名创建会得到 409，可先 `list_instances` 查名再建。
 
-- [工具总览（57 个）](#工具总览57-个)
+- [工具总览（61 个）](#工具总览61-个)
 
 | 分组 | 工具 |
 |---|---|
@@ -75,8 +75,8 @@ claude mcp add --transport http --header "Authorization: Bearer <token>" chrome-
 | 实例（9） | `create_instance` · `list_instances` · `get_instance` · `start_instance` · `stop_instance` · `restart_instance` · `delete_instance` · `get_cdp` · `create_cdp_session` |
 | 常驻诊断（6） | `get_diagnostics` · `get_console` · `get_network` · `get_network_body` · `get_screenshot` · `get_har` |
 | 标签页（3） | `list_tabs` · `open_tab` · `navigate` |
-- [工具总览（57 个）](#工具总览57-个)
-| 页面控制（23） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_wait` · `page_dialogs` · `page_eval` · `page_raw` · `page_html` · `page_clickxy` · `page_loadall` · `page_type` · `page_navigate` · `page_back` · `page_forward` · `page_reload` · `page_screenshot` · `page_pdf` · `page_emulate` · `page_extract` · `page_download_wait` · `page_downloads` · `page_upload` |
+- [工具总览（61 个）](#工具总览61-个)
+| 页面控制（27） | `page_snap` · `page_click` · `page_fill` · `page_press` · `page_wait` · `page_dialogs` · `page_eval` · `page_raw` · `page_html` · `page_clickxy` · `page_loadall` · `page_type` · `page_navigate` · `page_back` · `page_forward` · `page_reload` · `page_screenshot` · `page_pdf` · `page_diff` · `page_diff_shot` · `page_profiler_start` · `page_profiler_stop` · `page_emulate` · `page_extract` · `page_download_wait` · `page_downloads` · `page_upload` |
 | 登录态（2） | `login_profile`（action: get / capture / reset） · `session_status` |
 | 扩展（7） | `list_extensions` · `get_extension` · `register_extension` · `set_extension_enabled` · `delete_extension` · `get_extension_config` · `set_extension_config` |
 
@@ -168,11 +168,15 @@ new+close 组合近似会丢历史）；等待 load 至多 25s，未证实 → �
 | `page_clickxy` | `instanceId`, `x`, `y`；可选 `tab` | 视口坐标点击（CSS 像素；无定位/遮挡校验，坐标即意图）；跨域 iframe 元素兜底 |
 | `page_loadall` | `instanceId`, `selector`；可选 `interval`, `maxClicks`, `tab` | 循环点击直到消失（interval 缺省 `"1500ms"`，maxClicks 缺省 200）；达上限仍未消失时结果明示 still present |
 | `page_type` | `instanceId`, `text`；可选 `tab` | 向当前焦点元素直接输入（无定位无校验）；跨域 iframe 内坐标级兜底（@eN 已支持帧直达，selector 不可达帧内时先 `page_clickxy` 点入）；空文本 → 400 |
-- [工具总览（57 个）](#工具总览57-个)
+- [工具总览（61 个）](#工具总览61-个)
 | `page_download_wait` | `instanceId`；可选 `timeoutMs`（缺省 30000）、`tab` | 等待**下一次**下载完成（命令式：先调本工具再另行 `page_click` 触发；等待期不阻塞其他命令）。返回 filePath/fileName/bytes（落盘在实例 profile 的 downloads/）；失败/取消 → 500 PAGE_DOWNLOAD_FAILED；超时 → 409 PAGE_DOWNLOAD_TIMEOUT |
 | `page_downloads` | `instanceId`；可选 `tab` | 下载终态记录环（最近 20 条，含已消费——matched 区分；并发下载未被等待者拿走的在此可查） |
 | `page_upload` | `instanceId`, `target`, `filePath`；可选 `tab` | 主机文件设入 input[type=file]（触发原生 change；React 受控表单同常收到）。filePath 绝对路径且拒符号链接（422，macOS /tmp 类软链拒绝）、不存在 → 404、超 100MB → 422；非 file input → 422 PAGE_TARGET_NOT_FILE_INPUT |
 | `page_extract` | `instanceId`；可选 `target`（@eN / CSS，缺省 = 最大表格自动发现）、`tab` | 表格 → 结构化 JSON：columns（name/path/source）/rows（null = 被合并覆盖，"" = 真实空单元格）/meta（spans 锚点）/coverage（datasetComplete 只有 unknown/incomplete，永不装作取全）。非表格目标 → 422 PAGE_EXTRACT_NOT_A_TABLE |
+| `page_diff` | `instanceId`；可选 `tab`、`selector`、`compact`、`depth`、`baseline` | 快照文本 diff（I3）：当前 snap（与 page_snap 同管线，@eN 正常演进）↔ 基线的行级 unified diff。无 baseline = 与该 tab 上次 diff 的快照（滚动基线）比较并更新之；有 = 只比较不更新。响应 `{changed, added[], removed[], counts, diff, baselineCleared?}`；@eN 记号不剥（记号漂移即真实变化）；首次无基线 = 全部 added；快照超 2MiB 不入基线并标 baselineCleared |
+| `page_diff_shot` | `instanceId`, `baseline`（base64 png，必填）；可选 `tab`、`full` | 像素 diff（I3）：基线 png ↔ 当前截图（full=true 全页，缺省视口；与 page_screenshot 同管线）。响应 `{differing, ratio（差异像素百分比）, image?（差异图 base64：红标 + 灰阶，仅 differing）, dimensionMismatch?（尺寸不一致，此时 ratio=100）}`；颜色距离阈值 0.1（容忍抗锯齿噪声） |
+| `page_profiler_start` | `instanceId`；可选 `tab`、`categories`（数组） | 启动性能采样（I3，Chrome tracing ReportEvents + 采样；常驻不占实例串行锁，采样期间其他 page 命令正常）。categories 缺省 = 全家桶（devtools.timeline/v8/blink 等）。同一实例同时只允许一个：重复 → 409 PAGE_PROFILER_ALREADY_ACTIVE |
+| `page_profiler_stop` | `instanceId`；可选 `out`（app 主机落盘路径，缺省 <实例id>-trace.json） | 停止采样并落盘（I3；按 start 锚点路由，无需 tab）。事件收集至多 30s → traceEvents JSON。响应 `{result, path, eventCount}`；无运行中 → 409 PAGE_PROFILER_NOT_RUNNING；收集超时 → 504 可重试（tracing 仍 active） |
 
 `tab` = targetId 或唯一前缀（`list_tabs` 获得）；省略 = 唯一页面标签自动选中，
 多标签 409 并在 message 列出全部 targetId。错误处置看 code 分支：`PAGE_REF_STALE`/

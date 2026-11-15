@@ -324,6 +324,10 @@ PAGE_SERVICE_UNAVAILABLE`）。
 | `GET /api/v1/instances/{id}/page/intercept?tab=` | 拦截状态：各规则命中计数/剩余/活跃 + 干预记录环（最近 200 条，url 已脱敏）+ `liveSince` |
 | `POST /api/v1/instances/{id}/page/screenshot` | 元素/视口/全页 png 截图（base64）。body `{ "target?", "full?", "tab?" }`；full 与 target 互斥 |
 | `POST /api/v1/instances/{id}/page/pdf` | 整页 PDF（base64）。body `{ "landscape?", "printBackground?", "paperWidth?", "paperHeight?", "tab?" }`（英寸，缺省 Letter 8.5×11） |
+| `POST /api/v1/instances/{id}/page/diff` | 快照文本 diff（I3）：当前 snap ↔ 基线的行级 unified diff。body `{ "tab?", "selector?", "compact?", "depth?", "baseline?" }`——无 baseline = 与该 tab 上次 diff 的快照（滚动基线）比较并更新之；有 = 只比较不更新。响应 `{changed, added[], removed[], counts:{added,removed,unchanged}, diff, baselineCleared?}`；快照超 2MiB 不入基线并标 baselineCleared |
+| `POST /api/v1/instances/{id}/page/diff-shot` | 像素 diff（I3）。body `{ "tab?", "full?", "baseline" }`（baseline = 基线 png 的 base64，必填）→ 响应 `{differing, ratio, image?, dimensionMismatch?}`；尺寸不一致 → differing + ratio=100 + dimensionMismatch |
+| `POST /api/v1/instances/{id}/page/profiler/start` | 启动性能采样（I3，Chrome tracing；常驻不占实例串行锁）。body `{ "tab?", "categories?" }`（数组，缺省全家桶）；重复 → 409 |
+| `POST /api/v1/instances/{id}/page/profiler/stop` | 停止采样并落盘 traceEvents JSON（I3；按 start 锚点路由，无 tab 入参）。body `{ "out?" }`（app 主机路径，缺省 `<实例id>-trace.json`）；响应 `{result, path, eventCount}` |
 | `POST /api/v1/instances/{id}/page/emulate` | 设备仿真（preset / viewport / off 三形态互斥）。body `{ "preset?" \| "viewport"+"userAgent?"+"mobile?"+"touch?" \| "off", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/extract` | 表格结构化提取 → `{ columns, rows, coverage, meta }`。body `{ "target?", "tab?" }`（target 缺省 = 主文档最大表格自动发现；详见下文「表格提取」） |
 | `GET /api/v1/instances/{id}/page/downloads` | 下载终态记录环（最近 20 条，含已消费——matched 字段区分） |
@@ -684,6 +688,7 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 409 | `PAGE_REF_STALE` / `PAGE_TARGET_MOVED` | @eN 引用节点死亡且恢复无果（durable 语义，重 snap）/ 引用节点不再可解析 |
 | 409 | `PAGE_ELEMENT_BLOCKED` / `PAGE_FILL_VALUE_MISMATCH` / `PAGE_WAIT_TIMEOUT` | 点击点被遮挡 / fill 回读不一致（写入可能已部分生效，先观察再决定）/ 等待超时 |
 | 409 | `PAGE_NAV_NO_HISTORY` | page back/forward 已在导航历史边界（无更早/更晚条目） |
+| 409 | `PAGE_PROFILER_ALREADY_ACTIVE` / `PAGE_PROFILER_NOT_RUNNING` | profiler 重复 start / stop 时无运行中采样（含从未 start、已 stop、连接重建或锚点 tab 关闭致运行态废弃——message 披露具体路径） |
 | 409 | `PAGE_FOCUS_FAILED` / `PAGE_FILL_FOCUS_LOST` | page press/fill 焦点失败 / 页面在 fill 过程中抢走焦点 |
 | 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_ELEMENT_DISABLED` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / 元素被禁用（v0.8+ kit 解析链） / fill 目标不可编辑 |
 | 500 | `PAGE_ACTION_FAILED` | page 工具链未分类失败（v0.8+ kit String 错误兜底，message 原文透传） |
