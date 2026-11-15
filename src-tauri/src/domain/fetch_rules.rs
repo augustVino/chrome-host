@@ -15,6 +15,9 @@
 //! 通配（`*` = 任意字符序列含空），但独立实现（两层的匹配目标不同：
 //! net-rules 生成 DNR urlFilter，这里直接字符串匹配 + 透传 CDP
 //! Fetch urlPattern——spike 真机实测 CDP pattern 同为 `*` 通配）。
+//! 连续 `*` 在编译期折叠为单个（`**` ≡ `*`，对齐上游参考实现
+//! `collapse_wildcards`——CDP urlPattern 收到 `**` 的行为未定义，折叠后
+//! 下发与本地二次匹配口径一致）。
 
 use std::collections::{HashMap, HashSet};
 
@@ -53,9 +56,14 @@ pub const RESOURCE_TYPES: [&str; 10] = [
 pub fn is_forbidden_header(name: &str) -> bool {
     let lower = name.trim().to_lowercase();
     // 常见变体（cookie2/proxy-authorization 等）也拦：前缀式收紧
-    lower == "cookie" || lower == "cookie2" || lower == "authorization"
-        || lower == "origin" || lower == "content-length" || lower == "host"
-        || lower.starts_with("sec-") || lower.starts_with("proxy-")
+    lower == "cookie"
+        || lower == "cookie2"
+        || lower == "authorization"
+        || lower == "origin"
+        || lower == "content-length"
+        || lower == "host"
+        || lower.starts_with("sec-")
+        || lower.starts_with("proxy-")
 }
 
 /// 拦截动作。
@@ -71,6 +79,14 @@ pub enum Action {
         body: Vec<u8>,
         /// 0-10000ms（mock 上游侧延迟）
         delay_ms: u64,
+        /// CORS 收紧（I5）：声明则仅当请求 Origin 精确匹配（尾 `/` 归一）
+        /// 才由 mock 上游注入 `Access-Control-Allow-Origin`（回显请求
+        /// Origin）+ `Access-Control-Allow-Credentials: true`；不匹配则
+        /// 不注入（浏览器侧拒读）。None = 缺省宽松（回显任意 Origin——
+        /// loopback 改写的跨源可读契约，spike 真机定案，保持不变）。
+        /// 对齐上游参考 mocked_response 的 allowOrigin 语义（见
+        /// [`collapse_wildcards`] 来源注）。
+        allow_origin: Option<String>,
     },
     /// 改写请求头（continueRequest 替换语义下的合并：原头 ∪ 规则头，规则优先）。
     SetHeaders { headers: Vec<(String, String)> },
@@ -100,7 +116,10 @@ fn invalid(msg: impl Into<String>) -> AppError {
 /// 空 rules 是合法输入（= 清空，应用层据此 Fetch.disable）。
 pub fn compile_rules(rules: &[Value]) -> Result<Vec<InterceptRule>, AppError> {
     if rules.len() > MAX_RULES {
-        return Err(invalid(format!("规则数 {} 超上限 {MAX_RULES}", rules.len())));
+        return Err(invalid(format!(
+            "规则数 {} 超上限 {MAX_RULES}",
+            rules.len()
+        )));
     }
     let mut out = Vec::with_capacity(rules.len());
     let mut seen_ids: HashSet<String> = HashSet::new();
@@ -122,20 +141,21 @@ pub fn compile_rules(rules: &[Value]) -> Result<Vec<InterceptRule>, AppError> {
             .ok_or_else(|| invalid(format!("{at}.match.urlPattern 必须是非空字符串")))?;
         validate_url_pattern(pattern)
             .map_err(|e| invalid(format!("{at}.match.urlPattern: {e}")))?;
+        // 编译期折叠连续 `*`（`**` ≡ `*`）：存储/下发/二次匹配共用折叠后
+        // 的规范形（上游参考同款语义；CDP urlPattern 对 `**` 行为未定义）
+        let pattern = collapse_wildcards(pattern);
         let resource_types = match r.pointer("/match/resourceTypes") {
             None | Some(Value::Null) => None,
             Some(Value::Array(types)) if types.is_empty() => None,
             Some(Value::Array(types)) => {
                 let mut ts = Vec::with_capacity(types.len());
                 for t in types {
-                    let s = t
-                        .as_str()
-                        .ok_or_else(|| invalid(format!("{at}.match.resourceTypes 须为字符串数组")))?;
+                    let s = t.as_str().ok_or_else(|| {
+                        invalid(format!("{at}.match.resourceTypes 须为字符串数组"))
+                    })?;
                     // 输入大小写不敏感，存储 CDP 规范形态（大小写敏感：小写会被
                     // Fetch.enable 拒 -32602——真机实测，owner 复测打回根因）
-                    let Some(canonical) = RESOURCE_TYPES
-                        .iter()
-                        .find(|c| c.eq_ignore_ascii_case(s))
+                    let Some(canonical) = RESOURCE_TYPES.iter().find(|c| c.eq_ignore_ascii_case(s))
                     else {
                         return Err(invalid(format!(
                             "{at}.match.resourceTypes: 未知类型 {s:?}（合法集（大小写不敏感）: {:?}；WebSocket/Manifest 等被 CfT 131 Fetch.enable 拒绝，勿用）",
@@ -173,10 +193,11 @@ pub fn compile_rules(rules: &[Value]) -> Result<Vec<InterceptRule>, AppError> {
 }
 
 fn compile_action(a: &Value, at: &str) -> Result<Action, AppError> {
-    let ty = a
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid(format!("{at}.action.type 必填（mock | setHeaders | block）")))?;
+    let ty = a.get("type").and_then(Value::as_str).ok_or_else(|| {
+        invalid(format!(
+            "{at}.action.type 必填（mock | setHeaders | block）"
+        ))
+    })?;
     match ty {
         "mock" => {
             // 有效域 = 2xx ∪ 4xx/599：3xx（重定向）与 304 不是终态响应，
@@ -186,14 +207,17 @@ fn compile_action(a: &Value, at: &str) -> Result<Action, AppError> {
                 .and_then(Value::as_u64)
                 .and_then(|s| u16::try_from(s).ok())
                 .filter(|s| (200..=299).contains(s) || (400..=599).contains(s))
-                .ok_or_else(|| invalid(format!("{at}.action.status 须为 2xx 或 4xx-599（不允许 3xx 重定向/304）")))?;
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{at}.action.status 须为 2xx 或 4xx-599（不允许 3xx 重定向/304）"
+                    ))
+                })?;
             let headers = compile_headers(a.get("headers"), &format!("{at}.action.headers"))?;
             // body / bodyBase64 二选一（文本优先；都缺 = 空 body）
             let body = if let Some(text) = a.get("body").and_then(Value::as_str) {
                 text.as_bytes().to_vec()
             } else if let Some(b64) = a.get("bodyBase64").and_then(Value::as_str) {
-                base64_decode(b64)
-                    .map_err(|e| invalid(format!("{at}.action.bodyBase64: {e}")))?
+                base64_decode(b64).map_err(|e| invalid(format!("{at}.action.bodyBase64: {e}")))?
             } else {
                 Vec::new()
             };
@@ -205,11 +229,21 @@ fn compile_action(a: &Value, at: &str) -> Result<Action, AppError> {
                     .ok_or_else(|| invalid(format!("{at}.action.delayMs 须为 0-10000")))?,
                 Some(_) => return Err(invalid(format!("{at}.action.delayMs 须为非负整数"))),
             };
+            let allow_origin = match a.get("allowOrigin") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                Some(_) => {
+                    return Err(invalid(format!(
+                    "{at}.action.allowOrigin 须为非空字符串（origin 形态，如 http://page.example）"
+                )))
+                }
+            };
             Ok(Action::Mock {
                 status,
                 headers,
                 body,
                 delay_ms,
+                allow_origin,
             })
         }
         "setHeaders" => {
@@ -247,6 +281,32 @@ fn compile_headers(v: Option<&Value>, at: &str) -> Result<Vec<(String, String)>,
         out.push((name.to_string(), value.to_string()));
     }
     Ok(out)
+}
+
+/// 连续 `*` 折叠为单个 `*`（`**` ≡ `*`）。
+///
+/// 来源：抄自 vercel-labs/agent-browser（Apache-2.0，LICENSES/
+/// Apache-2.0-agent-browser.txt）网络拦截参考实现的 `collapse_wildcards`
+/// （上游 `cli/src/native/actions.rs`，`laf/bidi-network-emulation` 分支；
+/// 该文件依赖未 vendor 的 `browser::PageInfo`，按红线仅参考不 import）。
+/// 本地 [`glob_match`] 的回溯算法对 `**` 天然等价 `*`，折叠的价值在
+/// 规范化存储与 **CDP urlPattern 下发**（`Fetch.enable` 收到 `**` 的行为
+/// 未定义，折叠后下发消除歧义）。
+pub fn collapse_wildcards(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut last_was_star = false;
+    for ch in pattern.chars() {
+        if ch == '*' {
+            if !last_was_star {
+                out.push(ch);
+            }
+            last_was_star = true;
+        } else {
+            out.push(ch);
+            last_was_star = false;
+        }
+    }
+    out
 }
 
 /// URL pattern 校验（非空、长度上限、须以 `scheme://` 或 `*://` 开头；
@@ -314,6 +374,47 @@ pub fn first_live_match<'a>(
     })
 }
 
+/// 放行原因诊断（journal 披露用，I5）：无命中时返回"最接近命中"的失败
+/// 维度，与 [`first_live_match`] 同口径（三条件 glob × resourceType ×
+/// times）。优先级：url+类型均过但次数耗尽 > url 过但类型被滤 > url 未中。
+/// 有命中返回 None（调用方不该走到——防御性保留）。
+pub fn pass_reason(
+    rules: &[InterceptRule],
+    used: &HashMap<String, u64>,
+    url: &str,
+    resource_type: &str,
+) -> String {
+    if first_live_match(rules, used, url, resource_type).is_some() {
+        return String::new();
+    }
+    let mut url_hit = false;
+    let mut type_hit = false;
+    for r in rules {
+        if !glob_match(&r.url_pattern, url) {
+            continue;
+        }
+        url_hit = true;
+        let type_ok = r
+            .resource_types
+            .as_ref()
+            .is_none_or(|ts| ts.iter().any(|t| t.eq_ignore_ascii_case(resource_type)));
+        if !type_ok {
+            continue;
+        }
+        type_hit = true;
+        if r.times == 0 || used.get(&r.id).copied().unwrap_or(0) < u64::from(r.times) {
+            return String::new(); // 不可达（first_live_match 已判命中），防御
+        }
+    }
+    if type_hit {
+        "times exhausted".to_string()
+    } else if url_hit {
+        format!("resourceType filtered (event={resource_type})")
+    } else {
+        "url unmatched (paused by CDP pattern; local glob re-check failed)".to_string()
+    }
+}
+
 /// 展开为 Fetch.enable 的 patterns（urlPattern + 单数 resourceType；缺省
 /// 类型不设 resourceType = 全类型）。展开超上限报错（拒绝下发而非静默截断
 /// ——静默截断会让「以为拦了」的规则漏拦，诚实拒绝）。
@@ -346,10 +447,7 @@ pub fn cdp_patterns(rules: &[InterceptRule]) -> Result<Vec<Value>, AppError> {
 /// 实现侧 body 走 UTF-8 JSON 无碍；mock 上游按原始字节回应。
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let s: Vec<u8> = input
-        .bytes()
-        .filter(|b| !b" \t\r\n".contains(b))
-        .collect();
+    let s: Vec<u8> = input.bytes().filter(|b| !b" \t\r\n".contains(b)).collect();
     if s.is_empty() {
         return Ok(Vec::new());
     }
@@ -400,9 +498,18 @@ mod tests {
     /// glob 语义矩阵：`*` 跨段通配、`?` 单字符、字面前缀/后缀锚定、多星。
     #[test]
     fn glob_match_matrix() {
-        assert!(glob_match("https://api.foo.com/v1/*", "https://api.foo.com/v1/users?a=1"));
-        assert!(glob_match("*://127.0.0.1:18799/api/*", "http://127.0.0.1:18799/api/data?n=1"));
-        assert!(!glob_match("https://api.foo.com/v1/*", "https://api.foo.com/v2/x"));
+        assert!(glob_match(
+            "https://api.foo.com/v1/*",
+            "https://api.foo.com/v1/users?a=1"
+        ));
+        assert!(glob_match(
+            "*://127.0.0.1:18799/api/*",
+            "http://127.0.0.1:18799/api/data?n=1"
+        ));
+        assert!(!glob_match(
+            "https://api.foo.com/v1/*",
+            "https://api.foo.com/v2/x"
+        ));
         assert!(!glob_match("*://api.foo.com/*", "https://evil.com/x"));
         assert!(glob_match("a*c*e", "abcde"));
         assert!(glob_match("*", "anything at all"));
@@ -417,6 +524,41 @@ mod tests {
         assert!(glob_match("*", ""));
         assert!(!glob_match("a*", ""));
         assert!(glob_match("a*", "a"));
+    }
+
+    /// 连续 `*` 折叠（I5，上游 collapse_wildcards 同款）：`**` ≡ `*`，
+    /// 编译期规范化存储 + cdp_patterns 下发折叠后形态。
+    #[test]
+    fn collapse_wildcards_folds_runs() {
+        assert_eq!(collapse_wildcards("https://a.com/**"), "https://a.com/*");
+        assert_eq!(collapse_wildcards("**://**.foo.com/**"), "*://*.foo.com/*");
+        assert_eq!(collapse_wildcards("a***b**c"), "a*b*c");
+        assert_eq!(collapse_wildcards("no-wildcard"), "no-wildcard");
+        assert_eq!(collapse_wildcards(""), "");
+        // 折叠语义与 glob_match 自身等价：`**` 匹配结果 = 折叠后单星
+        let (p_raw, p_fold) = ("https://a.**/x*", "https://a.*/x*");
+        for s in [
+            "https://a./x",
+            "https://a.b/x",
+            "https://a.b/x1",
+            "https://a./xy",
+        ] {
+            assert_eq!(glob_match(p_raw, s), glob_match(p_fold, s), "s={s}");
+        }
+        // 编译入口折叠：规则存储 url_pattern 为折叠后形态
+        let rules = compile_rules(
+            json!([{ "id": "f", "match": {"urlPattern": "*://a.com/**"},
+                      "action": {"type":"block"} }])
+            .as_array()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rules[0].url_pattern, "*://a.com/*");
+        // cdp_patterns 下发同折叠（未定义行为的 `**` 不出现在 wire）
+        assert_eq!(
+            cdp_patterns(&rules).unwrap()[0]["urlPattern"],
+            json!("*://a.com/*")
+        );
     }
 
     // ---------------- compile_rules 校验矩阵 ----------------
@@ -443,9 +585,18 @@ mod tests {
             Some(vec!["XHR".to_string(), "Fetch".to_string()])
         );
         match &rules[0].action {
-            Action::Mock { status, headers, body, delay_ms } => {
+            Action::Mock {
+                status,
+                headers,
+                body,
+                delay_ms,
+                ..
+            } => {
                 assert_eq!((*status, *delay_ms), (200, 0));
-                assert_eq!(headers, &[("Content-Type".to_string(), "application/json".to_string())]);
+                assert_eq!(
+                    headers,
+                    &[("Content-Type".to_string(), "application/json".to_string())]
+                );
                 assert_eq!(body, b"{\"ok\":true}");
             }
             other => panic!("r1 应为 Mock: {other:?}"),
@@ -456,6 +607,43 @@ mod tests {
         }
         // 空表 = 清空（合法）
         assert!(compile_rules(&[]).unwrap().is_empty());
+    }
+
+    /// allowOrigin（I5）：可选字符串，编译进 Mock action；非法类型 400。
+    #[test]
+    fn compile_mock_allow_origin() {
+        let rules = compile_rules(
+            json!([{ "id": "c1", "match": {"urlPattern": "*://x/*"},
+                      "action": {"type":"mock","status":200,"body":"{}","allowOrigin":"http://page.example"} }])
+                .as_array()
+                .unwrap(),
+        )
+        .unwrap();
+        match &rules[0].action {
+            Action::Mock { allow_origin, .. } => {
+                assert_eq!(allow_origin.as_deref(), Some("http://page.example"))
+            }
+            other => panic!("{other:?}"),
+        }
+        // 缺省：None（宽松回显，loopback 跨源可读契约不变）
+        let rules = compile_rules(
+            json!([{ "id": "c2", "match": {"urlPattern": "*://x/*"},
+                      "action": {"type":"mock","status":200} }])
+            .as_array()
+            .unwrap(),
+        )
+        .unwrap();
+        match &rules[0].action {
+            Action::Mock { allow_origin, .. } => assert_eq!(*allow_origin, None),
+            other => panic!("{other:?}"),
+        }
+        // 非字符串 / 空白串 → 400 且 message 指向 allowOrigin
+        for bad in [json!(42), json!(""), json!("   ")] {
+            let body = json!([{ "id": "c3", "match": {"urlPattern": "*://x/*"},
+                                "action": {"type":"mock","status":200,"allowOrigin": bad} }]);
+            let e = compile_rules(body.as_array().unwrap()).unwrap_err();
+            assert!(e.to_string().contains("allowOrigin"), "{e}");
+        }
     }
 
     /// 拒绝面：黑名单头（大小写/变体）、status 越界、delay 越界、坏 id/
@@ -552,7 +740,10 @@ mod tests {
         let many: Vec<Value> = (0..MAX_RULES + 1)
             .map(|i| json!({ "id": format!("r{i}"), "match": {"urlPattern": "*://a.com/*"}, "action": {"type":"block"} }))
             .collect();
-        assert!(compile_rules(&many).unwrap_err().to_string().contains("超上限"));
+        assert!(compile_rules(&many)
+            .unwrap_err()
+            .to_string()
+            .contains("超上限"));
     }
 
     /// bodyBase64 二进制通道 + base64 解码矩阵（padding/空/非法）。
@@ -570,15 +761,28 @@ mod tests {
         // 二进制字节完整往返
         let bin = vec![0u8, 1, 2, 255, 254];
         let b64: String = {
-            const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            const T: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             let mut s = String::new();
             for chunk in bin.chunks(3) {
-                let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+                let b = [
+                    chunk[0],
+                    *chunk.get(1).unwrap_or(&0),
+                    *chunk.get(2).unwrap_or(&0),
+                ];
                 let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
                 s.push(T[(n >> 18) as usize & 63] as char);
                 s.push(T[(n >> 12) as usize & 63] as char);
-                s.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-                s.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+                s.push(if chunk.len() > 1 {
+                    T[(n >> 6) as usize & 63] as char
+                } else {
+                    '='
+                });
+                s.push(if chunk.len() > 2 {
+                    T[n as usize & 63] as char
+                } else {
+                    '='
+                });
             }
             s
         };
@@ -619,6 +823,58 @@ mod tests {
         assert!(first_live_match(&rules, &used, "https://api.foo.com/x", "XHR").is_none());
     }
 
+    /// 放行原因诊断（I5）：无命中时按最接近维度披露——耗尽 > 类型被滤
+    /// > url 未中；有命中返回空串。journal detail 消费。
+    #[test]
+    fn pass_reason_reports_closest_dimension() {
+        let rules = compile_rules(ok_body()["rules"].as_array().unwrap()).unwrap();
+        let mut used = std::collections::HashMap::new();
+        // 有命中：空串
+        assert_eq!(
+            pass_reason(&rules, &used, "https://api.foo.com/v1/x", "XHR"),
+            ""
+        );
+        // url 未中
+        let r = pass_reason(&rules, &used, "https://other.com/x", "XHR");
+        assert!(r.starts_with("url unmatched"), "{r}");
+        // url 中但类型被滤（单规则限类型，事件类型不在集内）
+        let single = compile_rules(
+            json!([{ "id": "s", "match": {"urlPattern": "*://a.com/*", "resourceTypes": ["xhr"]},
+                      "action": {"type":"block"} }])
+            .as_array()
+            .unwrap(),
+        )
+        .unwrap();
+        let r = pass_reason(&single, &used, "https://a.com/x", "Script");
+        assert!(r.starts_with("resourceType filtered"), "{r}");
+        assert!(r.contains("Script"), "披露事件类型: {r}");
+        // url+类型均中但耗尽
+        used.insert("s".to_string(), 1);
+        assert_eq!(
+            pass_reason(&single, &used, "https://a.com/x", "XHR"),
+            "times exhausted"
+        );
+        // 耗尽优先于类型被滤：第一条 url 中但类型被滤，第二条 url+类型中
+        // 但耗尽 → 报耗尽
+        let multi = compile_rules(
+            json!([
+                { "id": "m1", "match": {"urlPattern": "*://a.com/*", "resourceTypes": ["xhr"]},
+                  "action": {"type":"block"} },
+                { "id": "m2", "match": {"urlPattern": "*://a.com/*"}, "times": 1,
+                  "action": {"type":"block"} }
+            ])
+            .as_array()
+            .unwrap(),
+        )
+        .unwrap();
+        let mut used2 = std::collections::HashMap::new();
+        used2.insert("m2".to_string(), 1);
+        assert_eq!(
+            pass_reason(&multi, &used2, "https://a.com/x", "Script"),
+            "times exhausted"
+        );
+    }
+
     /// times=0 不限次耗尽。
     #[test]
     fn times_zero_means_unlimited() {
@@ -641,7 +897,10 @@ mod tests {
         assert_eq!(pats[0]["urlPattern"], json!("https://api.foo.com/v1/*"));
         assert_eq!(pats[0]["resourceType"], json!("XHR"), "CDP 规范形态");
         assert_eq!(pats[0]["requestStage"], json!("Request"));
-        assert!(pats[2].get("resourceType").is_none(), "缺省类型不带 resourceType");
+        assert!(
+            pats[2].get("resourceType").is_none(),
+            "缺省类型不带 resourceType"
+        );
 
         // 展开 pattern 超限（32 规则 × 2+ 类型 > 64）
         let many: Vec<Value> = (0..MAX_RULES)
@@ -649,6 +908,9 @@ mod tests {
                             "action": {"type":"block"} }))
             .collect();
         let rules = compile_rules(&many).unwrap();
-        assert!(cdp_patterns(&rules).unwrap_err().to_string().contains("pattern"));
+        assert!(cdp_patterns(&rules)
+            .unwrap_err()
+            .to_string()
+            .contains("pattern"));
     }
 }

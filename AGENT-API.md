@@ -383,8 +383,9 @@ block/redirect/headers，intercept 管任务内 mock/改头/按需 block）。**
 ```json
 { "rules": [
   { "id": "r1", "match": { "urlPattern": "https://api.foo.com/v1/*", "resourceTypes": ["xhr","fetch"] },
-    "action": { "type": "mock", "status": 200, "headers": {"Content-Type":"application/json"},
-                "body": "{\"ok\":true}", "delayMs": 0 }, "times": 1 },
+    "action": { "type": "mock", "status": 200, "headers": {"X-Source":"mock"},
+                "body": "{\"ok\":true}", "delayMs": 0,
+                "allowOrigin": "http://page.example" }, "times": 1 },
   { "id": "r2", "match": { "urlPattern": "*://*.foo.com/*" },
     "action": { "type": "setHeaders", "headers": {"X-Debug-Uid":"42"} } },
   { "id": "r3", "match": { "urlPattern": "https://ads.example.com/*" },
@@ -394,14 +395,28 @@ block/redirect/headers，intercept 管任务内 mock/改头/按需 block）。**
 
 - **`urlPattern`**：glob（`*` 通配，与 net-rules 同语义）；须含 scheme
   （`https://…` 或 `*://…`）。透传 CDP `Fetch.enable` patterns 并在应用层
-  同 pattern 二次匹配。
+  同 pattern 二次匹配。连续 `*` 编译期折叠（`**` ≡ `*`——折叠后存储
+  与下发，CDP urlPattern 对 `**` 行为未定义）；无 `*` 时全串字面匹配
+  （`?` 是 query 分隔符不是单字符通配）。
 - **`action.type`**：`mock`（不发出真实请求，本地回任意 status/headers/body/
-  delay）、`setHeaders`（改写请求头：原头全保留 + 规则头同名覆盖）、
-  `block`（`Fetch.failRequest` BlockedByClient，页面表现为网络错误）。
+  delay）、`setHeaders`（改写请求头：原头全保留 + 规则头同名覆盖——
+  `Fetch.continueRequest` 是替换语义，合并后整体下发）、`block`
+  （`Fetch.failRequest` BlockedByClient，页面表现为网络错误）。
+- **`action.allowOrigin`**（mock 可选，I5）：CORS 收紧——声明则仅当请求
+  `Origin` **精确匹配**（尾 `/` 归一）时 mock 上游才注入
+  `Access-Control-Allow-Origin`（回显请求 Origin）+
+  `Access-Control-Allow-Credentials: true`；不匹配则不注入（浏览器拒读，
+  preflight 也拒绝）。**缺省不声明 = 宽松回显任意 Origin**（loopback 改写
+  的跨源可读契约，保持旧行为）。规则显式设置 CORS 头（同名）优先于注入。
+- **`action` 的 Content-Type 缺省推断**（mock，I5）：规则未显式设置
+  `Content-Type` 且 body 是合法 JSON（含 `null`/数字/字符串字面量）→
+  自动 `application/json`（页面与诊断捕获读到 JSON 形态）；显式设置
+  优先，非 JSON / 二进制 body 不推断。
 - **校验**（`400 INVALID_REQUEST`，message 带规则路径）：`status` 限 2xx ∪
   4xx-599（3xx 重定向/304 不允许——mock 是终态响应）；`delayMs` 0-10000；
   headers 黑名单（cookie/authorization/origin/content-length/host/`sec-*`/
-  `proxy-*`——防规则窃取凭据/破坏连接语义）；`resourceTypes` 白名单见下；
+  `proxy-*`——防规则窃取凭据/破坏连接语义）；`allowOrigin` 须为非空字符串
+  （origin 形态，如 `http://page.example`）；`resourceTypes` 白名单见下；
   规则 ≤32、展开 patterns ≤64；`body`（UTF-8 文本）或 `bodyBase64`（二进制）
   二选一。
 - **`resourceTypes` 枚举（真机实测口径，务必注意）**：合法值
@@ -422,12 +437,20 @@ block/redirect/headers，intercept 管任务内 mock/改头/按需 block）。**
   锁，与 in-flight page 命令并发）；**未命中/耗尽的请求一律 continueRequest
   放行，决策命令失败也裸放行兜底**——启用拦截绝不悬挂页面请求。
 - **mock 实现披露**：mock 经本地 loopback 上游改写（`Fetch.continueRequest`
-  → `http://127.0.0.1:<port>/m/<token>`，上游注入 CORS 头使跨源可读）——
-  页面 JS 读到的 `response.url` 是 mock 上游 URL 而非原 URL；CfT 131 的
+  → `http://127.0.0.1:<port>/m/<token>`，上游注入 CORS 头使跨源可读；
+  `allowOrigin` 声明时收紧为精确匹配才注入）——页面 JS 读到的
+  `response.url` 是 mock 上游 URL 而非原 URL；CfT 131 的
   `Fetch.fulfillRequest` 存在响应体不交付缺陷（spike 实测），故不走该路径。
+  preflight OPTIONS 一律 204 空体（`allowOrigin` 不匹配时不带 CORS 放口头，
+  预检在收紧声明下同样生效）。
 - **干预记录**（GET `journal`）：被 pause 的每个请求一条——`requestId`、
   `url`（脱敏）、`rule`、`outcome`（`mocked` / `headers-set` / `blocked` /
   `passed` / `failed-then-passed` / `stranded`）、`detail`、`ts`；环 200 条。
+  放行条目的 `detail`（I5 细化）按最接近命中的维度披露：
+  `times exhausted`（url+类型均中但次数耗尽）> `resourceType filtered
+  (event=…)`（url 中但事件类型不在规则类型集）> `url unmatched …`
+  （CDP pattern 命中但本地 glob 二次匹配未中）；GET 规则表新增
+  `action.allowOrigin` 披露（缺省 null）。
 | `POST /api/v1/instances/{id}/page/intercept` | **Fetch 会话层拦截**：规则集整表替换（空 `rules` = 清空 + `Fetch.disable`）。body `{ "rules": [...], "tab?" }`，规则模型见下 |
 | `GET /api/v1/instances/{id}/page/intercept?tab=` | 拦截状态：各规则命中计数/剩余/活跃 + 干预记录环（最近 200 条，url 已脱敏）+ `liveSince` |
 

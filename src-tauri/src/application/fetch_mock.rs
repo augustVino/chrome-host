@@ -7,9 +7,14 @@
 //! 拦截时把请求 `continueRequest` 改写到 `http://127.0.0.1:<port>/m/<token>`，
 //! 由本组件按 spec 回任意 status/headers/body/delayMs。
 //!
-//! CORS 是跨源改写的必过关卡（页面源 ≠ 127.0.0.1 上游源）：所有响应注入
-//! `Access-Control-Allow-Origin`（回显请求 Origin），OPTIONS preflight 统一
-//! 放行——真机验证页面 fetch 可完整读取 mock body。
+//! CORS 是跨源改写的必过关卡（页面源 ≠ 127.0.0.1 上游源）：缺省注入
+//! `Access-Control-Allow-Origin`（回显请求 Origin，无 Origin 头回 `*`），
+//! OPTIONS preflight 统一 204 放行——真机验证页面 fetch 可完整读取 mock
+//! body。I5 起规则可选 `allowOrigin` 收紧：声明则仅请求 Origin 精确匹配
+//! （尾 `/` 归一）才注入 ACAO + `Access-Control-Allow-Credentials: true`
+//! （对齐上游 mocked_response 语义），不匹配则不注入（浏览器拒读）；
+//! Content-Type 缺省推断（body 是合法 JSON → application/json，规则显式
+//! 设置优先）。
 //!
 //! 生命周期：进程内全局惰性单例（首个 mock 命中时 bind 127.0.0.1:0），仅
 //! 监听 loopback；token 一次性消费（每次拦截各注册一份，times>1 的规则逐次
@@ -26,6 +31,10 @@ pub struct MockSpec {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub delay_ms: u64,
+    /// CORS 收紧（I5）：Some(origin) = 仅请求 Origin 精确匹配才注入 ACAO；
+    /// None = 缺省宽松回显（见模块文档）。语义对齐上游参考 mocked_response
+    /// 的 allowOrigin（vercel-labs/agent-browser，Apache-2.0）。
+    pub allow_origin: Option<String>,
 }
 
 pub struct MockUpstream {
@@ -76,9 +85,8 @@ impl MockUpstream {
                     }
                     listener_loop(listener, instance).await;
                 });
-                rx.await.map_err(|_| {
-                    crate::error::AppError::internal("mock 上游初始化任务早退")
-                })?
+                rx.await
+                    .map_err(|_| crate::error::AppError::internal("mock 上游初始化任务早退"))?
             })
             .await?
             .clone())
@@ -99,6 +107,46 @@ impl MockUpstream {
     fn take(&self, token: &str) -> Option<MockSpec> {
         self.specs.lock().unwrap().remove(token)
     }
+
+    /// 只读查询 token 在册 spec 的 allowOrigin（不消费——preflight OPTIONS
+    /// 不吃掉 token，真实请求到达时才 take；I5 CORS 收紧需要 preflight
+    /// 与正式响应同一口径）。
+    fn peek_allow_origin(&self, token: &str) -> Option<Option<String>> {
+        self.specs
+            .lock()
+            .unwrap()
+            .get(token)
+            .map(|s| s.allow_origin.clone())
+    }
+}
+
+/// CORS ACAO 值决策（纯函数，I5）：
+/// - 规则声明 `allowOrigin`：请求 Origin 精确匹配（尾 `/` 归一）才回显
+///   该 Origin；不匹配 → None（不注入，浏览器拒读——收紧语义）。
+/// - 未声明：宽松回显（请求 Origin，无 Origin 头用 `*`——loopback 跨源
+///   改写的可读性契约，spike 真机定案保持不变）。
+fn acao_value(allow_origin: Option<&str>, req_origin: Option<&str>) -> Option<String> {
+    fn norm(s: &str) -> &str {
+        s.trim_end_matches('/')
+    }
+    match allow_origin {
+        Some(allowed) => req_origin
+            .filter(|o| norm(o) == norm(allowed))
+            .map(str::to_string),
+        None => Some(req_origin.unwrap_or("*").to_string()),
+    }
+}
+
+/// Content-Type 缺省推断（纯函数，I5，对齐上游 mocked_response）：规则
+/// 未显式设置 Content-Type 且 body 是合法 JSON → application/json（页面
+/// 与 HAR 捕获读到 JSON 形态而非默认 text/plain）；规则显式设置优先，
+/// 非 JSON body / 空 body 不推断。
+fn inferred_content_type(headers: &[(String, String)], body: &[u8]) -> Option<&'static str> {
+    let has_ct = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+    (!has_ct && serde_json::from_slice::<serde_json::Value>(body).is_ok())
+        .then_some("application/json")
 }
 
 /// listener 主循环：逐连接 spawn（mock 并发量 = 页面并发请求，个位数量级）。
@@ -144,38 +192,60 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, upstream: Arc<MockUpstre
             (k.trim().eq_ignore_ascii_case(name)).then(|| v.trim().to_string())
         })
     };
-    let origin = header("origin").unwrap_or_else(|| "*".to_string());
+    let origin_hdr = header("origin");
     let acrh = header("access-control-request-headers");
 
     let token = path.strip_prefix("/m/").unwrap_or_default().to_string();
     let (status, headers, body, delay_ms) = if method == "OPTIONS" {
-        // CORS preflight 统一放行（跨源改写 + 自定义请求头必经）
-        (
-            204,
-            vec![
-                ("Access-Control-Allow-Origin".to_string(), origin.clone()),
-                (
-                    "Access-Control-Allow-Methods".to_string(),
-                    "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS".to_string(),
-                ),
-                (
-                    "Access-Control-Allow-Headers".to_string(),
-                    acrh.unwrap_or_else(|| "*".to_string()),
-                ),
-                ("Access-Control-Max-Age".to_string(), "600".to_string()),
-            ],
-            Vec::new(),
-            0,
-        )
+        // CORS preflight 统一 204 空体放行（跨源改写 + 自定义请求头必经）；
+        // I5：token 在册且声明 allowOrigin 时同口径收紧（Origin 不匹配则
+        // 不带 ACAO → 浏览器预检失败，收紧在 preflight 阶段即生效）
+        let allow = upstream.peek_allow_origin(&token).flatten();
+        let mut preflight = vec![
+            (
+                "Access-Control-Allow-Methods".to_string(),
+                "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS".to_string(),
+            ),
+            (
+                "Access-Control-Allow-Headers".to_string(),
+                acrh.unwrap_or_else(|| "*".to_string()),
+            ),
+            ("Access-Control-Max-Age".to_string(), "600".to_string()),
+        ];
+        match acao_value(allow.as_deref(), origin_hdr.as_deref()) {
+            Some(acao) => {
+                preflight.insert(0, ("Access-Control-Allow-Origin".to_string(), acao));
+            }
+            None => {
+                // 收紧声明且不匹配：不带任何 CORS 放口头（浏览器拒预检）
+                preflight.clear();
+            }
+        }
+        (204, preflight, Vec::new(), 0)
     } else if !token.is_empty() {
         match upstream.take(&token) {
             Some(spec) => {
                 // CORS 注入与规则头合并：规则同名覆盖注入（规则显式设置
-                // CORS 头优先——黑名单不含响应侧 CORS 头，允许规则自控）
-                let mut headers = vec![
-                    ("Access-Control-Allow-Origin".to_string(), origin.clone()),
-                    ("Content-Length".to_string(), spec.body.len().to_string()),
-                ];
+                // CORS 头优先——黑名单不含响应侧 CORS 头，允许规则自控）。
+                // I5：Content-Type 缺省推断（JSON body）；allowOrigin 声明
+                // 时 ACAO 精确匹配才注入 + 附 ACAC: true（对齐上游）
+                let mut headers = vec![("Content-Length".to_string(), spec.body.len().to_string())];
+                if let Some(ct) = inferred_content_type(&spec.headers, &spec.body) {
+                    headers.push(("Content-Type".to_string(), ct.to_string()));
+                }
+                match acao_value(spec.allow_origin.as_deref(), origin_hdr.as_deref()) {
+                    Some(acao) => {
+                        headers.push(("Access-Control-Allow-Origin".to_string(), acao));
+                        if spec.allow_origin.is_some() {
+                            // 收紧路径对齐上游：回显具体 Origin 时声明凭据可用
+                            headers.push((
+                                "Access-Control-Allow-Credentials".to_string(),
+                                "true".to_string(),
+                            ));
+                        }
+                    }
+                    None => {}
+                }
                 for (k, v) in &spec.headers {
                     headers.retain(|(hk, _)| !hk.eq_ignore_ascii_case(k));
                     headers.push((k.clone(), v.clone()));
@@ -184,7 +254,9 @@ async fn handle_conn(mut stream: tokio::net::TcpStream, upstream: Arc<MockUpstre
             }
             None => (
                 404,
-                vec![("Access-Control-Allow-Origin".to_string(), origin)],
+                acao_value(None, origin_hdr.as_deref())
+                    .map(|o| vec![("Access-Control-Allow-Origin".to_string(), o)])
+                    .unwrap_or_default(),
                 b"mock token consumed or unknown".to_vec(),
                 0,
             ),
@@ -211,7 +283,11 @@ fn http_response(status: u16, headers: &[(String, String)], body: &[u8]) -> Vec<
     };
     let mut out = format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n").into_bytes();
     for (k, v) in headers {
-        let clean = |s: &str| s.chars().filter(|c| *c != '\r' && *c != '\n').collect::<String>();
+        let clean = |s: &str| {
+            s.chars()
+                .filter(|c| *c != '\r' && *c != '\n')
+                .collect::<String>()
+        };
         out.extend_from_slice(format!("{}: {}\r\n", clean(k), clean(v)).as_bytes());
     }
     out.extend_from_slice(b"\r\n");
@@ -253,21 +329,34 @@ mod tests {
             headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             body: b"{\"ok\":true}".to_vec(),
             delay_ms: 120,
+            allow_origin: None,
         });
         let token = url.rsplit('/').next().unwrap().to_string();
 
         let t0 = Instant::now();
-        let resp = http_get(port, &format!("/m/{token}"), &[("Origin", "http://page.example")]).await;
+        let resp = http_get(
+            port,
+            &format!("/m/{token}"),
+            &[("Origin", "http://page.example")],
+        )
+        .await;
         let elapsed = t0.elapsed();
         let head = String::from_utf8_lossy(&resp[..resp.len().min(200)]);
-        assert!(head.starts_with("HTTP/1.1 201"), "status: {}", &head[..head.len().min(40)]);
+        assert!(
+            head.starts_with("HTTP/1.1 201"),
+            "status: {}",
+            &head[..head.len().min(40)]
+        );
         assert!(head.contains("Content-Type: application/json"));
         assert!(
             head.contains("Access-Control-Allow-Origin: http://page.example"),
             "CORS 回显 Origin"
         );
         assert!(resp.ends_with(b"{\"ok\":true}"), "body 字节精确");
-        assert!(elapsed >= Duration::from_millis(100), "延迟生效（{elapsed:?}）");
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "延迟生效（{elapsed:?}）"
+        );
 
         // 一次性：同 token 二次请求 → 404
         let resp2 = http_get(port, &format!("/m/{token}"), &[]).await;
@@ -288,6 +377,7 @@ mod tests {
             headers: vec![],
             body: bin.clone(),
             delay_ms: 0,
+            allow_origin: None,
         });
         let token = url.rsplit('/').next().unwrap();
         let resp = http_get(upstream.port(), &format!("/m/{token}"), &[]).await;
@@ -330,9 +420,15 @@ mod tests {
             headers: vec![("Access-Control-Allow-Origin".to_string(), "*".to_string())],
             body: Vec::new(),
             delay_ms: 0,
+            allow_origin: None,
         });
         let token = url.rsplit('/').next().unwrap();
-        let resp = http_get(upstream.port(), &format!("/m/{token}"), &[("Origin", "http://x")]).await;
+        let resp = http_get(
+            upstream.port(),
+            &format!("/m/{token}"),
+            &[("Origin", "http://x")],
+        )
+        .await;
         let head = String::from_utf8_lossy(&resp);
         assert!(head.contains("Access-Control-Allow-Origin: *"));
         assert!(!head.contains("Access-Control-Allow-Origin: http://x"));
@@ -347,12 +443,282 @@ mod tests {
             headers: vec![("X-Evil".to_string(), "a\r\nX-Injected: 1".to_string())],
             body: Vec::new(),
             delay_ms: 0,
+            allow_origin: None,
         });
         let token = url.rsplit('/').next().unwrap();
         let resp = http_get(upstream.port(), &format!("/m/{token}"), &[]).await;
         let head = String::from_utf8_lossy(&resp);
-        assert!(head.contains("X-Evil: aX-Injected: 1"), "换行剔除后并入值: {head}");
+        assert!(
+            head.contains("X-Evil: aX-Injected: 1"),
+            "换行剔除后并入值: {head}"
+        );
         // 无响应拆分：注入内容不构成独立头行（无 CRLF 前导的 X-Injected 头）
         assert!(!head.contains("\r\nX-Injected:"), "无独立注入头行");
+    }
+
+    // ---------------- I5：allowOrigin 收紧 / Content-Type 推断 ----------------
+
+    /// acao_value 纯函数矩阵：声明精确匹配（尾 / 归一）/ 不匹配拒 / 缺省宽松。
+    #[test]
+    fn acao_value_matrix() {
+        // 缺省：回显任意 Origin；无 Origin 头 → *
+        assert_eq!(
+            acao_value(None, Some("https://evil.example")),
+            Some("https://evil.example".to_string())
+        );
+        assert_eq!(acao_value(None, None), Some("*".to_string()));
+        // 声明：精确匹配（含尾 / 归一）才回显请求 Origin
+        assert_eq!(
+            acao_value(Some("http://page.example/"), Some("http://page.example")),
+            Some("http://page.example".to_string())
+        );
+        assert_eq!(
+            acao_value(Some("http://page.example"), Some("http://page.example/")),
+            Some("http://page.example/".to_string())
+        );
+        // 不匹配（含子域/scheme 变体）→ None（不注入）
+        assert_eq!(
+            acao_value(Some("http://page.example"), Some("https://page.example")),
+            None
+        );
+        assert_eq!(
+            acao_value(Some("http://page.example"), Some("http://sub.page.example")),
+            None
+        );
+        assert_eq!(acao_value(Some("http://page.example"), None), None);
+    }
+
+    /// Content-Type 缺省推断矩阵：JSON body → application/json；显式设置
+    /// 优先（含大小写变体）；非 JSON / 空 body 不推断。
+    #[test]
+    fn inferred_content_type_matrix() {
+        assert_eq!(
+            inferred_content_type(&[], b"{\"a\":1}"),
+            Some("application/json")
+        );
+        assert_eq!(
+            inferred_content_type(&[], b"null"),
+            Some("application/json")
+        );
+        assert_eq!(inferred_content_type(&[], b"42"), Some("application/json"));
+        // 非 JSON / 空 → 不推断
+        assert_eq!(inferred_content_type(&[], b"<html>hi</html>"), None);
+        assert_eq!(inferred_content_type(&[], b""), None);
+        assert_eq!(inferred_content_type(&[], &[0, 1, 255]), None);
+        // 规则显式设置优先（大小写不敏感检测，不重复注入）
+        assert_eq!(
+            inferred_content_type(&[("Content-Type".into(), "text/html".into())], b"{}"),
+            None
+        );
+        assert_eq!(
+            inferred_content_type(&[("content-type".into(), "text/plain".into())], b"{}"),
+            None
+        );
+    }
+
+    /// 端到端：allowOrigin 声明且匹配 → 回显 + ACAC；不匹配 → 无 ACAO。
+    #[tokio::test]
+    async fn mock_upstream_allow_origin_tightens_cors() {
+        let upstream = MockUpstream::shared().await.unwrap();
+        // 匹配：ACAO 回显请求 Origin + ACAC true
+        let url = upstream.register(MockSpec {
+            status: 200,
+            headers: vec![],
+            body: b"{}".to_vec(),
+            delay_ms: 0,
+            allow_origin: Some("http://page.example".to_string()),
+        });
+        let token = url.rsplit('/').next().unwrap();
+        let resp = http_get(
+            upstream.port(),
+            &format!("/m/{token}"),
+            &[("Origin", "http://page.example")],
+        )
+        .await;
+        let head = String::from_utf8_lossy(&resp);
+        assert!(
+            head.contains("Access-Control-Allow-Origin: http://page.example"),
+            "{head}"
+        );
+        assert!(
+            head.contains("Access-Control-Allow-Credentials: true"),
+            "{head}"
+        );
+        // 同 token 二次请求已消费 → 404；换新 token 验证不匹配拒
+        let url2 = upstream.register(MockSpec {
+            status: 200,
+            headers: vec![],
+            body: b"{}".to_vec(),
+            delay_ms: 0,
+            allow_origin: Some("http://page.example".to_string()),
+        });
+        let token2 = url2.rsplit('/').next().unwrap();
+        let resp2 = http_get(
+            upstream.port(),
+            &format!("/m/{token2}"),
+            &[("Origin", "https://evil.example")],
+        )
+        .await;
+        let head2 = String::from_utf8_lossy(&resp2);
+        assert!(
+            !head2.contains("Access-Control-Allow-Origin"),
+            "不匹配不注入: {head2}"
+        );
+        assert!(
+            !head2.contains("Access-Control-Allow-Credentials"),
+            "{head2}"
+        );
+        // 规则仍可显式自控 CORS（同名覆盖注入，收紧声明下也优先）
+        let url3 = upstream.register(MockSpec {
+            status: 200,
+            headers: vec![(
+                "Access-Control-Allow-Origin".to_string(),
+                "https://custom.example".to_string(),
+            )],
+            body: b"".to_vec(),
+            delay_ms: 0,
+            allow_origin: Some("http://page.example".to_string()),
+        });
+        let token3 = url3.rsplit('/').next().unwrap();
+        let resp3 = http_get(
+            upstream.port(),
+            &format!("/m/{token3}"),
+            &[("Origin", "https://evil.example")],
+        )
+        .await;
+        let head3 = String::from_utf8_lossy(&resp3);
+        assert!(
+            head3.contains("Access-Control-Allow-Origin: https://custom.example"),
+            "{head3}"
+        );
+    }
+
+    /// 端到端：Content-Type 缺省推断——JSON body 自动 application/json；
+    /// 显式 Content-Type / 非 JSON body 不推断。
+    #[tokio::test]
+    async fn mock_upstream_infers_json_content_type() {
+        let upstream = MockUpstream::shared().await.unwrap();
+        // JSON body 无显式 CT → 推断
+        let url = upstream.register(MockSpec {
+            status: 200,
+            headers: vec![],
+            body: b"{\"ok\":true}".to_vec(),
+            delay_ms: 0,
+            allow_origin: None,
+        });
+        let token = url.rsplit('/').next().unwrap();
+        let resp = http_get(upstream.port(), &format!("/m/{token}"), &[]).await;
+        let head = String::from_utf8_lossy(&resp);
+        assert!(head.contains("Content-Type: application/json"), "{head}");
+        // 显式优先（规则设 text/csv，JSON body 不覆盖）
+        let url2 = upstream.register(MockSpec {
+            status: 200,
+            headers: vec![("content-type".to_string(), "text/csv".to_string())],
+            body: b"a,b\"1\",2".to_vec(),
+            delay_ms: 0,
+            allow_origin: None,
+        });
+        let token2 = url2.rsplit('/').next().unwrap();
+        let resp2 = http_get(upstream.port(), &format!("/m/{token2}"), &[]).await;
+        let head2 = String::from_utf8_lossy(&resp2);
+        assert!(head2.contains("content-type: text/csv"), "{head2}");
+        assert!(
+            !head2.to_lowercase().contains("application/json"),
+            "{head2}"
+        );
+        // 非 JSON body 无显式 CT → 不推断（二进制通道不受影响）
+        let url3 = upstream.register(MockSpec {
+            status: 200,
+            headers: vec![],
+            body: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            delay_ms: 0,
+            allow_origin: None,
+        });
+        let token3 = url3.rsplit('/').next().unwrap();
+        let resp3 = http_get(upstream.port(), &format!("/m/{token3}"), &[]).await;
+        let head3 = String::from_utf8_lossy(&resp3);
+        assert!(!head3.to_lowercase().contains("content-type"), "{head3}");
+    }
+
+    /// preflight 收紧：token 在册且声明 allowOrigin 时，不匹配 Origin 的
+    /// OPTIONS 不带任何 CORS 放口头（浏览器拒预检）；未声明的 token 维持
+    /// 204 放行；未知 token 也维持 204（token 无关的探测不炸）。
+    #[tokio::test]
+    async fn mock_upstream_preflight_respects_allow_origin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upstream = MockUpstream::shared().await.unwrap();
+        async fn raw_options(port: u16, path: &str, origin: Option<&str>) -> String {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let mut req = format!(
+                "OPTIONS {path} HTTP/1.1\r\nHost: x\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n"
+            );
+            if let Some(o) = origin {
+                req.push_str(&format!("Origin: {o}\r\n"));
+            }
+            req.push_str("\r\n");
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        }
+        let port = upstream.port();
+        // 在册收紧 token：不匹配 Origin → 204 但零 CORS 头
+        let url = upstream.register(MockSpec {
+            status: 200,
+            headers: vec![],
+            body: b"".to_vec(),
+            delay_ms: 0,
+            allow_origin: Some("http://page.example".to_string()),
+        });
+        let token = url.rsplit('/').next().unwrap().to_string();
+        let resp = raw_options(port, &format!("/m/{token}"), Some("https://evil.example")).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 204"),
+            "仍 204 空体: {}",
+            &resp[..resp.len().min(30)]
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-"),
+            "不匹配零放口头: {resp}"
+        );
+        // 匹配 Origin → 完整放口头（ACAO 回显 + ACAM/ACRH）
+        let url2 = upstream.register(MockSpec {
+            status: 200,
+            headers: vec![],
+            body: b"".to_vec(),
+            delay_ms: 0,
+            allow_origin: Some("http://page.example".to_string()),
+        });
+        let token2 = url2.rsplit('/').next().unwrap().to_string();
+        let resp2 = raw_options(port, &format!("/m/{token2}"), Some("http://page.example")).await;
+        assert!(
+            resp2.contains("Access-Control-Allow-Origin: http://page.example"),
+            "{resp2}"
+        );
+        assert!(resp2.contains("Access-Control-Allow-Methods"), "{resp2}");
+        // 注意：preflight 不消费 token（上方两次 OPTIONS 后 spec 仍在）
+        let url3 = upstream.register(MockSpec {
+            status: 200,
+            headers: vec![],
+            body: b"".to_vec(),
+            delay_ms: 0,
+            allow_origin: None,
+        });
+        let token3 = url3.rsplit('/').next().unwrap().to_string();
+        let resp3 = raw_options(port, &format!("/m/{token3}"), Some("https://any.example")).await;
+        assert!(
+            resp3.contains("Access-Control-Allow-Origin: https://any.example"),
+            "未声明维持宽松: {resp3}"
+        );
+        // 未知 token：维持 204 放行（token 无关探测）
+        let resp4 = raw_options(port, "/m/nonexistent", Some("https://any.example")).await;
+        assert!(resp4.starts_with("HTTP/1.1 204"));
+        assert!(
+            resp4.contains("Access-Control-Allow-Origin: https://any.example"),
+            "{resp4}"
+        );
     }
 }

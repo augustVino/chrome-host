@@ -1055,8 +1055,9 @@ impl PageService {
                             "id": r.id,
                             "urlPattern": r.url_pattern,
                             "action": match &r.action {
-                                Action::Mock { status, delay_ms, .. } =>
-                                    json!({"type": "mock", "status": status, "delayMs": delay_ms}),
+                                Action::Mock { status, delay_ms, allow_origin, .. } =>
+                                    json!({"type": "mock", "status": status, "delayMs": delay_ms,
+                                           "allowOrigin": allow_origin}),
                                 Action::SetHeaders { .. } => json!({"type": "setHeaders"}),
                                 Action::Block => json!({"type": "block"}),
                             },
