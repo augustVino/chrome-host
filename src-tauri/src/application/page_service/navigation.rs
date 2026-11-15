@@ -49,7 +49,7 @@ async fn await_load(rx: oneshot::Receiver<()>, deadline: Instant) -> bool {
 }
 
 /// navigate <url>：Page.navigate 直发到 page session。
-/// 等待语义（任务决策记录）：CDP 导航命令返回 ≠ 加载完成，本工具等待
+/// 等待语义：CDP 导航命令返回 ≠ 加载完成，本工具等待
 /// Page.loadEventFired（窗口 NAV_LOAD_TIMEOUT）后返回：
 /// - 窗口内观察到 → loaded:true；
 /// - 窗口耗尽 → loaded:false（导航已开始、加载未证实——不编造成功，也不

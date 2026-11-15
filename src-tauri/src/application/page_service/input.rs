@@ -1,9 +1,9 @@
-//! input 族（I2）：click/fill/type/press 换 browser_kit interaction 内核，
-//! 新增 hover/scroll/drag/select/check/tap。分工：
+//! input 族：click/fill/type/press 走 browser_kit interaction 内核，
+//! 另有 hover/scroll/drag/select/check/tap。分工：
 //!
 //! - **click**：kit `interaction::click`（resolve 链 + ClickPhase 派发 +
 //!   settle + actionability 全开：可见/启用/遮挡 + 对话框竞速）。ref 与
-//!   selector 两路径统一走 kit（我方 locate/hit-test JS 与三段派发删除）；
+//!   selector 两路径统一走 kit；
 //!   dialog 竞速的 pending_release 补偿在 kit 外闭环（watch_loop 的
 //!   on_dialog_opening 先 accept 对话框、事件才转发到 bus，此处补发的
 //!   release 落在已解锁的渲染进程上——顺序天然正确）。双击/右键经
@@ -11,22 +11,19 @@
 //! - **fill**：kit `interaction::fill` + 我方契约保全层——可填前置检查
 //!   （422 PAGE_TARGET_NOT_FILLABLE，kit 无此检查）+ contenteditable 预清空
 //!   （kit 清空只覆盖表单控件）+ 回读校验追加（PAGE_FILL_VALUE_MISMATCH /
-//!   gone / PAGE_FILL_FOCUS_LOST——focus_lost 从清空阶段移到回读阶段，
-//!   触发点变化、码与状态不变）。
+//!   gone / PAGE_FILL_FOCUS_LOST）。
 //! - **type**：kit `type_text_into_active_context`（逐字符：可打印字符
-//!   insertText，\n/\t 走 keyDown/keyUp——对焦点元素无定位无校验语义不变，
-//!   但从单次 insertText 变为逐字符派发）。
+//!   insertText，\n/\t 走 keyDown/keyUp——对焦点元素无定位无校验）。
 //! - **press**：`parse_key` 校验（400 PAGE_KEY_UNKNOWN 契约）后走 kit
-//!   `press_key(_with_modifiers)`（keyDown+keyUp 两段——原 rawKeyDown/char/
-//!   keyUp 三段序列随之退役，文本抑制语义保留：Ctrl/Meta 组合不发 text）。
-//!   `--target` 聚焦链两端统一走 kit resolve（selector 路径原页内 eval
-//!   focus 脚本删除；不再先滚动——DOM.focus 不依赖可见性）。
-//! - **wait**：**保留我方 eval 轮询实现**（kit 无 wait_for_selector——该
-//!   原语在未 vendor 的上游 actions.rs 层；owner 已批：wait 为我方永久
-//!   自有原语）。四态映射与 PAGE_WAIT_TIMEOUT（附最后观察态 + 轮询数）
-//!   契约不变。
-//! - **clickxy**：保留我方三段派发（上游无坐标点击原语；`dispatch_click`
-//!   仅此一处调用方）。loadall 循环层换 kit click（selector 路径）。
+//!   `press_key(_with_modifiers)`（keyDown+keyUp 两段，文本抑制语义：
+//!   Ctrl/Meta 组合不发 text）。
+//!   `--target` 聚焦链两端统一走 kit resolve（不先滚动——DOM.focus
+//!   不依赖可见性）。
+//! - **wait**：我方 eval 轮询实现（kit 无 wait_for_selector——该
+//!   原语在未 vendor 的上游 actions.rs 层，为我方永久自有原语）。
+//!   四态映射与 PAGE_WAIT_TIMEOUT（附最后观察态 + 轮询数）契约不变。
+//! - **clickxy**：我方三段派发（上游无坐标点击原语；`dispatch_click`
+//!   仅此一处调用方）。loadall 循环层走 kit click（selector 路径）。
 
 use super::{
     cdp_send, fill_focus_lost, focus_failed, kit_client, require_conn, CLICK_RELEASE_DELAY,
@@ -54,11 +51,11 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-// fill 的回读校验页内脚本（TS fill.mjs 的 verify 演化）。I2 起 fill 主链
+// fill 的回读校验页内脚本。fill 主链
 // 走 kit（focus/select 清空/insertText），本脚本是回读契约的载体：
 // gone（元素被移除）/ focus_lost（值不一致且焦点不在目标上——页面抢焦点
 // 导致 insertText 落到别处）/ matches（含期望/实际摘要）。值一致时不再
-// 检查焦点（成功路径行为同旧链：页面 fill 后主动 blur 不算失败）。
+// 检查焦点（成功路径：页面 fill 后主动 blur 不算失败）。
 // FILL_EDITABLE 内联理由：页面无模块作用域，每个模板各自携带源码文本。
 const FILL_EDITABLE: &str = r#"function fillEditable(el) {
   if (!el || !el.isConnected) return { editable: false, why: 'element is not in the document' };
@@ -104,7 +101,7 @@ fn fill_verify_expr() -> String {
     .replace("__FILL_EDITABLE__", FILL_EDITABLE)
 }
 
-/// contenteditable 预清空（I2）：kit fill 的清空是 `select() + value = ''`，
+/// contenteditable 预清空：kit fill 的清空是 `select() + value = ''`，
 /// 只对表单控件生效；编辑根需要 textContent 清空。focus 由随后的 kit fill
 /// 建立（本脚本只做 DOM 清理 + input 事件，无焦点前提）。
 fn fill_preclear_editable_expr() -> String {
@@ -213,10 +210,9 @@ pub(crate) async fn click_tool(
         "click",
     )
     .await?;
-    // I4 --cursor 采样钩子：成功派发后记入帧间插值历史（无录制时零开销）
+    // --cursor 采样钩子：成功派发后记入帧间插值历史（无录制时零开销）
     super::recording_tool::record_cursor(watched, result.x, result.y, 0);
-    // 坐标 = kit 投影后的顶层视口坐标（帧内元素含帧偏移；旧 ref 路径打印
-    // 帧本地坐标——文案坐标基准变化，提交信息披露）
+    // 坐标 = kit 投影后的顶层视口坐标（帧内元素含帧偏移）
     let verb = match (double, right) {
         (true, true) => "Double-right-clicked",
         (true, false) => "Double-clicked",
@@ -287,7 +283,7 @@ pub(crate) async fn fill_tool(
         watched, &conn, tid, sid, &esid, &object_id, target, &desc, ref_name, value,
     )
     .await;
-    // finally 语义（TS）：无论成败都归还对象句柄（best-effort）——归还发到
+    // finally 语义：无论成败都归还对象句柄（best-effort）——归还发到
     // 解析它的同一会话（objectId 会话作用域）
     let _ = cdp_send(
         &conn,
@@ -328,7 +324,7 @@ async fn fill_pipeline(
     }
     // ③ kit fill：focus + select/value 清空（表单控件）+ Input.insertText
     //（page 级会话——渲染进程按焦点路由，OOPIF 同理）。CR 归一后传入
-    //（回读期望与旧链同口径）。
+    //（回读期望同此归一）。
     let multi_line = value.replace("\r\n", "\n").replace('\r', "\n");
     let client = kit_client(watched)?;
     let (ref_map, iframe_sessions) = ref_maps(watched, tid);
@@ -479,8 +475,8 @@ pub(crate) async fn press_tool(
             (format!(" on {label}"), esid)
         }
     };
-    // kit press_key（keyDown+keyUp 两段；Ctrl/Meta 组合抑制 text——与旧链
-    // 的 char 抑制语义一致）。修饰键位域 = CDP 位掩码（Alt1/Ctrl2/Meta4/
+    // kit press_key（keyDown+keyUp 两段；Ctrl/Meta 组合抑制 text）。
+    // 修饰键位域 = CDP 位掩码（Alt1/Ctrl2/Meta4/
     // Shift8），domain 的 u8 位序与之相同，直接透传。
     let client = kit_client(watched)?;
     if kp.modifiers != 0 {
@@ -514,7 +510,7 @@ pub(crate) async fn wait_tool(
     loop {
         polls += 1;
         // eval 失败（导航中）= detached 继续轮询；返回垃圾 = unknown（永不
-        // 满足除 attached 外的任何状态——P2-A 语义原样保留）
+        // 满足除 attached 外的任何状态）
         last = match eval_json(&conn, sid, &expr, "wait").await {
             Ok(v) => v
                 .get("observed")
@@ -543,12 +539,12 @@ pub(crate) async fn wait_tool(
             )
             .into());
         }
-        // 绝不睡过截止线（TS 同）
+        // 绝不睡过截止线
         tokio::time::sleep(WAIT_POLL_INTERVAL.min(timeout.saturating_sub(elapsed))).await;
     }
 }
 
-/// TS clickXyStr：复用我方三段派发链（kit 无坐标点击原语），无 locate/
+/// clickxy：我方三段派发链（kit 无坐标点击原语），无 locate/
 /// hit-test（坐标即意图）。
 pub(crate) async fn clickxy_tool(
     watched: &Watched,
@@ -558,16 +554,16 @@ pub(crate) async fn clickxy_tool(
 ) -> Result<Value, AppError> {
     let conn = require_conn(watched)?;
     dispatch_click(&conn, sid, x, y).await?;
-    // I4 --cursor 采样钩子（成功派发后；坐标即意图无 hit-test，直接记）
+    // --cursor 采样钩子（成功派发后；坐标即意图无 hit-test，直接记）
     super::recording_tool::record_cursor(watched, x, y, 0);
     Ok(json!({
         "result": format!("Clicked at CSS ({}, {})", js_num(x), js_num(y))
     }))
 }
 
-/// TS typeStr 语义（对当前焦点元素输入、无定位无校验）换 kit
-/// `type_text_into_active_context`：逐字符派发（可打印字符 insertText、
-/// \n/\t 走 keyDown/keyUp——Enter 现在是真按键事件，可触发提交）。
+/// type：对当前焦点元素输入（无定位无校验），kit `type_text_into_active_context`
+/// 逐字符派发（可打印字符 insertText、
+/// \n/\t 走 keyDown/keyUp——Enter 是真按键事件，可触发提交）。
 /// 字符计数用 Unicode 标量（fill 同口径）。
 pub(crate) async fn type_tool(watched: &Watched, sid: &str, text: &str) -> Result<Value, AppError> {
     let client = kit_client(watched)?;
@@ -579,10 +575,10 @@ pub(crate) async fn type_tool(watched: &Watched, sid: &str, text: &str) -> Resul
     }))
 }
 
-/// TS loadAllStr 的循环骨架。点击层换 kit click（selector 路径：定位 +
-/// actionability + 三段派发一体）。两处任务口径偏差（I1 前既有，保留）：
-/// - 点击用原生链替换 TS 的页内 el.click() 合成点击（项目纪律是原生输入）；
-/// - 上限从 5min 硬顶改为 max-clicks，达上限后补一次存在性复查定文案
+/// loadall 的循环骨架。点击层走 kit click（selector 路径：定位 +
+/// actionability + 三段派发一体）。两处语义取舍：
+/// - 点击用原生输入链，不用页内 el.click() 合成点击（项目纪律是原生输入）；
+/// - 上限用 max-clicks（非 5min 硬顶），达上限后补一次存在性复查定文案
 ///   （诚实区分「消失了」与「仍在页面上」）。
 pub(crate) async fn loadall_tool(
     watched: &Watched,
@@ -635,7 +631,7 @@ pub(crate) async fn loadall_tool(
 }
 
 // ============================================================================
-// I2 新命令：hover / scroll / drag / select / check / tap
+// hover / scroll / drag / select / check / tap 命令
 // ============================================================================
 
 /// `page hover <ID> <sel|@eN>`：kit interaction::hover（resolve + 单发
@@ -688,7 +684,7 @@ pub(crate) async fn scroll_tool(
     }))
 }
 
-/// drag 轨迹合成（任务书 seed 的等价重写，本仓库代码）：步数
+/// drag 轨迹合成：步数
 /// `clamp(dist/12, 1, 60)`、LCG 弧线（二次贝塞尔控制点垂直偏移）、
 /// smoothstep 缓动。LCG 种子由端点坐标位混合派生——确定性（同端点同
 /// 轨迹，测试可复现），无时钟依赖。
@@ -725,7 +721,7 @@ pub(crate) fn drag_trajectory(from: (f64, f64), to: (f64, f64)) -> Vec<(f64, f64
 }
 
 /// drag 的单发鼠标事件（我方直发 Input.dispatchMouseEvent——kit 未暴露
-/// move/press/release 组合原语；无对话框竞速，已知边界见提交信息披露）。
+/// move/press/release 组合原语；无对话框竞速，已知边界）。
 /// buttons 位图：移动中持键 = 1（左键按下态），press = 1、release = 0；
 /// clickCount 仅 press/release 携带。
 async fn drag_mouse(
@@ -801,8 +797,8 @@ pub(crate) async fn drag_tool(
     let pts = drag_trajectory((fx, fy), (tx, ty));
     let (first, rest) = (pts.first().copied().unwrap_or((fx, fy)), &pts[1..]);
     drag_mouse(&client, &fsid, "mouseMoved", first.0, first.1, 0, None).await?;
-    // I4 --cursor 采样钩子：每个轨迹点（含按钮态 0→1→1…→0）逐点记入，
-    // 帧间插值才能复现拖拽路径（仅追加调用点，控制流不变）
+    // --cursor 采样钩子：每个轨迹点（含按钮态 0→1→1…→0）逐点记入，
+    // 帧间插值才能复现拖拽路径
     super::recording_tool::record_cursor(watched, first.0, first.1, 0);
     drag_mouse(&client, &fsid, "mousePressed", first.0, first.1, 1, Some(1)).await?;
     super::recording_tool::record_cursor(watched, first.0, first.1, 1);
@@ -824,7 +820,7 @@ pub(crate) async fn drag_tool(
 /// `page select <ID> <sel|@eN> <value>`：kit select_option。匹配语义 =
 /// kit JS：原生 select 按 value / label / textContent 匹配；role=combobox/
 /// listbox 控件按可访问名或 data-value/value 匹配（--label 未设——kit
-/// 已同时按值与可见文本匹配，label-only 无行为差异，owner 已批）。
+/// 已同时按值与可见文本匹配，label-only 无行为差异）。
 pub(crate) async fn select_tool(
     watched: &Watched,
     tid: &str,
@@ -916,12 +912,12 @@ pub(crate) async fn tap_tool(
 }
 
 // ============================================================================
-// 我方三段派发（clickxy 专属；click/loadall 已换 kit）
+// 我方三段派发（clickxy 专属）
 // ============================================================================
 
-/// 三段鼠标派发（§2.4）：mouseMoved → mousePressed → 50ms → mouseReleased。
+/// 三段鼠标派发：mouseMoved → mousePressed → 50ms → mouseReleased。
 /// press 后失败补一发 release（按钮绝不卡死按下态），effect_state 按位次
-/// 标注（§2.7：pre-press = none / post-press = unknown）。
+/// 标注（pre-press = none / post-press = unknown）。
 async fn dispatch_click(conn: &SharedPageConn, sid: &str, x: f64, y: f64) -> Result<(), AppError> {
     let base = |ty: &str| json!({ "type": ty, "x": x, "y": y, "button": "left", "clickCount": 1, "modifiers": 0 });
     cdp_send(
@@ -962,11 +958,11 @@ async fn dispatch_click(conn: &SharedPageConn, sid: &str, x: f64, y: f64) -> Res
 }
 
 // ============================================================================
-// I2 新命令的 pub 入口（独立 impl 块——避免与其他并行任务在同一块内冲突）
+// 新命令的 pub 入口（独立 impl 块）
 // ============================================================================
 
 impl PageService {
-    /// hover <tab> <sel|@eN>（I2 新命令）：kit interaction::hover。
+    /// hover <tab> <sel|@eN>：kit interaction::hover。
     pub async fn hover(&self, ins_id: &str, tab: &str, target: &str) -> Result<Value, AppError> {
         self.command(
             TOOL_TIMEOUT,
@@ -978,7 +974,7 @@ impl PageService {
         .await
     }
 
-    /// scroll <tab> [sel|@eN] <dx> <dy>（I2 新命令）：有 target 滚元素、
+    /// scroll <tab> [sel|@eN] <dx> <dy>：有 target 滚元素、
     /// 无 target 滚页面。非有限 delta 在建连前快速失败（400）。
     pub async fn scroll(
         &self,
@@ -1003,7 +999,7 @@ impl PageService {
         .await
     }
 
-    /// drag <tab> <from> <to>（I2 新命令）：kit resolve 两端点 + 我方轨迹
+    /// drag <tab> <from> <to>：kit resolve 两端点 + 我方轨迹
     /// 插值链（LCG 弧线 + smoothstep）。
     pub async fn drag(
         &self,
@@ -1022,7 +1018,7 @@ impl PageService {
         .await
     }
 
-    /// select <tab> <sel|@eN> <value>（I2 新命令）：kit select_option
+    /// select <tab> <sel|@eN> <value>：kit select_option
     ///（按 value 或可见文本匹配；空串 value 合法 = 选中空值选项）。
     pub async fn select(
         &self,
@@ -1041,7 +1037,7 @@ impl PageService {
         .await
     }
 
-    /// check <tab> <sel|@eN> [--uncheck]（I2 新命令）：kit check/uncheck。
+    /// check <tab> <sel|@eN> [--uncheck]：kit check/uncheck。
     pub async fn check(
         &self,
         ins_id: &str,
@@ -1059,7 +1055,7 @@ impl PageService {
         .await
     }
 
-    /// tap <tab> <sel|@eN>（I2 新命令）：kit tap_touch（触摸序列）。
+    /// tap <tab> <sel|@eN>：kit tap_touch（触摸序列）。
     pub async fn tap(&self, ins_id: &str, tab: &str, target: &str) -> Result<Value, AppError> {
         self.command(TOOL_TIMEOUT, "tap", ins_id, tab, |w, tid, sid| async move {
             tap_tool(&w, &tid, &sid, target).await

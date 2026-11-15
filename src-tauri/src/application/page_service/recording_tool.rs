@@ -1,4 +1,4 @@
-//! page record start/stop（I4）：kit recording.rs 的录屏编排。
+//! page record start/stop：kit recording.rs 的录屏编排。
 //!
 //! 常驻任务特例（同 profiler 模式，不走 command() 骨架）：
 //! - **不占实例串行锁**（ensure 后 drop(serial)）：录制期间其他 page 命令

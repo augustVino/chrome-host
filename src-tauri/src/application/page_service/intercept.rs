@@ -86,9 +86,9 @@ fn merge_request_headers(original: Option<&Value>, overrides: &[(String, String)
     }
     out
 }
-/// requestPaused 事件流内决策（红线 ①不碰串行锁；红线 ②任何错误必放行）。
+/// requestPaused 事件流内决策（红线：不碰串行锁；任何错误必放行）。
 /// 无规则/未命中/耗尽 → continueRequest 裸放行；决策命令失败 → 裸 continue
-/// 兑底（requestPaused 不回应 = 页面挂死，spike 实测）；兑底也失败（连接
+/// 兑底（requestPaused 不回应 = 页面挂死，真机实测）；兑底也失败（连接
 /// 已死）→ journal 记 stranded（请求随连接死亡，无从挽救）。
 pub(crate) async fn on_request_paused(watched: &Watched, session_id: &str, params: &Value) {
     let Some(conn) = watched.conn.lock().unwrap().clone() else {
@@ -117,7 +117,7 @@ pub(crate) async fn on_request_paused(watched: &Watched, session_id: &str, param
         .unwrap_or("Other");
 
     // 决策（短锁：匹配 + 计数 + journal；无状态/未命中/耗尽 → None = 放行）。
-    // I5：未命中时同锁取 pass_reason（最接近命中的失败维度：耗尽/类型被滤
+    // 未命中时同锁取 pass_reason（最接近命中的失败维度：耗尽/类型被滤
     // /url 未中）作 journal detail——诊断与决策同口径一致。
     let (decision, pass_detail): (Option<(String, Action)>, String) = {
         let mut guard = watched.intercept.lock().unwrap();
@@ -254,7 +254,7 @@ pub(crate) async fn on_request_paused(watched: &Watched, session_id: &str, param
 mod tests {
     use super::*;
 
-    // ---------------- merge_request_headers（I5 对齐测试）----------------
+    // ---------------- merge_request_headers（对齐测试）----------------
     // 语义与上游参考实现对齐（continueRequest 替换语义）：continueRequest 替换语义下原头全保留 + 规则头同名
     // 大小写不敏感覆盖；无原头/无覆盖头各自退化正常。
 
@@ -337,7 +337,7 @@ mod tests {
     }
 
     /// journal 条目形态：字段集与脱敏 url（诚实披露契约，格式不变约束的
-    /// 回归锚点——I5 只允许新增字段，不允许改字段语义）。
+    /// 回归锚点——只允许新增字段，不允许改字段语义）。
     #[test]
     fn journal_entry_shape_stable() {
         let e = journal_entry(

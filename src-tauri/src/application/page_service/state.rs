@@ -16,7 +16,7 @@ use std::time::Instant;
 
 /// per-instance page tab 表：`(targetId, sessionId)` 按 attach 先后保序。
 ///
-/// 空 target 语义（P2-F）：唯一 page target 自动选中；多个 → 409 并在错误
+/// 空 target 语义：唯一 page target 自动选中；多个 → 409 并在错误
 /// message 列出全部 targetId（曾试过「最近 attach」近似活跃 tab，真机复测
 /// 取错页面，改为诚实语义）。列表需稳定可读，HashMap 迭代序随机故用 Vec；
 /// 表长 = 标签数（个位数），线性扫描即可。
@@ -43,7 +43,7 @@ impl TabTable {
         self.rows.clear();
     }
 
-    /// L2 握手窗口的判空探针：任一 page target 已入表即视作首批 attach 已到
+    /// attach 握手窗口的判空探针：任一 page target 已入表即视作首批 attach 已到
     pub(crate) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -61,7 +61,7 @@ impl TabTable {
     }
 }
 
-/// per-tab OOPIF 帧登记（W-oopif）。不变式：OOPIF 的 targetId == frameId
+/// per-tab OOPIF 帧登记。不变式：OOPIF 的 targetId == frameId
 ///（Chrome 实现稳定不变式，Puppeteer 同样依赖）；同源 iframe 不是独立
 /// target（session 恒 None，内容已在主树中，不参与任何路由）。
 /// owner 元素（主文档/父帧中的 <iframe>）backendNodeId 惰性解析
@@ -85,7 +85,7 @@ pub(crate) struct FrameInfo {
     pub(crate) owner_backend_node_id: Option<i64>,
 }
 
-/// 实例级 profiler 运行态（I3：page profiler start/stop）。kit TracingState
+/// 实例级 profiler 运行态（page profiler start/stop）。kit TracingState
 /// 不 derive Clone（kit 红线零修改），跨 await 的可变借用靠 take-out/写回
 ///（锁内不 await 的模块纪律）；tid/sid 是 start 时刻的会话锚点——stop
 /// 无 TAB 入参，按锚点路由 Tracing.end 与事件过滤。
@@ -97,7 +97,7 @@ pub(crate) struct ProfilerState {
     pub(crate) sid: String,
 }
 
-/// 实例级录制运行态（I4：page record start/stop）。包装 kit RecordingState
+/// 实例级录制运行态（page record start/stop）。包装 kit RecordingState
 ///（kit 红线零修改，锚点字段在外层）：tid 是 start 时刻的 tab 锚点——stop
 /// 无 TAB 入参按锚点路由，drop_tab 废弃判定同 profiler；kit state 不 derive
 /// Clone，跨 await 的可变借用靠 take-out/写回（锁内不 await 的模块纪律）。
@@ -113,13 +113,13 @@ pub(crate) struct Watched {
     /// 当前连接（断连置 None，重建整体替换）。std Mutex 只做槽位读写；
     /// 收发在 [`PageCdp`]（&self 并发 send，无锁包裹）里。
     pub(crate) conn: Mutex<Option<SharedPageConn>>,
-    /// per-instance 命令串行（决策 3）：锁的获取即建连检查点——并发首命令
+    /// per-instance 命令串行：锁的获取即建连检查点——并发首命令
     /// 只有先拿到锁的那个建连，其余直接复用（防双连接竞态）。
     pub(crate) cmd_lock: Arc<tokio::sync::Mutex<()>>,
     /// autoAttach 维护的 targetId → sessionId（仅 type=page），attach 序
     /// 保序（空 target 唯一性路由用，见 [`TabTable`]）
     pub(crate) tabs: Mutex<TabTable>,
-    /// per-tab @eN ref 表（I1b 起 = browser_kit element::RefMap，loaderId 代际
+    /// per-tab @eN ref 表（= browser_kit element::RefMap，loaderId 代际
     /// durable refs；snap 整表重建、导航不主动失效——stale 由解析时
     /// is_detached/AX 唯一匹配恢复判定产生）。锁纪律：锁内禁止 await，
     /// 需跨 await 时先 clone 出、事后整表写回（RefMap: Clone）。
@@ -128,7 +128,7 @@ pub(crate) struct Watched {
     /// establish 整清、drop_tab 摘除。RefMap 自身的代际是 loaderId 语义，
     /// 与这个「第几次 snap」计数是两回事）
     pub(crate) snap_gen: Mutex<HashMap<String, u64>>,
-    /// per-tab OOPIF 帧登记（W-oopif）：frameAttached/attachedToTarget 维护
+    /// per-tab OOPIF 帧登记：frameAttached/attachedToTarget 维护
     pub(crate) frames: Mutex<HashMap<String, FrameTable>>,
     /// attach 先于 frameAttached 到达的孤儿 frame 会话（targetId → sessionId；
     /// frameAttached 归属 tab 后认领）
@@ -154,27 +154,27 @@ pub(crate) struct Watched {
     /// cmd_lock）；拦截响应命令走 conn 的并发 send（&self），与 in-flight
     /// 工具命令互不阻塞。
     pub(crate) intercept: Mutex<HashMap<String, InterceptState>>,
-    /// 实例级下载运行态（W-file）：Browser 域下载事件无 session 维度，整实例
+    /// 实例级下载运行态：Browser 域下载事件无 session 维度，整实例
     /// 一份（非 per-tab）。in_flight = WillBegin 登记；history = 终态环形
     /// 记录（容量 20）；waiters = download-wait 的等待者（先注册后触发，
     /// 命令式等待）。establish 整体重置（等待者 rx 收 Err 诚实报失效）。
     pub(crate) downloads: Mutex<DownloadState>,
-    /// per-tab 上次快照文本（I3：page diff 的滚动基线）。establish 整清、
+    /// per-tab 上次快照文本（page diff 的滚动基线）。establish 整清、
     /// drop_tab 摘除；单条 2MiB 上限（超限不存并在 diff 响应披露
     /// baselineCleared——见 diff_tool 的 LAST_SNAP_MAX_BYTES）。锁纪律同
     /// refs：锁内不 await。
     pub(crate) last_snap: Mutex<HashMap<String, String>>,
-    /// 实例级 profiler 运行态（I3）。同一时刻至多一个（Chrome tracing 是
+    /// 实例级 profiler 运行态。同一时刻至多一个（Chrome tracing 是
     /// 实例级单会话资源）；establish 整清（连接死 → tracing session 失效），
     /// 锚点 tab 关闭（drop_tab）时废弃——session 死后事件流无处可收，trace
     /// 本就不可回收，保留只会让 stop 报误导性错误。
     pub(crate) profiler: Mutex<Option<ProfilerState>>,
-    /// 实例级录制运行态（I4）。同一实例至多一路（Chrome 每实例一路
+    /// 实例级录制运行态。同一实例至多一路（Chrome 每实例一路
     /// screencast capture session + 一个 ffmpeg 编码器）；establish 整清
     ///（连接死 → capture session 死，帧流不可回收），锚点 tab 关闭
     ///（drop_tab）时废弃（同 profiler 语义：best-effort cancel，产物不可回收）。
     pub(crate) recording: Mutex<Option<RecordingSlot>>,
-    /// 录制 capture session 豁免表（I4，attach 事件分流）：capture sessionId
+    /// 录制 capture session 豁免表（attach 事件分流）：capture sessionId
     /// → 锚点 targetId。kit 录制对同一 page target 建**第二个** flattened
     /// session（screencast 专属），其 attachedToTarget/detachedFromTarget
     /// 事件不得当作新 tab / tab 关闭处理（否则 tabs 表被污染、路由全乱）。

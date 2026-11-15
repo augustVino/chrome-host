@@ -65,7 +65,7 @@ type Calls = Arc<Mutex<Vec<Recorded>>>;
 type Script = Arc<Mutex<HashMap<String, VecDeque<Result<Value, String>>>>>;
 type EventTap = Arc<Mutex<Option<EventSink>>>;
 /// 方法 → 完成闸门：send 记录调用后先等闸门放行再回脚本响应（模拟服务端
-/// 响应延迟，构造「命令 in-flight 未完成」形态——P2-F 并发回归的靶子）。
+/// 响应延迟，构造「命令 in-flight 未完成」形态——并发回归的靶子）。
 /// 发送端 drop（测试结束）也视为放行，无死锁残留。
 type Gates = Arc<Mutex<HashMap<String, VecDeque<tokio::sync::oneshot::Receiver<()>>>>>;
 
@@ -80,7 +80,7 @@ struct FakeCdp {
 }
 
 impl PageCdp for FakeCdp {
-    /// kit typed_raw 通道（I1b）：同一脚本表/调用记录，响应帧文本化
+    /// kit typed_raw 通道：同一脚本表/调用记录，响应帧文本化
     /// （{"result": ...} / {"error": {...}} 信封，对齐 ws.rs 透传形态）
     fn send_raw<'a>(
         &'a self,
@@ -218,7 +218,7 @@ fn resolve_obj_eval(object_id: &str) -> Result<Value, String> {
     Ok(json!({ "result": { "type": "object", "objectId": object_id } }))
 }
 
-/// 测试 ref 预种子（S5：RefMap::add_with_frame 构造，替代旧 RefStore JSON 形态）。
+/// 测试 ref 预种子（RefMap::add_with_frame 构造）。
 /// role/name 是 kit stale 恢复链的输入，默认 button/OK；frame 传 Some 时帧内条目。
 fn seed_ref(watched: &Watched, tid: &str, ref_id: &str, bni: i64, frame: Option<&str>) {
     seed_ref_as(watched, tid, ref_id, bni, frame, "button", "OK");
@@ -339,15 +339,15 @@ fn resolve_target_routes_exact_and_prefix_and_errors() {
     // 无匹配：404 PAGE_TAB_NOT_FOUND
     let miss = resolve_target(&tabs, "NOPE").unwrap_err();
     assert_eq!((miss.code(), miss.status()), ("PAGE_TAB_NOT_FOUND", 404));
-    // 多匹配：409 PAGE_TAB_AMBIGUOUS（文案对齐 TS resolvePrefix）
+    // 多匹配：409 PAGE_TAB_AMBIGUOUS
     let amb = resolve_target(&tabs, "T").unwrap_err();
     assert_eq!((amb.code(), amb.status()), ("PAGE_TAB_AMBIGUOUS", 409));
     assert!(amb.to_string().contains("matches 2 targets"));
     // 空 target 的语义见 resolve_target_empty_input_selects_unique_or_lists_all
-    //（P2-F F1：不参与前缀匹配，唯一自动选中 / 多个 409 列全表）
+    //（不参与前缀匹配，唯一自动选中 / 多个 409 列全表）
 }
 
-/// F1（真机复测修正）：空 target 不猜页面——唯一 page target 自动选中；
+/// 空 target 不猜页面（真机复测修正）——唯一 page target 自动选中；
 /// 多个 → 409 `PAGE_TAB_AMBIGUOUS` 且 message 列出全部 targetId 供选择
 ///（「最近 attach」近似真机取错页面，已放弃）；表空 → 404。
 #[test]
@@ -384,7 +384,7 @@ fn resolve_target_empty_input_selects_unique_or_lists_all() {
     );
 }
 
-/// TS interact.mjs isRefTarget：@ 宽松、裸 e<digits> 严格、其余是选择器。
+/// ref 目标判定：@ 宽松、裸 e<digits> 严格、其余是选择器。
 /// '@E3' 也走 ref 路径（随后大小写敏感失配 → ref_not_found，而非误读为选择器）
 #[test]
 fn is_ref_target_matches_ts_routing() {
@@ -397,7 +397,7 @@ fn is_ref_target_matches_ts_routing() {
 }
 
 // ---------------- 纯逻辑：locate / hit 分类 -----------------------------
-// （I2 已删：locate/hit-test JS 分类随 click 换 kit 解析链退役，矩阵由 kit
+// （locate/hit-test JS 分类已删除（click 走 kit 解析链），矩阵由 kit
 // element.rs 自带测试 + click_selector_classifies_visibility_and_coverage 覆盖）
 
 // ---------------- ensure：门卫 / 幂等 -----------------------------------
@@ -448,7 +448,7 @@ async fn ensure_is_idempotent_and_sends_flatten_autoattach() {
 // ---------------- watch_loop 事件接线 ------------------------------------
 
 /// attachedToTarget(page) 建映射 + 双 enable；iframe target 不入 tabs 表
-/// 但得同一套 enable（W-oopif：frame session 是跨 frame 命令通道）；
+/// 但得同一套 enable（frame session 是跨 frame 命令通道）；
 /// worker 等其他 target 完全不参与
 #[tokio::test]
 async fn attached_registers_page_tab_and_enables_domains() {
@@ -488,14 +488,14 @@ async fn attached_registers_page_tab_and_enables_domains() {
     assert_eq!(calls_of(&calls, "Page.enable").len(), 2);
 }
 
-/// L2（冒烟遗留）：首条 attachedToTarget 延迟 100ms 到达（真机形态：事件
+/// attach 握手窗口：首条 attachedToTarget 延迟 100ms 到达（真机形态：事件
 /// 异步在途）——ensure 的建连分支在握手窗口内等它入表，紧随其后的 snap
 /// 不再 PAGE_TAB_NOT_FOUND；连接已在位后（已有命令在跑）不再重等窗口。
 #[tokio::test]
 async fn ensure_handshake_window_absorbs_late_first_attach() {
     let calls: Calls = Arc::default();
     let script: Script = Arc::default();
-    // 无对话框场景：attach 后的 L3 探测被 Chrome 拒（-32602 形态，静默）
+    // 无对话框场景：attach 后的对话框盲探测被 Chrome 拒（-32602 形态，静默）
     given(
         &script,
         "Page.handleJavaScriptDialog",
@@ -553,7 +553,7 @@ async fn ensure_handshake_window_absorbs_late_first_attach() {
     );
 }
 
-/// L2 兑底：窗口内无任何 attach 到达 → 300ms 到点放行（不报错不悬挂），
+/// attach 握手窗口兑底：窗口内无任何 attach 到达 → 300ms 到点放行（不报错不悬挂），
 /// snap 报 PAGE_TAB_NOT_FOUND，保留 retry shortly 语义。
 #[tokio::test]
 async fn ensure_handshake_window_times_out_into_retry_semantics() {
@@ -573,7 +573,7 @@ async fn ensure_handshake_window_times_out_into_retry_semantics() {
     assert!(elapsed < Duration::from_secs(5), "到点即返回，不悬挂");
 }
 
-/// L3（冒烟遗留）：session attach 时盲发一次 handleJavaScriptDialog——
+/// 重连对话框盲探测：session attach 时盲发一次 handleJavaScriptDialog——
 /// 成功 = 重连前挂着的历史对话框已被接管，无事件参数可得，用保守默认
 /// 构造 DialogInfo 入缓冲（Page.enable 之后、握手内顺序完成）。
 #[tokio::test]
@@ -609,7 +609,7 @@ async fn attach_probe_adopts_stale_dialog_with_conservative_defaults() {
     assert_eq!(e.sequence, 1);
 }
 
-/// L3：无对话框（Chrome 回 -32602 No dialog is showing 形态）→ 静默忽略：
+/// 盲探测无对话框（Chrome 回 -32602 No dialog is showing 形态）→ 静默忽略：
 /// 不建缓冲、不影响映射建立；其他错误同样吞掉（best-effort 探测）。
 #[tokio::test]
 async fn attach_probe_silent_when_no_dialog_showing() {
@@ -633,7 +633,7 @@ async fn attach_probe_silent_when_no_dialog_showing() {
     );
 }
 
-/// L3 与常规对话框路径互不干扰：探测接管历史对话框（seq 1，保守默认）
+/// 盲探测与常规对话框路径互不干扰：探测接管历史对话框（seq 1，保守默认）
 /// 后，新对话框仍走事件驱动应答（seq 2，真实参数），sequence 顺延不断档。
 #[tokio::test]
 async fn attach_probe_coexists_with_event_driven_dialog_flow() {
@@ -645,7 +645,7 @@ async fn attach_probe_coexists_with_event_driven_dialog_flow() {
     );
     // 重连握手：探测接管重连前挂着的历史对话框
     handle_event(&watched, &attach_event("T1", "S1", "page")).await;
-    // 常规路径：新对话框事件到达，带真实参数应答（F2 后事件驱动照旧）
+    // 常规路径：新对话框事件到达，带真实参数应答（事件驱动照旧）
     handle_event(
         &watched,
         &json!({
@@ -772,7 +772,7 @@ async fn dialog_opening_accepts_and_records_only_on_success() {
     };
     assert_eq!(len, 1);
 
-    // 失败路径：不 record（游标不动，对话框保持打开——§1.5 协议）
+    // 失败路径：不 record（游标不动，对话框保持打开——协议语义）
     let before = watched.dialogs.lock().unwrap().get("T1").unwrap().cursor();
     handle_event(
         &watched,
@@ -790,7 +790,7 @@ async fn dialog_opening_accepts_and_records_only_on_success() {
     assert_eq!(after, (before, 1), "失败不移动游标不入档");
 }
 
-/// F2（真机形态，根治回归）：工具命令 in-flight（响应被闸门挂住——真机
+/// 对话框竞速根治回归（真机形态）：工具命令 in-flight（响应被闸门挂住——真机
 /// = click 卡在被 alert 阻塞的页面，命令响应迟迟不回）期间，对话框
 /// 事件到达，handle 必须在同一条连接上立即发出并完成，不等该命令。
 /// 连接被锁包裹（或 send 串行化）的旧实现会在等锁/等命令中错过对话框
@@ -861,7 +861,7 @@ async fn dialog_handle_completes_while_command_in_flight() {
     inflight.await.unwrap().unwrap();
 }
 
-/// F1 端到端：空 target 唯一 page target 时自动选中；多 target → 409 且
+/// 空 target 端到端：唯一 page target 时自动选中；多 target → 409 且
 /// message 列出全部 targetId（不再猜「最近 attach」）。
 #[tokio::test]
 async fn empty_tab_selects_unique_target_or_lists_all() {
@@ -886,9 +886,8 @@ async fn empty_tab_selects_unique_target_or_lists_all() {
     assert_eq!(resp["targetId"], json!("T1"));
 }
 
-/// 根 frame 导航失效 ref；子 frame 导航不失效；文档事件按各自 reason
-/// I1b 行为变化 ②（durable refs）：导航（根/子帧）、documentOpened、
-/// documentUpdated 都**不再主动失效** refs——stale 由解析时判定产生（见
+/// durable refs：导航（根/子帧）、documentOpened、
+/// documentUpdated 都不主动失效 refs——stale 由解析时判定产生（见
 /// click 的 stale 测试）。各事件处理后表内容不变。
 #[tokio::test]
 async fn navigation_keeps_refs_durable_until_resolve_fails() {
@@ -916,7 +915,7 @@ async fn navigation_keeps_refs_durable_until_resolve_fails() {
         );
     }
 
-    // DOM.documentUpdated 事件臂已删除（durable 语义下无事可做）——同样不动 refs
+    // durable 语义下 DOM.documentUpdated 无事可做——同样不动 refs
     handle_event(
         &watched,
         &json!({ "method": "DOM.documentUpdated", "sessionId": "S1" }),
@@ -1071,7 +1070,7 @@ async fn snap_builds_text_swaps_refs_and_bumps_generation() {
     );
 }
 
-/// durable refs（I1b 行为变化 ①）：同文档（frameTree loaderId 不变）两次
+/// durable refs：同文档（frameTree loaderId 不变）两次
 /// snap，@eN 对同一 backendNodeId 稳定复用；无 ref 消失 → removedRefs 省略。
 #[tokio::test]
 async fn snap_durable_refs_reuse_ids_across_snaps_same_document() {
@@ -1206,7 +1205,7 @@ async fn extension_style_sheets_are_excluded_from_registry() {
 
 /// 端到端：登记表 → 取文本 → domain 提取 → querySelectorAll 逐选择器 →
 /// pushNodes 桥 → 第二遍渲染标 [hover] / [hover-reveal]，hoverScan=ok。
-/// spike 定案路径全链（display:none 的 reveal 目标在真实浏览器可命中，
+/// 真机实测定案路径全链（display:none 的 reveal 目标在真实浏览器可命中，
 /// FakeCdp 只验证链路形状）。
 #[tokio::test]
 async fn snap_marks_hover_and_reveal_from_css() {
@@ -1424,7 +1423,7 @@ async fn snap_hover_scan_truncated_by_rule_budget() {
     assert_eq!(resp["refs_count"], json!(0));
 }
 
-/// 桥接失败（pushNodes 报错）→ status=error（任务书三值外的第四值：
+/// 桥接失败（pushNodes 报错）→ status=error（
 /// 诚实区分「没扫出」与「扫不了」）；标记放弃但 snap 主体不受影响。
 #[tokio::test]
 async fn snap_hover_scan_error_when_bridge_fails() {
@@ -1500,7 +1499,7 @@ async fn navigation_clears_sheet_registry_root_frame_only() {
         }),
     )
     .await;
-    // I1b：refs 不随导航失效（durable）；sheets 清理独立发生
+    // refs 不随导航失效（durable）；sheets 清理独立发生
     assert!(
         watched.sheets.lock().unwrap().get("T1").is_none(),
         "根 frame 导航整清登记"
@@ -1653,7 +1652,7 @@ async fn style_sheet_events_maintain_registry_per_tab() {
 
 // ---------------- 工具：click（ref / selector 两路）----------------------
 
-/// ref 路径（I1b：kit resolve_element_center 解析链——DOM.resolveNode →
+/// ref 路径（kit resolve_element_center 解析链——DOM.resolveNode →
 /// 页内 JS 连接检查 + 点击点；坐标 + 我方三段派发）
 #[tokio::test]
 async fn click_ref_path_resolves_center_and_dispatches() {
@@ -1893,7 +1892,7 @@ async fn click_ref_miss_and_stale_errors() {
     }
 
     // 旧 ref 在解析时判 stale：节点脱离 + AX 恢复无果
-    //（I1b 行为变化 ②：stale 不再来自事件失效，来自解析链判定）
+    //（stale 不来自事件失效，来自解析链判定）
     let (svc2, watched2, _c2, script2) = armed();
     seed_ref(&watched2, "T1", "e1", 1, None);
     given(&script2, "DOM.resolveNode", vec![resolve_node_ok("obj1")]);
@@ -1978,7 +1977,7 @@ async fn click_selector_path_locates_hit_tests_and_dispatches() {
 }
 
 /// 可见性 / 遮挡分类（kit 文案）：reason not visible → 422；blocker → 409，
-/// 且零派发（错误码不变；文案从旧 locate/hit 自有文案换 kit 文案）
+/// 且零派发（错误码不变）
 #[tokio::test]
 async fn click_selector_classifies_visibility_and_coverage() {
     let (svc, _w, calls, script) = armed();
@@ -2009,8 +2008,7 @@ async fn click_selector_classifies_visibility_and_coverage() {
 
 /// kit 派发失败：错误码保持 PAGE_DISPATCH_FAILED，effect 语义保守 unknown
 ///（kit 不外露失败相位；绝不标 none——盲重试 = 二次点击）。kit 链无补偿
-/// release（相位未知）——与 clickxy 旧链的「补一发 release」差异点，提交
-/// 信息已披露。
+/// release（相位未知）。
 #[tokio::test]
 async fn click_dispatch_failure_maps_to_conservative_dispatch_failed() {
     let (svc, _w, calls, script) = armed();
@@ -2036,8 +2034,8 @@ async fn click_dispatch_failure_maps_to_conservative_dispatch_failed() {
 
 // ---------------- 工具：fill ---------------------------------------------
 
-/// I2 fill 链：可填前置检查（我方）→ kit fill（focus + select/value 清空
-/// + insertText）→ 回读校验追加（我方）。成功路径结果串与旧链同构。
+/// fill 链：可填前置检查（我方）→ kit fill（focus + select/value 清空
+/// + insertText）→ 回读校验追加（我方）。
 #[tokio::test]
 async fn fill_check_kit_fill_and_readback_verify() {
     let (svc, _w, calls, script) = armed();
@@ -2188,8 +2186,7 @@ async fn fill_rejects_not_fillable_and_reports_mismatch() {
 }
 
 /// 回读阶段 focus_lost：值不一致且焦点不在目标上（页面抢焦点——
-/// insertText 可能落到别处）→ 409 PAGE_FILL_FOCUS_LOST（码与状态不变，
-/// 触发点从旧链的清空阶段移到回读阶段）
+/// insertText 可能落到别处）→ 409 PAGE_FILL_FOCUS_LOST
 #[tokio::test]
 async fn fill_reports_focus_lost_when_page_steals_focus() {
     let (svc, _w, _calls, script) = armed();
@@ -2215,7 +2212,6 @@ async fn fill_reports_focus_lost_when_page_steals_focus() {
 // ---------------- 工具：press --------------------------------------------
 
 /// kit 按键序列：keyDown（带 text）+ keyUp 两段；Ctrl 组合抑制 text
-///（旧链 rawKeyDown/char/keyUp 三段退役——行为差异已在提交信息披露）
 #[tokio::test]
 async fn press_dispatches_keydown_keyup_and_suppresses_combo_text() {
     let (svc, _w, calls, _script) = armed();
@@ -2291,7 +2287,7 @@ async fn press_focuses_ref_target_before_dispatch() {
     );
 }
 
-/// --target selector：统一 kit 解析链（旧链页内 eval focus 脚本退役），
+/// --target selector：统一 kit 解析链，
 /// 未命中 → 404 PAGE_ELEMENT_NOT_FOUND（与 click 同码）
 #[tokio::test]
 async fn press_target_selector_via_kit_resolve() {
@@ -2360,7 +2356,7 @@ async fn wait_satisfied_first_poll_and_timeout_paths() {
         .unwrap();
     assert!(resp3["result"].as_str().unwrap().contains("is detached"));
 
-    // 垃圾观察值 = unknown：满足 attached（TS `observed !== 'detached'` 原样）
+    // 垃圾观察值 = unknown：满足 attached（observed !== 'detached' 原样）
     let (svc4, _w4, _c4, script4) = armed();
     given(
         &script4,
@@ -2420,7 +2416,7 @@ async fn dialogs_reads_buffer_since_cursor() {
     assert_eq!(resp2["entries"].as_array().unwrap().len(), 0);
 }
 
-/// §1.6：命令期间新应答的对话框附 dialogs_seen（仅成功响应）
+/// 命令期间新应答的对话框附 dialogs_seen（仅成功响应）
 #[tokio::test]
 async fn command_attaches_dialogs_seen_on_success() {
     let (svc, _watched, _calls, _script) = armed();
@@ -2472,7 +2468,7 @@ async fn command_attaches_dialogs_seen_on_success() {
 
 // ---------------- 工具级预算 ---------------------------------------------
 
-/// 预算超时 → 504 PAGE_TOOL_TIMEOUT（wait 例外口径在 wait() 内组装）
+/// 预算超时 → 504 PAGE_TOOL_TIMEOUT（wait 例外在 wait() 内组装）
 #[tokio::test]
 async fn within_budget_times_out_stalled_tools() {
     let e = within_budget::<Value, _>(Duration::from_millis(20), "test", std::future::pending())
@@ -2493,14 +2489,14 @@ async fn unknown_tab_errors_through_tool_entry() {
     assert_eq!((e.code(), e.status()), ("PAGE_TAB_NOT_FOUND", 404));
 }
 
-// ---------------- 工具：eval（P2-G）---------------------------------------
+// ---------------- 工具：eval---------------------------------------
 
 /// Runtime.evaluate 原始响应形状（工具层直接拼 result RemoteObject）
 fn rt_result(value: Value) -> Result<Value, String> {
     Ok(json!({ "result": { "type": "stub", "value": value } }))
 }
 
-/// evalStr 序列化全分支：对象 pretty JSON / 字符串原样 / undefined 与
+/// eval 序列化全分支：对象 pretty JSON / 字符串原样 / undefined 与
 /// null 字面量（靠 result.type 区分）/ 数字 JS 形态 / 布尔 / 数组
 #[tokio::test]
 async fn eval_serializes_result_per_ts_evalstr() {
@@ -2574,7 +2570,7 @@ async fn eval_exception_maps_to_page_eval_failed() {
     assert!(e.to_string().contains("ReferenceError"));
 }
 
-// ---------------- 工具：html（P2-G）---------------------------------------
+// ---------------- 工具：html---------------------------------------
 
 /// 两分支：缺省 = documentElement.outerHTML；有 selector = querySelector
 /// 命中元素的 outerHTML（表达式形状断言防退化）
@@ -2614,8 +2610,7 @@ async fn html_reads_full_document_or_selector_element() {
     assert!(expr.contains("outerHTML"));
 }
 
-/// selector 未命中 → 404 PAGE_ELEMENT_NOT_FOUND（任务两选一取错误码，
-/// 区别于 TS 的字符串哨兵 'Element not found'）
+/// selector 未命中 → 404 PAGE_ELEMENT_NOT_FOUND
 #[tokio::test]
 async fn html_selector_miss_reports_element_not_found() {
     let (svc, _w, _calls, script) = armed();
@@ -2631,7 +2626,7 @@ async fn html_selector_miss_reports_element_not_found() {
     assert!(e.to_string().contains("#gone"));
 }
 
-// ---------------- 工具：extract（W-ext）---------------------------------
+// ---------------- 工具：extract---------------------------------
 
 /// 收集器事实（同构 wire 样本）：thead 2 列 + tbody 1 行 + aria-rowcount
 /// 超出可见行 → 归一化后 columns/rows/coverage/meta 齐备
@@ -2771,7 +2766,7 @@ async fn extract_ref_path_resolves_and_calls_on_element() {
     assert_eq!((e.code(), e.status()), ("PAGE_REF_NOT_FOUND", 404));
 }
 
-// ---------------- 工具：clickxy（P2-G）------------------------------------
+// ---------------- 工具：clickxy------------------------------------
 
 /// 坐标即意图：直接三段派发（带 session），零 eval（无 locate/hit-test）
 #[tokio::test]
@@ -2812,7 +2807,7 @@ async fn clickxy_rejects_non_finite_coordinates() {
     assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 0);
 }
 
-// ---------------- 工具：type（P2-G，owner 补充）---------------------------
+// ---------------- 工具：type---------------------------
 
 /// kit type_text_into_active_context：对焦点元素逐字符派发（可打印字符
 /// insertText，\n/\t 走真按键事件），无任何定位/校验 eval
@@ -2841,7 +2836,7 @@ async fn type_inserts_text_into_focused_element() {
     assert_eq!(calls_of(&calls2, "Input.insertText").len(), 2);
 }
 
-/// 空文本 → 400（对齐 TS typeStr 的 'text required'）
+/// 空文本 → 400（'text required'）
 #[tokio::test]
 async fn type_rejects_empty_text() {
     let (svc, _w, calls, _script) = armed();
@@ -2850,7 +2845,7 @@ async fn type_rejects_empty_text() {
     assert_eq!(calls_of(&calls, "Input.insertText").len(), 0);
 }
 
-// ---------------- 工具：loadall（P2-G）------------------------------------
+// ---------------- 工具：loadall------------------------------------
 
 fn rt_bool(b: bool) -> Result<Value, String> {
     Ok(json!({ "result": { "type": "boolean", "value": b } }))
@@ -2862,7 +2857,7 @@ fn located_ok() -> Result<Value, String> {
 }
 
 /// 分支一：存在 → 原生点击一次 → 下一轮探针消失 → 'until it disappeared'
-///（I2：点击层 = kit click selector 路径，定位与派发一体）
+///（点击层 = kit click selector 路径，定位与派发一体）
 #[tokio::test]
 async fn loadall_clicks_until_selector_disappears() {
     let (svc, _w, calls, script) = armed();
@@ -2970,7 +2965,7 @@ async fn loadall_rejects_bad_interval_and_empty_selector() {
     assert_eq!(calls_of(&calls, "Input.dispatchMouseEvent").len(), 0);
 }
 
-// ---------------- 工具：hover / scroll / drag / select / check / tap（I2）--
+// ---------------- 工具：hover / scroll / drag / select / check / tap--
 
 /// hover：ref 路径解析链 + 单发 mouseMoved；结果坐标 = 顶层视口
 #[tokio::test]
@@ -3618,7 +3613,7 @@ async fn load_event_resolves_waiter_by_tab_and_cleanup_on_drop() {
     assert!(watched.load_waiters.lock().unwrap().get("TAB2").is_none());
 }
 
-// ---------------- 工具：screenshot（W-cap；I3 内核 = kit screenshot.rs）----
+// ---------------- 工具：screenshot（内核 = kit screenshot.rs）----
 
 /// 无 target = 整视口：kit captureScreenshot（fromSurface=true，无 clip——
 /// 与 CDP 缺省 fromSurface 同义）；响应形状契约不变（format/data）。
@@ -3648,10 +3643,10 @@ async fn screenshot_viewport_captures_without_clip() {
     assert_eq!(cap[0].session.as_deref(), Some("S1"));
 }
 
-/// ref 路径（I3：kit 对象解析 → getBoundingClientRect（视口 rect）→ 文档
+/// ref 路径（kit 对象解析 → getBoundingClientRect（视口 rect）→ 文档
 /// 坐标换算（帧偏移 + window scroll）→ 浮点 clip + captureBeyondViewport）。
-/// **不滚动页面**（kit 文档坐标换算不依赖滚动，截图无副作用——与旧实现
-/// 的 scrollIntoView 差异，报告披露）；clip 不再外扩取整（kit 浮点直传）。
+/// **不滚动页面**（kit 文档坐标换算不依赖滚动，截图无副作用）；clip 不
+/// 外扩取整（kit 浮点直传）。
 #[tokio::test]
 async fn screenshot_ref_clips_document_rect_without_scrolling() {
     let (svc, watched, calls, script) = armed();
@@ -3675,7 +3670,7 @@ async fn screenshot_ref_clips_document_rect_without_scrolling() {
     );
     let resp = svc.screenshot(INS, "T1", Some("@e1"), false).await.unwrap();
     assert_eq!(resp["data"], json!("aGVsbG8="));
-    // 不滚动（旧实现的 scrollIntoViewIfNeeded 在 kit 路径不存在）
+    // 不滚动（kit 路径无 scrollIntoViewIfNeeded）
     assert_eq!(
         calls_of(&calls, "DOM.scrollIntoViewIfNeeded").len(),
         0,
@@ -3691,7 +3686,7 @@ async fn screenshot_ref_clips_document_rect_without_scrolling() {
     assert_eq!(cap[0].param("fromSurface"), json!(true));
 }
 
-/// selector 路径（I3：kit Runtime.evaluate 对象解析，不再走 nodeId 链）；
+/// selector 路径（kit Runtime.evaluate 对象解析，不走 nodeId 链）；
 /// 未命中（result 无 objectId）→ kit "Element not found" → 404 同码。
 #[tokio::test]
 async fn screenshot_selector_resolves_via_kit_and_reports_not_found() {
@@ -3748,9 +3743,9 @@ async fn screenshot_selector_resolves_via_kit_and_reports_not_found() {
     assert_eq!((e.code(), e.status()), ("PAGE_ELEMENT_NOT_FOUND", 404));
 }
 
-/// 零面积 rect（I3 行为变化，报告披露）：kit 无退化前置校验，0 高 rect
-/// 原样进 clip → CDP 拒绝 → 500 PAGE_ACTION_FAILED 带原文（旧实现为 409
-/// PAGE_TARGET_MOVED——截图三形态契约不变，错误码语义变化已披露）。
+/// 零面积 rect：kit 无退化前置校验，0 高 rect
+/// 原样进 clip → CDP 拒绝 → 500 PAGE_ACTION_FAILED 带原文（截图三形态
+/// 契约不变）。
 #[tokio::test]
 async fn screenshot_zero_height_rect_fails_via_cdp_rejection() {
     let (svc, watched, _calls, script) = armed();
@@ -3804,9 +3799,9 @@ async fn screenshot_empty_target_is_rejected() {
     assert_eq!(calls_of(&calls, "Page.captureScreenshot").len(), 0);
 }
 
-// ---------------- 工具：screenshot --full（W-shot；I3 尺寸源 = kit 同源）--
+// ---------------- 工具：screenshot --full（尺寸源 = kit 同源）--
 
-/// full 未超限（I3）：我方预读（eval DPR + getLayoutMetrics cssContentSize）
+/// full 未超限：我方预读（eval DPR + getLayoutMetrics cssContentSize）
 /// → kit full_page（kit 内部再读一次 getLayoutMetrics 定 clip——幂等读，
 /// 与预读同源 cssContentSize）。响应尺寸证据字段 = 预读值；clip 由 kit
 /// 构造（0,0,w,h,scale 1）+ captureBeyondViewport。
@@ -3854,7 +3849,7 @@ async fn screenshot_full_clips_whole_document_with_evidence_fields() {
 /// 上限 8192 CSS px：20000×9000.8 文档 → 双边截到 8192、truncated=true、
 /// documentWidth/Height 保留原始读数。**此罕见路径 kit 无法表达截断 clip**
 ///（ScreenshotOptions 无自定义 clip 入口），保留我方 CDP 直发序列——契约
-/// 优先于「全走 kit」（报告披露）。DPR=1 → 上限 16384：宽截高不截，
+/// 优先于「全走 kit」。DPR=1 → 上限 16384：宽截高不截，
 /// truncated 仍 true（任一边）。
 #[tokio::test]
 async fn screenshot_full_caps_each_side_by_dpr_and_marks_truncated() {
@@ -3944,7 +3939,7 @@ async fn screenshot_full_and_target_are_mutually_exclusive() {
     assert_eq!(calls_of(&calls, "Runtime.evaluate").len(), 0);
 }
 
-// ---------------- 工具：pdf（W-cap）------------------------------------
+// ---------------- 工具：pdf------------------------------------
 
 /// 参数透传 + 缺省归一：landscape=false / printBackground=true /
 /// 8.5×11；显式给值时原样透传；响应 format=pdf + data。
@@ -4000,7 +3995,7 @@ async fn pdf_rejects_non_positive_paper() {
     assert_eq!(calls_of(&calls, "Page.printToPDF").len(), 0);
 }
 
-// ---------------- 工具：diff（I3：快照文本 diff）--------------------------
+// ---------------- 工具：diff（快照文本 diff）--------------------------
 
 /// 快照 mock：单按钮 AX 树（name 可变，构造两次 diff 间的变化）
 fn snap_tree(name: &str) -> Result<Value, String> {
@@ -4066,7 +4061,7 @@ async fn diff_first_run_counts_all_added_then_baseline_updates() {
 }
 
 /// 变化检测：按钮 name 变化 → removed 旧行 + added 新行 + counts 对齐；
-/// @eN 记号不剥（durable refs 下记号漂移即真实变化信号——I1b 决策）。
+/// @eN 记号不剥（durable refs 下记号漂移即真实变化信号）。
 #[tokio::test]
 async fn diff_detects_content_change_and_keeps_ref_tokens() {
     let (svc, watched, _calls, script) = armed();
@@ -4196,7 +4191,7 @@ async fn diff_oversized_snapshot_clears_baseline_with_disclosure() {
     );
 }
 
-// ---------------- 工具：diff-shot（I3：像素 diff）------------------------
+// ---------------- 工具：diff-shot（像素 diff）------------------------
 
 /// 构造纯色 png bytes（image crate 编码，与 kit diff_screenshot 同依赖）
 fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
@@ -4299,7 +4294,7 @@ async fn diff_shot_rejects_bad_baseline() {
     assert!(e2.to_string().contains("baseline"), "{e2}");
 }
 
-// ---------------- 工具：profiler（I3：kit tracing.rs）--------------------
+// ---------------- 工具：profiler（kit tracing.rs）--------------------
 
 /// start → stop 全链路：Tracing.start（categories 透传 + ReportEvents 采样
 /// 模式）→ 事件总线注入 dataCollected/tracingComplete → Tracing.end →
@@ -4423,7 +4418,7 @@ async fn profiler_stop_without_running_conflicts_and_tab_drop_discards() {
     assert_eq!((e2.code(), e2.status()), ("PAGE_PROFILER_NOT_RUNNING", 409));
 }
 
-// ---------------- 工具：emulate（W-cap）-------------------------------
+// ---------------- 工具：emulate-------------------------------
 
 /// preset 形态：metrics + UA + touch 三命令成套（iphone-14 自带 mobile/touch
 /// 与真实 UA），deviceScaleFactor 不覆盖（0 = 保持宿主缩放）。
@@ -4584,7 +4579,7 @@ async fn emulate_unknown_preset_422_before_any_cdp() {
     assert_eq!(emulate_calls, 0);
 }
 
-// ---------------- W-oopif：帧登记 / snap 合并 / 投影 / 帧会话路由 ----------------
+// ---------------- 帧登记 / snap 合并 / 投影 / 帧会话路由 ----------------
 
 fn register_frame(
     watched: &Watched,
@@ -4608,8 +4603,7 @@ fn register_frame(
     );
 }
 
-/// frameAttached → iframe attach 认领 → frameDetached 摘除 + 帧内 ref 失效；
-/// frameAttached → iframe attach 认领 → frameDetached 摘除登记（I1b 起不
+/// frameAttached → iframe attach 认领 → frameDetached 摘除登记（不
 /// 标记 ref 失效：durable refs，帧死亡由解析链自然判定）；attach 先于
 /// frameAttached 的孤儿路径同样收敛
 #[tokio::test]
@@ -4713,8 +4707,7 @@ async fn frame_registry_lifecycle_via_events() {
     );
 }
 
-/// frameNavigated：子帧 → 仅该帧条目 stale；根帧 → 整表失效 + 帧登记清空
-/// I1b durable 语义下的帧导航：子帧导航只换该帧文档（帧表登记不动、refs
+/// 帧导航（durable 语义）：子帧导航只换该帧文档（帧表登记不动、refs
 /// 不失效）；根导航重建帧表（root 先清后写）+ 清 sheets，refs 同样不动。
 #[tokio::test]
 async fn frame_navigation_scopes_invalidation() {
@@ -4862,8 +4855,7 @@ async fn root_navigation_rebuilds_frame_table_with_root_set() {
     );
 }
 
-/// snap 合并：帧树渲染为挂接点下的 [frame] 段，@eN 连续编号，
-/// snap 合并（I1b：kit 帧递归）：Iframe 节点行下内嵌帧子树（缩进 +2），
+/// snap 合并（kit 帧递归）：Iframe 节点行下内嵌帧子树（缩进 +2），
 /// @eN 跨帧连续编号（主树先、帧树后）；RefMap 条目携带 frame_id（主树条目
 /// 无）；帧 AX 拉取走帧会话（OOPIF），主树走主会话。
 #[tokio::test]
@@ -4933,7 +4925,7 @@ async fn snap_merges_frame_subtree_with_continuous_refs() {
 }
 
 /// click 帧内 ref：元素 quad 在帧会话解析 → owner quad 在主会话解析 →
-/// OOPIF 帧本地坐标——浏览器按帧会话路由，取代旧的根视口投影链）。
+/// OOPIF 帧本地坐标——浏览器按帧会话路由）。
 #[tokio::test]
 async fn click_ref_in_frame_resolves_and_dispatches_on_frame_session() {
     let (svc, watched, _calls, script) = armed();
@@ -5046,7 +5038,7 @@ async fn click_frame_ref_via_event_path_registered_frame() {
 }
 
 /// fill 帧内 ref：解析/检查/回读（DOM/Runtime 命令）路由到 frame session；
-/// kit fill 的 insertText 发 page 级会话（渲染进程按焦点路由——I2 语义）
+/// kit fill 的 insertText 发 page 级会话（渲染进程按焦点路由）
 #[tokio::test]
 async fn fill_ref_in_frame_runs_on_frame_session() {
     let (svc, watched, _calls, script) = armed();
@@ -5117,7 +5109,7 @@ async fn fill_ref_in_frame_runs_on_frame_session() {
 }
 
 /// 帧级失效后的 ref 使用 → 409 PAGE_REF_STALE（曾存在、已随帧死亡，
-///（曾存在、解析失败——语义区别于 NOT_FOUND；I1b 起由解析链产生）
+///（曾存在、解析失败——语义区别于 NOT_FOUND；由解析链产生）
 #[tokio::test]
 async fn stale_frame_ref_reports_ref_stale() {
     let (svc, watched, _calls, script) = armed();
@@ -5152,13 +5144,10 @@ async fn stale_frame_ref_reports_ref_stale() {
     assert_eq!(err2.code(), "PAGE_REF_NOT_FOUND", "未知 ref 仍 404");
 }
 
-/// sync 帧树主动路径（真机打磨核心）：未注入登记时，snap 内联完成
-/// getTargets 发现 → getFrameOwner 归属（owner 校验：主树 bni 必须是
-/// iframe 类节点，防死帧/异页污染）→ attachToTarget 认领会话 → 帧树
-/// sync 帧树主动路径（W-oopif 保留）：未注入登记时，snap 内联完成
+/// sync 帧树主动路径：未注入登记时，snap 内联完成
 /// getTargets 发现 → getFrameOwner 归属 → attachToTarget 认领会话 →
-/// kit 帧递归合并。I1b：owner 校验（主树 bni 必须是 iframe 类节点）随 AX
-/// 中间树删除移交 kit——死帧登记不再被拒，但表现为惰性（快照递归按 AX 树
+/// kit 帧递归合并。owner 校验（主树 bni 必须是 iframe 类节点）在 kit——
+/// 死帧登记不被拒，但表现为惰性（快照递归按 AX 树
 /// 的 Iframe 节点发起，死帧不在树中不会被请求；iframe_sessions 只含带
 /// 会话的活帧）。
 #[tokio::test]
@@ -5238,11 +5227,11 @@ async fn snap_syncs_frame_registry_via_target_probe() {
     assert!(m.get("e2").unwrap().frame_id.is_none());
 }
 
-/// nodeId 碰撞回归（owner 复测缺陷）：主树与帧树的 nodeId 是两套独立
+/// nodeId 碰撞回归（复测缺陷）：主树与帧树的 nodeId 是两套独立
 /// 计数（都从 1 起）——裸键共享 visited 时帧节点被误判重复剪掉，
 /// 帧内容**稳定**整体缺席（id 全碰撞形态）。修复 = 帧树 visited 键加
 
-// ---------------- W-file：下载等待 / 记录环 / 上传 ----------------------
+// ---------------- 下载等待 / 记录环 / 上传 ----------------------
 
 /// 临时目录里的真实文件（上传校验用；目录唯一防并发测试互踩）。
 /// 返回 canonicalize 物理路径——macOS 的 temp 在 /var 软链下，upload 的
@@ -5735,7 +5724,7 @@ fn validate_upload_file_enforces_host_side_rules() {
     assert_eq!((name.as_str(), size), ("ok.txt", 5));
 }
 
-// ---------------- 工具：record（I4：kit recording.rs）--------------------
+// ---------------- 工具：record（kit recording.rs）--------------------
 
 use crate::application::browser_kit::recording::{
     CaptureSession, RecordingOptions, RecordingState,
@@ -5813,7 +5802,7 @@ async fn record_stop_without_running_conflicts() {
     assert!(e.to_string().contains("连接重建"), "{e}");
 }
 
-/// attach/detach 豁免（I4 重点）：capture session 的事件不得进 tabs 生命周期
+/// attach/detach 豁免：capture session 的事件不得进 tabs 生命周期
 /// ——attachedToTarget 不得覆写锚点 tab 的 session（否则后续命令全路由到
 /// capture session）、detachedFromTarget 不得误删锚点 tab。两层判定：
 /// kit owns_attachment（slot 有 sid / in-flight 无 sid）+ 豁免表（stop 后

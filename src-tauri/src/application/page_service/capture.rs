@@ -9,27 +9,27 @@ use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::SharedPageConn;
 use serde_json::{json, Value};
 // ============================================================================
-// 6b. 截图 / PDF / 仿真（W-cap；I3 起 screenshot 内核 = kit screenshot.rs）
+// 6b. 截图 / PDF / 仿真（screenshot 内核 = kit screenshot.rs）
 // ============================================================================
 
-/// screenshot 工具（I3：内核换 kit `screenshot::take_screenshot`）。三形态
+/// screenshot 工具（内核 = kit `screenshot::take_screenshot`）。三形态
 /// → kit 三模式：视口（无 clip、fromSurface）/ 元素（selector 入参，kit
 /// 对象解析 + 视口 rect → 文档坐标换算 → clip + captureBeyondViewport）/
 /// 全页（Page.getLayoutMetrics cssContentSize → clip + captureBeyondViewport）。
 /// 我方保留层（kit 无此保护）：全页 DPR 16384 设备像素上限与 truncated
 /// 披露、互斥校验（service 入口）、响应形状契约。
 ///
-/// 与旧实现的行为差异（I3 全量 diff 披露，详见任务报告）：
-/// - 元素路径不再 scrollIntoView（kit 文档坐标换算不依赖滚动，截图不再
-///   改变页面滚动位置）；clip 从外扩取整（rounded_clip）变为 kit 浮点
+/// 行为要点：
+/// - 元素路径不做 scrollIntoView（kit 文档坐标换算不依赖滚动，截图不
+///   改变页面滚动位置）；clip 为 kit 浮点
 ///   rect 直传（DPR≠1 下边缘可能存在亚像素差异）；
-/// - 元素几何退化（零宽/高）不再前置拦为 409 PAGE_TARGET_MOVED——kit 无
-///  该校验，0×0 clip 由 CDP 拒绝 → 500 PAGE_ACTION_FAILED 带原文；
-/// - 全页尺寸源从 eval scrollWidth/scrollHeight 换为 getLayoutMetrics
-///   cssContentSize（与 kit 内部 clip 同源，消除两套读数的边缘错位）；
+/// - 元素几何退化（零宽/高）不前置拦为 409 PAGE_TARGET_MOVED——kit 无
+///   该校验，0×0 clip 由 CDP 拒绝 → 500 PAGE_ACTION_FAILED 带原文；
+/// - 全页尺寸源 = getLayoutMetrics
+///   cssContentSize（与 kit 内部 clip 同源，避免两套读数的边缘错位）；
 /// - 超限（cssContentSize 任一边 > 16384/DPR）时 kit 无法表达截断 clip
-///   （ScreenshotOptions 无自定义 clip 入口，红线禁改 kit），保留旧 CDP
-///   直发截断序列作为此罕见路径的实现——对外契约（截断 + truncated:
+///   （ScreenshotOptions 无自定义 clip 入口，且 kit 禁改），走我方 CDP
+///   直发截断序列——对外契约（截断 + truncated:
 ///   true + 原始读数）不变。
 pub(crate) async fn screenshot_tool(
     watched: &Watched,
@@ -314,8 +314,8 @@ pub(crate) async fn emulate_tool(
     }
 }
 
-/// 存在性探针（TS loadAllStr 的 `!!document.querySelector(sel)`）：eval
-/// 失败（导航中）原样上抛，循环不吞异常（TS 同为抛错退出）。
+/// 存在性探针（!!document.querySelector(sel)）：eval
+/// 失败（导航中）原样上抛，循环不吞异常。
 pub(crate) async fn selector_exists(
     conn: &SharedPageConn,
     sid: &str,
