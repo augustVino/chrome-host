@@ -79,11 +79,11 @@ page extract <id> [sel|@eN] [--tab t] [--out f.json]  表格 → 结构化 JSON�
 page pdf     <id> [--out f] [--landscape] [--no-print-background] [--paper-width 8.5] [--paper-height 11] [--tab t]  整页 PDF（缺省 Letter 纵向带背景）
 page diff    <id> [t] [-s sel] [-c] [-d n] [--baseline-file f]  快照文本 diff：当前 snap ↔ 上次基线（滚动更新；@eN 记号不剥，漂移即变化）；--baseline-file 只比较不更新；响应 {changed, added, removed, counts, diff}；快照超 2MiB 不入基线标 baselineCleared；quiet=changed
 page diff-shot <id> --baseline-file <png> [--full] [--tab t] [--out f]  像素 diff：基线 png（必填）↔ 当前截图（--full 全页）；{differing, ratio, image?, dimensionMismatch?}；--out 落差异图（红标+灰阶）
-page profiler start <id> [t] [--categories "a,b"]  启动性能采样（Chrome tracing ReportEvents+采样；不占串行锁；缺省全家桶分类；重复 → 409 PAGE_PROFILER_ALREADY_ACTIVE）
-page profiler stop  <id> [--out f.json]  停止采样并落盘 traceEvents JSON（按 start 锚点路由无需 tab；收集至多 30s；缺省 <id>-trace.json；无运行中 → 409 PAGE_PROFILER_NOT_RUNNING；quiet=落盘路径）
+page profiler-start <id> [t] [--categories "a,b"]  启动性能采样（Chrome tracing ReportEvents+采样；不占串行锁；缺省全家桶分类；重复 → 409 PAGE_PROFILER_ALREADY_ACTIVE）
+page profiler-stop  <id> [--out f.json]  停止采样并落盘 traceEvents JSON（按 start 锚点路由无需 tab；收集至多 30s；缺省 <id>-trace.json；无运行中 → 409 PAGE_PROFILER_NOT_RUNNING；quiet=落盘路径）
 
-| `page record start <ID> <FILE> [--fps N] [--cursor] [--tab T]` | 启动录屏：screencast→ffmpeg；FILE 扩展名定容器（.webm/.mp4/.mov）；fps 1-60 缺省 30；--cursor 合成光标；缺 ffmpeg → 422 PAGE_RECORD_NO_FFMPEG；重复 → 409 |
-| `page record stop <ID> [--status]` | 停止录屏落盘（编码收尾数秒；响应 path/frames/capturedFrames/fps；无运行中 → 409 PAGE_RECORD_NOT_RUNNING） |page emulate <id> --preset NAME | --viewport WxH [--user-agent UA] [--mobile] [--touch] | --off [--tab t]  设备仿真（预设：iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p；仅作用该 tab，重复=覆盖，--off 恢复）
+| `page record-start <ID> <FILE> [--fps N] [--cursor] [--tab T]` | 启动录屏：screencast→ffmpeg；FILE 扩展名定容器（.webm/.mp4/.mov）；fps 1-60 缺省 30；--cursor 合成光标；缺 ffmpeg → 422 PAGE_RECORD_NO_FFMPEG；重复 → 409 |
+| `page record-stop <ID> [--status]` | 停止录屏落盘（编码收尾数秒；响应 path/frames/capturedFrames/fps；无运行中 → 409 PAGE_RECORD_NOT_RUNNING） |page emulate <id> --preset NAME | --viewport WxH [--user-agent UA] [--mobile] [--touch] | --off [--tab t]  设备仿真（预设：iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p；仅作用该 tab，重复=覆盖，--off 恢复）
 page eval    <id> <expr> [--tab t]          执行 JS（returnByValue+awaitPromise；优先用上面的原语）
 page raw     <id> <method> [json] [--tab t] [--browser]  任意 CDP 命令透传（⚠ 最高权限逃生舱；--browser 发 browser 级）
 page html    <id> [selector] [--tab t]      页面/元素 outerHTML
