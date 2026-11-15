@@ -241,6 +241,12 @@ jobs:
           key: cli-${{ matrix.target }}
           prefix-key: v2-cli
 
+      # musl 目标需要 C 编译器（ring/rustls 的加密原语含 C 代码）：
+      # musl-tools 提供 x86_64-linux-musl-gcc（v0.7.5 首跑缺此包构建失败）
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build CLI
         run: cargo build --release -p chrome-host-cli --target ${{ matrix.target }}
 
