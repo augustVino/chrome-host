@@ -12,6 +12,15 @@
 //! 错误形态：上游能力层以 `Result<_, String>` 传递错误（无错误分类），适配器
 //! 把 AppError 的 message 抽出为 String；集成层（page_service）负责把 kit 的
 //! String 错误映射回 chrome-host 的错误码体系。
+//!
+//! CHROME-HOST ADAPTATIONS (V1): CdpClient 增加会话级 active_frame 字段。
+//!   what: 新增 `active_frame: Option<String>` 字段（构造期经
+//!         `with_active_frame` 注入，无 interior mutability）、只读 getter
+//!         `active_frame()`；new() 签名不变（默认 None）。
+//!   why: 上游把 active_frame 放在 element.rs 的进程级 static
+//!        （ACTIVE_FRAME）里、命令前镜像会话态——单 session 单浏览器安全；
+//!        chrome-host 多实例并发，进程级全局会跨实例串态，故下沉为 client
+//!        实例字段，随连接生命周期隔离。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -42,11 +51,16 @@ struct RawError {
 pub struct CdpClient {
     conn: SharedPageConn,
     bus: broadcast::Sender<CdpEvent>,
-    /// subscribe_session 的过滤转发任务登记：session_id → 发送端（与
+    /// session_subs 的过滤转发任务登记：session_id → 发送端（与
     /// subscribe_session 的通道形态统一为有界 Sender）。持有 clone 供
     /// unsubscribe_session 移除（drop 发送端 → 转发任务在下次 send 失败
     /// 时自然退场；接收端 drop 同理）。
     session_subs: Mutex<HashMap<String, mpsc::Sender<CdpEvent>>>,
+    /// 会话级 `frame <sel>` 选择：CSS 选择器解析时优先在该 frame 内解析
+    /// （见 element.rs 两个 fallback 分支）。构造期注入后只读——上游在
+    /// daemon 里每次命令前镜像 DaemonState.active_frame_id，本项目改为
+    /// 按会话在构造期定值，避免进程级全局态跨实例串扰。
+    active_frame: Option<String>,
 }
 
 impl CdpClient {
@@ -55,7 +69,21 @@ impl CdpClient {
             conn,
             bus,
             session_subs: Mutex::new(HashMap::new()),
+            active_frame: None,
         }
+    }
+
+    /// 构造器：注入会话级 active_frame（链式，链完即定值）。语义对齐上游
+    /// daemon 的 set_active_frame(state.active_frame_id)，但改为构造期
+    /// 一次性注入——client 无 interior mutability，多实例并发下天然隔离。
+    pub fn with_active_frame(mut self, frame_id: Option<String>) -> Self {
+        self.active_frame = frame_id;
+        self
+    }
+
+    /// 当前会话的 `frame <sel>` 选择（无则 None；见字段注释）。
+    pub fn active_frame(&self) -> Option<&str> {
+        self.active_frame.as_deref()
     }
 
     /// 测试构造器（vendored 测试模块用）：直连 ws URL 建真实 CdpConnection
@@ -96,8 +124,8 @@ impl CdpClient {
         params: &P,
         session_id: Option<&str>,
     ) -> Result<R, String> {
-        let params_value = serde_json::to_value(params)
-            .map_err(|e| format!("Failed to serialize params: {e}"))?;
+        let params_value =
+            serde_json::to_value(params).map_err(|e| format!("Failed to serialize params: {e}"))?;
         let result = self
             .send_command(method, Some(params_value), session_id)
             .await?;
@@ -122,8 +150,8 @@ impl CdpClient {
         params: &P,
         session_id: Option<&str>,
     ) -> Result<R, String> {
-        let params_value = serde_json::to_value(params)
-            .map_err(|e| format!("Failed to serialize params: {e}"))?;
+        let params_value =
+            serde_json::to_value(params).map_err(|e| format!("Failed to serialize params: {e}"))?;
         let text = self
             .conn
             .send_raw(method, params_value, session_id)
@@ -138,11 +166,14 @@ impl CdpClient {
             None => Err(error),
         })?;
         if let Some(err) = response.error {
-            return Err(format!("CDP error ({method}): {} {}", err.code, err.message));
+            return Err(format!(
+                "CDP error ({method}): {} {}",
+                err.code, err.message
+            ));
         }
-        response
-            .result
-            .ok_or_else(|| format!("Failed to deserialize CDP response for {method}: missing result"))
+        response.result.ok_or_else(|| {
+            format!("Failed to deserialize CDP response for {method}: missing result")
+        })
     }
 
     /// 发送命令不等响应（recording 的 screencastFrameAck：高频 ack 不占
