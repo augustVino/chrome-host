@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 // ============================================================================
-// 3c. 下载运行态（W-file）：browser 级事件登记 + 终态结算 + 命令式等待
+// 3c. 下载运行态：browser 级事件登记 + 终态结算 + 命令式等待
 // ============================================================================
 
 /// 实例级下载运行态（Browser 域事件无 session 维度，故非 per-tab）。
@@ -47,7 +47,7 @@ impl DownloadState {
         self.waiters.clear();
     }
 }
-/// 下载文件名净化（W-file 安全边界）：拒路径分隔符与 ../ 逃逸。
+/// 下载文件名净化（安全边界）：拒路径分隔符与 ../ 逃逸。
 /// 返回 (展示名, 是否拒绝拼路径)。判定规则：
 /// - 含 '/' 或 '\\'、或 file_name() 取出的末段 ≠ 原文（含 ../ 类形态）、
 ///   或末段为空/. /.. → unsafe；
@@ -169,7 +169,7 @@ pub(crate) fn on_download_progress(watched: &Watched, params: &Value) {
         record["note"] = json!("suggestedFilename 含路径形态，路径拼接已拒绝");
     }
     // 等待者结算：弹栈直到 send 成功（超时残留的死 sender 在此清理）；
-    // 先到先得 = 多下载并行时等待者拿最早结算的（任务口径：wait 返回
+    // 先到先得 = 多下载并行时等待者拿最早结算的（wait 返回
     // 最先完成的；其余留在环里供 GET /page/downloads 查询）
     let mut matched = false;
     while let Some(tx) = st.waiters.pop_front() {

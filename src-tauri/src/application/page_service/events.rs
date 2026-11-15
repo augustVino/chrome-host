@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedReceiver;
 // ============================================================================
-// 2. watch_loop：事件消费（对接 P2-A 模型）
+// 2. watch_loop：事件消费
 // ============================================================================
 
 /// watcher 主循环：消费事件流直到通道关闭（= reader 结束 = 连接死亡，与
@@ -65,8 +65,7 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
     };
     let params = event.get("params").cloned().unwrap_or(Value::Null);
     match method {
-        // §3.6 失效源接线（daemon.mjs bindRefInvalidation）+ attach 映射 +
-        // OOPIF 帧登记（W-oopif）
+        // attach 映射 + OOPIF 帧登记
         "Target.attachedToTarget" => on_attached(watched, &params).await,
         "Target.detachedFromTarget" => on_detached(watched, &params),
         "Target.targetDestroyed" => {
@@ -139,7 +138,7 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
                 }
             }
         }
-        // Fetch 拦截决策（任务红线 ①）：requestPaused 在**事件流内**决策并回——
+        // Fetch 拦截决策：requestPaused 在**事件流内**决策并回——
         // on_request_paused 不碰 per-instance 命令串行锁（watch_loop 天然不持
         // 锁），拦截响应命令走 conn 并发 send，与 in-flight 工具命令互不阻塞；
         // 否则规则拦截会堵死全部 page 命令。
@@ -148,12 +147,12 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
                 on_request_paused(watched, sid, &params).await;
             }
         }
-        // W-file：browser 级下载事件（无 session 维度，establish 时
+        // browser 级下载事件（无 session 维度，establish 时
         // setDownloadBehavior{eventsEnabled} 开启）：WillBegin 登记、
         // Progress 终态结算 + 等待者放行（同步登记，不发命令，不碰串行锁）
         "Browser.downloadWillBegin" => on_download_begin(watched, &params),
         "Browser.downloadProgress" => on_download_progress(watched, &params),
-        // 仅根 frame（parentId 为空）才换主文档。I1b 起 refs 不再主动失效
+        // 仅根 frame（parentId 为空）才换主文档。refs 不主动失效
         //（durable refs：stale 由解析时 is_detached / AX 唯一匹配恢复判定产生）；
         // 帧表维护保留：根导航 = 新文档的旧子帧全部死亡（frameDetached 不保证
         // 补发，整表重建），子帧导航无事可做。
@@ -187,7 +186,7 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
             }
         }
         // OOPIF 帧树维护（主 frame session 事件）：attach 登记（含父链），
-        // detach → 摘除登记（I1b 起不标记 ref 失效，durable refs 自判）
+        // detach → 摘除登记（不标记 ref 失效，durable refs 自判）
         "Page.frameAttached" => {
             if let Some(tid) = tab_of_session(watched, event) {
                 let (Some(fid), Some(parent)) = (
@@ -223,7 +222,7 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
                 // document.open() 同样换文档：旧样式表全部销毁且
                 // styleSheetRemoved 不保证补发（与根导航同一死表形态）——
                 // 清登记 + 重开结算窗口，新表由 styleSheetAdded 重放。
-                // refs 不主动失效（I1b durable 语义）。
+                // refs 不主动失效（durable 语义）。
                 reset_sheet_registry(watched, &tid);
             }
         }
@@ -231,7 +230,7 @@ pub(crate) async fn handle_event(watched: &Watched, event: &Value) {
     }
 }
 
-/// 录制 capture session 判定（I4）：该 (targetId, sessionId) 是否属于当前
+/// 录制 capture session 判定：该 (targetId, sessionId) 是否属于当前
 /// 录制的专属 capture session。两层：豁免表（attach 响应后登记，含 stop
 /// 后 slot 已清的窗口——detach 事件消费式摘除）；kit owns_attachment
 ///（attach in-flight：Chrome 先发 attachedToTarget 再回 attach 响应，
@@ -249,7 +248,7 @@ fn is_capture_session(watched: &Watched, tid: &str, sid: &str) -> bool {
 }
 
 /// attachedToTarget：type=page 建 targetId→sessionId 映射并补域 enable；
-/// type=iframe 登记 OOPIF 帧会话（W-oopif，enable 复用同一套——fill/press/
+/// type=iframe 登记 OOPIF 帧会话（enable 复用同一套——fill/press/
 /// eval 的 DOM/Runtime 命令将路由到 frame session）。best-effort：enable/
 /// 探测失败只缺对应能力，不影响命令路径。
 async fn on_attached(watched: &Watched, params: &Value) {
@@ -266,7 +265,7 @@ async fn on_attached(watched: &Watched, params: &Value) {
     let Some(sid) = params.get("sessionId").and_then(Value::as_str) else {
         return;
     };
-    // I4 attach 豁免（关键）：kit 录制对锚点 page target 建第二个 flattened
+    // attach 豁免（关键）：kit 录制对锚点 page target 建第二个 flattened
     // capture session（screencast 专属），其 attach 事件 type=page——不豁免会
     // 被 tabs.attach 原位覆写锚点 tab 的 session（后续命令全部路由到 capture
     // session，路由全乱）。两层判定见 is_capture_session。
@@ -281,7 +280,7 @@ async fn on_attached(watched: &Watched, params: &Value) {
             watched.tabs.lock().unwrap().attach(tid, sid);
             enable_session_domains(watched, &conn, tid, sid, true).await;
         }
-        // OOPIF（W-oopif）：targetId == frameId（Chrome 不变式）。归属 tab 未知
+        // OOPIF：targetId == frameId（Chrome 不变式）。归属 tab 未知
         // 时先存孤儿会话（frameAttached 到达时认领）；enable 照发——frame
         // session 的 Page/DOM 域是 fill/press 跨 frame 的命令通道
         "iframe" => {
@@ -314,8 +313,8 @@ async fn on_attached(watched: &Watched, params: &Value) {
     }
 }
 
-/// per-session 域启用（page 与 iframe attach 共用，W-oopif 抽出）：
-/// 对话框盲探测先行（L3，悬挂对话框时唯一不被阻塞的命令）→ Page/DOM/CSS
+/// per-session 域启用（page 与 iframe attach 共用）：
+/// 对话框盲探测先行（悬挂对话框时唯一不被阻塞的命令）→ Page/DOM/CSS
 /// enable。`is_page`：仅 page target 记 css_since（hover 结算窗口起点）——
 /// frame target 不记（hover 扫描不进 frame，其样式表事件无 tab 可归属）。
 pub(crate) async fn enable_session_domains(
@@ -325,7 +324,7 @@ pub(crate) async fn enable_session_domains(
     sid: &str,
     is_page: bool,
 ) {
-    // L3：盲探测必须**先于** enable 发出——对话框悬挂时唯一不被 renderer
+    // 盲探测必须**先于** enable 发出——对话框悬挂时唯一不被 renderer
     // 阻塞的命令就是 handleJavaScriptDialog（Page/Runtime.enable 等都会挂起
     // 至超时）；若 alert 挂着，先探测 accept 再 enable 才能全部成功。探测
     // 与常规事件驱动路径互不干扰（无对话框时 -32602 静默）。frame 会话
@@ -349,7 +348,7 @@ pub(crate) async fn enable_session_domains(
             css_enabled = ok;
         }
     }
-    // session 级 auto-attach（W-oopif）：browser 级 setAutoAttach 只覆盖顶层
+    // session 级 auto-attach：browser 级 setAutoAttach 只覆盖顶层
     // target，OOPIF（type=iframe）的 attachedToTarget 由 page/帧 session 自己
     // 的 autoAttach 产生（flatten：事件发到父 session，params.sessionId =
     // 新帧会话——on_attached 按 params 处理，天然兼容）。帧会话同样下发，
@@ -373,7 +372,7 @@ pub(crate) async fn enable_session_domains(
     }
 }
 
-/// L3 重连对话框盲探测：CDP 断连重连后**不重播** javascriptDialogOpening——
+/// 重连对话框盲探测：CDP 断连重连后**不重播** javascriptDialogOpening——
 /// 重连前已挂着的 JS 对话框对 PageService 失明（无事件可驱动
 /// [`on_dialog_opening`]，该 tab 的全部 CDP 命令被阻塞至超时、永久卡死）。
 /// 故每个新 page session 在 Page.enable 后盲发一次 handleJavaScriptDialog
@@ -417,7 +416,7 @@ async fn probe_reconnected_dialog(watched: &Watched, conn: &SharedPageConn, tid:
 /// detachedFromTarget / targetDestroyed 的共同清理：page target → 整 tab
 /// 摘除（映射 + RefMap / DialogBuffer / load 等待者一起删——会话已死，
 /// 状态随之作废；等待中的导航命令各自走到自己的超时分支）；
-/// frame target → 仅摘除该帧登记（I1b 起不标记 ref 失效：durable refs 由
+/// frame target → 仅摘除该帧登记（不标记 ref 失效：durable refs 由
 /// 解析链自行判定，帧会话死亡会让帧内 ref 的恢复解析自然失败）。
 pub(crate) fn drop_target(watched: &Watched, tid: &str) {
     if watched.tabs.lock().unwrap().contains_target(tid) {
@@ -449,7 +448,7 @@ fn drop_frame(watched: &Watched, tab_tid: &str, fid: &str) {
 fn on_detached(watched: &Watched, params: &Value) {
     let tid = params.get("targetId").and_then(Value::as_str);
     let sid = params.get("sessionId").and_then(Value::as_str);
-    // I4 detach 豁免：capture session 的 detachedFromTarget 带**锚点 targetId**
+    // detach 豁免：capture session 的 detachedFromTarget 带**锚点 targetId**
     //（capture session 挂在同一 page target 上）——不豁免会被 drop_target
     // 当作锚点 tab 关闭误删整 tab。豁免表按 sessionId 消费式摘除（条目
     // 生命周期终点；stop 后在途事件依豁免此层，见 state.rs 注释）；kit
@@ -483,7 +482,7 @@ fn on_detached(watched: &Watched, params: &Value) {
                 drop_tab(watched, &t);
                 return;
             }
-            // frame session（W-oopif）：按会话反查帧
+            // frame session：按会话反查帧
             if let Some((tab_tid, fid)) = frame_session_lookup(watched, s) {
                 drop_frame(watched, &tab_tid, &fid);
             }
@@ -502,12 +501,12 @@ pub(crate) fn drop_tab(watched: &Watched, tid: &str) {
     watched.sheets.lock().unwrap().remove(tid);
     watched.css_since.lock().unwrap().remove(tid);
     watched.frames.lock().unwrap().remove(tid);
-    // I3：diff 滚动基线随 tab 摘除；profiler 锚点匹配时废弃（session 死后
+    // diff 滚动基线随 tab 摘除；profiler 锚点匹配时废弃（session 死后
     // 事件流无处可收，trace 不可回收——stop 将报 NOT_RUNNING 并在 message
     // 披露废弃原因，不装作可继续）
     watched.last_snap.lock().unwrap().remove(tid);
     watched.profiler.lock().unwrap().take_if(|p| p.tid == tid);
-    // I4：录制随锚点 tab 关闭废弃（同 profiler 语义——capture session 死于
+    // 录制随锚点 tab 关闭废弃（同 profiler 语义——capture session 死于
     // 同一 target，帧流不可回收，保留只会让 stop 报误导性错误）。锁内同步
     // best-effort：发 cancel 让常驻任务自行收尾（stopScreencast/detach 由
     // 任务内部 best-effort，client clone 在任务闭包内）；JoinHandle 随 state

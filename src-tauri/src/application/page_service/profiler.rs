@@ -1,4 +1,4 @@
-//! page profiler（I3）：kit tracing.rs 的 Tracing.start/end 编排。
+//! page profiler：kit tracing.rs 的 Tracing.start/end 编排。
 //!
 //! 常驻任务特例（同 download_wait 模式，不走 command() 骨架）：
 //! - **不占实例串行锁**（ensure 后 drop(serial)）：tracing 常驻期间其他

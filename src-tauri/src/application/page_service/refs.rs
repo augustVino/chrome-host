@@ -3,8 +3,8 @@ use crate::application::page_service::state::Watched;
 use crate::domain::page_control::{normalize_ref, PageControlError};
 use crate::error::AppError;
 
-/// TS interact.mjs isRefTarget：'@…' 宽松（CSS 选择器不可能以 @ 开头）、
-/// 裸 'e<digits>' 严格；'E3'/'@E3' 走 ref 路径后大小写敏感失配（§3.7），
+/// ref 目标形态判定：'@…' 宽松（CSS 选择器不可能以 @ 开头）、
+/// 裸 'e<digits>' 严格；'E3'/'@E3' 走 ref 路径后大小写敏感失配，
 /// 而不是被误读成选择器。
 pub(crate) fn is_ref_target(target: &str) -> bool {
     if target.starts_with('@') {
@@ -14,8 +14,8 @@ pub(crate) fn is_ref_target(target: &str) -> bool {
     !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// ref 路径的前置查表（I1b：RefMap 语义）。ref 不在表 → 404 PAGE_REF_NOT_FOUND
-/// （无表 = 从未 snap 同码；I1b 起导航不再主动失效，stale 不在此产生——
+/// ref 路径的前置查表（RefMap 语义）。ref 不在表 → 404 PAGE_REF_NOT_FOUND
+/// （无表 = 从未 snap 同码；导航不主动失效，stale 不在此产生——
 /// 由 kit 解析链的 is_detached / AX 唯一匹配恢复判定产生）。查中返回条目
 /// clone（name 供结果文案用）。'@E3' 等大小写形态在这里自然失配 → 404，
 /// 不会被 kit 误读成 CSS 选择器。
@@ -29,19 +29,18 @@ pub(crate) fn require_ref(
     let entry = tabs.get(tid).and_then(|m| m.get(key)).cloned();
     match entry {
         Some(e) => Ok(e),
-        // 无表 = 从未 snap：等价 TS 的 throwaway store → ref_not_found
+        // 无表 = 从未 snap → ref_not_found
         None => Err(PageControlError::ref_not_found(raw_ref).into()),
     }
 }
 
 /// browser_kit 的 String 错误 → chrome-host 错误码体系（集成层契约，kit/mod.rs
-/// 头注释约定的映射责任落点）。规则按任务书 S4（含单测全模式）；kit 原文
-/// 透传不吞信息。两条任务书未列、但为保全既有契约所必需的规则（I1b 提交
-/// 信息有登记）：
-/// - "unknown ref"（kit map miss 文案）→ PAGE_REF_NOT_FOUND——红线 1 要求
-///   保留 404 ref 未命中语义（否则沦为 500）；
+/// 头注释约定的映射责任落点）。kit 原文
+/// 透传不吞信息。两条为保全既有契约所必需的扩展规则：
+/// - "unknown ref"（kit map miss 文案）→ PAGE_REF_NOT_FOUND——保留
+///   404 ref 未命中语义（否则沦为 500）；
 /// - "could not locate element"（kit 唯一匹配恢复无果的文案，仅出现在
-///   stale 恢复路径）→ PAGE_REF_STALE——S5 要求导航后旧 ref 报 stale。
+///   stale 恢复路径）→ PAGE_REF_STALE——导航后旧 ref 报 stale。
 pub(crate) fn map_kit_error(raw: &str, tool: &str) -> AppError {
     let m = raw.to_lowercase();
     if m.contains("is stale")
@@ -60,7 +59,7 @@ pub(crate) fn map_kit_error(raw: &str, tool: &str) -> AppError {
     } else if m.contains("unknown ref") {
         PageControlError::ref_not_found(raw).into()
     } else if m.contains("no option matched") || m.contains("no visible role=option") {
-        // I2 select：选项未命中（kit 原文列出可用项，透传不吞）；combobox
+        // select：选项未命中（kit 原文列出可用项，透传不吞）；combobox
         // 展开但无可选项同码
         AppError::business(422, "PAGE_SELECT_NO_OPTION", raw.to_string())
     } else if m.contains("multiple options matched") {
@@ -68,7 +67,7 @@ pub(crate) fn map_kit_error(raw: &str, tool: &str) -> AppError {
     } else if m.contains("is not a <select>") {
         AppError::business(422, "PAGE_SELECT_NOT_SELECT", raw.to_string())
     } else if m.contains("input.dispatchmouseevent") {
-        // I2 click/drag 的 Input 派发失败（真实链路错误文案含方法名，如
+        // click/drag 的 Input 派发失败（真实链路错误文案含方法名，如
         // "CDP 命令 Input.dispatchMouseEvent 被拒绝: …"）。kit 不外露失败
         // 相位——effect 语义按保守 unknown 处理（绝不标 none：盲目重试 =
         // 二次点击）。
@@ -99,7 +98,7 @@ mod tests {
         (e.code().to_string(), e.status())
     }
 
-    /// map_kit_error 全模式矩阵（任务书 S4：含单测全模式）——每条规则取 kit
+    /// map_kit_error 全模式矩阵（含单测全模式）——每条规则取 kit
     /// element.rs 的真实文案形态，防启发式自嗨
     #[test]
     fn map_kit_error_covers_all_kit_messages() {
@@ -130,7 +129,7 @@ mod tests {
                 "{raw}"
             );
         }
-        // 禁用（I1b 新码）
+        // 禁用
         assert_eq!(
             code_ref(&map_kit_error(
                 "Element '@e1' is disabled, so the click would not reach it",
@@ -138,7 +137,7 @@ mod tests {
             )),
             ("PAGE_ELEMENT_DISABLED".to_string(), 422)
         );
-        // fill 链不可编辑（I2 接入 kit fill 时生效；规则先备齐）
+        // fill 链不可编辑
         assert_eq!(
             code_ref(&map_kit_error("Element '@e1' is not editable", "fill")),
             ("PAGE_TARGET_NOT_FILLABLE".to_string(), 422)
@@ -166,14 +165,14 @@ mod tests {
                 "{raw}"
             );
         }
-        // 兜底：500 PAGE_ACTION_FAILED（新码），tool 前缀 + 原文透传
+        // 兜底：500 PAGE_ACTION_FAILED，tool 前缀 + 原文透传
         let e = map_kit_error("CDP error (DOM.enable): boom", "snap");
         assert_eq!(code_ref(&e), ("PAGE_ACTION_FAILED".to_string(), 500));
         assert!(e.to_string().contains("snap"), "tool 上下文在前缀");
         assert!(e.to_string().contains("boom"), "原文不吞");
     }
 
-    /// I2 新增规则：select 族（选项未命中/多匹配/非 select 目标）与 Input
+    /// select 族规则（选项未命中/多匹配/非 select 目标）与 Input
     /// 派发失败（保守 unknown）
     #[test]
     fn map_kit_error_covers_i2_select_and_dispatch_rules() {

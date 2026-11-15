@@ -8,7 +8,7 @@ use crate::domain::page_control::PageControlError;
 use crate::error::AppError;
 use serde_json::{json, Value};
 // ============================================================================
-// 6a-2. 表格结构化提取（W-ext：收集编排 + 归一化接线）
+// 6a-2. 表格结构化提取（收集编排 + 归一化接线）
 // ============================================================================
 
 /// extract 工具：目标三路解析（自动发现 / @eN ref（含跨帧）/ CSS 选择器）
@@ -34,7 +34,7 @@ pub(crate) async fn extract_tool(
             (v, "(auto-discovered)".to_string())
         }
         Some(t) if is_ref_target(t) => {
-            // I1b：kit resolve_element_object_id（帧路由 + stale 恢复在 kit 内）
+            // kit resolve_element_object_id（帧路由 + stale 恢复在 kit 内）
             // → 收集器 callFunctionOn 在 effective session 上执行
             require_ref(watched, tid, t)?;
             let client = kit_client(watched)?;

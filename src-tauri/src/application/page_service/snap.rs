@@ -18,8 +18,8 @@ use std::time::Instant;
 // 6. 工具编排（每个 = 一个内部 async fn，公开入口在 PageService 上）
 // ============================================================================
 
-/// I1b：snap 管线 = kit take_snapshot（durable refs + 上游快照引擎）+ 我方
-/// hover_scan 与 meta 契约。锁纪律（任务书附录决策 1）：refs 的 Mutex 锁内
+/// snap 管线 = kit take_snapshot（durable refs + 上游快照引擎）+ 我方
+/// hover_scan 与 meta 契约。锁纪律：refs 的 Mutex 锁内
 /// 禁止 await——RefMap 先 clone 出、take_snapshot 完成后整表写回；resolve
 /// 路径只读 clone。begin_snapshot 是 kit 的调用方契约（清 map、保留
 /// documents 桶与编号计数：同文档 @eN 稳定复用，消失的 ref 不僵尸残留）。
@@ -30,7 +30,7 @@ pub(crate) async fn snap_tool(
     params: &SnapParams,
 ) -> Result<Value, AppError> {
     let conn = require_conn(watched)?;
-    // 帧登记同步（W-oopif 保留路径）：事件流只覆盖增量，早于命令连接存在的
+    // 帧登记同步：事件流只覆盖增量，早于命令连接存在的
     // OOPIF 靠 target 面探测补登记——iframe_sessions 的完备性前提
     sync_frame_tree(watched, &conn, tid, sid).await;
     // 锁窗口内取 clone（不跨 await）
@@ -52,7 +52,7 @@ pub(crate) async fn snap_tool(
         depth: params.depth,
         urls: params.urls,
     };
-    // frame_id 恒 None（主文档；任务书附录决策 2）：OOPIF 由 kit 经
+    // frame_id 恒 None（主文档）：OOPIF 由 kit 经
     // iframe_sessions 自递归，同源 iframe 由 kit 内部 frameId 参数处理
     let mut text = take_snapshot(
         &client,
@@ -89,7 +89,7 @@ pub(crate) async fn snap_tool(
         *g += 1;
         *g
     };
-    // 消失的 ref（pre - post，@eN 形态；非空才进响应——任务书红线 1）
+    // 消失的 ref（pre - post，@eN 形态；非空才进响应）
     let removed: Vec<String> = {
         let post = watched.refs.lock().unwrap();
         let post = post.get(tid).map(|m| m.ref_ids()).unwrap_or_default();
@@ -215,7 +215,7 @@ fn rewrite_ref_tokens(line: &str) -> (String, Vec<String>) {
     (out, refs)
 }
 
-/// 帧树主动同步（W-oopif，幂等，每次 snap 前跑）：事件路径
+/// 帧树主动同步（幂等，每次 snap 前跑）：事件路径
 /// （frameAttached/attachedToTarget）只覆盖**增量**——页面早于命令连接存在
 /// 的帧拿不到事件（Page 域不回放，getFrameTree 快照亦不含跨进程子帧，
 /// CfT 131 实测）。故走 target 面探测：
@@ -226,8 +226,7 @@ fn rewrite_ref_tokens(line: &str) -> (String, Vec<String>) {
 ///    backendNodeId 顺手缓存；
 /// 3. 无会话帧 → orphan 认领或 browser 级 attachToTarget 主动建会话 + 补域
 ///    enable。任何失败不阻断 snap（该帧缺席，主树完整）。
-/// I1b：原「宿主主树 AX 校验（owner bni 必须是 iframe 类节点，防死帧残留）」
-/// 随 AX 中间树移交 kit 而失去数据源，删除——kit 管线对死帧天然容忍（快照
+/// 不做宿主主树 AX 校验：kit 管线对死帧天然容忍（快照
 /// 递归按 AX 树中的 Iframe 节点发起，死帧不在树中即不会被请求；解析链的
 /// frame_id 只来自快照条目），脏登记表现为惰性残留（targetDestroyed 摘除）。
 async fn sync_frame_tree(watched: &Watched, conn: &SharedPageConn, tab_tid: &str, main_sid: &str) {
@@ -356,21 +355,20 @@ async fn sync_frame_tree(watched: &Watched, conn: &SharedPageConn, tab_tid: &str
 struct HoverOutcome {
     /// backendNodeId → "hover" | "hover-reveal"（后处理入参）
     marks: HoverMarks,
-    /// "ok" | "truncated" | "skipped" | "error"——任务书三值外增加 error
-    ///（桥接等基础设施故障，诚实区分「没扫出」与「扫不了」），报告披露
+    /// "ok" | "truncated" | "skipped" | "error"——error 为桥接等基础设施
+    /// 故障（诚实区分「没扫出」与「扫不了」）
     status: &'static str,
 }
 
-/// hover 扫描编排（spike 定案路径，全部 CDP 域、零注入）：
+/// hover 扫描编排（真机实测定案路径，全部 CDP 域、零注入）：
 /// 样式表登记（CSS.enable@attach → styleSheetAdded 事件，origin=regular 且
 /// 未 disabled）→ CSS.getStyleSheetText → domain 提取（预算 MAX_HOVER_*）→
-/// DOM.querySelectorAll 逐选择器求值（spike 验证：纯选择器零文本污染、
+/// DOM.querySelectorAll 逐选择器求值（真机实测：纯选择器零文本污染、
 /// display:none 的 reveal 目标可命中）→ DOM.pushNodesByBackendIdsToFrontend
 /// 一次批量桥 backendNodeId → nodeId → 命中映射 ref 行标记。
 /// 失败语义（诚实证据）：单表/单选择器失败 → 截断标记继续（部分数据优于
 /// 无数据）；桥接失败 → status error（标记无法落到 ref，snap 主体不受影响）。
-/// I1b：入参从 AX refs JSON 改为主树 bni 集合（RefMap 主桶）——kit 快照不
-/// 再产出 AX 中间树，桥接语义不变。
+/// 入参 = 主树 bni 集合（RefMap 主桶，帧内条目不参与桥接）。
 async fn hover_scan(
     watched: &Watched,
     conn: &SharedPageConn,
@@ -437,7 +435,7 @@ async fn hover_scan(
         };
     }
     // DOM 求值：根 nodeId（fill 定位链同款 getDocument；退化值 1 = 主文档恒为
-    // 首个 getDocument 的 nodeId，spike 实测）
+    // 首个 getDocument 的 nodeId，真机实测）
     let root = match cdp_send(conn, "DOM.getDocument", json!({}), Some(sid)).await {
         Ok(r) => r
             .pointer("/root/nodeId")
@@ -453,7 +451,7 @@ async fn hover_scan(
     for sel in &rules.reveals {
         hover_query_hits(conn, sid, root, sel, &mut reveal_hits, &mut truncated).await;
     }
-    // 桥接：主树 backendNodeId 集合 → nodeId（一次批量，spike 验证逐位对齐）
+    // 桥接：主树 backendNodeId 集合 → nodeId（一次批量，真机实测逐位对齐）
     let backends: Vec<i64> = main_bnis.to_vec();
     let node_ids: Vec<i64> = match cdp_send(
         conn,

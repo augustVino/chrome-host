@@ -4,7 +4,7 @@ use crate::domain::page_control::PageControlError;
 use crate::error::AppError;
 use crate::infrastructure::cdp::page_cdp::SharedPageConn;
 use serde_json::{json, Value};
-/// JS Number 的 toString 形态（150.0 → "150"）：结果文案里的坐标格式与 TS 一致。
+/// JS Number 的 toString 形态（150.0 → "150"）：结果文案里的坐标格式基准。
 pub(crate) fn js_num(n: f64) -> String {
     if n.is_finite() && n.fract() == 0.0 {
         format!("{}", n as i64)
@@ -13,7 +13,7 @@ pub(crate) fn js_num(n: f64) -> String {
     }
 }
 
-/// TS truncate：40 字符 + '…'（fill 回读摘要用）
+/// 截断：40 字符 + '…'（fill 回读摘要用）
 pub(crate) fn truncate40(s: &str) -> String {
     if s.chars().count() > 40 {
         let mut t: String = s.chars().take(40).collect();
@@ -25,11 +25,11 @@ pub(crate) fn truncate40(s: &str) -> String {
 }
 
 // ============================================================================
-// 4. 页内 eval 基件（TS evaluate.mjs evalStr / click-native.mjs evalJson）
+// 4. 页内 eval 基件
 // ============================================================================
 
 /// Runtime.evaluate 的完整 result RemoteObject（eval 取值 / eval 工具序列化 /
-/// html 共用基件；TS evalStr 形态：每次先 Runtime.enable（幂等），
+/// html 共用基件；每次先 Runtime.enable（幂等），
 /// returnByValue + awaitPromise）。页面异常 → 500 PAGE_EVAL_FAILED。
 async fn eval_remote_object(
     conn: &SharedPageConn,
@@ -73,7 +73,7 @@ pub(crate) async fn eval_raw(
         .unwrap_or(Value::Null))
 }
 
-/// eval + JSON.parse（TS evalJson）：页内脚本约定返回 JSON 字符串；
+/// eval + JSON.parse：页内脚本约定返回 JSON 字符串；
 /// 垃圾返回 → 500（wait 把一切 eval 错误都当 detached 继续轮询）。
 pub(crate) async fn eval_json(
     conn: &SharedPageConn,
@@ -97,7 +97,7 @@ pub(crate) async fn eval_json(
 }
 
 /// Runtime.callFunctionOn（this = objectId 的页内函数调用，fill/几何回退用）。
-/// 页面异常 → 500 PAGE_EVAL_FAILED（消息带 fill 前缀与 TS 对齐）。
+/// 页面异常 → 500 PAGE_EVAL_FAILED（消息带 fill 前缀）。
 pub(crate) async fn call_fn(
     conn: &SharedPageConn,
     sid: &str,
@@ -136,16 +136,15 @@ pub(crate) async fn call_fn(
 }
 
 // ============================================================================
-// 6b. 工具编排续（P2-G）：eval / html / clickxy / type / loadall
-// （cdp.mjs 退役前置——规格照抄 TS evaluate.mjs / interact.mjs，复用既有
-//  eval 基件与 click 派发链，纯增量）
+// 6b. 工具编排续：eval / html / clickxy / type / loadall
+// （复用既有 eval 基件与 click 派发链）
 // ============================================================================
 
-/// TS evalStr 的结果序列化：对象/数组 → pretty JSON 字符串（对齐
-/// JSON.stringify(v, null, 2) 的 2 空格缩进）、字符串原样、undefined/null
-/// → "undefined"/"null"、数字/布尔 → JS String 形态。与 TS 的微差：
-/// undefined 在 TS 是空串（String(val ?? '')），任务口径取字面量
-/// "undefined"（空串与「无返回」不可区分，字面量更诚实）。
+/// eval 的结果序列化：对象/数组 → pretty JSON 字符串（
+/// JSON.stringify(v, null, 2) 的 2 空格缩进）、字符串原样、
+/// undefined/null → "undefined"/"null"、数字/布尔 → JS String
+/// 形态（undefined 取字面量而非空串——空串与「无返回」
+/// 不可区分，字面量更诚实）。
 fn eval_str_from_remote(result: &Value) -> String {
     match result.get("value") {
         // returnByValue 下 undefined 无 value 键、null 的 value 为 JSON null，
@@ -171,8 +170,8 @@ pub(crate) async fn eval_tool(
     Ok(json!({ "result": eval_str_from_remote(&result) }))
 }
 
-/// raw <method> [json]：任意 CDP 命令透传（PLAN D5 逃生舱；与退役前 cdp.mjs
-/// evalraw 同权限）。browser=true 发 browser 级（Target.getTargets 等），
+/// raw <method> [json]：任意 CDP 命令透传（逃生舱，权限等价 eval）。
+/// browser=true 发 browser 级（Target.getTargets 等），
 /// 否则发到 tab 的 page session（Runtime/DOM/Input/Emulation 全域可达）。
 /// 响应 = CDP 原始 result 对象，原样透传不裁剪。
 pub(crate) async fn raw_tool(
@@ -194,9 +193,8 @@ pub(crate) async fn raw_tool(
     Ok(json!({ "result": result }))
 }
 
-/// TS htmlStr：selector 缺省 = 整文档 outerHTML；命中元素 → outerHTML。
-/// 未命中的行为差异（任务两选一，取错误码）：TS 返回字符串哨兵
-/// 'Element not found'，此处报 404 PAGE_ELEMENT_NOT_FOUND——与 click/locate
+/// html：selector 缺省 = 整文档 outerHTML；命中元素 → outerHTML。
+/// 未命中报 404 PAGE_ELEMENT_NOT_FOUND——与 click/locate
 /// 的未命中语义一致，调用方按码分支而非解析文案。
 pub(crate) async fn html_tool(
     watched: &Watched,

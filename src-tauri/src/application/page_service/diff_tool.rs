@@ -1,9 +1,9 @@
-//! page diff / diff-shot（I3）：快照文本 diff 与像素 diff。
+//! page diff / diff-shot：快照文本 diff 与像素 diff。
 //!
 //! - diff：当前 snap（snap_tool 全管线，refs 正常演进）↔ 基线的行级 unified
 //!   diff（kit diff.rs）。基线两来源：滚动基线（per-tab `last_snap`，比较后
 //!   更新）或显式 baseline 文本（API `baseline` 参数，只比较不更新）。
-//!   diff 文本**不剥 @eN 记号**（I1b 决策：durable refs 下同文档 ref 稳定，
+//!   diff 文本**不剥 @eN 记号**（durable refs 下同文档 ref 稳定，
 //!   记号漂移即真实变化信号——kit 的 snapshot_comparison_text 剥记号路径
 //!   是跨文档比较用的，这里不用）。
 //! - diff-shot：显式 baseline png（base64）↔ 服务端当前截图（screenshot_tool
@@ -18,7 +18,7 @@ use crate::error::AppError;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-/// last_snap 单条上限（任务书内存边界）：当前快照超限时**不存**且清掉旧
+/// last_snap 单条上限（内存边界）：当前快照超限时**不存**且清掉旧
 /// 基线（防陈旧基线与后续快照错位比较），diff 响应披露 baselineCleared——
 /// 下次无显式 baseline 的 diff 将与空基线比较（全部计为 added）。
 const LAST_SNAP_MAX_BYTES: usize = 2 * 1024 * 1024;

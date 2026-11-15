@@ -5,14 +5,14 @@ use crate::application::page_service::state::Watched;
 use crate::domain::page_control::{normalize_ref, PageControlError};
 use crate::error::AppError;
 use serde_json::{json, Value};
-/// upload 单文件大小上限（W-file 任务口径：100MB，读取前显式拒绝）。
+/// upload 单文件大小上限（100MB，读取前显式拒绝）。
 pub(crate) const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 
-/// 主机文件校验（W-file 安全边界，锁外快速失败）：
+/// 主机文件校验（安全边界，锁外快速失败）：
 /// 1. 必须绝对路径（防相对路径歧义）；
 /// 2. 拒符号链接：逐组件 symlink_metadata 检查（canonicalize 对比会把
 ///    macOS /tmp→/private/tmp 这类系统别名也判死，逐组件只拒真软链——
-///    任务括注「canonicalize 校验」的意图是拒逃逸，不拒系统默认别名）；
+///    意图是拒逃逸，不拒系统默认别名）；
 /// 3. 必须存在且是普通文件（目录/不存在分列 422/404）；
 /// 4. ≤ 100MB（超出显式报错，不读入内存）。
 pub(crate) fn validate_upload_file(
@@ -80,8 +80,8 @@ pub(crate) fn validate_upload_file(
     Ok((p.to_path_buf(), name, md.len()))
 }
 
-/// describeNode 响应 → 是否 input[type=file]（W-file：不是则 422，任务
-/// 口径「校验是 file input（不是则 422）」）。attributes 是扁平数组
+/// describeNode 响应 → 是否 input[type=file]（不是则 422）。attributes
+/// 是扁平数组
 /// ["type","file","name","f",...]；input 无 type 属性 = 默认 text，拒绝。
 fn ensure_file_input(desc_resp: &Value, target_desc: &str) -> Result<(), AppError> {
     let err = |detail: String| {
@@ -123,7 +123,7 @@ fn ensure_file_input(desc_resp: &Value, target_desc: &str) -> Result<(), AppErro
 /// nodeId，同 fill 的定位链）→ describeNode 校验 file input →
 /// DOM.setFileInputFiles（不拷贝文件，CDP 直接引用主机路径）。
 /// setFileInputFiles 会触发页面原生 change 事件（React 受控表单同常收到
-/// ——真机验证见任务报告）。
+/// ——真机验证）。
 pub(crate) async fn upload_tool(
     watched: &Watched,
     tid: &str,
@@ -134,8 +134,8 @@ pub(crate) async fn upload_tool(
     size: u64,
 ) -> Result<Value, AppError> {
     let conn = require_conn(watched)?;
-    // 定位：(参数键, 节点 id, 发送会话, 描述)。ref 路径 = I1b RefMap 直查
-    //（无 CDP 往返，miss → PAGE_REF_NOT_FOUND 语义对齐现 404）；帧内 ref 经
+    // 定位：(参数键, 节点 id, 发送会话, 描述)。ref 路径 = RefMap 直查
+    //（无 CDP 往返，miss → 404 PAGE_REF_NOT_FOUND）；帧内 ref 经
     // iframe_sessions 路由（无登记 = 同源帧/会话已死 → 主会话，同 kit 语义）。
     // selector 路径：nodeId，同 fill 的定位链。
     let (key, node_id, esid, desc) = if is_ref_target(target) {

@@ -1,31 +1,29 @@
-//! page 控制服务编排层（P2-B）：实例级常驻 CDP 连接 + per-tab 状态 + L2 工具编排。
+//! page 控制服务编排层：实例级常驻 CDP 连接 + per-tab 状态 + 工具编排。
 //!
-//! 行为规格 = Phase 1 的 TS per-tab daemon（`skills/chrome-host/scripts/lib/daemon.mjs`
-//! 及其 tools/*，183 单测验证）。与 TS 架构的差异是刻意的（PAGE-CONTROL-PLAN
-//! Phase 2 的 owner 决策）：
+//! 架构要点：
 //!
-//! - **实例级一条连接**（决策 1）：与 diagnostics 的常驻连接并存（Chrome 侧两条
+//! - **实例级一条连接**：与 diagnostics 的常驻连接并存（Chrome 侧两条
 //!   客户端互不干扰），但**不共用**——维持 diagnostics「只订阅不操作」纪律。
-//!   连接惰性建立（决策 5）：实例首次 page 命令时 connect_eventing →
+//!   连接惰性建立：实例首次 page 命令时 connect_eventing →
 //!   Target.setAutoAttach(flatten) → spawn watch_loop；WS 断连（EventSink recv
 //!   None，与 diagnostics 同信号）时清理登记，下一条命令重建。
-//! - **targetId 路由**（决策 2）：autoAttach 的 attachedToTarget 事件维护
-//!   `targetId → sessionId` 映射；命令入参的 targetId 支持唯一前缀（对齐 TS
-//!   resolvePrefix：无匹配 404 / 多匹配 409）。空 target 不参与前缀匹配
-//!   ——唯一 page target 自动选中，多个 409 并列出全部 targetId（P2-F F1，
-//!   真机复测后放弃「最近 attach」近似）。
-//! - **per-instance 命令串行**（决策 3）：一条 tokio Mutex 串行整实例的全部
+//! - **targetId 路由**：autoAttach 的 attachedToTarget 事件维护
+//!   `targetId → sessionId` 映射；命令入参的 targetId 支持唯一前缀（无匹配
+//!   404 / 多匹配 409）。空 target 不参与前缀匹配
+//!   ——唯一 page target 自动选中，多个 409 并列出全部 targetId
+//!   （真机复测后放弃「最近 attach」近似）。
+//! - **per-instance 命令串行**：一条 tokio Mutex 串行整实例的全部
 //!   page 命令（含建连），正确性优先；并发需求出现后可演进为 per-tab 锁。
-//! - **per-tab RefStore / DialogBuffer**（决策 4）：snap 整表替换，导航/文档
-//!   替换事件不再主动失效——I1b 起 ref 表 = browser_kit RefMap（loaderId
+//! - **per-tab RefStore / DialogBuffer**：snap 整表替换，导航/文档
+//!   替换事件不主动失效——ref 表 = browser_kit RefMap（loaderId
 //!   代际 durable refs，stale 由解析时 is_detached/唯一匹配恢复判定产生）。
-//! - **导航命令族**（navigate/back/forward/reload，page 族后补）：同一 page
+//! - **导航命令族**（navigate/back/forward/reload）：同一 page
 //!   session 内 Page.navigate / 导航历史回退 / Page.reload——保留历史（实例级
 //!   navigate 的 new+close 组合近似会丢历史，该端点保留给 GUI，文档已指向
 //!   本族）。加载等待走 Page.loadEventFired 事件（命令发送前登记等待者，窗口
 //!   NAV_LOAD_TIMEOUT，未见 → loaded:false；同文档导航/同文档历史条目不触发
 //!   load，走响应分类 / 历史索引 + readyState 快路径）。
-//! - **文件传输**（W-file）：establish 时 browser 级
+//! - **文件传输**：establish 时 browser 级
 //!   Browser.setDownloadBehavior{allow, <profile>/downloads, events}，
 //!   downloadWillBegin/Progress 事件在 handle_event 登记/结算（终态入环 20
 //!   条 + 命令式等待者先到先得）；upload = 定位 + describeNode 校验
@@ -36,35 +34,28 @@
 //! IO 全部经 [`PageCdp`] trait（infrastructure/cdp/page_cdp.rs 的 dyn 适配），
 //! 测试注入 fake 即可覆盖全部编排路径，不依赖真 Chrome。
 //!
-//! 与 TS 的已知偏差（详见各处注释及任务报告）：
-//! - 对话框应答与命令共用一条连接且天然并发（P2-F 根治）：ws.rs 的 send
+//! 已知偏差（详见各处注释）：
+//! - 对话框应答与命令共用一条连接且天然并发：ws.rs 的 send
 //!   由 &mut self 改 &self（写帧短锁 + AtomicU64 id），in-flight 工具命令
 //!   （如 click 卡在被 alert 阻塞的页面至 15s 超时）不再阻塞同连接的
 //!   Page.handleJavaScriptDialog。真机曾证伪的中转方案：旁路短连接——CDP
 //!   sessionId 是**连接级作用域**，携主连接 sessionId 必 -32001
 //!   Session not found，已回滚。
-//! - dialogs_seen 仅附在成功响应上（TS 对错误响应也附；AppError 无扩展字段，
-//!   P2-C 若需可扩展错误负载）。
+//! - dialogs_seen 仅附在成功响应上（AppError 无扩展字段，若需可扩展错误
+//!   负载）。
 //! - focus 类错误码（PAGE_FOCUS_FAILED / PAGE_FILL_FOCUS_LOST）与
-//!   PAGE_TAB_AMBIGUOUS / PAGE_TOOL_TIMEOUT 为本层新增：P2-A 错误表未含 TS 的
-//!   focus_failed / fill_focus_lost（domain 已冻结，编排在 application 层补齐）。
-//! - **L2 attach 握手窗口**（冒烟遗留）：连接建立后首批 attachedToTarget 异步
+//!   PAGE_TAB_AMBIGUOUS / PAGE_TOOL_TIMEOUT 为本层新增（domain 已冻结，
+//!   编排在 application 层补齐）。
+//! - **attach 握手窗口**：连接建立后首批 attachedToTarget 异步
 //!   到达，立即执行首条命令会 PAGE_TAB_NOT_FOUND——ensure 的建连分支在返回
 //!   前短轮询 tabs 表（≤300ms / 10ms 间隔）等首个 page target 入表；超时也
 //!   放行（保留 retry shortly 兜底），连接已在位的命令不经过这段（不阻塞）。
-//! - **L3 重连对话框盲探测**（冒烟遗留）：CDP 不重播 javascriptDialogOpening，
+//! - **重连对话框盲探测**：CDP 不重播 javascriptDialogOpening，
 //!   重连前已挂着的 JS 对话框对新连接失明（tab 永久卡死）——on_attached 对
 //!   每个 page session 在 Page.enable 后盲发一次 handleJavaScriptDialog，
 //!   成功 = 历史对话框已被接管（保守默认入缓冲），失败静默（无对话框为常态）。
-//!
-//! **I1a 结构拆分**（2026-11-15，任务书 I1a）：本模块原为 9566 行单文件，现按
-//! SPLIT-MAP.md 的域边界平移为模块目录（mod/state/events/ax/snap/frames/refs/
-//! input/eval/extract/capture/navigation/dialogs/downloads/upload/intercept +
-//! tests，16 文件）。纯结构移动、零行为变化：函数体、错误文案、常量值与
-//! 118 个测试逐字保留；变化仅限代码位置、可见性（被跨模块引用者 →
-//! `pub(crate)`）与 use 路径。
 
-// P2-C 已接线（api/pages.rs + api/mcp.rs）：仅测试注入构造 with_connector
+// 已接线（api/pages.rs + api/mcp.rs）：仅测试注入构造 with_connector
 // 仍无生产调用方，逐项 allow（不再整模块豁免，防新死代码静默滑入）。
 use std::collections::HashMap;
 use std::future::Future;
@@ -125,11 +116,9 @@ use self::state::*;
 use self::upload::*;
 
 /// snap hover 感知：backendNodeId → 标记（"hover" = hover 触发器，
-/// "hover-reveal" = hover 后才显示/变化的目标）。原 ax.rs 随 I1b 删除，
-/// 类型随唯一消费者迁入。
+/// "hover-reveal" = hover 后才显示/变化的目标）。
 pub(crate) type HoverMarks = HashMap<i64, &'static str>;
 /// per-tab 样式表登记：targetId → { styleSheetId → (origin, disabled) }。
-/// 原 ax.rs 随 I1b 删除，类型随唯一消费者迁入（state.rs 引用）。
 pub(crate) type SheetRegistry = HashMap<String, HashMap<String, (String, bool)>>;
 
 /// snap 的可选参数（CLI -c/-i/-d/-u/-s、API body、MCP 参数三面同源；全缺省
@@ -147,10 +136,10 @@ pub struct SnapParams {
 /// 无响应页面（wait 例外：用户 timeout + 5s）。
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const WAIT_TOOL_GRACE: Duration = Duration::from_secs(5);
-/// wait 轮询缺省超时与间隔（TS wait.mjs 默认；间隔固定起步，不做参数）
+/// wait 轮询缺省超时与间隔（间隔固定起步，不做参数）
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// mousePressed → mouseReleased 的间隔（TS dispatchClickAtPoint 的 50ms）
+/// mousePressed → mouseReleased 的间隔（50ms）
 const CLICK_RELEASE_DELAY: Duration = Duration::from_millis(50);
 
 /// hover 扫描：样式表登记回放等待窗口（attach 后 CSS.enable 的
@@ -161,12 +150,12 @@ const HOVER_SETTLE_POLL: Duration = Duration::from_millis(10);
 /// hover 扫描：单选择器命中上限，超出按截断处理（防 `div` 类选择器命中
 /// 万级节点；漏标优于错标，状态诚实报 truncated）。
 const MAX_HOVER_QUERY_HITS: usize = 1000;
-/// loadall 缺省轮询间隔（TS loadAllStr 的 1500ms）
+/// loadall 缺省轮询间隔（1500ms）
 const DEFAULT_LOADALL_INTERVAL: Duration = Duration::from_millis(1500);
-/// loadall 缺省点击上限。TS 是 5min 硬顶（200 × 1500ms = 5min，量级对齐），
-/// max-clicks × interval 组合等价但更可控（任务决策，报告披露）。
+/// loadall 缺省点击上限（默认 200 × 1500ms = 5min 量级，与 5min 硬顶等价；
+/// max-clicks × interval 组合更可控）。
 const DEFAULT_LOADALL_MAX_CLICKS: u32 = 200;
-/// L2 attach 握手窗口上界（owner 真机冒烟定调）：establish 完成（连接 +
+/// attach 握手窗口上界（真机实测定调）：establish 完成（连接 +
 /// setAutoAttach + watch_loop 就位）后首批 attachedToTarget 仍异步在途，立即
 /// 路由首条命令会 PAGE_TAB_NOT_FOUND。ensure 的建连分支在返回前短轮询 tabs
 /// 表，首个 page target 入表即放行；窗口耗尽也放行（不报错——兜底仍是
@@ -177,7 +166,7 @@ const ATTACH_HANDSHAKE_WINDOW: Duration = Duration::from_millis(300);
 /// 握手窗口的轮询间隔：10ms 在「attach 到表即响应」与「空转次数」间折中
 ///（300ms 窗口至多 30 次查询，tabs 表是个位数行的 Vec 线性判空）。
 const ATTACH_HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(10);
-/// 全页截图单边上限（**设备像素**，W-shot 真机 spike 定准）：Chrome 光栅面
+/// 全页截图单边上限（**设备像素**，真机实测定准）：Chrome 光栅面
 /// 单边硬顶 16384 device px——真机实测（CfT 131 / Retina DPR=2）clip
 /// 8192 CSS px（=16384 device）成功、8193 CSS px（=16386 device）即被
 /// CDP 拒绝（-32000 Unable to capture screenshot）。故 CSS 上限按
@@ -185,9 +174,9 @@ const ATTACH_HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// DPR=2 → 8192）。超限显式截断并标 truncated（诚实证据，不产出可疑图，
 /// 也不让调用方拿到裸 500）。png 实际尺寸 = 响应 width/height × DPR。
 const FULL_SHOT_MAX_DEVICE_SIDE: f64 = 16384.0;
-/// download-wait 缺省等待窗口（W-file 任务口径：30s）。
+/// download-wait 缺省等待窗口（30s）。
 const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
-/// 下载终态环形记录容量（GET /page/downloads 查询面；W-file 任务口径 20）。
+/// 下载终态环形记录容量（GET /page/downloads 查询面；20 条）。
 const MAX_DOWNLOAD_HISTORY: usize = 20;
 
 /// 连接工厂：生产 = connect_page（browser 级 eventing WS），测试注入 fake。
@@ -243,7 +232,7 @@ fn tool_timeout(tool: &str, budget: Duration) -> AppError {
 
 /// 409：download-wait 超时 = 窗口内无终态到达。in_flight 非空时披露
 /// 「已有下载在进行但未完成」——与 PAGE_DOWNLOAD_FAILED（下载了但失败）
-/// 严格区分（任务红线：超时 = 无下载完成的证据，不是失败断言）。
+/// 严格区分（超时 = 无下载完成的证据，不是失败断言）。
 fn download_timeout(in_flight: usize, timeout: Duration) -> AppError {
     let detail = if in_flight > 0 {
         format!("（{} 个下载仍在进行中未完成）", in_flight)
@@ -288,7 +277,7 @@ impl PageService {
     }
 
     /// 命令前置：实例 Running（复用 diagnostics 的实例状态获取路径）→ 取/建
-    /// Watched → 串行锁内惰性建连（决策 5）。返回 (Watched, 串行守卫)：
+    /// Watched → 串行锁内惰性建连。返回 (Watched, 串行守卫)：
     /// 守卫由调用方持有到命令结束，全程串行。
     async fn ensure(
         &self,
@@ -316,7 +305,7 @@ impl PageService {
         if watched.conn.lock().unwrap().is_none() {
             self.establish(ins_id, &watched, port, &ins.profile_dir)
                 .await?;
-            // L2：establish 返回 ≠ 首批 attachedToTarget 已入表（事件异步在
+            // establish 返回 ≠ 首批 attachedToTarget 已入表（事件异步在
             // 途），建连分支内短等首个 page target 再放行（见常量注释）。
             // 仅建连分支调用：连接已在位（已有命令在跑）时不经过这里，无额外阻塞。
             wait_first_attach(&watched).await;
@@ -336,7 +325,7 @@ impl PageService {
     ) -> Result<(), AppError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let conn = (self.connector)(port, tx).await?;
-        // waitForDebuggerOnStart 在 CfT 131 为必填（缺省 -32602，M6 实测）；
+        // waitForDebuggerOnStart 在 CfT 131 为必填（缺省 -32602，真机实测）；
         // false = attach 不暂停目标页（与 diagnostics 同款 autoAttach 形态）
         cdp_send(
             &conn,
@@ -345,7 +334,7 @@ impl PageService {
             None,
         )
         .await?;
-        // W-file：下载落盘目录 = 实例 profile 下 downloads/ 子目录（每实例
+        // 下载落盘目录 = 实例 profile 下 downloads/ 子目录（每实例
         // 隔离，实例删除随 profile 清理——天然生命周期）。browser 级设置
         //（session=None）：downloadWillBegin/Progress 事件因此无 session 维度，
         // 由 handle_event 直接分派。目录创建失败 = establish 失败（不静默
@@ -379,11 +368,11 @@ impl PageService {
         // Fetch 拦截随死会话失效（Fetch.enable 是 session 级，新连接需重新
         // 下发规则——契约：连接重建即失效，GET intercept 返回空 + liveSince null）
         watched.intercept.lock().unwrap().clear();
-        // I3：diff 滚动基线与 profiler 运行态同理属于死会话——tracing session
+        // diff 滚动基线与 profiler 运行态同理属于死会话——tracing session
         // 随连接失效，基线快照的 @eN 也随 refs 代际作废，整清不残留
         watched.last_snap.lock().unwrap().clear();
         *watched.profiler.lock().unwrap() = None;
-        // I4：录制运行态同理属于死会话（capture session / 常驻采集任务随连接
+        // 录制运行态同理属于死会话（capture session / 常驻采集任务随连接
         // 死亡，帧流不可回收）——整清；豁免表同理（残留 sessionId 永不再匹配，
         // 清掉防泄漏）。已 spawn 的采集任务持有 cancel_tx 发送端在 Watched 侧
         // 随槽位清空而 drop → 任务自行收尾退场。
@@ -405,7 +394,7 @@ impl PageService {
     }
 
     /// 工具命令的统一骨架：预算超时 → ensure → tab 路由 → 对话框游标打标
-    /// （§1.6）→ 执行 → 组装响应（instanceId/targetId + dialogs_seen）。
+    /// → 执行 → 组装响应（instanceId/targetId + dialogs_seen）。
     /// 错误响应不带 dialogs_seen（AppError 无扩展字段，见模块注释偏差项）。
     async fn command<F, Fut>(
         &self,
@@ -473,8 +462,8 @@ impl PageService {
         .await
     }
 
-    /// click <tab> <@eN | selector> [--double] [--right]（I2：内核换 kit
-    /// interaction::click——resolve 链 + ClickPhase 派发 + settle +
+    /// click <tab> <@eN | selector> [--double] [--right]（kit
+    /// interaction::click 内核——resolve 链 + ClickPhase 派发 + settle +
     /// actionability 全开：可见/启用/遮挡 + 对话框竞速；双击/右键经
     /// ClickSpec 透传）。
     pub async fn click(
@@ -495,7 +484,7 @@ impl PageService {
         .await
     }
 
-    /// fill <tab> <@eN | selector> <value>（I2：主链换 kit interaction::fill
+    /// fill <tab> <@eN | selector> <value>（kit interaction::fill 主链
     ///——focus + select/value 清空 + insertText；可填前置检查、contenteditable
     /// 预清空与回读校验为我方契约保全层）。value 为空串 = 仅清空。
     pub async fn fill(
@@ -515,8 +504,8 @@ impl PageService {
         .await
     }
 
-    /// press <tab> <key> [--target]（I2：按键序列换 kit press_key(_with_modifiers)
-    ///——keyDown+keyUp 两段，Ctrl/Meta 组合抑制 text；--target 先聚焦
+    /// press <tab> <key> [--target]（kit press_key(_with_modifiers) 按键
+    /// 序列——keyDown+keyUp 两段，Ctrl/Meta 组合抑制 text；--target 先聚焦
     ///（ref 与 selector 两路径统一 kit resolve）。
     pub async fn press(
         &self,
@@ -536,7 +525,7 @@ impl PageService {
     }
 
     /// wait <tab> <selector> [--state] [--timeout]：轮询观测直到状态满足或
-    /// 超时。预算 = 用户 timeout + 5s（wait 例外口径）。
+    /// 超时。预算 = 用户 timeout + 5s（wait 为唯一例外）。
     pub async fn wait(
         &self,
         ins_id: &str,
@@ -565,7 +554,7 @@ impl PageService {
         .await
     }
 
-    /// dialogs <tab> [--since N]：读 per-tab 对话框缓冲（§1.6 游标语义）。
+    /// dialogs <tab> [--since N]：读 per-tab 对话框缓冲（游标语义）。
     /// 响应 meta 带证据边界（dropped/capacity）：缓冲 FIFO 逐出对调用方可见。
     pub async fn dialogs(
         &self,
@@ -604,9 +593,8 @@ impl PageService {
     }
 
     /// eval <tab> <expr>：任意 JS 求值（Runtime.evaluate，returnByValue +
-    /// awaitPromise），结果按 TS evalStr 形态序列化成字符串（P2-G）。
-    /// **高权限原语**（可执行任意 JS，与退役前 cdp.mjs 同权限）——契约文档
-    /// 已标注「仅在需要时使用，优先 page 原语」。
+    /// awaitPromise），结果序列化成字符串。**高权限原语**（可执行任意 JS）
+    /// ——契约文档已标注「仅在需要时使用，优先 page 原语」。
     pub async fn eval(&self, ins_id: &str, tab: &str, expression: &str) -> Result<Value, AppError> {
         self.command(
             TOOL_TIMEOUT,
@@ -618,8 +606,8 @@ impl PageService {
         .await
     }
 
-    /// raw <tab> <method> [params]：任意 CDP 命令透传（D5 逃生舱，对齐退役前
-    /// cdp.mjs evalraw）。browser=true 发 browser 级（sid 置 None）。
+    /// raw <tab> <method> [params]：任意 CDP 命令透传（逃生舱）。browser=true
+    /// 发 browser 级（sid 置 None）。
     pub async fn raw(
         &self,
         ins_id: &str,
@@ -638,7 +626,7 @@ impl PageService {
         .await
     }
 
-    /// download-wait <tab>（W-file）：等待**下一次**下载完成（从调用时刻起
+    /// download-wait <tab>：等待**下一次**下载完成（从调用时刻起
     /// 算，命令式等待：先调 wait 再触发点击）。语义决策：
     /// - **不占实例串行锁**（drop(serial) 后再等）：典型用法是 wait 挂着、
     ///   随后 click 触发下载——若等待期持锁会死锁到超时（click 排不上队）；
@@ -683,7 +671,7 @@ impl PageService {
         }
     }
 
-    /// downloads <tab>（W-file）：终态记录环查询（最近 MAX_DOWNLOAD_HISTORY
+    /// downloads <tab>：终态记录环查询（最近 MAX_DOWNLOAD_HISTORY
     /// 条，含被等待者消费的——审计面；matched 字段区分）。
     pub async fn downloads_list(&self, ins_id: &str, tab: &str) -> Result<Value, AppError> {
         self.command(
@@ -702,7 +690,7 @@ impl PageService {
         .await
     }
 
-    /// upload <tab> <target> <filePath>（W-file）：主机文件设入页面 file
+    /// upload <tab> <target> <filePath>：主机文件设入页面 file
     /// input（DOM.setFileInputFiles， chooser 模式）。主机侧校验（绝对路径 /
     /// 拒符号链接 / 存在性 / ≤100MB）在锁外快速失败；页面侧校验（必须是
     /// input[type=file]，否则 422）+ setFileInputFiles 在命令内完成。
@@ -734,7 +722,7 @@ impl PageService {
     }
 
     /// html <tab> [selector]：读 outerHTML（缺省 = 整文档；selector 未命中
-    /// → 404 PAGE_ELEMENT_NOT_FOUND，见 html_tool 的行为差异说明）（P2-G）。
+    /// → 404 PAGE_ELEMENT_NOT_FOUND，见 html_tool 的行为差异说明）。
     pub async fn html(
         &self,
         ins_id: &str,
@@ -751,7 +739,7 @@ impl PageService {
         .await
     }
 
-    /// extract <tab> [target]：表格 → 结构化 JSON（W-ext 两段式：收集器
+    /// extract <tab> [target]：表格 → 结构化 JSON（两段式：收集器
     /// 只读采 DOM 事实 → domain/table_extract 归一化）。target 缺省 = 主文档
     /// 最大表格自动发现；支持 @eN（含跨帧 ref）与 CSS 选择器。
     pub async fn extract(
@@ -771,7 +759,7 @@ impl PageService {
     }
 
     /// clickxy <tab> <x> <y>：视口 CSS 像素坐标直接三段派发（无 locate /
-    /// hit-test——坐标即意图；跨域 iframe 内元素的兜底点击路径）（P2-G）。
+    /// hit-test——坐标即意图；跨域 iframe 内元素的兜底点击路径）。
     pub async fn clickxy(
         &self,
         ins_id: &str,
@@ -780,7 +768,7 @@ impl PageService {
         y: f64,
     ) -> Result<Value, AppError> {
         // JSON 无法携带 NaN/Infinity，这道门拦的是 CLI/本地调用方的 inf/nan
-        // 字面量（对齐 TS clickXyStr 的 isNaN 检查）
+        // 字面量（isNaN 检查拦不住 JSON 外的形态，双保险）
         if !x.is_finite() || !y.is_finite() {
             return Err(AppError::invalid_request(
                 "x and y must be finite numbers (CSS pixels)",
@@ -797,9 +785,9 @@ impl PageService {
     }
 
     /// loadall <tab> <sel> [--interval] [--max-clicks]：循环点击直到选择器
-    /// 消失或达上限（P2-G；I2：点击层换 kit click selector 路径）。预算 =
+    /// 消失或达上限（点击层走 kit click 的 selector 路径）。预算 =
     /// interval × max-clicks + 工具兑底
-    /// （默认 200 × 1500ms = 5min + 30s，对齐 TS 的 5min 硬顶量级）。
+    /// （默认 200 × 1500ms = 5min + 30s）。
     pub async fn loadall(
         &self,
         ins_id: &str,
@@ -829,12 +817,11 @@ impl PageService {
         .await
     }
 
-    /// type <tab> <text>：对当前焦点元素输入（I2：换 kit
+    /// type <tab> <text>：对当前焦点元素输入（kit
     /// type_text_into_active_context——逐字符派发，\n/\t 走真按键事件；
-    /// 无定位、无校验语义不变）——跨域 iframe 输入的唯一路径（eval/fill 的
-    /// selector 均不可达跨域 frame，先 clickxy 点入获得焦点）（P2-G，owner
-    /// 补充）。空文本 →
-    /// 400（对齐 TS typeStr）。
+    /// 无定位、无校验）——跨域 iframe 输入的唯一路径（eval/fill 的
+    /// selector 均不可达跨域 frame，先 clickxy 点入获得焦点）。空文本 →
+    /// 400。
     pub async fn r#type(&self, ins_id: &str, tab: &str, text: &str) -> Result<Value, AppError> {
         if text.is_empty() {
             return Err(AppError::invalid_request("text required"));
@@ -883,7 +870,7 @@ impl PageService {
     }
 
     /// screenshot <tab> [--target] [--full]：元素级（@eN / CSS 选择器，复用定位链）、
-    /// 整视口、或全页 png 截图（W-cap；--full 形态 W-shot）。target 缺省 = 当前
+    /// 整视口、或全页 png 截图（--full）。target 缺省 = 当前
     /// 视口；元素路径：scrollIntoView best-effort → quads 联合 bbox → 回退
     /// getBoundingClientRect → Page.captureScreenshot { clip }（与 click 的几何
     /// 链同源，clip 是区域取并集，点击是点取最大 quad）。full = 发起时刻的
@@ -931,10 +918,10 @@ impl PageService {
         .await
     }
 
-    /// pdf <tab>：Page.printToPDF 整页 PDF（W-cap）。landscape 缺省 false、
+    /// pdf <tab>：Page.printToPDF 整页 PDF。landscape 缺省 false、
     /// printBackground 缺省 true、纸张缺省 Letter 8.5×11 英寸。前置
     /// Page.enable 已由 on_attached 在 session 建立时统一补启（与对话框事件
-    /// 共用同一域启用集，无需命令内按需 enable——见任务报告决策 2）。
+    /// 共用同一域启用集，无需命令内按需 enable）。
     pub async fn pdf(
         &self,
         ins_id: &str,
@@ -1105,7 +1092,7 @@ impl PageService {
         .await
     }
 
-    /// emulate <tab>：设备仿真（W-cap）。preset / viewport / off 三形态，
+    /// emulate <tab>：设备仿真。preset / viewport / off 三形态，
     /// 解析（含 422 未知预设）在 domain::emulate 完成——建连前即可拒绝。
     /// 语义：同一 tab 重复 emulate = 覆盖（未给字段恢复默认，非合并）；
     /// off 清全部；override 绑定 page session，连接重建/实例重启自然清除。
@@ -1140,7 +1127,7 @@ async fn within_budget<T, F: Future<Output = Result<T, AppError>>>(
     }
 }
 
-/// L2 attach 握手窗口：短轮询 tabs 表至首个 page target 入表，或窗口
+/// attach 握手窗口：短轮询 tabs 表至首个 page target 入表，或窗口
 ///（300ms）耗尽——先到者为准。超时不报错：保留现有 PAGE_TAB_NOT_FOUND 的
 /// retry shortly 语义兑底（无 tab 开着 / attach 事件丢失都落到这里）。
 /// 只在 ensure 的建连分支调用（连接已在位 = 已有命令在跑，不经过这里）。
@@ -1158,9 +1145,9 @@ async fn wait_first_attach(watched: &Watched) {
 // 3. tab 路由与共享小件
 // ============================================================================
 
-/// targetId 唯一前缀解析（对齐 TS pages.mjs resolvePrefix：大小写不敏感；
-/// 无匹配 404 / 多匹配 409）。空 target 不参与前缀匹配（P2-F F1 真机复测
-/// 修正）：唯一 page target 自动选中；多个 → 409 并在 message 列出全部
+/// targetId 唯一前缀解析（大小写不敏感；无匹配 404 / 多匹配 409）。
+/// 空 target 不参与前缀匹配（真机复测修正）：唯一 page target 自动选中；
+/// 多个 → 409 并在 message 列出全部
 /// targetId（不猜「最近 attach」近似——真机会取错页面）；无 target → 404。
 fn resolve_target(tabs: &TabTable, input: &str) -> Result<(String, String), AppError> {
     if input.is_empty() {
@@ -1211,9 +1198,8 @@ fn require_conn(watched: &Watched) -> Result<SharedPageConn, AppError> {
         .ok_or_else(|| unavailable("page 控制连接未就绪（建立中或已断开），稍后重试"))
 }
 
-/// browser_kit 能力层的 client 构造（I1b：snap 管线与元素解析链的入口）。
-/// active_frame=None（CSS 选择器的 `frame <sel>` 会话态是 I2 范畴；构造期
-/// 定值，见 kit client.rs 的 V1 适配说明）。
+/// browser_kit 能力层的 client 构造（snap 管线与元素解析链的入口）。
+/// active_frame=None（构造期定值，见 kit client.rs 的适配说明）。
 pub(crate) fn kit_client(
     watched: &Watched,
 ) -> Result<crate::application::browser_kit::CdpClient, AppError> {
@@ -1223,7 +1209,7 @@ pub(crate) fn kit_client(
     ))
 }
 
-/// 发送：连接 send 已 &self 并发化（P2-F 根治，无锁包裹）——wait 轮询间隔、
+/// 发送：连接 send 已 &self 并发化（无锁包裹）——wait 轮询间隔、
 /// click 释放间隙、对话框 handle 与 in-flight 工具命令全部天然并发，不再
 /// 依赖「per-send 拿锁不跨 sleep」的间隙仲裁。
 async fn cdp_send(
