@@ -211,9 +211,11 @@ chrome-host env delete <id> --yes
 ### page — 页面控制
 
 页面操作面（P2-C；仅运行中实例，否则 409 exit 5）。操作循环：`page snap` 拿
-@eN 引用 → `page click/fill/press --target` 用引用操作 → 页面变化后重新 `snap`
-（导航后引用整表失效，报 `PAGE_REF_STALE` / `PAGE_REF_NOT_FOUND` → **重 snap，
-不要对旧引用重试**）。对话框（alert/confirm/prompt/beforeunload）会被自动
+@eN 引用 → `page click/fill/press --target` 用引用操作 → 页面变化后重新 `snap`。
+引用是 **durable** 的（v0.7+，I1b）：SPA 同文档更新（局部刷新/pushState）后旧
+@eN 仍可用（同节点直接命中，节点失联时按 role/name 唯一匹配恢复）；只有解析
+报 `PAGE_REF_STALE`（节点已随导航/替换死亡且恢复无果）时才**重 snap，不要对
+旧引用重试**；`PAGE_REF_NOT_FOUND` = 从未 snap / 引用拼错。对话框（alert/confirm/prompt/beforeunload）会被自动
 accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示行，历史用
 `page dialogs` 查。导航四件套（navigate/back/forward/reload）在同一标签内
 导航并**保留历史**（`instance navigate` 的 new+close 组合近似会丢历史，保留
@@ -222,10 +224,16 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 
 | 命令 | 说明 |
 |---|---|
-| `page snap <ID\|NAME> [TAB_ID]` | AX 树文本快照（可交互节点内联 @e1..@eN 引用）+ 元信息行（targetId/refs/generation）；行内 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化（meta `hoverScan`：ok/truncated/skipped/error，预算 32 表/2MiB/256 规则）；跨域 iframe 内容以 `[frame]` 段内嵌，@eN 跨 frame 连续编号（v0.7+；click/fill/press 对帧内 @eN 直接可用，CSS 选择器仍只查主 frame）；`--quiet` 输出 targetId |
-| `page click <ID> <sel\|@eN> [--tab T]` | 原生输入点击（三段鼠标事件，非 el.click()）；selector 路径带可见性/遮挡校验 |
-| `page fill <ID> <sel\|@eN> <value> [--tab T]` | 聚焦→全选清空→输入→回读校验；空 value = 仅清空；不可编辑 → 422 exit 7 |
-| `page press <ID> <key> [--target <sel\|@eN>] [--tab T]` | 三段键盘事件；key 支持 Enter/Tab/单字符/组合键（`Control+A`）；`--target` 先聚焦 |
+| `page snap <ID\|NAME> [TAB_ID] [-c] [-i] [-d N] [-u] [-s SEL]` | AX 树文本快照（上游风格行：`- button "Buy" @e1`，可交互节点内联 @e1..@eN 引用）+ 元信息行（targetId/refs/generation；引用有消失时附 `removed: @e2, @e5` 行）；行尾 `[hover]` = hover 触发器 / `[hover-reveal]` = hover 后才变化（meta `hoverScan`：ok/truncated/skipped/error，预算 32 表/2MiB/256 规则）；跨域 iframe 内容内嵌在 Iframe 节点行下（缩进子树，@eN 跨 frame 连续编号；click/fill/press 对帧内 @eN 直接可用，CSS 选择器仍只查主 frame）。flags（v0.7+，全缺省 = 完整树）：`-c/--compact` 压缩输出、`-i/--interactive` 只保留可交互节点、`-d/--depth N` 渲染深度上限、`-u/--urls` link 附 url、`-s/--selector SEL` 只快照该选择器命中子树；`--quiet` 输出 targetId |
+| `page click <ID> <sel\|@eN> [--double] [--right] [--tab T]` | 原生输入点击（v0.7+ kit 内核：settle + 可见/启用/遮挡校验 + 对话框竞速）；--double 双击 / --right 右键 |
+| `page fill <ID> <sel\|@eN> <value> [--tab T]` | 聚焦→清空→输入→回读校验（v0.7+ kit fill 主链 + 我方回读契约）；空 value = 仅清空；不可编辑 → 422 exit 7 |
+| `page press <ID> <key> [--target <sel\|@eN>] [--tab T]` | 键盘事件（keyDown+keyUp，v0.7+）；key 支持 Enter/Tab/单字符/组合键（`Control+A`）；`--target` 先聚焦 |
+| `page hover <ID> <sel\|@eN> [--tab T]` | 悬停（mouseMoved）：菜单类页面展开 hover 菜单，展开后重 snap 拿新引用（v0.7+ 新增） |
+| `page scroll <ID> [sel\|@eN] <dx> <dy> [--tab T]` | 滚动：有目标滚元素、无目标滚页面；dx/dy 单位 CSS 像素可负（v0.7+ 新增） |
+| `page drag <ID> <from> <to> [--tab T]` | 拖拽（滑块/排序/拖放；人类化弧线轨迹）；两端点须同帧，跨帧 → 422（v0.7+ 新增） |
+| `page select <ID> <sel\|@eN> <value> [--tab T]` | 下拉选择：value 按 option 的 value 或可见文本匹配（原生 select 与 combobox 组件）；未命中 → 422 且 message 列可用项（v0.7+ 新增） |
+| `page check <ID> <sel\|@eN> [--uncheck] [--tab T]` | 勾选/取消勾选复选框、单选钮；已处于目标态 no-op 成功（结果串明示 already）（v0.7+ 新增） |
+| `page tap <ID> <sel\|@eN> [--tab T]` | 触摸轻点（touchStart/touchEnd）：移动端仿真页只响应 touch 事件的控件用它替代 click（v0.7+ 新增） |
 | `page wait <ID> <selector> [--state V] [--timeout 10s] [--tab T]` | 轮询等待（250ms 间隔）；state = visible（缺省）/hidden/attached/detached；超时 → 409 exit 5 |
 | `page dialogs <ID> [--tab T] [--since N]` | 已自动应答的对话框日志（SEQ/TYPE/MESSAGE 表 + cursor 行；`--since` 增量拉取） |
 | `page eval <ID> <expr> [--tab T]` | 任意 JS 求值（⚠ 高权限：优先 snap/click 等专用原语，仅在不够用时用）；对象结果 = pretty JSON |
@@ -236,6 +244,12 @@ accept，命令期间新弹的对话框在结果行后附 `dialogs_seen` 提示�
 | `page type <ID> <text> [--tab T]` | 向当前焦点元素输入文本（跨域 iframe 内坐标级兑底：@eN 已支持帧直达，selector 不可达帧内时先 clickxy 点入）；空文本 → 400 exit 7 |
 | `page screenshot <ID> [sel\|@eN] [--full] [--tab T] [--out F]` | png 截图三形态：目标缺省 = 视口；@eN/选择器 = 元素；--full = 全页（截发起时刻整文档，懒加载未加载内容不在图；上限 16384 设备像素 ÷ DPR）；--full 缺省 `<id>-full.png`；与 target 互斥 exit 2 |
 | `page pdf <ID> [--landscape] [--no-print-background] [--paper-width 8.5] [--paper-height 11] [--tab T] [--out F]` | 整页 PDF（缺省 Letter 纵向带背景；缺省 `<id>.pdf`） |
+| `page diff <ID> [TAB] [-s SEL] [-c] [-d N] [--baseline-file F]` | 快照文本 diff（I3）：当前 snap ↔ 上次基线（滚动更新，@eN 记号不剥——记号漂移即真实变化）；--baseline-file 显式基线只比较不更新；响应 `{changed, added, removed, counts, diff}`；快照超 2MiB 不入基线标 baselineCleared；首次无基线 = 全部 added；quiet = changed |
+| `page diff-shot <ID> --baseline-file <png> [--full] [--tab T] [--out F]` | 像素 diff（I3）：基线 png（必填）↔ 当前截图（--full 全页，缺省视口）；响应 `{differing, ratio, image?, dimensionMismatch?}`（阈值 0.1 容忍抗锯齿）；--out 落差异图（差异红标 + 原图灰阶） |
+| `page profiler-start <ID> [TAB] [--categories "a,b"]` | 启动性能采样（I3，Chrome tracing ReportEvents + 采样；常驻不占实例串行锁；categories 缺省 = 全家桶；重复 start → 409 `PAGE_PROFILER_ALREADY_ACTIVE`） |
+| `page profiler-stop <ID> [--out F]` | 停止采样并落盘 traceEvents JSON（I3；按 start 锚点路由无需 tab；事件收集至多 30s；--out 缺省 `<id>-trace.json`；无运行中 → 409 `PAGE_PROFILER_NOT_RUNNING`；quiet = 落盘路径） |
+| `page record-start <ID> <FILE> [--fps N] [--cursor] [--tab T]` | 启动页录屏（I4，screencast 帧流 → ffmpeg 编码；常驻不占实例串行锁，录制期间其他 page 命令正常）。FILE 必填（app 主机路径，扩展名定容器 .webm/.mp4/.mov…，无扩展名 → 400）；fps 1-60 缺省 30；--cursor 合成光标（页内覆盖层 + click/drag/clickxy 输入采样插值）；重复 start → 409 `PAGE_RECORD_ALREADY_ACTIVE`；无 ffmpeg → 422 `PAGE_RECORD_NO_FFMPEG`（带安装提示） |
+| `page record-stop <ID> [--status]` | 停止录屏并结算产物（I4；按 start 锚点路由无需 tab；编码收尾可能数秒——screencast teardown/ffmpeg flush）。响应 `{result, path, frames, capturedFrames, fps}`；--status 附完整终态（capture 模式/设备缩放）；无运行中 → 409 `PAGE_RECORD_NOT_RUNNING`；quiet = 产物路径 |
 | `page emulate <ID> --preset P \| --viewport WxH [--user-agent UA] [--mobile] [--touch] \| --off [--tab T]` | 设备仿真（仅作用该 tab；重复 = 覆盖，--off 恢复；预设：iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p） |
 | `page navigate <ID> <url> [--tab T]` | 页内导航（page session 上 Page.navigate，保留历史）；等 load 至多 25s，未证实 → loaded:false；导航失败（net::ERR_*）→ 500 exit 5；URL 非法 → 400 exit 7 |
 | `page back <ID> [--tab T]` | 历史后退一步；无更早条目 → 409 `PAGE_NAV_NO_HISTORY` exit 5 |
@@ -254,14 +268,17 @@ targetId（诚实语义：不猜活跃 tab，避免取错页面；真机复测�
 loadall 缺省 1500ms。`page eval <ID> '--x'` 这类以 `-` 开头的表达式需 `--`
 分隔。
 
-错误看 `[PAGE_XXX]` 前缀分支处置（不解析文案）：`ref_stale`/`ref_not_found` 重
-snap；`element_blocked` 先处理遮挡；`element_not_visible`/`target_not_fillable`
+错误看 `[PAGE_XXX]` 前缀分支处置（不解析文案）：`ref_stale` 重 snap（durable
+语义下只在节点真正死亡时出现）；`ref_not_found` 先确认 snap 过/引用没拼错；
+`element_blocked` 先处理遮挡；`element_not_visible`/`target_not_fillable`/`element_disabled`
 检查页面状态；`fill_value_mismatch` 写入可能已部分生效，先观察再决定；
-`dispatch_failed` 附 effect_state（`none`=未发出可重试 / `unknown`=已发出禁盲目重试）；
-`tool_timeout` 连接停滞或页面无响应。
+`dispatch_failed` 附 effect_state（`none`=未发出可重试 / `unknown`=已发出禁盲目
+重试；v0.7+ click/drag 链一律保守 unknown）；`select_no_option` 检查选项拼写
+（message 列出可用项）；`drag_cross_frame` 两端点改同帧目标；`tool_timeout`
+连接停滞或页面无响应。
 
 ```bash
-# 典型循环：snap → 引用操作 → 变化后重 snap
+# 典型循环：snap → 引用操作 → 变化后重 snap（SPA 局部刷新后旧 @eN 仍可用）
 chrome-host page snap ins_xxx
 chrome-host page click ins_xxx @e3
 chrome-host page fill ins_xxx '#search input' 'hello world'
@@ -276,6 +293,14 @@ chrome-host page loadall ins_xxx '.load-more' --interval 2s --max-clicks 50
 chrome-host page clickxy ins_xxx 320 240
 chrome-host page type ins_xxx 'hello iframe'
 chrome-host page eval ins_xxx 'document.title'   # 高权限，最后手段
+
+# 输入面六新件（v0.7+ / I2：hover/scroll/drag/select/check/tap）
+chrome-host page hover ins_xxx @e3              # 悬停展开菜单 → 重 snap 拿新引用
+chrome-host page scroll ins_xxx '#feed' 0 -600  # 滚元素（省略目标滚整页）
+chrome-host page drag ins_xxy '#thumb' '#drop'  # 拖拽（弧线轨迹）
+chrome-host page select ins_xxx '#state' '已上线' # 按 value 或可见文本选择
+chrome-host page check ins_xxx '#agree'         # 勾选（--uncheck 取消）
+chrome-host page tap ins_xxx '#pay'             # 触摸轻点（仿真页专用）
 
 # 表格提取（QA：订单列表/查询结果 → JSON）
 chrome-host page extract ins_xxx                     # 主文档最大表格自动发现

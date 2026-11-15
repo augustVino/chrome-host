@@ -187,8 +187,8 @@ export const API_CATALOG: CatalogGroup[] = [
       {
         method: 'POST',
         path: '/instances/:id/page/click',
-        desc: '原生输入点击：<sel|@eN>（可见性检查 + 遮挡拦截 + 三段鼠标事件）',
-        body: '{ "target": "@e1", "tab": null }',
+        desc: '原生输入点击：<sel|@eN>（v0.9+ kit 内核：settle + 可见/启用/遮挡 + 对话框竞速；double/right 透传）',
+        body: '{ "target": "@e1", "double": false, "right": false, "tab": null }',
       },
       {
         method: 'POST',
@@ -199,8 +199,44 @@ export const API_CATALOG: CatalogGroup[] = [
       {
         method: 'POST',
         path: '/instances/:id/page/press',
-        desc: '按键：命名键/单字符/组合键（Control+A）；target 先聚焦',
+        desc: '按键：命名键/单字符/组合键（Control+A）；target 先聚焦（v0.9+ keyDown+keyUp）',
         body: '{ "key": "Enter", "target": "@e1", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/hover',
+        desc: '悬停（mouseMoved 到元素中心）：菜单展开后重 snap（v0.9+）',
+        body: '{ "target": "@e1", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/scroll',
+        desc: '滚动：有 target 滚元素、无 target 滚页面（dx/dy = CSS 像素可负）（v0.9+）',
+        body: '{ "target": "#feed", "dx": 0, "dy": -600, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/drag',
+        desc: '拖拽：<from> <to>（人类化弧线轨迹；两端点同帧，跨帧 → 422）（v0.9+）',
+        body: '{ "from": "#thumb", "to": "#drop", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/select',
+        desc: '下拉选择：value 按 option 的 value 或可见文本匹配（原生 select 与 combobox 组件）（v0.9+）',
+        body: '{ "target": "#state", "value": "已上线", "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/check',
+        desc: '勾选/取消勾选复选框、单选钮（uncheck=true 取消；已处于目标态 no-op 成功）（v0.9+）',
+        body: '{ "target": "#agree", "uncheck": false, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/tap',
+        desc: '触摸轻点（touchStart/touchEnd）：移动端仿真页专用（v0.9+）',
+        body: '{ "target": "#pay", "tab": null }',
       },
       {
         method: 'POST',
@@ -302,6 +338,42 @@ export const API_CATALOG: CatalogGroup[] = [
         desc: '整页 PDF（Page.printToPDF）：landscape/printBackground/纸张英寸可调，缺省 Letter 纵向带背景',
         body: '{ "landscape": false, "printBackground": true, "paperWidth": 8.5, "paperHeight": 11, "tab": null }',
         note: '纸张单位英寸；A4 = 8.27×11.69',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/diff',
+        desc: '快照文本 diff：当前 snap ↔ 基线（无 baseline 用滚动基线并更新；baseline 给定只比较；首次全 added）（v0.7+）',
+        body: '{ "baseline": null, "selector": null, "compact": false, "depth": null, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/diff-shot',
+        desc: '像素 diff：base64 png 基线 ↔ 当前截图（阈值 0.1 容抗锯齿；尺寸不一致披露 dimensionMismatch）（v0.7+）',
+        body: '{ "baseline": "<b64png>", "full": false, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/profiler/start',
+        desc: '启动性能采样（Chrome tracing；categories 缺省全家桶；常驻不占串行锁；重复 → 409）（v0.7+）',
+        body: '{ "categories": null, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/profiler/stop',
+        desc: '停止采样落盘 traceEvents JSON（out 缺省 <id>-trace.json；收集至多 30s；无运行中 → 409）（v0.7+）',
+        body: '{ "out": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/record/start',
+        desc: '启动页录屏（screencast→ffmpeg；file 扩展名定容器；fps 1-60 缺省 30；cursor 合成光标；重复 → 409；无 ffmpeg → 422）（v0.7+）',
+        body: '{ "file": "/tmp/demo.webm", "fps": 30, "cursor": true, "tab": null }',
+      },
+      {
+        method: 'POST',
+        path: '/instances/:id/page/record/stop',
+        desc: '停止录屏并落盘（编码收尾数秒；响应 path/frames/capturedFrames/fps；无运行中 → 409）（v0.7+）',
+        body: '{ "status": false }',
       },
       {
         method: 'POST',

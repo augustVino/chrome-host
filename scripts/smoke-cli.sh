@@ -108,7 +108,8 @@ CNT=$(cli status --json | jqpy "1 if d.get('counts') else 0")
 check "$CNT" "1" "status --json 含 counts 字段"
 
 echo "[9/12] doctor"
-CHK=$(cli doctor --json | jqpy "1 if isinstance(d.get('checks'), list) else 0")
+# doctor exit 1（存在失败项，如隧道不可达）为合法态——pipefail 下需先摘 -e
+set +e; CHK=$(cli doctor --json | jqpy "1 if isinstance(d.get('checks'), list) else 0"); set -e
 check "$CHK" "1" "doctor --json 含 checks 数组"
 set +e; cli doctor >/dev/null 2>&1; code=$?; set -e
 if [ "$code" = "0" ] || [ "$code" = "1" ]; then

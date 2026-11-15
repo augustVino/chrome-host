@@ -37,6 +37,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
+/// raw 响应通道的 pending 表：响应帧文本（不解析）回送等待者。browser_kit
+/// 的 send_command_typed_raw 用它做 MB 级响应的单次反序列化（防双份内存）。
+type RawPending = Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>>;
 /// 常驻连接的事件出口：无 id 帧（CDP 事件）透传给消费者
 pub type EventSink = mpsc::UnboundedSender<serde_json::Value>;
 
@@ -57,6 +60,18 @@ impl Drop for PendingGuard {
     }
 }
 
+/// raw 通道版取消安全守卫（语义同 [`PendingGuard`]）。
+struct RawPendingGuard {
+    pending: RawPending,
+    id: u64,
+}
+
+impl Drop for RawPendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
 /// 一次性 CDP 命令连接（可共享：`Arc<CdpConnection>` 直接发命令，无锁包裹）。
 pub struct CdpConnection {
     /// 写半部短锁：只覆盖「写一帧」，不等响应——若把等响应也留在锁内，
@@ -64,6 +79,8 @@ pub struct CdpConnection {
     write: tokio::sync::Mutex<SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>,
     next_id: AtomicU64,
     pending: Pending,
+    /// raw 响应表（send_raw 路径）：reader 优先于此表路由 id 帧
+    raw_pending: RawPending,
     timeout: Duration,
 }
 
@@ -118,13 +135,74 @@ impl CdpConnection {
             })?;
         let (write, read) = ws.split();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        tokio::spawn(reader_loop(read, Arc::clone(&pending), events));
+        let raw_pending: RawPending = Arc::new(Mutex::new(HashMap::new()));
+        tokio::spawn(reader_loop(read, Arc::clone(&pending), Arc::clone(&raw_pending), events));
         Ok(Self {
             write: tokio::sync::Mutex::new(write),
             next_id: AtomicU64::new(0),
             pending,
+            raw_pending,
             timeout,
         })
+    }
+
+    /// raw 形态：发送命令并把**完整响应帧文本**回送（不解析成 Value）。供
+    /// browser_kit 的 typed_raw 路径做大响应单次反序列化（getFullAXTree 的
+    /// MB 级 AX 树，防 Value 中间树的双份内存峰值）。
+    ///
+    /// 错误语义与 [`CdpConnection::send`] 一致（Chrome error/超时/断连统一
+    /// CDP_COMMAND_FAILED）；错误帧也以文本回送，由调用方解析后自行识别
+    /// error 字段（信封式消费，见 browser_kit::client::RawEnvelope）。
+    pub async fn send_raw(
+        &self,
+        method: &str,
+        params: impl Serialize,
+        session_id: Option<&str>,
+    ) -> Result<String, AppError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+
+        let mut payload = serde_json::json!({
+            "id": id,
+            "method": method,
+            "params": serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
+        });
+        if let Some(sid) = session_id {
+            payload["sessionId"] = serde_json::Value::String(sid.to_string());
+        }
+
+        let (tx, rx) = oneshot::channel();
+        self.raw_pending.lock().unwrap().insert(id, tx);
+        let _guard = RawPendingGuard {
+            pending: Arc::clone(&self.raw_pending),
+            id,
+        };
+
+        {
+            let mut write = self.write.lock().await;
+            write
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    payload.to_string().into(),
+                ))
+                .await
+                .map_err(|e| {
+                    AppError::business(500, "CDP_COMMAND_FAILED", format!("CDP 命令发送失败: {e}"))
+                })?;
+        }
+
+        let outcome = tokio::time::timeout(self.timeout, rx).await;
+        match outcome {
+            Err(_elapsed) => Err(AppError::business(
+                500,
+                "CDP_COMMAND_FAILED",
+                format!("CDP 命令 {method} 超时（{}ms）", self.timeout.as_millis()),
+            )),
+            Ok(Err(_closed)) => Err(AppError::business(
+                500,
+                "CDP_COMMAND_FAILED",
+                "CDP 连接在命令完成前关闭",
+            )),
+            Ok(Ok(text)) => Ok(text),
+        }
     }
 
     /// 发送命令并等待响应（`&self`：多条命令可并发 in-flight，见模块注释）。
@@ -207,11 +285,24 @@ impl CdpConnection {
 /// 读循环：响应（带 id）路由回 pending 等待者；事件（无 id）——短连接无消费方
 /// 丢弃，常驻连接（M6 起）透传给事件通道。事件通道随 reader 结束而 drop，
 /// 消费侧 recv 返回 None 即连接已死的信号。
-async fn reader_loop(read: SplitStream<WsStream>, pending: Pending, events: Option<EventSink>) {
+async fn reader_loop(
+    read: SplitStream<WsStream>,
+    pending: Pending,
+    raw_pending: RawPending,
+    events: Option<EventSink>,
+) {
     let mut read = read;
     while let Some(msg) = read.next().await {
         match msg {
             Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                // raw 通道优先：命中 raw_pending 的 id 直接回送帧文本（不解析）。
+                // 快路径代价：非 raw 场景多做一次 HashMap::remove（miss），可忽略
+                if let Some(id) = fast_id_probe(&text) {
+                    if let Some(tx) = raw_pending.lock().unwrap().remove(&id) {
+                        let _ = tx.send(text.to_string());
+                        continue;
+                    }
+                }
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
                     continue;
                 };
@@ -225,6 +316,12 @@ async fn reader_loop(read: SplitStream<WsStream>, pending: Pending, events: Opti
                     }
                     continue;
                 };
+                // raw 兑底：fast_id_probe 未命中（id 不在前缀的帧序）但确实在等
+                // raw 响应——原文本回送后继续（不进入 pending 路径）
+                if let Some(tx) = raw_pending.lock().unwrap().remove(&id) {
+                    let _ = tx.send(text.to_string());
+                    continue;
+                }
                 let tx = pending.lock().unwrap().remove(&id);
                 if let Some(tx) = tx {
                     let result = match v.get("error") {
@@ -248,6 +345,29 @@ async fn reader_loop(read: SplitStream<WsStream>, pending: Pending, events: Opti
     for (_, tx) in stranded {
         let _ = tx.send(Err("CDP 连接已关闭".to_string()));
     }
+    let stranded_raw: Vec<_> = raw_pending.lock().unwrap().drain().collect();
+    for (_, tx) in stranded_raw {
+        let _ = tx.send(String::new());
+    }
+}
+
+/// 响应帧 id 的快速探测（raw 通道路由用）：轻量扫描 `{"id":N` 前缀，避免
+/// 全帧解析。事件帧（无 id）与畸形帧返回 None，走完整解析路径。
+fn fast_id_probe(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 8 || bytes[0] != b'{' {
+        return None;
+    }
+    // serde_json 序列化的帧文本格式固定：{"id":N,...}（payload 由本模块构造）。
+    // 扫描前 32 字符内 "id": 后的十进制数
+    let head = &text[..text.len().min(32)];
+    let pos = head.find("\"id\":")?;
+    let rest = &head[pos + 5..];
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse().ok()
 }
 
 #[cfg(test)]

@@ -65,7 +65,7 @@ chrome-host instance delete <id> --yes      删除（运行中自动 stop→dele
 命令结构：`chrome-host page <子命令> <insId> [tab] ...`。`tab` 是 `instance tabs` 输出的 targetId 唯一前缀；单标签实例可省略，多标签缺省报 `PAGE_TAB_AMBIGUOUS` 并列出全部 tab。本地/远程同用，无需 CDP 端口或代理凭证。
 
 ```text
-page snap    <id> [tab]                     可访问性树 + @eN 引用 + [hover]/[hover-reveal] 标记（--json 另含 hoverScan 状态）
+page snap    <id> [tab] [-c|-i|-d N|-u|-s sel]  可访问性树 + @eN 引用 + [hover]/[hover-reveal] 标记（--json 另含 hoverScan 与 removedRefs）
 page click   <id> <sel|@eN> [--tab t]       原生输入点击：可见性检查 + hit-test 拦截遮挡 + 三段鼠标事件
 page fill    <id> <sel|@eN> <value> [--tab t]  聚焦+清空+输入+回读校验；空 value = 仅清空
 page press   <id> <key> [--target <sel|@eN>] [--tab t]  键入：命名键/单字符/组合键（Control+A、Meta+V）；可先聚焦
@@ -74,10 +74,16 @@ page navigate <id> <url> [--tab t]         页内导航（Page.navigate，保留
 page back    <id> [--tab t]                历史后退一步（边界 → 409 PAGE_NAV_NO_HISTORY）
 page forward <id> [--tab t]               历史前进一步（边界 → 409 PAGE_NAV_NO_HISTORY）
 page reload  <id> [--ignore-cache] [--tab t]  重载当前页（等待语义同 navigate）
-page screenshot <id> [sel|@eN] [--full] [--out f] [--tab t]  png 截图：目标缺省=当前视口；元素路径先滚入视口再截包围盒（跨行取并集）；--full=全页长截图（上限 16384 设备像素 ÷ DPR，Retina=8192 CSS；缺省文件 <id>-full.png；与目标互斥）
+page screenshot <id> [sel|@eN] [--full] [--out f] [--tab t]  png 截图：目标缺省=当前视口；元素路径不滚动页面（文档坐标 clip + captureBeyondViewport 可截屏外元素）；--full=全页长截图（上限 16384 设备像素 ÷ DPR，Retina=8192 CSS；缺省文件 <id>-full.png；与目标互斥）
 page extract <id> [sel|@eN] [--tab t] [--out f.json]  表格 → 结构化 JSON（columns/rows/coverage/meta；缺省目标 = 主文档最大表格自动发现；null=被合并覆盖、""=真实空单元格；coverage.datasetComplete 只有 unknown/incomplete——aria-rowcount 超出/截断/空 tbody 均 incomplete 并给 reasons，永不装作取全；非表格 → 422 PAGE_EXTRACT_NOT_A_TABLE）
 page pdf     <id> [--out f] [--landscape] [--no-print-background] [--paper-width 8.5] [--paper-height 11] [--tab t]  整页 PDF（缺省 Letter 纵向带背景）
-page emulate <id> --preset NAME | --viewport WxH [--user-agent UA] [--mobile] [--touch] | --off [--tab t]  设备仿真（预设：iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p；仅作用该 tab，重复=覆盖，--off 恢复）
+page diff    <id> [t] [-s sel] [-c] [-d n] [--baseline-file f]  快照文本 diff：当前 snap ↔ 上次基线（滚动更新；@eN 记号不剥，漂移即变化）；--baseline-file 只比较不更新；响应 {changed, added, removed, counts, diff}；快照超 2MiB 不入基线标 baselineCleared；quiet=changed
+page diff-shot <id> --baseline-file <png> [--full] [--tab t] [--out f]  像素 diff：基线 png（必填）↔ 当前截图（--full 全页）；{differing, ratio, image?, dimensionMismatch?}；--out 落差异图（红标+灰阶）
+page profiler-start <id> [t] [--categories "a,b"]  启动性能采样（Chrome tracing ReportEvents+采样；不占串行锁；缺省全家桶分类；重复 → 409 PAGE_PROFILER_ALREADY_ACTIVE）
+page profiler-stop  <id> [--out f.json]  停止采样并落盘 traceEvents JSON（按 start 锚点路由无需 tab；收集至多 30s；缺省 <id>-trace.json；无运行中 → 409 PAGE_PROFILER_NOT_RUNNING；quiet=落盘路径）
+
+| `page record-start <ID> <FILE> [--fps N] [--cursor] [--tab T]` | 启动录屏：screencast→ffmpeg；FILE 扩展名定容器（.webm/.mp4/.mov）；fps 1-60 缺省 30；--cursor 合成光标；缺 ffmpeg → 422 PAGE_RECORD_NO_FFMPEG；重复 → 409 |
+| `page record-stop <ID> [--status]` | 停止录屏落盘（编码收尾数秒；响应 path/frames/capturedFrames/fps；无运行中 → 409 PAGE_RECORD_NOT_RUNNING） |page emulate <id> --preset NAME | --viewport WxH [--user-agent UA] [--mobile] [--touch] | --off [--tab t]  设备仿真（预设：iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p；仅作用该 tab，重复=覆盖，--off 恢复）
 page eval    <id> <expr> [--tab t]          执行 JS（returnByValue+awaitPromise；优先用上面的原语）
 page raw     <id> <method> [json] [--tab t] [--browser]  任意 CDP 命令透传（⚠ 最高权限逃生舱；--browser 发 browser 级）
 page html    <id> [selector] [--tab t]      页面/元素 outerHTML
@@ -90,14 +96,15 @@ page downloads <id> [--tab t]               下载终态记录环（近 20 条�
 page upload <id> <sel|@eN> <abs> [--tab t]  主机文件设入 input[type=file]（触发原生 change；必须物理绝对路径——macOS /tmp、/var 软链拒绝改传 /private/...；拒软链/目录/超100MB → 422，不存在 → 404）
 ```
 
-**操作循环**：snap → 用 @eN 操作 → 页面变化后重 snap。导航后 @eN 整表失效（PAGE_REF_STALE），重新 snap，不要对旧引用重试。
+**操作循环**：snap → 用 @eN 操作 → 页面变化后重 snap。@eN 引用是 durable 的：SPA 同文档局部刷新后旧引用仍可用；收到 PAGE_REF_STALE（节点死亡且恢复无果）时重新 snap，不要对旧引用重试。
 
 **PAGE_* 错误码**（stderr 行 `[PAGE_XXX] message`，按码分支处置，不解析文案）：
 
 | 错误码 | 处置 |
 |---|---|
 | PAGE_TAB_NOT_FOUND / PAGE_TAB_AMBIGUOUS | 前者：连接刚建立时重试同一命令；后者：带 tab 列表，显式选一个 |
-| PAGE_REF_NOT_FOUND / PAGE_REF_STALE | 重新 snap 取新引用 |
+| PAGE_REF_STALE | 节点已死（导航/替换/恢复无果）：重新 snap 取新引用 |
+| PAGE_REF_NOT_FOUND | 未 snap 过或引用拼错：先 snap / 核对引用号 |
 | PAGE_ELEMENT_NOT_FOUND / PAGE_ELEMENT_NOT_VISIBLE | 核对选择器；不可见先处理可见性 |
 | PAGE_ELEMENT_BLOCKED | 点击点被浮层遮挡（信息含遮挡元素）——先关浮层或改点遮挡层自身 |
 | PAGE_TARGET_NOT_FILLABLE | 目标不是可输入元素（input/textarea/contenteditable 编辑根） |

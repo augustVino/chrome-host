@@ -839,13 +839,44 @@ impl AgentClient {
     }
 
     /// POST /api/v1/instances/{id}/page/snap —— body `{tab?}`
-    pub fn page_snap(&self, id: &str, tab: Option<&str>) -> Result<serde_json::Value, CliError> {
-        let body = serde_json::json!({ "tab": tab });
+    pub fn page_snap(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+        flags: &crate::cli::page::SnapFlags,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({
+            "tab": tab,
+            "compact": flags.compact,
+            "interactive": flags.interactive,
+            "depth": flags.depth,
+            "urls": flags.urls,
+            "selector": flags.selector,
+        });
         Self::decode(self.send(Method::POST, &Self::page_path(id, "snap"), Some(body), true))
     }
 
-    /// POST /api/v1/instances/{id}/page/click —— body `{target, tab?}`
+    /// POST /api/v1/instances/{id}/page/click —— body `{target, double?, right?, tab?}`
     pub fn page_click(
+        &self,
+        id: &str,
+        target: &str,
+        double: bool,
+        right: bool,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body =
+            serde_json::json!({ "target": target, "double": double, "right": right, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "click"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/hover —— body `{target, tab?}`
+    pub fn page_hover(
         &self,
         id: &str,
         target: &str,
@@ -854,10 +885,87 @@ impl AgentClient {
         let body = serde_json::json!({ "target": target, "tab": tab });
         Self::decode(self.send(
             Method::POST,
-            &Self::page_path(id, "click"),
+            &Self::page_path(id, "hover"),
             Some(body),
             true,
         ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/scroll —— body `{target?, dx, dy, tab?}`
+    ///（dx/dy = CSS 像素可负；target 缺省 = 整页滚动）
+    pub fn page_scroll(
+        &self,
+        id: &str,
+        target: Option<&str>,
+        dx: f64,
+        dy: f64,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "dx": dx, "dy": dy, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "scroll"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/drag —— body `{from, to, tab?}`
+    pub fn page_drag(
+        &self,
+        id: &str,
+        from: &str,
+        to: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "from": from, "to": to, "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "drag"), Some(body), true))
+    }
+
+    /// POST /api/v1/instances/{id}/page/select —— body `{target, value, tab?}`
+    ///（value 按 option 的 value 或可见文本匹配）
+    pub fn page_select(
+        &self,
+        id: &str,
+        target: &str,
+        value: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "value": value, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "select"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/check —— body `{target, uncheck?, tab?}`
+    pub fn page_check(
+        &self,
+        id: &str,
+        target: &str,
+        uncheck: bool,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "uncheck": uncheck, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "check"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/tap —— body `{target, tab?}`
+    pub fn page_tap(
+        &self,
+        id: &str,
+        target: &str,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "target": target, "tab": tab });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "tap"), Some(body), true))
     }
 
     /// POST /api/v1/instances/{id}/page/fill —— body `{target, value, tab?}`
@@ -1019,37 +1127,31 @@ impl AgentClient {
         tab: Option<&str>,
     ) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "url": url, "tab": tab });
-        Self::decode(
-            self.send(
-                Method::POST,
-                &Self::page_path(id, "navigate"),
-                Some(body),
-                true,
-            ),
-        )
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "navigate"),
+            Some(body),
+            true,
+        ))
     }
 
     /// POST /api/v1/instances/{id}/page/back —— body `{tab?}`
     /// （历史后退；无更早条目 → 409 PAGE_NAV_NO_HISTORY）
     pub fn page_back(&self, id: &str, tab: Option<&str>) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "tab": tab });
-        Self::decode(
-            self.send(Method::POST, &Self::page_path(id, "back"), Some(body), true),
-        )
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "back"), Some(body), true))
     }
 
     /// POST /api/v1/instances/{id}/page/forward —— body `{tab?}`
     /// （历史前进；无更晚条目 → 409 PAGE_NAV_NO_HISTORY）
     pub fn page_forward(&self, id: &str, tab: Option<&str>) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "tab": tab });
-        Self::decode(
-            self.send(
-                Method::POST,
-                &Self::page_path(id, "forward"),
-                Some(body),
-                true,
-            ),
-        )
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "forward"),
+            Some(body),
+            true,
+        ))
     }
 
     /// POST /api/v1/instances/{id}/page/reload —— body `{ignoreCache?, tab?}`
@@ -1061,14 +1163,12 @@ impl AgentClient {
         tab: Option<&str>,
     ) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "ignoreCache": ignore_cache, "tab": tab });
-        Self::decode(
-            self.send(
-                Method::POST,
-                &Self::page_path(id, "reload"),
-                Some(body),
-                true,
-            ),
-        )
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "reload"),
+            Some(body),
+            true,
+        ))
     }
 
     /// POST /api/v1/instances/{id}/page/screenshot —— body `{target?, full?, tab?}`
@@ -1098,7 +1198,12 @@ impl AgentClient {
         tab: Option<&str>,
     ) -> Result<serde_json::Value, CliError> {
         let body = serde_json::json!({ "target": target, "tab": tab });
-        Self::decode(self.send(Method::POST, &Self::page_path(id, "extract"), Some(body), true))
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "extract"),
+            Some(body),
+            true,
+        ))
     }
 
     /// POST /api/v1/instances/{id}/page/pdf —— body `{tab?, landscape?, printBackground?,
@@ -1130,7 +1235,12 @@ impl AgentClient {
         id: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, CliError> {
-        Self::decode(self.send(Method::POST, &Self::page_path(id, "emulate"), Some(body), true))
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "emulate"),
+            Some(body),
+            true,
+        ))
     }
 
     /// POST /api/v1/instances/{id}/page/download-wait —— body `{timeoutMs?, tab?}`
@@ -1181,6 +1291,111 @@ impl AgentClient {
         Self::decode(self.send(
             Method::POST,
             &Self::page_path(id, "upload"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/diff —— body `{tab?, selector?, compact?,
+    /// depth?, baseline?}`（快照文本 diff：无 baseline = 与服务端滚动基线
+    /// 比较并更新；响应 {changed, added, removed, counts, diff}）
+    pub fn page_diff(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+        selector: Option<&str>,
+        compact: bool,
+        depth: Option<usize>,
+        baseline: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({
+            "tab": tab,
+            "selector": selector,
+            "compact": compact,
+            "depth": depth,
+            "baseline": baseline,
+        });
+        Self::decode(self.send(Method::POST, &Self::page_path(id, "diff"), Some(body), true))
+    }
+
+    /// POST /api/v1/instances/{id}/page/diff-shot —— body `{tab?, full?, baseline}`
+    ///（像素 diff：baseline = 基线 png 的 base64；响应 {differing, ratio,
+    /// image?, dimensionMismatch?}）
+    pub fn page_diff_shot(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+        full: bool,
+        baseline: &str,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "tab": tab, "full": full, "baseline": baseline });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "diff-shot"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/profiler/start —— body `{tab?, categories?}`
+    ///（常驻采样：不占实例串行锁；重复 start → 409）
+    pub fn page_profiler_start(
+        &self,
+        id: &str,
+        tab: Option<&str>,
+        categories: Option<Vec<String>>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "tab": tab, "categories": categories });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "profiler/start"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/profiler/stop —— body `{out?}`
+    ///（停止采样并落盘 traceEvents JSON；out 缺省 <id>-trace.json 服务端 cwd）
+    pub fn page_profiler_stop(
+        &self,
+        id: &str,
+        out: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "out": out });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "profiler/stop"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/record/start —— body `{file, fps?, cursor?, tab?}`
+    ///（I4 录屏：常驻不占实例串行锁；重复 start → 409；无 ffmpeg → 422）
+    pub fn page_record_start(
+        &self,
+        id: &str,
+        file: &str,
+        fps: Option<u32>,
+        cursor: bool,
+        tab: Option<&str>,
+    ) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "file": file, "fps": fps, "cursor": cursor, "tab": tab });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "record/start"),
+            Some(body),
+            true,
+        ))
+    }
+
+    /// POST /api/v1/instances/{id}/page/record/stop —— body `{status?}`
+    ///（I4：编码收尾可能数秒；响应 { result, path, frames, capturedFrames, fps }）
+    pub fn page_record_stop(&self, id: &str, status: bool) -> Result<serde_json::Value, CliError> {
+        let body = serde_json::json!({ "status": status });
+        Self::decode(self.send(
+            Method::POST,
+            &Self::page_path(id, "record/stop"),
             Some(body),
             true,
         ))

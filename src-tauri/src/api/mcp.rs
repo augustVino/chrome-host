@@ -92,7 +92,9 @@ struct InstanceArgs {
 struct CreateInstanceArgs {
     #[schemars(description = "环境 id（env_ 前缀）")]
     environment_id: String,
-    #[schemars(description = "可选实例名：1-64 字符、非纯空白；同环境内唯一，重名 → 409 INSTANCE_NAME_CONFLICT。多任务并行时建议命名，便于后续按名锚定")]
+    #[schemars(
+        description = "可选实例名：1-64 字符、非纯空白；同环境内唯一，重名 → 409 INSTANCE_NAME_CONFLICT。多任务并行时建议命名，便于后续按名锚定"
+    )]
     name: Option<String>,
 }
 
@@ -215,7 +217,9 @@ struct NetworkBodyArgs {
     request_id: String,
     #[schemars(description = "窗口起点，UTF-16 code unit（JS String 同构）；缺省 0")]
     offset: Option<usize>,
-    #[schemars(description = "窗口长度（UTF-16 unit）；缺省 8192，上限 65536。truncated=true 时用 offset+=returned 续读")]
+    #[schemars(
+        description = "窗口长度（UTF-16 unit）；缺省 8192，上限 65536。truncated=true 时用 offset+=returned 续读"
+    )]
     limit: Option<usize>,
 }
 
@@ -260,6 +264,18 @@ struct PageSnapArgs {
     instance_id: String,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
+    #[schemars(description = "压缩输出（kit compact_tree：去掉空行/冗余层级），默认 false")]
+    compact: Option<bool>,
+    #[schemars(description = "只保留可交互节点（带 @eN 引用的行），默认 false")]
+    interactive: Option<bool>,
+    #[schemars(description = "渲染深度上限（缩进层级），默认不限")]
+    depth: Option<usize>,
+    #[schemars(description = "link 节点附 url= 属性，默认 false")]
+    urls: Option<bool>,
+    #[schemars(
+        description = "只快照该 CSS 选择器命中子树（未命中 → 500 PAGE_ACTION_FAILED 带原因）"
+    )]
+    selector: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -268,9 +284,13 @@ struct PageClickArgs {
     #[schemars(description = "实例 id（ins_ 前缀）")]
     instance_id: String,
     #[schemars(
-        description = "点击目标：@eN 引用（上次 page_snap 产生，导航后失效需重新 snap）或 CSS 选择器"
+        description = "点击目标：@eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）或 CSS 选择器"
     )]
     target: String,
+    #[schemars(description = "true = 双击（clickCount=2）；缺省 false")]
+    double: Option<bool>,
+    #[schemars(description = "true = 右键（button=right）；缺省 false（左键）")]
+    right: Option<bool>,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
 }
@@ -281,7 +301,7 @@ struct PageFillArgs {
     #[schemars(description = "实例 id（ins_ 前缀）")]
     instance_id: String,
     #[schemars(
-        description = "填写目标：@eN 引用（上次 page_snap 产生，导航后失效需重新 snap）或 CSS 选择器"
+        description = "填写目标：@eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）或 CSS 选择器"
     )]
     target: String,
     #[schemars(description = "填入文本；空串 = 仅清空")]
@@ -301,6 +321,100 @@ struct PagePressArgs {
     key: String,
     #[schemars(description = "可选聚焦目标：@eN 引用或 CSS 选择器（先 focus 再按键）")]
     target: Option<String>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageHoverArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "悬停目标：@eN 引用（上次 page_snap 产生）或 CSS 选择器（菜单类页面的 hover 展开）"
+    )]
+    target: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageScrollArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "滚动目标：@eN 引用或 CSS 选择器；省略 = 整页滚动（window.scrollBy）"
+    )]
+    target: Option<String>,
+    #[schemars(description = "水平滚动量（CSS 像素，可负；0 = 不动）")]
+    dx: f64,
+    #[schemars(description = "垂直滚动量（CSS 像素，可负；负值向上滚）")]
+    dy: f64,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageDragArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "拖拽起点：@eN 引用或 CSS 选择器（可见/启用/未被遮挡，否则 422/409）"
+    )]
+    from: String,
+    #[schemars(
+        description = "拖拽终点：@eN 引用或 CSS 选择器（须与 from 同帧；跨帧拖拽 → 422 PAGE_DRAG_CROSS_FRAME）"
+    )]
+    to: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageSelectArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "选择目标：@eN 引用或 CSS 选择器（原生 <select> 或 role=combobox/listbox 控件；非此类 → 422 PAGE_SELECT_NOT_SELECT）"
+    )]
+    target: String,
+    #[schemars(
+        description = "选项的 value 或可见文本（label），两者任一匹配即选中；空串 = 选中空值选项。未命中 → 422 PAGE_SELECT_NO_OPTION（message 列出可用项）；多候选 → 409 PAGE_SELECT_AMBIGUOUS"
+    )]
+    value: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageCheckArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "勾选目标：@eN 引用或 CSS 选择器（input[type=checkbox/radio]、关联 label 或内嵌 input 的容器）"
+    )]
+    target: String,
+    #[schemars(
+        description = "true = 取消勾选；缺省 false = 勾选。已处于目标态时 no-op 成功（结果串明示 already）"
+    )]
+    uncheck: Option<bool>,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageTapArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "轻点目标：@eN 引用或 CSS 选择器（触摸序列 touchStart/touchEnd——移动端仿真页面用 tap 而非 click）"
+    )]
+    target: String,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
 }
@@ -359,7 +473,9 @@ struct PageRawArgs {
     params: Option<serde_json::Value>,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
-    #[schemars(description = "true = 发 browser 级（Target 域等）；缺省 false = 发到 tab 的 page session（Runtime/DOM/Input/Emulation）")]
+    #[schemars(
+        description = "true = 发 browser 级（Target 域等）；缺省 false = 发到 tab 的 page session（Runtime/DOM/Input/Emulation）"
+    )]
     browser: Option<bool>,
 }
 
@@ -438,7 +554,7 @@ struct PageScreenshotArgs {
     #[schemars(description = "实例 id（ins_ 前缀）")]
     instance_id: String,
     #[schemars(
-        description = "截图目标：@eN 引用（上次 page_snap 产生）或 CSS 选择器；省略 = 当前视口整幅。元素路径先滚动入视口再截其包围盒（跨行元素取并集）"
+        description = "截图目标：@eN 引用（上次 page_snap 产生）或 CSS 选择器；省略 = 当前视口整幅。元素路径不滚动页面（文档坐标 clip + captureBeyondViewport 可截屏外元素）"
     )]
     target: Option<String>,
     #[schemars(
@@ -473,6 +589,94 @@ struct PagePdfArgs {
     paper_height: Option<f64>,
     #[schemars(description = TAB_ARG_DESC)]
     tab: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageDiffArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+    #[schemars(description = "只快照该 CSS 选择器命中子树（与 page_snap 的 selector 同源）")]
+    selector: Option<String>,
+    #[schemars(description = "压缩快照输出（与 page_snap 的 compact 同源），默认 false")]
+    compact: Option<bool>,
+    #[schemars(description = "渲染深度上限（缩进层级），默认不限")]
+    depth: Option<usize>,
+    #[schemars(
+        description = "显式基线快照文本：给定则只比较不更新服务端滚动基线；省略 = 与该 tab 上次 diff 的快照（滚动基线）比较并更新之。首次无基线 → 与空比较（全部计为 added）"
+    )]
+    baseline: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageDiffShotArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+    #[schemars(
+        description = "基线截图（base64 png，必填）：与当前截图做像素 diff。尺寸不一致 → differing=true + ratio=100 + dimensionMismatch 披露"
+    )]
+    baseline: String,
+    #[schemars(description = "true = 当前侧用全页截图；缺省当前视口")]
+    full: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageProfilerStartArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+    #[schemars(
+        description = "追踪分类数组；缺省 = 全家桶（devtools.timeline/v8.execute/blink/latencyInfo 等，kit 默认）。同一实例同时只允许一个 profiler，重复 start → 409 PAGE_PROFILER_ALREADY_ACTIVE"
+    )]
+    categories: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageProfilerStopArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "traceEvents JSON 落盘路径（app 主机；缺省 <实例id>-trace.json）。停止按 start 时的 tab 路由，无需 tab 参数；无运行中 profiler → 409 PAGE_PROFILER_NOT_RUNNING"
+    )]
+    out: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageRecordStartArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(description = TAB_ARG_DESC)]
+    tab: Option<String>,
+    #[schemars(
+        description = "输出文件路径（app 主机；扩展名定容器：.webm/.mp4/.mov…，无扩展名 → 400）。录制期间其他 page 命令正常执行；click/drag/clickxy 的输入自动采样（--cursor 时合成光标）"
+    )]
+    file: String,
+    #[schemars(description = "采样率 1-60，缺省 30")]
+    fps: Option<u32>,
+    #[schemars(
+        description = "合成光标覆盖层（页内 JS 动画 + Rust 侧输入采样帧间插值）；缺省 false。同一实例同时只允许一路录制：重复 → 409 PAGE_RECORD_ALREADY_ACTIVE；ffmpeg 不可用 → 422 PAGE_RECORD_NO_FFMPEG"
+    )]
+    cursor: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PageRecordStopArgs {
+    #[schemars(description = "实例 id（ins_ 前缀）")]
+    instance_id: String,
+    #[schemars(
+        description = "附 kit 完整终态（capture 模式/设备缩放等披露字段）。停止按 start 锚点路由，无需 tab 参数；编码收尾可能数秒。无运行中录制 → 409 PAGE_RECORD_NOT_RUNNING"
+    )]
+    status: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -695,7 +899,9 @@ impl ChromeHostMcp {
         .await
     }
 
-    #[tool(description = "列出环境下的全部实例（含 name/状态/端口/pid；name 在同环境内唯一，可用于任务锚定）")]
+    #[tool(
+        description = "列出环境下的全部实例（含 name/状态/端口/pid；name 在同环境内唯一，可用于任务锚定）"
+    )]
     async fn list_instances(
         &self,
         Parameters(a): Parameters<EnvironmentArgs>,
@@ -1004,37 +1210,48 @@ impl ChromeHostMcp {
     // ── 页面控制（P2-C）───────────────────────────────────────
 
     #[tool(
-        description = "可访问性树快照：返回精简文本树（可交互节点带 @e1..@eN 引用，内联 role/name/value）+ refs_count + generation。跨域 iframe 内容以 [frame] 段内嵌，@eN 跨 frame 连续编号（click 走坐标投影、fill/press 走帧会话；CSS 选择器仍只查主 frame）。操作循环的起点：snap → 用 @eN 引用 click/fill/press → 页面变化后重新 snap（导航会使全部引用失效 → 409 PAGE_REF_STALE；单帧导航只失效该帧内引用，需重 snap 而非重试）"
+        description = "可访问性树快照（上游风格文本树：- role \"name\" @eN，可交互节点带 @e1..@eN 引用）+ refs_count + generation + hoverScan + removedRefs（本次快照消失的旧引用）。引用是 durable 的：SPA 同文档更新后旧 @eN 仍可用（同 backendNodeId 或按 role/name 唯一匹配恢复）；导航/文档替换后旧引用报 409 PAGE_REF_STALE 时重 snap。跨域 iframe 内容内嵌在 Iframe 节点行下（kit 帧递归，@eN 跨帧连续）；CSS 选择器仍只查主 frame。操作循环：snap → 用 @eN 引用 click/fill/press → 页面变化后重 snap（或旧引用报 STALE 时再 snap）"
     )]
     async fn page_snap(
         &self,
         Parameters(a): Parameters<PageSnapArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run(|| {
+            let params = crate::application::page_service::SnapParams {
+                compact: a.compact.unwrap_or(false),
+                interactive: a.interactive.unwrap_or(false),
+                depth: a.depth,
+                urls: a.urls.unwrap_or(false),
+                selector: a.selector.clone(),
+            };
             self.state
                 .page
-                .snap(&a.instance_id, a.tab.as_deref().unwrap_or(""))
+                .snap(&a.instance_id, a.tab.as_deref().unwrap_or(""), params)
         })
         .await
     }
 
     #[tool(
-        description = "原生输入点击（mouseMoved→mousePressed→mouseReleased，非 el.click()）：target 支持 @eN 引用（上次 page_snap 产生，导航后失效需重新 snap）与 CSS 选择器两种形态；selector 路径带可见性/遮挡校验（422 PAGE_ELEMENT_NOT_VISIBLE / 409 PAGE_ELEMENT_BLOCKED）。实例须运行中（409 PAGE_SERVICE_UNAVAILABLE）"
+        description = "原生输入点击（kit ClickPhase：mouseMoved→mousePressed→mouseReleased，非 el.click()；settle + 可见/启用/遮挡校验全开 + 对话框竞速）：target 支持 @eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）与 CSS 选择器；double=true 双击、right=true 右键（ClickSpec 透传）。不可见/被遮挡 → 422 PAGE_ELEMENT_NOT_VISIBLE / 409 PAGE_ELEMENT_BLOCKED；press 与 release 间弹对话框会自动 accept 并补发 release（结果串标注）。实例须运行中（409 PAGE_SERVICE_UNAVAILABLE）"
     )]
     async fn page_click(
         &self,
         Parameters(a): Parameters<PageClickArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run(|| {
-            self.state
-                .page
-                .click(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.target)
+            self.state.page.click(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.target,
+                a.double.unwrap_or(false),
+                a.right.unwrap_or(false),
+            )
         })
         .await
     }
 
     #[tool(
-        description = "填写输入框：target 支持 @eN 引用（上次 page_snap 产生，导航后失效需重新 snap）与 CSS 选择器；聚焦→全选清空→Input.insertText→回读校验，value 空串 = 仅清空。不可编辑 → 422 PAGE_TARGET_NOT_FILLABLE；回读不一致 → 409 PAGE_FILL_VALUE_MISMATCH（写入可能已部分生效，先观察再决定）"
+        description = "填写输入框：target 支持 @eN 引用（上次 page_snap 产生，durable：同文档更新仍可用，报 409 PAGE_REF_STALE 时重 snap）与 CSS 选择器；聚焦→全选清空→Input.insertText→回读校验，value 空串 = 仅清空。不可编辑 → 422 PAGE_TARGET_NOT_FILLABLE；回读不一致 → 409 PAGE_FILL_VALUE_MISMATCH（写入可能已部分生效，先观察再决定）"
     )]
     async fn page_fill(
         &self,
@@ -1052,7 +1269,7 @@ impl ChromeHostMcp {
     }
 
     #[tool(
-        description = "按键（rawKeyDown/char/keyUp 三段，IME 安全）：key 支持 Enter/Tab/Escape/Backspace/Delete/Home/End/PageUp/PageDown/ArrowUp…/Space/F1-F12、单字符、组合键（Control+A / Meta+V / Shift+ArrowDown）；未知键名 → 400 PAGE_KEY_UNKNOWN。可选 target 先聚焦（@eN 引用或 CSS 选择器）再按键"
+        description = "按键（kit keyDown+keyUp 两段，IME 安全）：key 支持 Enter/Tab/Escape/Backspace/Delete/Home/End/PageUp/PageDown/ArrowUp…/Space/F1-F12、单字符、组合键（Control+A / Meta+V / Shift+ArrowDown）；未知键名 → 400 PAGE_KEY_UNKNOWN。可选 target 先聚焦（@eN 引用或 CSS 选择器，统一 kit 解析链）再按键"
     )]
     async fn page_press(
         &self,
@@ -1065,6 +1282,109 @@ impl ChromeHostMcp {
                 &a.key,
                 a.target.as_deref(),
             )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "悬停（mouseMoved 到元素中心）：菜单类页面展开 hover 菜单用它，展开后重 page_snap 拿新引用。target 支持 @eN 引用与 CSS 选择器；不可见/被遮挡 → 422 PAGE_ELEMENT_NOT_VISIBLE / 409 PAGE_ELEMENT_BLOCKED"
+    )]
+    async fn page_hover(
+        &self,
+        Parameters(a): Parameters<PageHoverArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .hover(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.target)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "滚动：target 给 @eN 引用/选择器时滚该元素（scrollBy），省略时滚整页（window.scrollBy）。dx/dy 单位 CSS 像素可负（如 dy=-600 向上滚 600px；dy=0 dx=500 横向滚）。懒加载页面滚动后用 page_wait 等新内容"
+    )]
+    async fn page_scroll(
+        &self,
+        Parameters(a): Parameters<PageScrollArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.scroll(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.target.as_deref(),
+                a.dx,
+                a.dy,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "拖拽（滑块/排序/拖放）：from/to 支持 @eN 引用与 CSS 选择器；轨迹为人类化插值（弧线 + 缓动，非直线瞬移）。两端点须在同一帧内（跨帧 → 422 PAGE_DRAG_CROSS_FRAME）；端点不可见/被遮挡同 click 错误码"
+    )]
+    async fn page_drag(
+        &self,
+        Parameters(a): Parameters<PageDragArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.drag(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.from,
+                &a.to,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "下拉选择：value 按 option 的 value 或可见文本（label）任一匹配（空串 = 选中空值选项）。原生 <select> 与 role=combobox/listbox 组件（Radix/Headless UI 等）都支持；未命中 → 422 PAGE_SELECT_NO_OPTION（message 列出可用项）；多候选 → 409 PAGE_SELECT_AMBIGUOUS；非选择控件 → 422 PAGE_SELECT_NOT_SELECT"
+    )]
+    async fn page_select(
+        &self,
+        Parameters(a): Parameters<PageSelectArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.select(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.target,
+                &a.value,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "勾选复选框/单选钮：uncheck=true 取消勾选。已处于目标态时 no-op 成功（结果串明示 already）。目标支持 input 本体、关联 label 或内嵌 input 的容器（@eN 引用或 CSS 选择器）"
+    )]
+    async fn page_check(
+        &self,
+        Parameters(a): Parameters<PageCheckArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.check(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.target,
+                a.uncheck.unwrap_or(false),
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "触摸轻点（touchStart/touchEnd）：移动端仿真（page_emulate）页面上某些控件只响应 touch 事件时用它替代 page_click。target 支持 @eN 引用与 CSS 选择器"
+    )]
+    async fn page_tap(
+        &self,
+        Parameters(a): Parameters<PageTapArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .tap(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.target)
         })
         .await
     }
@@ -1191,7 +1511,7 @@ impl ChromeHostMcp {
     }
 
     #[tool(
-        description = "向当前焦点元素直接输入文本（Input.insertText，无定位无校验）：跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达跨域 frame）——先用 page_clickxy 点入 iframe 获得焦点再 type；空文本 → 400"
+        description = "向当前焦点元素逐字符输入（可打印字符 insertText、\\n/\\t 走真按键事件，无定位无校验）：跨域 iframe 输入的唯一路径（eval/fill 的 selector 均不可达跨域 frame）——先用 page_clickxy 点入 iframe 获得焦点再 type；空文本 → 400"
     )]
     async fn page_type(
         &self,
@@ -1213,17 +1533,15 @@ impl ChromeHostMcp {
         Parameters(a): Parameters<PageNavigateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         run(|| {
-            self.state.page.navigate(
-                &a.instance_id,
-                a.tab.as_deref().unwrap_or(""),
-                &a.url,
-            )
+            self.state
+                .page
+                .navigate(&a.instance_id, a.tab.as_deref().unwrap_or(""), &a.url)
         })
         .await
     }
 
     #[tool(
-        description = "png 截图：target 省略 = 当前视口整幅；target 为 @eN 引用或 CSS 选择器时截该元素（与 page_click 同定位链，先滚动入视口，clip 取元素包围盒）；full=true 截发起时刻的整文档（captureBeyondViewport，不滚动页面，懒加载/虚拟列表未加载内容不在图中——响应 documentHeight 供判断；单边超限截断标 truncated，上限 = 16384 设备像素 ÷ DPR，Retina = 8192 CSS px）。响应 data 为 base64 png；未命中 → 404 PAGE_ELEMENT_NOT_FOUND，几何退化 → 409 PAGE_TARGET_MOVED，full 与 target 同给 → 400"
+        description = "png 截图：target 省略 = 当前视口整幅；target 为 @eN 引用或 CSS 选择器时截该元素（不滚动页面，clip 文档坐标 + captureBeyondViewport）；full=true 截发起时刻的整文档（captureBeyondViewport，懒加载/虚拟列表未加载内容不在图中——响应 documentHeight 供判断；单边超限截断标 truncated，上限 = 16384 设备像素 ÷ DPR，Retina = 8192 CSS px）。响应 data 为 base64 png；未命中 → 404 PAGE_ELEMENT_NOT_FOUND，full 与 target 同给 → 400"
     )]
     async fn page_screenshot(
         &self,
@@ -1247,8 +1565,12 @@ impl ChromeHostMcp {
         &self,
         Parameters(a): Parameters<PageNavHistoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        run(|| self.state.page.back(&a.instance_id, a.tab.as_deref().unwrap_or("")))
-            .await
+        run(|| {
+            self.state
+                .page
+                .back(&a.instance_id, a.tab.as_deref().unwrap_or(""))
+        })
+        .await
     }
 
     #[tool(
@@ -1258,8 +1580,12 @@ impl ChromeHostMcp {
         &self,
         Parameters(a): Parameters<PageNavHistoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        run(|| self.state.page.forward(&a.instance_id, a.tab.as_deref().unwrap_or("")))
-            .await
+        run(|| {
+            self.state
+                .page
+                .forward(&a.instance_id, a.tab.as_deref().unwrap_or(""))
+        })
+        .await
     }
 
     #[tool(
@@ -1300,6 +1626,110 @@ impl ChromeHostMcp {
     }
 
     #[tool(
+        description = "快照文本 diff：当前 snap（与 page_snap 同管线，@eN 引用正常演进）↔ 基线的行级 unified diff。响应 { changed, added（新增行数组）, removed（删除行数组）, counts: {added,removed,unchanged}, diff（unified 文本） }；快照超 2MiB 不入滚动基线并标 baselineCleared。diff 不剥 @eN 记号（durable refs 下同文档 ref 稳定，记号漂移即真实变化）；基线给 baseline 参数则只比较不更新滚动基线；首次无基线 = 与空比较（全部 added）"
+    )]
+    async fn page_diff(
+        &self,
+        Parameters(a): Parameters<PageDiffArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let params = crate::application::page_service::SnapParams {
+            compact: a.compact.unwrap_or(false),
+            interactive: false,
+            depth: a.depth,
+            urls: false,
+            selector: a.selector,
+        };
+        run(|| {
+            self.state.page.diff(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                params,
+                a.baseline,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "像素 diff：baseline（base64 png）↔ 当前截图（full=true 全页，缺省视口；与 page_screenshot 同管线）。响应 { differing, ratio（差异像素百分比 0-100）, image?（差异图 base64 png：差异红标 + 原图灰阶，仅 differing 时）, dimensionMismatch?（尺寸不一致披露，此时 ratio=100） }；颜色距离阈值 0.1（容忍抗锯齿噪声）"
+    )]
+    async fn page_diff_shot(
+        &self,
+        Parameters(a): Parameters<PageDiffShotArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.diff_shot(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.full.unwrap_or(false),
+                &a.baseline,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "启动性能采样（Chrome tracing，Tracing.start ReportEvents + 采样）：常驻任务不占实例串行锁，采样期间其他 page 命令可正常执行。categories 缺省 = 全家桶（devtools.timeline/v8/blink 等）。同一实例同时只允许一个：重复 → 409 PAGE_PROFILER_ALREADY_ACTIVE。停止用 page_profiler_stop（无需 tab，按 start 锚点路由）"
+    )]
+    async fn page_profiler_start(
+        &self,
+        Parameters(a): Parameters<PageProfilerStartArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.profiler_start(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                a.categories,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "停止采样并落盘：收集 tracing 事件（至多 30s）→ traceEvents JSON 写 out 路径（app 主机；缺省 <实例id>-trace.json）。响应 { result, path, eventCount }。无运行中 profiler → 409 PAGE_PROFILER_NOT_RUNNING；收集超时 → 504 可重试（tracing 仍 active）"
+    )]
+    async fn page_profiler_stop(
+        &self,
+        Parameters(a): Parameters<PageProfilerStopArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| self.state.page.profiler_stop(&a.instance_id, a.out)).await
+    }
+
+    #[tool(
+        description = "启动页录屏（screencast 帧流 → ffmpeg 编码）：file 路径扩展名定容器（.webm/.mp4/.mov…，无扩展名 → 400）；fps 1-60 缺省 30；cursor=true 合成光标（页内覆盖层动画 + click/drag/clickxy 输入采样插值）。常驻任务不占实例串行锁，录制期间其他 page 命令正常执行。前置 ffmpeg 探测：不可用 → 422 PAGE_RECORD_NO_FFMPEG（message 带安装提示）；同实例重复 start → 409 PAGE_RECORD_ALREADY_ACTIVE。停止用 page_record_stop"
+    )]
+    async fn page_record_start(
+        &self,
+        Parameters(a): Parameters<PageRecordStartArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state.page.record_start(
+                &a.instance_id,
+                a.tab.as_deref().unwrap_or(""),
+                &a.file,
+                a.fps,
+                a.cursor.unwrap_or(false),
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "停止录屏并结算产物：编码收尾（screencast teardown + ffmpeg flush，可能数秒）→ 响应 { result, path, frames, capturedFrames, fps }；status=true 附 kit 完整终态。无运行中录制 → 409 PAGE_RECORD_NOT_RUNNING（含连接重建/锚点 tab 关闭致废弃，message 披露）"
+    )]
+    async fn page_record_stop(
+        &self,
+        Parameters(a): Parameters<PageRecordStopArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        run(|| {
+            self.state
+                .page
+                .record_stop(&a.instance_id, a.status.unwrap_or(false))
+        })
+        .await
+    }
+
+    #[tool(
         description = "设备仿真：preset（iphone-14/iphone-se/pixel-7/galaxy-s23/ipad-air/desktop-1080p，自带真实 UA 与 mobile/touch）或 viewport+可选 userAgent/mobile/touch；off=true 恢复。只作用于该 tab 的 page session（与实例级无关）；同一 tab 重复 emulate = 覆盖（未给字段恢复默认）；连接重建/实例重启自然清除。仿真后 viewport 截图尺寸随之变化；page_pdf 输出也按仿真视口排页"
     )]
     async fn page_emulate(
@@ -1308,18 +1738,21 @@ impl ChromeHostMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let req = crate::domain::emulate::EmulateRequest {
             preset: a.preset,
-            viewport: a
-                .viewport
-                .map(|v| crate::domain::emulate::Viewport {
-                    width: v.width,
-                    height: v.height,
-                }),
+            viewport: a.viewport.map(|v| crate::domain::emulate::Viewport {
+                width: v.width,
+                height: v.height,
+            }),
             user_agent: a.user_agent,
             mobile: a.mobile,
             touch: a.touch,
             off: a.off.unwrap_or(false),
         };
-        run(|| self.state.page.emulate(&a.instance_id, a.tab.as_deref().unwrap_or(""), req)).await
+        run(|| {
+            self.state
+                .page
+                .emulate(&a.instance_id, a.tab.as_deref().unwrap_or(""), req)
+        })
+        .await
     }
 
     #[tool(

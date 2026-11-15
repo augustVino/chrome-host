@@ -203,6 +203,31 @@ fn routes(state: ApiState) -> Router {
             "/api/v1/instances/{id}/page/click",
             post(crate::api::pages::click),
         )
+        // I2 新命令：hover/scroll/drag/select/check/tap（input 族 kit 化随行）
+        .route(
+            "/api/v1/instances/{id}/page/hover",
+            post(crate::api::pages::hover),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/scroll",
+            post(crate::api::pages::scroll),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/drag",
+            post(crate::api::pages::drag),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/select",
+            post(crate::api::pages::select),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/check",
+            post(crate::api::pages::check),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/tap",
+            post(crate::api::pages::tap),
+        )
         .route(
             "/api/v1/instances/{id}/page/fill",
             post(crate::api::pages::fill),
@@ -271,6 +296,7 @@ fn routes(state: ApiState) -> Router {
             post(crate::api::pages::intercept_set).get(crate::api::pages::intercept_get),
         )
         // page 控制命令族（W-cap）：元素截图 / PDF / 设备仿真——仍为薄透传
+        //（screenshot 内核自 I3 换 browser_kit screenshot.rs，详见任务报告）
         .route(
             "/api/v1/instances/{id}/page/screenshot",
             post(crate::api::pages::screenshot),
@@ -278,6 +304,34 @@ fn routes(state: ApiState) -> Router {
         .route(
             "/api/v1/instances/{id}/page/pdf",
             post(crate::api::pages::pdf),
+        )
+        // page 控制命令族（I3）：快照/像素 diff + profiler——薄透传，
+        // 语义在 page_service（diff_tool / profiler）
+        .route(
+            "/api/v1/instances/{id}/page/diff",
+            post(crate::api::pages::diff),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/diff-shot",
+            post(crate::api::pages::diff_shot),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/profiler/start",
+            post(crate::api::pages::profiler_start),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/profiler/stop",
+            post(crate::api::pages::profiler_stop),
+        )
+        // page 控制命令族（I4）：页录屏 start/stop——薄透传，语义在
+        // page_service（recording_tool）
+        .route(
+            "/api/v1/instances/{id}/page/record/start",
+            post(crate::api::pages::record_start),
+        )
+        .route(
+            "/api/v1/instances/{id}/page/record/stop",
+            post(crate::api::pages::record_stop),
         )
         .route(
             "/api/v1/instances/{id}/page/emulate",

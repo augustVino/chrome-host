@@ -7,8 +7,9 @@
 //!
 //! 行为语义全部在服务层 page_service（P2-B）：本组只做参数透传 + 渲染。
 //! 核心循环（对齐 SKILL.md 教学）：`snap` 拿 @eN 引用 → `click`/`fill`/
-//! `press --target` 用引用操作 → 页面变化后重新 `snap`（旧引用报
-//! PAGE_REF_STALE / PAGE_REF_NOT_FOUND，重 snap 而非对旧引用重试）。
+//! `press --target` 用引用操作 → 页面变化后重新 `snap`。I1b 起引用是
+//! durable 的：SPA 同文档更新后旧 @eN 仍可用；收到 PAGE_REF_STALE 时重
+//! snap（而非对旧引用重试）。
 //!
 //! 渲染约定：
 //! - snap：文本树（@eN 内联在行内，本身就是主产物）+ 一行元信息；
@@ -20,7 +21,11 @@
 //! - dialogs：SEQ TYPE MESSAGE 表 + cursor 行（增量拉取的 --since 值）；
 //! - screenshot/pdf：解码 base64 落盘（--out，缺省 <实例id>.png/.pdf；
 //!   screenshot --full 缺省 <实例id>-full.png，文本输出附 size 与截断标注），
-//!   quiet 输出路径（与 instance screenshot/har 同先例）；emulate：一行 result。
+//!   quiet 输出路径（与 instance screenshot/har 同先例）；emulate：一行 result；
+//! - diff（I3）：摘要行（changed + counts）+ unified diff 文本，quiet =
+//!   changed 布尔串；diff-shot：differing/ratio 行 + --out 落差异图，quiet =
+//!   differing；profiler start/stop：result 型（stop 附 path/eventCount，
+//!   quiet = 落盘路径）。
 //! - 三态：`--json` 响应原样透传（P2-F F3 修复：snap 与 result 型命令的
 //!   shell 此前缺 --json 分支，文本树直接打到 stdout，管道侧拿不到合法
 //!   JSON；分流收敛在 [`snap_out`]/[`result_out`] 纯函数）；`--quiet` 输出
@@ -38,7 +43,8 @@ use crate::error::CliError;
 ///（P2-F F1；显式前缀仍是无匹配 404 / 多匹配 409）。
 #[derive(Debug, Subcommand)]
 pub enum PageCommands {
-    /// 可访问性树快照 + @eN 引用（操作循环起点；导航后引用整表失效）
+    /// 可访问性树快照 + @eN 引用（操作循环起点；引用 durable：报
+    /// PAGE_REF_STALE 时重 snap，SPA 同文档更新后旧引用仍可用）
     #[command(about = "可访问性树快照：可交互节点带 @e1..@eN 引用（操作循环起点）")]
     Snap {
         /// 实例 id
@@ -46,15 +52,38 @@ pub enum PageCommands {
         /// 目标标签页（targetId 或唯一前缀，由 instance tabs 获得；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(value_name = "TAB_ID")]
         tab: Option<String>,
+        /// 压缩输出（去掉空行/冗余层级）
+        #[arg(short = 'c', long)]
+        compact: bool,
+        /// 只保留可交互节点（带 @eN 引用的行）
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// 渲染深度上限（缩进层级）
+        #[arg(short = 'd', long, value_name = "N")]
+        depth: Option<usize>,
+        /// link 节点附 url= 属性
+        #[arg(short = 'u', long)]
+        urls: bool,
+        /// 只快照该 CSS 选择器命中的子树
+        #[arg(short = 's', long, value_name = "SEL")]
+        selector: Option<String>,
     },
 
-    /// 原生输入点击（选择器或 @eN 引用）
-    #[command(about = "原生输入点击：<sel|@eN>（三段鼠标事件，非 el.click()）")]
+    /// 原生输入点击（选择器或 @eN 引用；双击/右键经 ClickSpec 透传）
+    #[command(
+        about = "原生输入点击：<sel|@eN>（kit ClickPhase 三段，settle + 可见/遮挡校验；--double 双击 / --right 右键）"
+    )]
     Click {
         /// 实例 id
         id: String,
         /// 点击目标：@eN 引用（上次 snap 产生）或 CSS 选择器
         target: String,
+        /// 双击（clickCount=2）
+        #[arg(long)]
+        double: bool,
+        /// 右键（button=right）
+        #[arg(long)]
+        right: bool,
         /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
@@ -86,6 +115,86 @@ pub enum PageCommands {
         /// 可选聚焦目标：@eN 引用或 CSS 选择器
         #[arg(long, value_name = "SEL|@eN")]
         target: Option<String>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 悬停（菜单展开类页面的 hover 触发）
+    #[command(about = "悬停：<sel|@eN>（mouseMoved；展开后重 snap 拿新引用）")]
+    Hover {
+        /// 实例 id
+        id: String,
+        /// 悬停目标：@eN 引用或 CSS 选择器
+        target: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 滚动（有目标滚元素、无目标滚页面）
+    #[command(about = "滚动：[sel|@eN] <dx> <dy>（有目标滚元素，无目标滚页面；像素可负）")]
+    Scroll {
+        /// 实例 id
+        id: String,
+        /// 可选滚动目标 + 滚动量：`<dx> <dy>`（滚页面）或 `<sel|@eN> <dx> <dy>`（滚元素）
+        #[arg(value_name = "[SEL|@eN] DX DY", num_args = 2..=3, allow_negative_numbers = true)]
+        args: Vec<String>,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 拖拽（滑块/排序/拖放；人类化轨迹）
+    #[command(about = "拖拽：<from> <to>（弧线缓动轨迹；两端点同帧）")]
+    Drag {
+        /// 实例 id
+        id: String,
+        /// 拖拽起点：@eN 引用或 CSS 选择器
+        from: String,
+        /// 拖拽终点：@eN 引用或 CSS 选择器
+        to: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 下拉选择（原生 select 与 combobox 组件）
+    #[command(about = "下拉选择：<sel|@eN> <value>（按 value 或可见文本匹配）")]
+    Select {
+        /// 实例 id
+        id: String,
+        /// 选择目标：@eN 引用或 CSS 选择器
+        target: String,
+        /// 选项 value 或可见文本（label）
+        value: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 勾选/取消勾选复选框或单选钮
+    #[command(about = "勾选：<sel|@eN> [--uncheck 取消勾选]（已处于目标态 = no-op 成功）")]
+    Check {
+        /// 实例 id
+        id: String,
+        /// 勾选目标：@eN 引用或 CSS 选择器（input 或关联 label）
+        target: String,
+        /// 取消勾选（缺省 = 勾选）
+        #[arg(long)]
+        uncheck: bool,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 触摸轻点（移动端仿真页面）
+    #[command(about = "触摸轻点：<sel|@eN>（touchStart/touchEnd，仿真页专用）")]
+    Tap {
+        /// 实例 id
+        id: String,
+        /// 轻点目标：@eN 引用或 CSS 选择器
+        target: String,
         /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
         #[arg(long, value_name = "TAB_ID")]
         tab: Option<String>,
@@ -254,7 +363,9 @@ pub enum PageCommands {
     },
 
     /// 重载当前页（--ignore-cache 跳过缓存）
-    #[command(about = "重载当前页（--ignore-cache 跳过缓存；等 load 至多 25s，未证实 → loaded:false）")]
+    #[command(
+        about = "重载当前页（--ignore-cache 跳过缓存；等 load 至多 25s，未证实 → loaded:false）"
+    )]
     Reload {
         /// 实例 id
         id: String,
@@ -311,6 +422,109 @@ pub enum PageCommands {
         /// 输出文件路径
         #[arg(long = "out")]
         out: Option<String>,
+    },
+
+    /// 快照文本 diff（I3）：当前 snap ↔ 基线的行级 diff
+    #[command(
+        about = "快照 diff：[TAB]（当前 snap ↔ 上次基线；无变化 quiet 输出 false；快照超 2MiB 不入基线标 baselineCleared）"
+    )]
+    Diff {
+        /// 实例 id
+        id: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(value_name = "TAB_ID")]
+        tab: Option<String>,
+        /// 只快照该 CSS 选择器命中的子树（与 snap --selector 同源）
+        #[arg(short = 's', long, value_name = "SEL")]
+        selector: Option<String>,
+        /// 压缩快照输出（与 snap --compact 同源）
+        #[arg(short = 'c', long)]
+        compact: bool,
+        /// 渲染深度上限（缩进层级）
+        #[arg(short = 'd', long, value_name = "N")]
+        depth: Option<usize>,
+        /// 基线快照文本文件（上次 diff --json 的基线或自备；给定 = 只比较不更新滚动基线）
+        #[arg(long, value_name = "PATH")]
+        baseline_file: Option<String>,
+    },
+
+    /// 像素 diff（I3）：基线 png ↔ 当前截图
+    #[command(
+        about = "像素 diff：<--baseline-file PNG>（必填）↔ 当前截图；--full 当前侧全页；--out 写差异图"
+    )]
+    DiffShot {
+        /// 实例 id
+        id: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(value_name = "TAB_ID")]
+        tab: Option<String>,
+        /// 基线截图文件（png；必填——像素 diff 无默认基线）
+        #[arg(long, value_name = "PNG")]
+        baseline_file: String,
+        /// 当前侧用全页截图（缺省当前视口）
+        #[arg(long)]
+        full: bool,
+        /// 差异图落盘路径（仅 differing 时有图；缺省不落盘，--json 可取 base64）
+        #[arg(long = "out")]
+        out: Option<String>,
+    },
+
+    /// 启动性能采样（I3；常驻，不占实例串行锁）
+    #[command(
+        about = "启动性能采样：[TAB] [--categories \"a,b\"]（缺省全家桶；重复 start → 409；stop 落盘）"
+    )]
+    ProfilerStart {
+        /// 实例 id
+        id: String,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(value_name = "TAB_ID")]
+        tab: Option<String>,
+        /// 追踪分类（逗号分割；缺省 = devtools.timeline/v8/blink 全家桶）
+        #[arg(long, value_name = "CATS")]
+        categories: Option<String>,
+    },
+
+    /// 停止采样并落盘（I3；按 start 锚点路由，无需 tab）
+    #[command(about = "停止采样并落盘：[--out F]（缺省 <实例id>-trace.json；traceEvents JSON）")]
+    ProfilerStop {
+        /// 实例 id
+        id: String,
+        /// 落盘路径（app 主机；缺省 <实例id>-trace.json）
+        #[arg(long = "out")]
+        out: Option<String>,
+    },
+
+    /// 启动页录屏（I4；常驻，不占实例串行锁）
+    #[command(
+        about = "启动页录屏：<FILE> [--fps N] [--cursor]（扩展名定容器；重复 start → 409；无 ffmpeg → 422；stop 结算）"
+    )]
+    RecordStart {
+        /// 实例 id
+        id: String,
+        /// 输出文件路径（app 主机；扩展名定容器：.webm/.mp4/.mov…；无扩展名 → 400）
+        #[arg(value_name = "FILE")]
+        file: String,
+        /// 采样率（1-60；缺省 30）
+        #[arg(long, value_name = "N")]
+        fps: Option<u32>,
+        /// 合成光标（页内覆盖层 + 输入采样插值）
+        #[arg(long)]
+        cursor: bool,
+        /// 目标标签页（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签报错列出全部）
+        #[arg(long, value_name = "TAB_ID")]
+        tab: Option<String>,
+    },
+
+    /// 停止录屏并结算产物（I4；按 start 锚点路由，无需 tab）
+    #[command(
+        about = "停止录屏：[--status]（编码收尾可能数秒；quiet = 产物路径；无运行中 → 409）"
+    )]
+    RecordStop {
+        /// 实例 id
+        id: String,
+        /// 附完整终态（capture 模式/设备缩放等披露字段）
+        #[arg(long)]
+        status: bool,
     },
 
     /// 表格结构化提取（W-ext：表格/网格 → JSON；CSV 未做）
@@ -409,10 +623,34 @@ pub enum PageCommands {
 /// page 组分发入口（main.rs dispatch 的唯一调用点）。
 pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Result<(), CliError> {
     match cmd {
-        PageCommands::Snap { id, tab } => snap(globals, client, id, tab.as_deref()),
-        PageCommands::Click { id, target, tab } => {
-            click(globals, client, id, target, tab.as_deref())
-        }
+        PageCommands::Snap {
+            id,
+            tab,
+            compact,
+            interactive,
+            depth,
+            urls,
+            selector,
+        } => snap(
+            globals,
+            client,
+            id,
+            tab.as_deref(),
+            &SnapFlags {
+                compact: *compact,
+                interactive: *interactive,
+                depth: *depth,
+                urls: *urls,
+                selector: selector.as_deref(),
+            },
+        ),
+        PageCommands::Click {
+            id,
+            target,
+            double,
+            right,
+            tab,
+        } => click(globals, client, id, target, *double, *right, tab.as_deref()),
         PageCommands::Fill {
             id,
             target,
@@ -425,6 +663,26 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             target,
             tab,
         } => press(globals, client, id, key, target.as_deref(), tab.as_deref()),
+        PageCommands::Hover { id, target, tab } => {
+            hover(globals, client, id, target, tab.as_deref())
+        }
+        PageCommands::Scroll { id, args, tab } => scroll(globals, client, id, args, tab.as_deref()),
+        PageCommands::Drag { id, from, to, tab } => {
+            drag(globals, client, id, from, to, tab.as_deref())
+        }
+        PageCommands::Select {
+            id,
+            target,
+            value,
+            tab,
+        } => select(globals, client, id, target, value, tab.as_deref()),
+        PageCommands::Check {
+            id,
+            target,
+            uncheck,
+            tab,
+        } => check(globals, client, id, target, *uncheck, tab.as_deref()),
+        PageCommands::Tap { id, target, tab } => tap(globals, client, id, target, tab.as_deref()),
         PageCommands::Wait {
             id,
             selector,
@@ -529,6 +787,60 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             tab.as_deref(),
             out.as_deref(),
         ),
+        PageCommands::Diff {
+            id,
+            tab,
+            selector,
+            compact,
+            depth,
+            baseline_file,
+        } => diff(
+            globals,
+            client,
+            id,
+            tab.as_deref(),
+            selector.as_deref(),
+            *compact,
+            *depth,
+            baseline_file.as_deref(),
+        ),
+        PageCommands::DiffShot {
+            id,
+            tab,
+            baseline_file,
+            full,
+            out,
+        } => diff_shot(
+            globals,
+            client,
+            id,
+            tab.as_deref(),
+            baseline_file,
+            *full,
+            out.as_deref(),
+        ),
+        PageCommands::ProfilerStart {
+            id,
+            tab,
+            categories,
+        } => profiler_start(
+            globals,
+            client,
+            id,
+            tab.as_deref(),
+            categories.as_deref().unwrap_or(""),
+        ),
+        PageCommands::ProfilerStop { id, out } => {
+            profiler_stop(globals, client, id, out.as_deref())
+        }
+        PageCommands::RecordStart {
+            id,
+            file,
+            fps,
+            cursor,
+            tab,
+        } => record_start(globals, client, id, file, *fps, *cursor, tab.as_deref()),
+        PageCommands::RecordStop { id, status } => record_stop(globals, client, id, *status),
         PageCommands::Extract {
             id,
             target,
@@ -563,9 +875,11 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
             *off,
             tab.as_deref(),
         ),
-        PageCommands::DownloadWait { id, timeout_ms, tab } => {
-            download_wait(globals, client, id, *timeout_ms, tab.as_deref())
-        }
+        PageCommands::DownloadWait {
+            id,
+            timeout_ms,
+            tab,
+        } => download_wait(globals, client, id, *timeout_ms, tab.as_deref()),
         PageCommands::Downloads { id, tab } => downloads(globals, client, id, tab.as_deref()),
         PageCommands::Upload {
             id,
@@ -576,16 +890,28 @@ pub fn run(cmd: &PageCommands, globals: &GlobalArgs, client: &AgentClient) -> Re
     }
 }
 
-/// `page snap <ID> [TAB_ID]`：文本树 + 元信息行。quiet 输出 targetId
-/// （后续命令 `--tab $(...)` 的取值源）；json 响应原样透传（F3）。
+/// snap 的选项集（CLI 解析 → client body；与 API/MCP 的 SnapParams 同源）
+#[derive(Default)]
+pub(crate) struct SnapFlags<'a> {
+    pub(crate) compact: bool,
+    pub(crate) interactive: bool,
+    pub(crate) depth: Option<usize>,
+    pub(crate) urls: bool,
+    pub(crate) selector: Option<&'a str>,
+}
+
+/// `page snap <ID> [TAB_ID]`：文本树 + 元信息行（非空时附 removed: 行）。
+/// quiet 输出 targetId（后续命令 `--tab $(...)` 的取值源）；json 响应原样
+/// 透传（F3）。
 fn snap(
     globals: &GlobalArgs,
     client: &AgentClient,
     id: &str,
     tab: Option<&str>,
+    flags: &SnapFlags,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.page_snap(id, tab)?;
+    let resp = client.page_snap(id, tab, flags)?;
     print_page_out(&out, snap_out(&resp, &out));
     Ok(())
 }
@@ -597,15 +923,17 @@ fn render_result(out: &OutputCtx, resp: &serde_json::Value) {
     print_page_out(out, result_out(resp, out));
 }
 
-/// `page click <ID> <sel|@eN> [--tab T]`
+/// `page click <ID> <sel|@eN> [--double] [--right] [--tab T]`
 fn click(
     globals: &GlobalArgs,
     client: &AgentClient,
     id: &str,
     target: &str,
+    double: bool,
+    right: bool,
     tab: Option<&str>,
 ) -> Result<(), CliError> {
-    let resp = client.page_click(id, target, tab)?;
+    let resp = client.page_click(id, target, double, right, tab)?;
     render_result(&OutputCtx::from(globals), &resp);
     Ok(())
 }
@@ -634,6 +962,101 @@ fn press(
     tab: Option<&str>,
 ) -> Result<(), CliError> {
     let resp = client.page_press(id, key, target, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page hover <ID> <sel|@eN> [--tab T]`
+fn hover(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_hover(id, target, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page scroll <ID> [sel|@eN] <dx> <dy> [--tab T]`：位置参数 2 或 3 个
+///（负数被 clap 当 flag，故整组收集后本地解析定形）。非法形态/非数字
+/// 本地 exit 2。
+fn scroll(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    args: &[String],
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let (target, dx_s, dy_s) = match args {
+        [dx, dy] => (None, dx, dy),
+        [t, dx, dy] => (Some(t.as_str()), dx, dy),
+        _ => {
+            return Err(CliError::Local(
+                "scroll 参数为 <dx> <dy> 或 <sel|@eN> <dx> <dy>（像素可负）".into(),
+            ))
+        }
+    };
+    let bad = |what: &str| CliError::Local(format!("scroll {what} 必须为数字（CSS 像素，可负）"));
+    let dx: f64 = dx_s.parse().map_err(|_| bad("dx"))?;
+    let dy: f64 = dy_s.parse().map_err(|_| bad("dy"))?;
+    let resp = client.page_scroll(id, target, dx, dy, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page drag <ID> <from> <to> [--tab T]`
+fn drag(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    from: &str,
+    to: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_drag(id, from, to, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page select <ID> <sel|@eN> <value> [--tab T]`
+fn select(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: &str,
+    value: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_select(id, target, value, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page check <ID> <sel|@eN> [--uncheck] [--tab T]`
+fn check(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: &str,
+    uncheck: bool,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_check(id, target, uncheck, tab)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page tap <ID> <sel|@eN> [--tab T]`
+fn tap(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    target: &str,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let resp = client.page_tap(id, target, tab)?;
     render_result(&OutputCtx::from(globals), &resp);
     Ok(())
 }
@@ -814,7 +1237,8 @@ fn screenshot(
                 ("file".into(), path.clone()),
                 ("bytes".into(), bytes.len().to_string()),
             ];
-            let mut payload = serde_json::json!({ "file": path, "bytes": bytes.len(), "format": "png" });
+            let mut payload =
+                serde_json::json!({ "file": path, "bytes": bytes.len(), "format": "png" });
             if full {
                 let size = format!(
                     "{}x{}",
@@ -823,7 +1247,11 @@ fn screenshot(
                 );
                 rows.push(("size".into(), size.clone()));
                 payload["size"] = serde_json::json!(size);
-                if resp.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if resp
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     rows.push(("truncated".into(), "true".into()));
                     payload["truncated"] = serde_json::json!(true);
                 }
@@ -852,7 +1280,14 @@ fn pdf(
     out_path: Option<&str>,
 ) -> Result<(), CliError> {
     let out = OutputCtx::from(globals);
-    let resp = client.page_pdf(id, tab, landscape, print_background, paper_width, paper_height)?;
+    let resp = client.page_pdf(
+        id,
+        tab,
+        landscape,
+        print_background,
+        paper_width,
+        paper_height,
+    )?;
     let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
     let bytes = decode_base64(data, PDF_MAGIC, "PDF")?;
     if !out.json {
@@ -875,6 +1310,218 @@ fn pdf(
     } else {
         out.render_kv(&[], resp);
     }
+    Ok(())
+}
+
+/// `page diff <ID> [TAB] [-s SEL] [-c] [-d N] [--baseline-file F]`（I3）：
+/// 当前 snap ↔ 基线的行级 diff。--baseline-file 读文本文件（缺本地文件
+/// → exit 1，不建连）；无则用服务端滚动基线。table = 摘要行 + diff 文本
+//（无变化时省略）；quiet = changed 布尔串；json 原样。
+fn diff(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    tab: Option<&str>,
+    selector: Option<&str>,
+    compact: bool,
+    depth: Option<usize>,
+    baseline_file: Option<&str>,
+) -> Result<(), CliError> {
+    let baseline = match baseline_file {
+        Some(p) => Some(
+            std::fs::read_to_string(p)
+                .map_err(|e| CliError::Local(format!("读基线文件失败 {p}: {e}")))?,
+        ),
+        None => None,
+    };
+    let resp = client.page_diff(id, tab, selector, compact, depth, baseline.as_deref())?;
+    print_page_out(
+        &OutputCtx::from(globals),
+        diff_out(&resp, &OutputCtx::from(globals)),
+    );
+    Ok(())
+}
+
+/// `page diff-shot <ID> --baseline-file <png> [--full] [--tab T] [--out F]`
+//（I3）：像素 diff。CLI 读 png 转 base64 上行；--out 在 differing 时写
+/// 差异图（quiet = 路径）；无 --out 的 quiet = differing 布尔串。
+fn diff_shot(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    tab: Option<&str>,
+    baseline_file: &str,
+    full: bool,
+    out_path: Option<&str>,
+) -> Result<(), CliError> {
+    use base64::Engine;
+    let png_bytes = std::fs::read(baseline_file)
+        .map_err(|e| CliError::Local(format!("读基线截图失败 {baseline_file}: {e}")))?;
+    if !png_bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(CliError::Local(format!(
+            "基线文件不是 png（魔数校验失败）: {baseline_file}"
+        )));
+    }
+    let baseline_b64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+    let out = OutputCtx::from(globals);
+    let resp = client.page_diff_shot(id, tab, full, &baseline_b64)?;
+    // --out：仅 differing（有差异图）时落盘；给了 --out 但 identical → 提示行
+    if let Some(p) = out_path {
+        if let Some(img) = resp.get("image").and_then(|v| v.as_str()) {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(img)
+                .map_err(|e| CliError::Local(format!("差异图 base64 解码失败: {e}")))?;
+            std::fs::write(p, &bytes)
+                .map_err(|e| CliError::Local(format!("写差异图失败 {p}: {e}")))?;
+        } else if !out.quiet && !out.json {
+            out.render_text(format!("no diff image (identical) — {p} not written"));
+            return Ok(());
+        }
+    }
+    print_page_out(&out, diff_shot_out(&resp, &out, out_path));
+    Ok(())
+}
+
+/// `page profiler start <ID> [TAB] [--categories "a,b"]`（I3）：result 型
+/// 渲染。categories 逗号分割（trim 空项）。
+fn profiler_start(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    tab: Option<&str>,
+    categories: &str,
+) -> Result<(), CliError> {
+    let cats: Option<Vec<String>> = if categories.is_empty() {
+        None
+    } else {
+        Some(
+            categories
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect(),
+        )
+    };
+    let resp = client.page_profiler_start(id, tab, cats)?;
+    render_result(&OutputCtx::from(globals), &resp);
+    Ok(())
+}
+
+/// `page profiler stop <ID> [--out F]`（I3）：result 行含落盘路径；
+/// --out 缺省本地拼 <id>-trace.json（与 screenshot 缺省名同风格，CLI cwd）；
+/// quiet = 落盘路径。
+fn profiler_stop(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    out_path: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let path = out_path
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{id}-trace.json"));
+    let resp = client.page_profiler_stop(id, Some(&path))?;
+    if out.quiet {
+        out.print_id(resp.get("path").and_then(|v| v.as_str()).unwrap_or(&path));
+        return Ok(());
+    }
+    if out.json {
+        out.render_kv(&[], resp);
+        return Ok(());
+    }
+    out.render_text(format!(
+        "{}\npath: {} · events: {}",
+        resp.get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(响应缺少 result 字段)"),
+        resp.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+        resp.get("eventCount")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
+    ));
+    Ok(())
+}
+
+/// `page record start <ID> <FILE> [--fps N] [--cursor] [--tab T]`（I4）：
+/// result 型渲染（path/fps/cursor 详情行）。FILE 必填（app 主机路径，
+/// 扩展名定容器——不设缺省名，静默写 <id>.webm 到未知位置比报 400 差）。
+fn record_start(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    file: &str,
+    fps: Option<u32>,
+    cursor: bool,
+    tab: Option<&str>,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.page_record_start(id, file, fps, cursor, tab)?;
+    if out.quiet {
+        out.print_id(file);
+        return Ok(());
+    }
+    if out.json {
+        out.render_kv(&[], resp);
+        return Ok(());
+    }
+    let cursor_desc = if resp
+        .get("cursor")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(cursor)
+    {
+        "on"
+    } else {
+        "off"
+    };
+    out.render_text(format!(
+        "{}\npath: {} · fps: {} · cursor: {}",
+        resp.get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(响应缺少 result 字段)"),
+        resp.get("path").and_then(|v| v.as_str()).unwrap_or(file),
+        resp.get("fps")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| fps.map(|f| f.to_string()).unwrap_or_else(|| "30".into())),
+        cursor_desc,
+    ));
+    Ok(())
+}
+
+/// `page record stop <ID> [--status]`（I4）：quiet = 产物路径；table =
+/// result + path/frames 详情行（--status 时 json 分支自然携带完整终态）。
+fn record_stop(
+    globals: &GlobalArgs,
+    client: &AgentClient,
+    id: &str,
+    status: bool,
+) -> Result<(), CliError> {
+    let out = OutputCtx::from(globals);
+    let resp = client.page_record_stop(id, status)?;
+    if out.quiet {
+        out.print_id(
+            resp.get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(响应缺少 path 字段)"),
+        );
+        return Ok(());
+    }
+    if out.json {
+        out.render_kv(&[], resp);
+        return Ok(());
+    }
+    out.render_text(format!(
+        "{}\npath: {} · frames: {} · captured: {}",
+        resp.get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(响应缺少 result 字段)"),
+        resp.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+        resp.get("frames")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
+        resp.get("capturedFrames")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
+    ));
     Ok(())
 }
 
@@ -932,11 +1579,7 @@ fn download_wait(
     let out = OutputCtx::from(globals);
     let resp = client.page_download_wait(id, timeout_ms, tab)?;
     if out.quiet {
-        out.print_id(
-            resp.get("filePath")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-        );
+        out.print_id(resp.get("filePath").and_then(|v| v.as_str()).unwrap_or(""));
         return Ok(());
     }
     if out.json {
@@ -1042,7 +1685,9 @@ fn decode_base64(data: &str, magic: &[u8], label: &str) -> Result<Vec<u8>, CliEr
         .decode(data)
         .map_err(|e| CliError::Local(format!("{label} base64 解码失败: {e}")))?;
     if !bytes.starts_with(magic) {
-        return Err(CliError::Protocol(format!("{label} 数据格式不符（魔数校验失败）")));
+        return Err(CliError::Protocol(format!(
+            "{label} 数据格式不符（魔数校验失败）"
+        )));
     }
     Ok(bytes)
 }
@@ -1164,13 +1809,107 @@ fn snap_text(resp: &serde_json::Value) -> String {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "?".into())
     };
-    format!(
-        "targetId: {} · refs: {} · generation: {}\n{}",
+    let removed = resp
+        .get("removedRefs")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let meta = format!(
+        "targetId: {} · refs: {} · generation: {}",
         str_or("targetId"),
         str_or("refs_count"),
-        str_or("generation"),
-        resp.get("text").and_then(|v| v.as_str()).unwrap_or("")
-    )
+        str_or("generation")
+    );
+    let tree = resp.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if removed.is_empty() {
+        format!("{meta}\n{tree}")
+    } else {
+        format!("{meta}\nremoved: {removed}\n{tree}")
+    }
+}
+
+/// diff 三态：quiet = changed 布尔串；json = 响应原样；table = 摘要行
+//（changed + counts + baselineCleared 披露）+ diff 文本（无变化省略；
+/// 首次无基线时全部计为 added——文档披露语义）。
+fn diff_out(resp: &serde_json::Value, out: &OutputCtx) -> PageOut {
+    if out.quiet {
+        return PageOut::Quiet(
+            resp.get("changed")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        );
+    }
+    if out.json {
+        return PageOut::Json(resp.clone());
+    }
+    let counts = |key: &str| {
+        resp.pointer(&format!("/counts/{key}"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into())
+    };
+    let changed = resp
+        .get("changed")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".into());
+    let mut summary = format!(
+        "changed: {changed} · added: {} · removed: {} · unchanged: {}",
+        counts("added"),
+        counts("removed"),
+        counts("unchanged"),
+    );
+    if resp
+        .get("baselineCleared")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        summary.push_str("\nbaselineCleared: 快照超 2MiB 未入基线（下次 diff 与空基线比较）");
+    }
+    let diff_text = resp.get("diff").and_then(|v| v.as_str()).unwrap_or("");
+    if diff_text.is_empty() {
+        PageOut::Text(summary)
+    } else {
+        PageOut::Text(format!("{summary}\n{diff_text}"))
+    }
+}
+
+/// diff-shot 三态：quiet = differing 布尔串（--out 落差异图时路径优先，
+/// 落盘在 diff_shot 命令层已处理）；json 原样；table = differing/ratio 行
+//（+ 尺寸不一致披露 + 落盘路径行）。
+fn diff_shot_out(resp: &serde_json::Value, out: &OutputCtx, out_path: Option<&str>) -> PageOut {
+    if out.quiet {
+        return PageOut::Quiet(
+            resp.get("differing")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        );
+    }
+    if out.json {
+        return PageOut::Json(resp.clone());
+    }
+    let differing = resp
+        .get("differing")
+        .and_then(|v| v.as_bool())
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "?".into());
+    let ratio = resp
+        .get("ratio")
+        .and_then(|v| v.as_f64())
+        .map(|r| format!("{r:.2}%"))
+        .unwrap_or_else(|| "?".into());
+    let mut text = format!("differing: {differing} · ratio: {ratio}");
+    if let Some(dm) = resp.get("dimensionMismatch") {
+        text.push_str(&format!("\ndimensionMismatch: {}", dm));
+    }
+    if let Some(p) = out_path {
+        text.push_str(&format!("\ndiff image: {p}"));
+    }
+    PageOut::Text(text)
 }
 
 /// click/fill/press/wait/eval/clickxy/loadall/type 的主结果行（服务端 result
@@ -1214,11 +1953,7 @@ fn dialogs_seen_note(resp: &serde_json::Value) -> Option<String> {
 
 /// extract 三态：quiet = 行数（--out 时路径，供 $(...) 捕获）；json = 响应
 /// 原样（--out 已另落文件）；table = 摘要行 + 数据表。
-fn extract_out(
-    resp: &serde_json::Value,
-    out: &OutputCtx,
-    out_path: Option<&str>,
-) -> PageOut {
+fn extract_out(resp: &serde_json::Value, out: &OutputCtx, out_path: Option<&str>) -> PageOut {
     if out.quiet {
         return PageOut::Quiet(match out_path {
             Some(p) => p.to_string(),
@@ -1347,10 +2082,7 @@ fn dialogs_rows(resp: &serde_json::Value) -> Vec<TableRow> {
 fn download_wait_text(resp: &serde_json::Value) -> String {
     let name = resp.get("fileName").and_then(|v| v.as_str()).unwrap_or("?");
     let bytes = resp.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-    let path = resp
-        .get("filePath")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let path = resp.get("filePath").and_then(|v| v.as_str()).unwrap_or("");
     let mut line = format!("Downloaded \"{name}\" ({bytes} bytes) → {path}");
     if !resp
         .get("verified")
@@ -1375,9 +2107,15 @@ fn downloads_rows(resp: &serde_json::Value) -> Vec<TableRow> {
                         .unwrap_or("")
                         .to_string(),
                     cells: vec![
-                        e.get("state").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                        e.get("state")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string(),
                         truncate(e.get("fileName").and_then(|v| v.as_str()).unwrap_or(""), 40),
-                        e.get("bytes").and_then(|v| v.as_u64()).unwrap_or_default().to_string(),
+                        e.get("bytes")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or_default()
+                            .to_string(),
                         e.get("matched")
                             .and_then(|v| v.as_bool())
                             .map(|b| if b { "yes" } else { "no" })
@@ -1414,7 +2152,7 @@ mod tests {
         let resp = json!({
             "instanceId": "ins_1",
             "targetId": "TAB9F",
-            "text": "[WebArea] Home\n  @e1 [button] OK",
+            "text": "- button \"OK\" @e1",
             "refs_count": 2,
             "generation": 1
         });
@@ -1423,7 +2161,32 @@ mod tests {
             text.starts_with("targetId: \"TAB9F\" · refs: 2 · generation: 1"),
             "{text}"
         );
-        assert!(text.contains("@e1 [button] OK"), "树体必须原样保留: {text}");
+        assert!(
+            !text.contains("removed:"),
+            "无 removedRefs 不输出 removed 行: {text}"
+        );
+        assert!(
+            text.contains("- button \"OK\" @e1"),
+            "树体必须原样保留: {text}"
+        );
+    }
+
+    /// I1b：removedRefs 非空 → meta 行后附 `removed: @e2, @e5` 行（文本模式）
+    #[test]
+    fn snap_text_appends_removed_line_when_refs_dropped() {
+        let resp = json!({
+            "instanceId": "ins_1",
+            "targetId": "TAB9F",
+            "text": "- button \"OK\" @e1",
+            "refs_count": 1,
+            "generation": 2,
+            "removedRefs": ["@e2", "@e5"]
+        });
+        let text = snap_text(&resp);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "targetId: \"TAB9F\" · refs: 1 · generation: 2");
+        assert_eq!(lines[1], "removed: @e2, @e5");
+        assert_eq!(lines[2], "- button \"OK\" @e1");
     }
 
     /// F3（真机冒烟修复）：snap 三态分流——json 模式必须是响应原样 JSON
@@ -1554,7 +2317,10 @@ mod tests {
         });
         match extract_out(
             &resp,
-            &OutputCtx { json: false, quiet: true },
+            &OutputCtx {
+                json: false,
+                quiet: true,
+            },
             None,
         ) {
             PageOut::Quiet(n) => assert_eq!(n, "2", "quiet = 行数"),
@@ -1562,7 +2328,10 @@ mod tests {
         }
         match extract_out(
             &resp,
-            &OutputCtx { json: false, quiet: true },
+            &OutputCtx {
+                json: false,
+                quiet: true,
+            },
             Some("t.json"),
         ) {
             PageOut::Quiet(p) => assert_eq!(p, "t.json", "--out + quiet = 路径"),
@@ -1570,7 +2339,10 @@ mod tests {
         }
         match extract_out(
             &resp,
-            &OutputCtx { json: true, quiet: false },
+            &OutputCtx {
+                json: true,
+                quiet: false,
+            },
             None,
         ) {
             PageOut::Json(v) => assert_eq!(v, resp),
@@ -1578,7 +2350,10 @@ mod tests {
         }
         match extract_out(
             &resp,
-            &OutputCtx { json: false, quiet: false },
+            &OutputCtx {
+                json: false,
+                quiet: false,
+            },
             None,
         ) {
             PageOut::Text(t) => {

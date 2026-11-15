@@ -67,7 +67,7 @@ EXT=$(curl -s -X POST "$BASE/extensions" -H 'content-type: application/json' -d 
 EXT_ID=$(echo "$EXT" | jqpy "d['id']")
 [ -n "${EXT_ID}" ] && ok "注册用户扩展（manifest 元数据提取）" || bad "扩展注册失败: ${EXT}"
 NSYS=$(curl -s "$BASE/extensions" | jqpy "len([e for e in d if e['type']=='system'])")
-check "$NSYS" "1" "内置 system 扩展种子（env-label）"
+check "$NSYS" "3" "内置 system 扩展种子（env-label/net-rules/page-diagnostics）"
 
 # 按任意路径注册非法目录应 400（服务端校验 manifest）
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/extensions" -H 'content-type: application/json' -d '{"path":"/nonexistent/ext-dir"}')
@@ -129,7 +129,11 @@ D0=$(curl -s "$BASE/settings" | jqpy "1 if d['developerMode'] else 0")
 curl -s -X PUT "$BASE/settings" -H 'content-type: application/json' -d '{"developerMode":true}' > /dev/null
 D1=$(curl -s "$BASE/settings" | jqpy "1 if d['developerMode'] else 0")
 curl -s -X PUT "$BASE/settings" -H 'content-type: application/json' -d '{"developerMode":false}' > /dev/null
-[ "$D0" = "0" ] && [ "$D1" = "1" ] && ok "Developer Mode 开关持久化" || bad "Developer Mode 开关异常 (${D0}→${D1})"
+D_FLIP=$((1 - D0))
+curl -s -X PUT "$BASE/settings" -H 'content-type: application/json' -d "{\"developerMode\": $([ "$D0" = "1" ] && echo false || echo true)}" > /dev/null
+D2=$(curl -s "$BASE/settings" | jqpy "1 if d['developerMode'] else 0")
+[ "$D2" = "$D_FLIP" ] && ok "Developer Mode 开关持久化（${D0}→${D2}）" || bad "Developer Mode 开关异常（${D0}→${D2}）"
+curl -s -X PUT "$BASE/settings" -H 'content-type: application/json' -d "{\"developerMode\": $([ "$D0" = "1" ] && echo true || echo false)}" > /dev/null
 curl -s -X PATCH "$BASE/environments/$ENV_ID" -H 'content-type: application/json' -d '{"keepAlive":true}' > /dev/null
 KA=$(curl -s "$BASE/environments/$ENV_ID" | jqpy "1 if d['keepAlive'] else 0")
 check "$KA" "1" "PATCH keepAlive 生效"
@@ -149,47 +153,8 @@ LP=$(curl -s -X POST "$BASE/environments/$ENV_ID/login-profile/reset")
 ST=$(echo "$LP" | jqpy "d['status']")
 V=$(echo "$LP" | jqpy "d['snapshotVersion']")
 check "$ST,$V" "not_configured,0" "reset 归零回 not_configured"
-CODE=$(curl -s --max-time 90 -o /dev/null -w "%{http_code}" -X POST "$BASE/environments/$ENV_ID/login-profile/launch")
-check "$CODE" "200" "launch 登录浏览器"
-CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/environments/$ENV_ID/login-profile/launch")
-check "$CODE" "409" "重复 launch → 409 PROFILE_IN_USE"
-RUNNING=$(curl -s "$BASE/environments/$ENV_ID/login-profile" | jqpy "1 if d['browserRunning'] else 0")
-check "$RUNNING" "1" "browserRunning=true"
-CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/environments/$ENV_ID/login-profile/capture")
-check "$CODE" "409" "运行中 capture → 409（不代杀）"
-# 模拟 macOS 关窗：CDP 关闭全部页面，进程不退 → 服务应双确认后代为收尾
-LP_CDP=$(curl -s "$BASE/environments/$ENV_ID/login-profile" | jqpy "d['cdpPort']")
-curl -s "http://127.0.0.1:$LP_CDP/json/list" | python3 -c "import sys,json;[print(t['id']) for t in json.load(sys.stdin) if t['type']=='page']" | while read -r tid; do
-  curl -s "http://127.0.0.1:$LP_CDP/json/close/$tid" > /dev/null
-done
-RUNNING=1
-for i in $(seq 1 25); do
-  RUNNING=$(curl -s "$BASE/environments/$ENV_ID/login-profile" | jqpy "1 if d['browserRunning'] else 0")
-  [ "$RUNNING" = "0" ] && break
-  sleep 2
-done
-check "$RUNNING" "0" "关窗后 browserRunning 回正并代收进程"
-# 进程死亡路径：重新 launch 后 pkill 主进程 → watcher 事件回正
-CODE=$(curl -s --max-time 90 -o /dev/null -w "%{http_code}" -X POST "$BASE/environments/$ENV_ID/login-profile/launch")
-check "$CODE" "200" "关窗后可重新 launch"
-pkill -TERM -f "com.chromehost.dev/environments/.*login-profile" || true
-for i in $(seq 1 15); do
-  RUNNING=$(curl -s "$BASE/environments/$ENV_ID/login-profile" | jqpy "1 if d['browserRunning'] else 0")
-  [ "$RUNNING" = "0" ] && break
-  sleep 0.5
-done
-check "$RUNNING" "0" "进程退出后 browserRunning 回正"
-LP=$(curl -s --max-time 30 -X POST "$BASE/environments/$ENV_ID/login-profile/capture")
-ST=$(echo "$LP" | jqpy "d['status']")
-check "$ST" "ready" "关窗后 capture → ready"
-
-echo "[9.8/10] Extensions 生命周期"
-EN=$(curl -s -X PATCH "$BASE/extensions/$EXT_ID" -H 'content-type: application/json' -d '{"enabled":false}' | jqpy "d['enabled']")
-check "$EN" "False" "PATCH 禁用扩展"
-CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$BASE/extensions/$EXT_ID")
-check "$CODE" "200" "移除扩展注册项"
-CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/extensions/$EXT_ID")
-check "$CODE" "404" "移除后不可见"
+# 母本 launch 登录浏览器子系统已于 0.3.0 移除（AGENT-API「登录态」章，breaking）——
+# 现行契约：实例即登录源（实例登录→关闭→自动保存→create 克隆），capture/reset 见上
 
 echo "[10/10] start（已停止实例重启）+ 快照克隆 + 删除"
 STATUS=$(curl -s --max-time 120 -X POST "$BASE/instances/$INS_ID/start" | jqpy "d['status']")

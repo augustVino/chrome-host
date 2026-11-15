@@ -18,17 +18,99 @@ use crate::error::AppError;
 
 use super::server::ApiState;
 
-/// POST /api/v1/instances/{id}/page/snap —— AX 树快照 + @eN ref 整表替换。
+/// POST /api/v1/instances/{id}/page/snap —— kit 快照管线（durable refs）。
 #[derive(Deserialize)]
 pub struct SnapBody {
     /// 目标 tab（targetId 或唯一前缀；缺省 = 唯一页面标签自动选中，多标签 409 列出全部）
     pub tab: Option<String>,
+    /// --compact：压缩文本树（kit compact_tree）
+    #[serde(default)]
+    pub compact: Option<bool>,
+    /// --interactive：只保留可交互节点
+    #[serde(default)]
+    pub interactive: Option<bool>,
+    /// --depth：渲染深度上限
+    #[serde(default)]
+    pub depth: Option<u64>,
+    /// --urls：link 节点附 url 属性
+    #[serde(default)]
+    pub urls: Option<bool>,
+    /// --selector：只快照该 CSS 选择器命中的子树
+    #[serde(default)]
+    pub selector: Option<String>,
 }
 
-/// POST /api/v1/instances/{id}/page/click —— 原生输入点击。
+/// POST /api/v1/instances/{id}/page/click —— 原生输入点击（I2：kit
+/// interaction 内核；双击/右键经 ClickSpec 透传）。
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClickBody {
     /// 点击目标：@eN ref（上次 snap 产生）或 CSS 选择器
+    pub target: String,
+    /// 双击（clickCount=2）；缺省 false
+    pub double: Option<bool>,
+    /// 右键（button=right）；缺省 false（left）
+    pub right: Option<bool>,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/hover —— 悬停（I2 新命令：mouseMoved）。
+#[derive(Deserialize)]
+pub struct HoverBody {
+    /// 悬停目标：@eN ref 或 CSS 选择器
+    pub target: String,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/scroll —— 滚动（I2 新命令：有 target
+/// 滚元素、无 target 滚页面；dx/dy 单位 CSS 像素，可负）。
+#[derive(Deserialize)]
+pub struct ScrollBody {
+    /// 滚动目标：@eN ref 或 CSS 选择器；缺省 = 整页滚动
+    pub target: Option<String>,
+    pub dx: f64,
+    pub dy: f64,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/drag —— 拖拽（I2 新命令：轨迹插值链，
+/// LCG 弧线 + smoothstep，人类化轨迹）。
+#[derive(Deserialize)]
+pub struct DragBody {
+    /// 拖拽起点：@eN ref 或 CSS 选择器
+    pub from: String,
+    /// 拖拽终点：@eN ref 或 CSS 选择器（与 from 同帧）
+    pub to: String,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/select —— 下拉选择（I2 新命令：按
+/// value 或可见文本匹配；原生 select 与 role=combobox/listbox 控件）。
+#[derive(Deserialize)]
+pub struct SelectBody {
+    /// 选择目标：@eN ref 或 CSS 选择器
+    pub target: String,
+    /// 选项 value 或可见文本（label）；空串 = 选中空值选项
+    pub value: String,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/check —— 勾选/取消勾选（I2 新命令；
+/// 已处于目标态 = no-op 成功）。复选框/单选钮与关联 label 控件。
+#[derive(Deserialize)]
+pub struct CheckBody {
+    /// 勾选目标：@eN ref 或 CSS 选择器（input 或关联 label）
+    pub target: String,
+    /// true = 取消勾选；缺省 false = 勾选
+    pub uncheck: Option<bool>,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/tap —— 触摸轻点（I2 新命令：
+/// touchStart/touchEnd，移动端仿真页面用 tap 而非 click）。
+#[derive(Deserialize)]
+pub struct TapBody {
+    /// 轻点目标：@eN ref 或 CSS 选择器
     pub target: String,
     pub tab: Option<String>,
 }
@@ -149,12 +231,14 @@ pub struct ReloadBody {
 #[derive(Deserialize)]
 pub struct ScreenshotBody {
     /// 截图目标：@eN ref（上次 snap 产生）或 CSS 选择器；缺省 = 当前视口整幅。
-    /// 元素路径与 click 同定位链（scrollIntoView + quads），clip 取联合包围盒
+    /// 元素路径（I3 起 = kit screenshot.rs）：不滚动页面，clip 文档坐标 +
+    /// captureBeyondViewport（可截屏外元素）
     pub target: Option<String>,
     /// true = 全页截图：截发起时刻的整文档（clip 全文档 + captureBeyondViewport，
     /// 不滚动页面）；与 target 互斥（同给 → 400）。单边超限截断并标 truncated
     /// （上限 = 16384 设备像素 ÷ DPR，Retina DPR2 = 8192 CSS px）；响应带
-    /// width/height/documentWidth/documentHeight。
+    /// width/height/documentWidth/documentHeight（尺寸源 = getLayoutMetrics
+    /// cssContentSize，I3 起与 kit clip 同源）。
     pub full: Option<bool>,
     pub tab: Option<String>,
 }
@@ -230,14 +314,100 @@ pub struct UploadBody {
     pub tab: Option<String>,
 }
 
+/// POST /api/v1/instances/{id}/page/diff —— 快照文本 diff（I3）：当前
+/// snap ↔ 基线的行级 unified diff。无 baseline = 与 per-tab 滚动基线
+///（上次无显式 baseline 的 diff 快照）比较并更新之；有 baseline = 显式
+/// 基线文本，只比较不更新。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffBody {
+    pub tab: Option<String>,
+    /// 只快照该 CSS 选择器命中子树（与 snap --selector 同源）
+    pub selector: Option<String>,
+    /// 压缩输出（与 snap --compact 同源）
+    pub compact: Option<bool>,
+    /// 渲染深度上限
+    pub depth: Option<usize>,
+    /// 显式基线文本：上次 diff --json 的 diff 输入方（或自备）；给定则
+    /// 只比较不更新滚动基线。缺省 = 与服务端滚动基线比较
+    pub baseline: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/diff-shot —— 像素 diff（I3）：base64
+/// png 基线 ↔ 服务端当前截图 → kit 像素 diff。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffShotBody {
+    pub tab: Option<String>,
+    /// true = 当前侧用全页截图（缺省视口）
+    pub full: Option<bool>,
+    /// 基线截图（base64 png，必填；尺寸与当前不一致 → differing + 100%
+    /// + dimensionMismatch 披露）
+    pub baseline: String,
+}
+
+/// POST /api/v1/instances/{id}/page/profiler/start —— 启动性能采样（I3）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilerStartBody {
+    pub tab: Option<String>,
+    /// 追踪分类（数组；缺省 = kit 全家桶：devtools.timeline/v8/blink 等）
+    pub categories: Option<Vec<String>>,
+}
+
+/// POST /api/v1/instances/{id}/page/profiler/stop —— 停止采样并落盘（I3）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilerStopBody {
+    /// 落盘路径（服务端主机；缺省 <实例id>-trace.json）
+    pub out: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/record/start —— 启动页录屏（I4）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordStartBody {
+    /// 输出文件路径（服务端主机；扩展名定容器：.webm/.mp4/.mov…；
+    /// 无扩展名 → 400）
+    pub file: String,
+    /// 采样率（1-60；缺省 30）
+    pub fps: Option<u32>,
+    /// 合成光标覆盖层（页内 JS 动画 + Rust 侧输入采样插值）
+    pub cursor: Option<bool>,
+    pub tab: Option<String>,
+}
+
+/// POST /api/v1/instances/{id}/page/record/stop —— 停止录屏并结算产物（I4）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordStopBody {
+    /// 附 kit 完整终态（capture 模式/设备缩放等披露字段）
+    pub status: Option<bool>,
+}
+
 pub async fn snap(
     State(state): State<ApiState>,
     Path(id): Path<String>,
     Json(body): Json<SnapBody>,
 ) -> Result<Json<Value>, AppError> {
+    let depth = match body.depth {
+        Some(d) if d > usize::MAX as u64 => {
+            return Err(AppError::invalid_request(format!(
+                "depth 超出上限（got {d}）"
+            )))
+        }
+        d => d.map(|d| d as usize),
+    };
+    let params = crate::application::page_service::SnapParams {
+        compact: body.compact.unwrap_or(false),
+        interactive: body.interactive.unwrap_or(false),
+        depth,
+        urls: body.urls.unwrap_or(false),
+        selector: body.selector,
+    };
     let resp = state
         .page
-        .snap(&id, body.tab.as_deref().unwrap_or(""))
+        .snap(&id, body.tab.as_deref().unwrap_or(""), params)
         .await?;
     Ok(Json(resp))
 }
@@ -249,7 +419,101 @@ pub async fn click(
 ) -> Result<Json<Value>, AppError> {
     let resp = state
         .page
-        .click(&id, body.tab.as_deref().unwrap_or(""), &body.target)
+        .click(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.target,
+            body.double.unwrap_or(false),
+            body.right.unwrap_or(false),
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn hover(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<HoverBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .hover(&id, body.tab.as_deref().unwrap_or(""), &body.target)
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn scroll(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ScrollBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .scroll(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            body.target.as_deref(),
+            body.dx,
+            body.dy,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn drag(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DragBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .drag(&id, body.tab.as_deref().unwrap_or(""), &body.from, &body.to)
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn select(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<SelectBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .select(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.target,
+            &body.value,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn check(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<CheckBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .check(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.target,
+            body.uncheck.unwrap_or(false),
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+pub async fn tap(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<TapBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .tap(&id, body.tab.as_deref().unwrap_or(""), &body.target)
         .await?;
     Ok(Json(resp))
 }
@@ -530,6 +794,104 @@ pub async fn pdf(
     Ok(Json(resp))
 }
 
+/// POST /api/v1/instances/{id}/page/diff —— 快照文本 diff（I3）。
+pub async fn diff(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DiffBody>,
+) -> Result<Json<Value>, AppError> {
+    let params = crate::application::page_service::SnapParams {
+        compact: body.compact.unwrap_or(false),
+        interactive: false,
+        depth: body.depth,
+        urls: false,
+        selector: body.selector,
+    };
+    let resp = state
+        .page
+        .diff(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            params,
+            body.baseline,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/diff-shot —— 像素 diff（I3）。
+pub async fn diff_shot(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DiffShotBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .diff_shot(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            body.full.unwrap_or(false),
+            &body.baseline,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/profiler/start —— 启动性能采样（I3）。
+pub async fn profiler_start(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ProfilerStartBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .profiler_start(&id, body.tab.as_deref().unwrap_or(""), body.categories)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/profiler/stop —— 停止采样并落盘（I3）。
+pub async fn profiler_stop(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ProfilerStopBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state.page.profiler_stop(&id, body.out).await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/record/start —— 启动页录屏（I4）。
+pub async fn record_start(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<RecordStartBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .record_start(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            &body.file,
+            body.fps,
+            body.cursor.unwrap_or(false),
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+/// POST /api/v1/instances/{id}/page/record/stop —— 停止录屏并结算产物（I4）。
+pub async fn record_stop(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<RecordStopBody>,
+) -> Result<Json<Value>, AppError> {
+    let resp = state
+        .page
+        .record_stop(&id, body.status.unwrap_or(false))
+        .await?;
+    Ok(Json(resp))
+}
+
 /// POST /api/v1/instances/{id}/page/reload —— 重载（等待语义同 navigate）。
 pub async fn reload(
     State(state): State<ApiState>,
@@ -563,7 +925,11 @@ pub async fn extract(
 ) -> Result<Json<Value>, AppError> {
     let resp = state
         .page
-        .extract(&id, body.tab.as_deref().unwrap_or(""), body.target.as_deref())
+        .extract(
+            &id,
+            body.tab.as_deref().unwrap_or(""),
+            body.target.as_deref(),
+        )
         .await?;
     Ok(Json(resp))
 }
@@ -575,12 +941,10 @@ pub async fn emulate(
 ) -> Result<Json<Value>, AppError> {
     let req = crate::domain::emulate::EmulateRequest {
         preset: body.preset,
-        viewport: body
-            .viewport
-            .map(|v| crate::domain::emulate::Viewport {
-                width: v.width,
-                height: v.height,
-            }),
+        viewport: body.viewport.map(|v| crate::domain::emulate::Viewport {
+            width: v.width,
+            height: v.height,
+        }),
         user_agent: body.user_agent,
         mobile: body.mobile,
         touch: body.touch,

@@ -294,20 +294,28 @@ base64 + `encoding: "base64"`，HAR 惯例）；`_meta.uncollected` 逐行声明
 ### 页面控制（Page Control）
 
 实例级常驻 CDP 连接上的页面操作面：`snap` 产生 @eN 引用，`click`/`fill`/
-`press` 消费引用或 CSS 选择器，`wait` 轮询等待，`dialogs` 读自动应答的对话框
-日志；`eval`/`html`/`clickxy`/`loadall`/`type` 为 cdp.mjs 退役补齐的兑底五件
-（行为规格同源 TS 工具）；`navigate`/`back`/`forward`/`reload` 为导航四件套
-（page session 内导航/历史回退/重载，保留历史——实例级 `navigate` 的
-new+close 组合近似会丢历史，保留给 GUI）。连接惰性建立（实例首次 page
+`press`/`hover`/`scroll`/`drag`/`select`/`check`/`tap` 消费引用或 CSS 选择器
+（v0.7+ / I2：input 族内核 = browser_kit interaction——settle + actionability
+全开 + 对话框竞速），`wait` 轮询等待（我方自有实现），`dialogs` 读自动应答的
+对话框日志；`eval`/`html`/`clickxy`/`loadall`/`type` 为 cdp.mjs 退役补齐的兑
+底五件（行为规格同源 TS 工具）；`navigate`/`back`/`forward`/`reload` 为导航
+四件套（page session 内导航/历史回退/重载，保留历史——实例级 `navigate`
+的 new+close 组合近似会丢历史，保留给 GUI）。连接惰性建立（实例首次 page
 命令时），与常驻诊断连接互不干扰；仅对运行中实例可用（否则 `409
 PAGE_SERVICE_UNAVAILABLE`）。
 
 | 端点 | 说明 |
 |---|---|
-| `POST /api/v1/instances/{id}/page/snap` | AX 树快照 + @eN ref 整表替换 + hover 感知标记（行内 `[hover]` / `[hover-reveal]`，meta `hoverScan`）。body `{ "tab?": ... }`；跨域 iframe 内容以 `[frame]` 段内嵌（@eN 跨 frame 连续编号，v0.7+） |
-| `POST /api/v1/instances/{id}/page/click` | 原生输入点击（三段鼠标事件，非 `el.click()`）。body `{ "target", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/snap` | kit 快照管线 + durable @eN refs + hover 感知标记（行尾 `[hover]` / `[hover-reveal]`，meta `hoverScan`）。body `{ "tab?", "compact?", "interactive?", "depth?", "urls?", "selector?" }`（全缺省 = 完整树）；跨域 iframe 内容内嵌在 Iframe 节点行下（@eN 跨 frame 连续编号）；响应含 `removedRefs`（本次快照消失的旧引用，非空时才有） |
+| `POST /api/v1/instances/{id}/page/click` | 原生输入点击（v0.7+/I2 kit 内核：三段 ClickPhase + settle + 可见/启用/遮挡 + 对话框竞速；press→release 间弹框自动 accept 后补发 release）。body `{ "target", "double?", "right?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/hover` | 悬停（mouseMoved 到元素中心；菜单展开后重 snap）。body `{ "target", "tab?" }`（I2 新增） |
+| `POST /api/v1/instances/{id}/page/scroll` | 滚动：有 target 滚元素、无 target 滚页面；dx/dy 单位 CSS 像素可负。body `{ "target?", "dx", "dy", "tab?" }`（I2 新增） |
+| `POST /api/v1/instances/{id}/page/drag` | 拖拽（人类化弧线轨迹；两端点须同帧，跨帧 → 422 `PAGE_DRAG_CROSS_FRAME`）。body `{ "from", "to", "tab?" }`（I2 新增） |
+| `POST /api/v1/instances/{id}/page/select` | 下拉选择（原生 select 与 role=combobox/listbox；value 按 value 或可见文本匹配）。body `{ "target", "value", "tab?" }`（I2 新增） |
+| `POST /api/v1/instances/{id}/page/check` | 勾选/取消勾选复选框、单选钮（已处于目标态 no-op 成功）。body `{ "target", "uncheck?", "tab?" }`（I2 新增） |
+| `POST /api/v1/instances/{id}/page/tap` | 触摸轻点（touchStart/touchEnd，移动端仿真页）。body `{ "target", "tab?" }`（I2 新增） |
 | `POST /api/v1/instances/{id}/page/fill` | 聚焦→全选清空→insertText→回读校验。body `{ "target", "value", "tab?" }` |
-| `POST /api/v1/instances/{id}/page/press` | 键盘三段序列。body `{ "key", "target?", "tab?" }` |
+| `POST /api/v1/instances/{id}/page/press` | 键盘事件（v0.7+/I2：keyDown+keyUp 两段，Ctrl/Meta 组合抑制 text；--target 先聚焦，统一 kit 解析链）。body `{ "key", "target?", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/wait` | 轮询等待元素状态（250ms 间隔）。body `{ "selector", "state?", "timeout?", "tab?" }` |
 | `GET /api/v1/instances/{id}/page/dialogs` | 已自动应答的对话框日志。query `tab?&since=` |
 | `POST /api/v1/instances/{id}/page/eval` | 任意 JS 求值（⚠ 高权限，见下）。body `{ "expression", "tab?" }` |
@@ -324,6 +332,12 @@ PAGE_SERVICE_UNAVAILABLE`）。
 | `GET /api/v1/instances/{id}/page/intercept?tab=` | 拦截状态：各规则命中计数/剩余/活跃 + 干预记录环（最近 200 条，url 已脱敏）+ `liveSince` |
 | `POST /api/v1/instances/{id}/page/screenshot` | 元素/视口/全页 png 截图（base64）。body `{ "target?", "full?", "tab?" }`；full 与 target 互斥 |
 | `POST /api/v1/instances/{id}/page/pdf` | 整页 PDF（base64）。body `{ "landscape?", "printBackground?", "paperWidth?", "paperHeight?", "tab?" }`（英寸，缺省 Letter 8.5×11） |
+| `POST /api/v1/instances/{id}/page/diff` | 快照文本 diff（I3）：当前 snap ↔ 基线的行级 unified diff。body `{ "tab?", "selector?", "compact?", "depth?", "baseline?" }`——无 baseline = 与该 tab 上次 diff 的快照（滚动基线）比较并更新之；有 = 只比较不更新。响应 `{changed, added[], removed[], counts:{added,removed,unchanged}, diff, baselineCleared?}`；快照超 2MiB 不入基线并标 baselineCleared |
+| `POST /api/v1/instances/{id}/page/diff-shot` | 像素 diff（I3）。body `{ "tab?", "full?", "baseline" }`（baseline = 基线 png 的 base64，必填）→ 响应 `{differing, ratio, image?, dimensionMismatch?}`；尺寸不一致 → differing + ratio=100 + dimensionMismatch |
+| `POST /api/v1/instances/{id}/page/profiler/start` | 启动性能采样（I3，Chrome tracing；常驻不占实例串行锁）。body `{ "tab?", "categories?" }`（数组，缺省全家桶）；重复 → 409 |
+| `POST /api/v1/instances/{id}/page/profiler/stop` | 停止采样并落盘 traceEvents JSON（I3；按 start 锚点路由，无 tab 入参）。body `{ "out?" }`（app 主机路径，缺省 `<实例id>-trace.json`）；响应 `{result, path, eventCount}` |
+| `POST /api/v1/instances/{id}/page/record/start` | 启动页录屏（I4，screencast 帧流 → ffmpeg 编码；常驻不占实例串行锁）。body `{ "file", "fps?", "cursor?", "tab?" }`——file 必填（app 主机路径，扩展名定容器 .webm/.mp4/.mov…，无扩展名 → 400）；fps 1-60 缺省 30；cursor 合成光标；重复 → 409 |
+| `POST /api/v1/instances/{id}/page/record/stop` | 停止录屏并结算产物（I4；按 start 锚点路由，无 tab 入参；编码收尾可能数秒）。body `{ "status?" }`；响应 `{result, path, frames, capturedFrames, fps}`（status=true 附完整终态）；无运行中 → 409 |
 | `POST /api/v1/instances/{id}/page/emulate` | 设备仿真（preset / viewport / off 三形态互斥）。body `{ "preset?" \| "viewport"+"userAgent?"+"mobile?"+"touch?" \| "off", "tab?" }` |
 | `POST /api/v1/instances/{id}/page/extract` | 表格结构化提取 → `{ columns, rows, coverage, meta }`。body `{ "target?", "tab?" }`（target 缺省 = 主文档最大表格自动发现；详见下文「表格提取」） |
 | `GET /api/v1/instances/{id}/page/downloads` | 下载终态记录环（最近 20 条，含已消费——matched 字段区分） |
@@ -347,15 +361,16 @@ PAGE_SERVICE_UNAVAILABLE`）。
   `display:none` 隐藏的 reveal 目标不在 AX 树（hover 后出现，重新 snap 可见）；
   CSS 解析为启发式（`@keyframes`/注释/`:not(:hover)` 已排除，误报由 DOM
   求值兜底——查不到元素的选择器自然无标记）。
-- **`target`**：`@eN` 引用（上次 snap 产生；导航/文档替换后整表失效 → `PAGE_REF_STALE`，
-  需重新 snap 而非对旧引用重试）或 CSS 选择器两种形态。
+- **`target`**：`@eN` 引用（durable，v0.7+/I1b：SPA 同文档更新后旧引用仍可用
+  ——同节点直接命中，失联时按 role/name 唯一匹配恢复；导航/文档替换后节点死亡
+  → `PAGE_REF_STALE`，重 snap 而非对旧引用重试）或 CSS 选择器两种形态。
 - **跨域 iframe（OOPIF）**：snap 的 AX 树包含跨域 iframe 内的可交互元素
-  （挂接点下 `[frame]` 段，@eN 连续编号）；@eN 指向帧内元素时 click 走
-  坐标投影（帧内 quad → owner iframe 元素 quad 逐级上投 → 根视口，
-  Input 派发发根 target），fill/press 的 DOM/Runtime 命令路由到帧会话。
-  **CSS 选择器仍只查主 frame**（与 BrowserSkill 一致）；帧内导航/移除只
-  使该帧的 ref 失效（`PAGE_REF_STALE`，主 frame ref 不受影响）；帧内 hover
-  标记不适用（后续迭代边界）。同源 iframe 内容本就在主树中，无需特殊处理。
+  （Iframe 节点行下的缩进子树，@eN 连续编号）；@eN 指向帧内元素时 kit 解析链
+  自动路由到帧会话（click 的 Input 派发发帧会话，坐标为帧本地；fill/press 的
+  DOM/Runtime 命令同路由）。**CSS 选择器仍只查主 frame**（与 BrowserSkill 一致）；
+  帧内容换掉后旧帧内 ref 解析失败报 `PAGE_REF_STALE`（durable：不整表失效，
+  重 snap）；帧内 hover 标记不适用（后续迭代边界）。同源 iframe 内容本就在
+  主树中，无需特殊处理。
 - **`state`**：`visible`（缺省）/ `hidden` / `attached` / `detached`；非法 → `400 INVALID_REQUEST`。
 - **`timeout`**：时长字符串（`"10s"` / `"250ms"`，裸数字 = 毫秒），缺省 10s；工具级
   预算 = timeout + 5s。
@@ -382,8 +397,9 @@ block/redirect/headers，intercept 管任务内 mock/改头/按需 block）。**
 ```json
 { "rules": [
   { "id": "r1", "match": { "urlPattern": "https://api.foo.com/v1/*", "resourceTypes": ["xhr","fetch"] },
-    "action": { "type": "mock", "status": 200, "headers": {"Content-Type":"application/json"},
-                "body": "{\"ok\":true}", "delayMs": 0 }, "times": 1 },
+    "action": { "type": "mock", "status": 200, "headers": {"X-Source":"mock"},
+                "body": "{\"ok\":true}", "delayMs": 0,
+                "allowOrigin": "http://page.example" }, "times": 1 },
   { "id": "r2", "match": { "urlPattern": "*://*.foo.com/*" },
     "action": { "type": "setHeaders", "headers": {"X-Debug-Uid":"42"} } },
   { "id": "r3", "match": { "urlPattern": "https://ads.example.com/*" },
@@ -393,14 +409,28 @@ block/redirect/headers，intercept 管任务内 mock/改头/按需 block）。**
 
 - **`urlPattern`**：glob（`*` 通配，与 net-rules 同语义）；须含 scheme
   （`https://…` 或 `*://…`）。透传 CDP `Fetch.enable` patterns 并在应用层
-  同 pattern 二次匹配。
+  同 pattern 二次匹配。连续 `*` 编译期折叠（`**` ≡ `*`——折叠后存储
+  与下发，CDP urlPattern 对 `**` 行为未定义）；无 `*` 时全串字面匹配
+  （`?` 是 query 分隔符不是单字符通配）。
 - **`action.type`**：`mock`（不发出真实请求，本地回任意 status/headers/body/
-  delay）、`setHeaders`（改写请求头：原头全保留 + 规则头同名覆盖）、
-  `block`（`Fetch.failRequest` BlockedByClient，页面表现为网络错误）。
+  delay）、`setHeaders`（改写请求头：原头全保留 + 规则头同名覆盖——
+  `Fetch.continueRequest` 是替换语义，合并后整体下发）、`block`
+  （`Fetch.failRequest` BlockedByClient，页面表现为网络错误）。
+- **`action.allowOrigin`**（mock 可选，I5）：CORS 收紧——声明则仅当请求
+  `Origin` **精确匹配**（尾 `/` 归一）时 mock 上游才注入
+  `Access-Control-Allow-Origin`（回显请求 Origin）+
+  `Access-Control-Allow-Credentials: true`；不匹配则不注入（浏览器拒读，
+  preflight 也拒绝）。**缺省不声明 = 宽松回显任意 Origin**（loopback 改写
+  的跨源可读契约，保持旧行为）。规则显式设置 CORS 头（同名）优先于注入。
+- **`action` 的 Content-Type 缺省推断**（mock，I5）：规则未显式设置
+  `Content-Type` 且 body 是合法 JSON（含 `null`/数字/字符串字面量）→
+  自动 `application/json`（页面与诊断捕获读到 JSON 形态）；显式设置
+  优先，非 JSON / 二进制 body 不推断。
 - **校验**（`400 INVALID_REQUEST`，message 带规则路径）：`status` 限 2xx ∪
   4xx-599（3xx 重定向/304 不允许——mock 是终态响应）；`delayMs` 0-10000；
   headers 黑名单（cookie/authorization/origin/content-length/host/`sec-*`/
-  `proxy-*`——防规则窃取凭据/破坏连接语义）；`resourceTypes` 白名单见下；
+  `proxy-*`——防规则窃取凭据/破坏连接语义）；`allowOrigin` 须为非空字符串
+  （origin 形态，如 `http://page.example`）；`resourceTypes` 白名单见下；
   规则 ≤32、展开 patterns ≤64；`body`（UTF-8 文本）或 `bodyBase64`（二进制）
   二选一。
 - **`resourceTypes` 枚举（真机实测口径，务必注意）**：合法值
@@ -421,23 +451,33 @@ block/redirect/headers，intercept 管任务内 mock/改头/按需 block）。**
   锁，与 in-flight page 命令并发）；**未命中/耗尽的请求一律 continueRequest
   放行，决策命令失败也裸放行兜底**——启用拦截绝不悬挂页面请求。
 - **mock 实现披露**：mock 经本地 loopback 上游改写（`Fetch.continueRequest`
-  → `http://127.0.0.1:<port>/m/<token>`，上游注入 CORS 头使跨源可读）——
-  页面 JS 读到的 `response.url` 是 mock 上游 URL 而非原 URL；CfT 131 的
+  → `http://127.0.0.1:<port>/m/<token>`，上游注入 CORS 头使跨源可读；
+  `allowOrigin` 声明时收紧为精确匹配才注入）——页面 JS 读到的
+  `response.url` 是 mock 上游 URL 而非原 URL；CfT 131 的
   `Fetch.fulfillRequest` 存在响应体不交付缺陷（spike 实测），故不走该路径。
+  preflight OPTIONS 一律 204 空体（`allowOrigin` 不匹配时不带 CORS 放口头，
+  预检在收紧声明下同样生效）。
 - **干预记录**（GET `journal`）：被 pause 的每个请求一条——`requestId`、
   `url`（脱敏）、`rule`、`outcome`（`mocked` / `headers-set` / `blocked` /
   `passed` / `failed-then-passed` / `stranded`）、`detail`、`ts`；环 200 条。
+  放行条目的 `detail`（I5 细化）按最接近命中的维度披露：
+  `times exhausted`（url+类型均中但次数耗尽）> `resourceType filtered
+  (event=…)`（url 中但事件类型不在规则类型集）> `url unmatched …`
+  （CDP pattern 命中但本地 glob 二次匹配未中）；GET 规则表新增
+  `action.allowOrigin` 披露（缺省 null）。
 | `POST /api/v1/instances/{id}/page/intercept` | **Fetch 会话层拦截**：规则集整表替换（空 `rules` = 清空 + `Fetch.disable`）。body `{ "rules": [...], "tab?" }`，规则模型见下 |
 | `GET /api/v1/instances/{id}/page/intercept?tab=` | 拦截状态：各规则命中计数/剩余/活跃 + 干预记录环（最近 200 条，url 已脱敏）+ `liveSince` |
 
 ```json
-// POST .../page/snap 响应（蛇形键对齐 TS wire 字段；hoverScan 见下）
+// POST .../page/snap 响应（v0.7+ 上游风格行 + @eN 后处理；hoverScan 见下；
+// removedRefs 仅在本次快照有旧引用消失时出现）
 { "instanceId": "ins_...", "targetId": "ABC123",
-  "text": "[WebArea] Example Domain\n  @e1 [link] [hover] More information...",
-  "refs_count": 1, "generation": 1, "hoverScan": "ok" }
+  "text": "- link \"More information...\" @e1 [hover]\n- heading \"Example Domain\"",
+  "refs_count": 1, "generation": 2, "hoverScan": "ok", "removedRefs": ["@e3"] }
 
-// POST .../page/click 响应（fill/press/wait 同为 result 单行形态）
-{ "result": "Clicked <BUTTON> \"Save\" (native input @150,130)",
+// POST .../page/click 响应（v0.7+/I2：selector 路径无 tag/text 可供回显，
+// 结果串改为选择器 + 顶层视口坐标；fill/press/wait 等同为 result 单行形态）
+{ "result": "Clicked \"#save\" at CSS (150, 130)",
   "instanceId": "ins_...", "targetId": "ABC123" }
 
 // 命令期间自动应答了对话框时，成功响应附 dialogs_seen（snake_case 条目，同 dialogs 端点）
@@ -679,17 +719,23 @@ CDP_BASE=$(chrome-host instance cdp-session <ins_id> --quiet) cdp.mjs shot <targ
 | 400 | `PAGE_KEY_UNKNOWN` | page press 键名不认识（支持命名键/单字符/组合键） |
 | 404 | `PAGE_TAB_NOT_FOUND` / `PAGE_REF_NOT_FOUND` / `PAGE_ELEMENT_NOT_FOUND` | page 族：tab 路由未命中 / @eN 引用不在上次 snap 表 / 选择器未命中 |
 | 409 | `PAGE_TAB_AMBIGUOUS` / `PAGE_SERVICE_UNAVAILABLE` | page 族：tab 前缀多匹配，或省略 tab 且存在多个页面标签（message 列出全部 targetId）/ 实例未运行或无 CDP 端口 |
-| 409 | `PAGE_REF_STALE` / `PAGE_TARGET_MOVED` | @eN 引用已因导航/文档替换失效（重 snap）/ 引用节点不再可解析 |
+| 409 | `PAGE_REF_STALE` / `PAGE_TARGET_MOVED` | @eN 引用节点死亡且恢复无果（durable 语义，重 snap）/ 引用节点不再可解析 |
 | 409 | `PAGE_ELEMENT_BLOCKED` / `PAGE_FILL_VALUE_MISMATCH` / `PAGE_WAIT_TIMEOUT` | 点击点被遮挡 / fill 回读不一致（写入可能已部分生效，先观察再决定）/ 等待超时 |
 | 409 | `PAGE_NAV_NO_HISTORY` | page back/forward 已在导航历史边界（无更早/更晚条目） |
+| 409 | `PAGE_PROFILER_ALREADY_ACTIVE` / `PAGE_PROFILER_NOT_RUNNING` | profiler 重复 start / stop 时无运行中采样（含从未 start、已 stop、连接重建或锚点 tab 关闭致运行态废弃——message 披露具体路径） |
+| 409 | `PAGE_RECORD_ALREADY_ACTIVE` / `PAGE_RECORD_NOT_RUNNING` | record 重复 start（同实例同时只允许一路录制）/ stop 时无运行中录制（废弃路径同 profiler，message 披露） |
 | 409 | `PAGE_FOCUS_FAILED` / `PAGE_FILL_FOCUS_LOST` | page press/fill 焦点失败 / 页面在 fill 过程中抢走焦点 |
-| 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / fill 目标不可编辑 |
+| 422 | `PAGE_ELEMENT_NOT_VISIBLE` / `PAGE_ELEMENT_DISABLED` / `PAGE_TARGET_NOT_FILLABLE` | 元素不可见 / 元素被禁用（v0.7+ kit 解析链） / fill 目标不可编辑 |
+| 422 | `PAGE_RECORD_NO_FFMPEG` | 录制前置 ffmpeg 探测失败（message 带安装提示 brew/apt install ffmpeg） |
+| 500 | `PAGE_ACTION_FAILED` | page 工具链未分类失败（v0.7+ kit String 错误兜底，message 原文透传） |
 | 422 | `PAGE_EMULATE_UNKNOWN_PRESET` / `PAGE_EXTRACT_NOT_A_TABLE` | 未知仿真预设 / extract 目标非表格（仅接受 table/[role=table\|grid\|treegrid]） |
 | 422 | `PAGE_TARGET_NOT_FILE_INPUT` / `PAGE_UPLOAD_PATH_INVALID` / `PAGE_UPLOAD_FILE_TOO_LARGE` | upload 目标非 input[type=file] / filePath 非绝对路径或经符号链接或非普通文件 / 超 100MB 上限（W-file） |
 | 404 | `PAGE_UPLOAD_FILE_NOT_FOUND` | upload 的主机文件不存在（W-file） |
 | 409 | `PAGE_DOWNLOAD_TIMEOUT` | download-wait 窗口耗尽且无终态证据（有下载在进行中会在 message 披露；与失败严格区分，W-file） |
 | 500 | `PAGE_DOWNLOAD_FAILED` | 下载终态 = interrupted/canceled（或文件名不安全被拒）——下载了但失败（W-file） |
-| 500 | `PAGE_DISPATCH_FAILED` | Input 派发失败（message 附 effect_state：`none`=未发出可重试 / `unknown`=已发出禁盲目重试） |
+| 500 | `PAGE_DISPATCH_FAILED` | Input 派发失败（message 附 effect_state：`none`=未发出可重试 / `unknown`=已发出禁盲目重试；v0.7+/I2 kit click/drag 链不外露失败相位，一律保守 unknown） |
+| 422 | `PAGE_SELECT_NO_OPTION` / `PAGE_SELECT_NOT_SELECT` | select：选项未命中（message 列出可用项） / 目标非 select 或 role=combobox/listbox 控件（I2 新增） |
+| 409 | `PAGE_SELECT_AMBIGUOUS` / `PAGE_DRAG_CROSS_FRAME` | select 多候选匹配 / drag 两端点在不同帧（I2 新增） |
 | 500 | `PAGE_EVAL_FAILED` / `CDP_COMMAND_FAILED` | page 工具页内 eval 失败 / CDP 发送失败 |
 | 500 | `PAGE_NAV_FAILED` | page navigate 导航失败（`Page.navigate` 响应 errorText，`net::ERR_*` 族——与 `loaded:false`「已开始未证实」严格区分） |
 | 504 | `PAGE_TOOL_TIMEOUT` | page 工具超出预算（常规 30s；wait = 用户 timeout + 5s） |
