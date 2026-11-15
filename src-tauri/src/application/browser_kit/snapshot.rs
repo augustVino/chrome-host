@@ -5,6 +5,7 @@
 //  - 测试模块：tungstenite 0.26 的 Message::Text 入参从 String 改为 Utf8Bytes（.into()）；
 //    CdpClient::connect → CdpClient::connect_test（本项目适配器的测试构造器）。
 // 后续适配改动须在本文件继续登记。
+// - 运行时字符串治理：cursor-interactive 清理告警日志前缀 [agent-browser] → [chrome-host]。
 
 use std::collections::HashMap;
 
@@ -1034,7 +1035,7 @@ async fn find_cursor_interactive_elements(
         )
         .await
     {
-        eprintln!("[agent-browser] Warning: failed to clean up data-__ab-ci attributes: {e}");
+        eprintln!("[chrome-host] Warning: failed to clean up data-__ab-ci attributes: {e}");
     }
 
     // Build the map

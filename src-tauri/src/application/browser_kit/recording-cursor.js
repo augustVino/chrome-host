@@ -1,13 +1,23 @@
+// Vendored from vercel-labs/agent-browser (Apache-2.0), Copyright Vercel, Inc.
+// Upstream: https://github.com/vercel-labs/agent-browser @e0c121a96d3a5412e2078e0c8eba3f4d2db2b616 cli/src/native/recording-cursor.js
+// License text: LICENSES/Apache-2.0-agent-browser.txt
+// CHROME-HOST ADAPTATIONS:
+// - M0 机械 vendor 时遗漏本文件的来源头（本行补记，内容未改）。
+// - 运行时字符串治理：自定义元素名/属性与全局清理标识前缀
+//   agent-browser-recording-cursor / __agentBrowserRecordingCursorCleanup →
+//   chrome-host-recording-cursor / __chromeHostRecordingCursorCleanup
+//   （页面 DOM/全局可见标识，与 recording.rs 世界名同步更名）。
+
 (() => {
-  globalThis.__agentBrowserRecordingCursorCleanup?.();
+  globalThis.__chromeHostRecordingCursorCleanup?.();
   let host, pointer, shadow;
   const removers = [];
   let disposed = false;
 
   function mount() {
     if (disposed || host || !document.documentElement) return;
-    host = document.createElement('agent-browser-recording-cursor');
-    host.setAttribute('data-agent-browser-recording-cursor', '');
+    host = document.createElement('chrome-host-recording-cursor');
+    host.setAttribute('data-chrome-host-recording-cursor', '');
     host.setAttribute('aria-hidden', 'true');
     host.setAttribute('inert', '');
     host.style.cssText = 'all:initial!important;position:fixed!important;inset:0!important;z-index:2147483647!important;pointer-events:none!important;overflow:visible!important;contain:layout style!important;';
@@ -54,10 +64,10 @@
   });
   listen('DOMContentLoaded', mount);
   mount();
-  globalThis.__agentBrowserRecordingCursorCleanup = () => {
+  globalThis.__chromeHostRecordingCursorCleanup = () => {
     disposed = true;
     removers.forEach(remove => remove());
     host?.remove();
-    delete globalThis.__agentBrowserRecordingCursorCleanup;
+    delete globalThis.__chromeHostRecordingCursorCleanup;
   };
 })();

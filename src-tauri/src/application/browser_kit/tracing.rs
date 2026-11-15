@@ -3,6 +3,7 @@
 // License text: LICENSES/Apache-2.0-agent-browser.txt
 // CHROME-HOST ADAPTATIONS (M0 机械 vendor): import 路径改写到 browser_kit 模块布局，其余未改。
 // 后续适配改动须在本文件继续登记。
+// - 运行时字符串治理：默认输出目录 ~/.agent-browser|<tmp>/agent-browser → chrome-host（本项目集成恒传显式 out 路径，此默认仅兜底）。
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -364,16 +365,16 @@ fn get_clock_domain() -> Option<&'static str> {
 
 fn get_traces_dir() -> PathBuf {
     if let Some(home) = std::env::home_dir() {
-        home.join(".agent-browser").join("tmp").join("traces")
+        home.join(".chrome-host").join("tmp").join("traces")
     } else {
-        std::env::temp_dir().join("agent-browser").join("traces")
+        std::env::temp_dir().join("chrome-host").join("traces")
     }
 }
 
 fn get_profiles_dir() -> PathBuf {
     if let Some(home) = std::env::home_dir() {
-        home.join(".agent-browser").join("tmp").join("profiles")
+        home.join(".chrome-host").join("tmp").join("profiles")
     } else {
-        std::env::temp_dir().join("agent-browser").join("profiles")
+        std::env::temp_dir().join("chrome-host").join("profiles")
     }
 }

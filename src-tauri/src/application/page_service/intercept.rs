@@ -61,9 +61,8 @@ fn journal_entry(
 /// 请求头合并：pause 事件的原始头（对象形态）∪ 规则头（数组形态，同名覆盖）
 /// → CDP continueRequest 要的 [{name, value}] 数组（替换语义下原头全部保留
 /// ——包括页面自身的 cookie：黑名单拦的是**规则**设凭据，不动页面原生行为）。
-/// 与上游参考实现同语义（agent-browser resolve_fetch_paused 的 origin
-/// headers 注入路径：原头保留 + extra 同名大小写不敏感覆盖——continueRequest
-/// 是替换不是合并，不常原头即丢头）。
+/// 与上游参考实现同语义（continueRequest 替换语义：原头保留 + extra 同名
+/// 大小写不敏感覆盖，不常原头即丢头）。
 fn merge_request_headers(original: Option<&Value>, overrides: &[(String, String)]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let upsert = |out: &mut Vec<Value>, k: &str, v: &str| {
@@ -256,8 +255,7 @@ mod tests {
     use super::*;
 
     // ---------------- merge_request_headers（I5 对齐测试）----------------
-    // 语义与上游参考（agent-browser resolve_fetch_paused 的 origin headers
-    // 注入路径）对齐：continueRequest 替换语义下原头全保留 + 规则头同名
+    // 语义与上游参考实现对齐（continueRequest 替换语义）：continueRequest 替换语义下原头全保留 + 规则头同名
     // 大小写不敏感覆盖；无原头/无覆盖头各自退化正常。
 
     fn hdrs(v: &[(&str, &str)]) -> Vec<(String, String)> {

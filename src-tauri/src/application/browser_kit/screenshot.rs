@@ -3,6 +3,7 @@
 // License text: LICENSES/Apache-2.0-agent-browser.txt
 // CHROME-HOST ADAPTATIONS (M0 机械 vendor): import 路径改写到 browser_kit 模块布局，其余未改。
 // 后续适配改动须在本文件继续登记。
+// - 运行时字符串治理：默认输出目录与 annotate 对象组名的 "agent-browser" 前缀 → "chrome-host"（本项目集成恒传显式路径/不用 annotate，仅兜底路径更名）。
 
 use serde::Serialize;
 use serde_json::Value;
@@ -262,7 +263,7 @@ async fn collect_annotations(
                 "DOM.resolveNode",
                 Some(serde_json::json!({
                     "backendNodeId": backend_node_id,
-                    "objectGroup": "agent-browser-annotate"
+                    "objectGroup": "chrome-host-annotate"
                 })),
                 Some(session_id),
             )
@@ -663,10 +664,10 @@ fn round(value: f64) -> i64 {
 
 fn get_screenshot_dir() -> PathBuf {
     if let Some(home) = std::env::home_dir() {
-        home.join(".agent-browser").join("tmp").join("screenshots")
+        home.join(".chrome-host").join("tmp").join("screenshots")
     } else {
         std::env::temp_dir()
-            .join("agent-browser")
+            .join("chrome-host")
             .join("screenshots")
     }
 }

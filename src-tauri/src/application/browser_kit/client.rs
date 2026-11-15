@@ -1,5 +1,5 @@
 //! browser_kit 的 CDP 接缝适配器：把 chrome-host 的 [`SharedPageConn`]
-//! （PageCdp trait 对象）+ Watched 事件总线包装成 agent-browser 能力层期望的
+//! （PageCdp trait 对象）+ Watched 事件总线包装成 browser_kit 能力层期望的
 //! `CdpClient` 形态——上游能力文件（element/snapshot/interaction/…）只通过
 //! `send_command*` 与 `subscribe*` 两个原语族访问连接，本模块是这两个原语族
 //! 在本项目连接基础设施上的全部实现。

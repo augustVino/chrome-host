@@ -3,6 +3,8 @@
 // License text: LICENSES/Apache-2.0-agent-browser.txt
 // CHROME-HOST ADAPTATIONS (M0 机械 vendor): import 路径改写到 browser_kit 模块布局，其余未改。
 // 后续适配改动须在本文件继续登记。
+// - 运行时字符串治理：光标清理表达式 globalThis.__agentBrowserRecordingCursorCleanup → __chromeHostRecordingCursorCleanup（与 recording-cursor.js 同步）。
+// - 运行时字符串治理：光标覆盖层隔离世界名前缀 agent-browser-recording- → chrome-host-recording-（页面进程可见的标识）。
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -281,7 +283,7 @@ impl CursorOverlay {
         client
             .send_command_no_params("Page.enable", Some(session_id))
             .await?;
-        let world_name = format!("agent-browser-recording-{session_id}");
+        let world_name = format!("chrome-host-recording-{session_id}");
         let result = client
             .send_command(
                 "Page.addScriptToEvaluateOnNewDocument",
@@ -347,7 +349,7 @@ impl CursorOverlay {
                     "Runtime.evaluate",
                     Some(json!({
                         "contextId": context_id,
-                        "expression": "globalThis.__agentBrowserRecordingCursorCleanup?.()",
+                        "expression": "globalThis.__chromeHostRecordingCursorCleanup?.()",
                     })),
                     Some(session_id),
                 )

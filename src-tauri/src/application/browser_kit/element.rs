@@ -11,6 +11,7 @@
 //        chrome-host 多实例并发，同一进程跑多个浏览器实例，进程级 static 会跨实例
 //        串态（A 实例的 frame 选择泄漏到 B 实例）。
 // 后续适配改动须在本文件继续登记。
+// - 运行时字符串治理：CDP objectGroup 名 "agent-browser" → "chrome-host"（RemoteObject 组标签，无行为影响）。
 
 use std::collections::HashMap;
 
@@ -304,7 +305,7 @@ pub(super) async fn frame_owner_object_id(
             &DomResolveNodeParams {
                 backend_node_id: Some(backend_node_id),
                 node_id: None,
-                object_group: Some("agent-browser".to_string()),
+                object_group: Some("chrome-host".to_string()),
             },
             Some(session_id),
         )
@@ -582,7 +583,7 @@ async fn resolve_node_object_id(
             &DomResolveNodeParams {
                 backend_node_id: Some(backend_node_id),
                 node_id: None,
-                object_group: Some("agent-browser".to_string()),
+                object_group: Some("chrome-host".to_string()),
             },
             Some(session_id),
         )
@@ -675,7 +676,7 @@ pub async fn resolve_element_object_id(
                     &DomResolveNodeParams {
                         backend_node_id: Some(backend_node_id),
                         node_id: None,
-                        object_group: Some("agent-browser".to_string()),
+                        object_group: Some("chrome-host".to_string()),
                     },
                     Some(effective_session_id),
                 )
@@ -711,7 +712,7 @@ pub async fn resolve_element_object_id(
                 &DomResolveNodeParams {
                     backend_node_id: Some(fresh_id),
                     node_id: None,
-                    object_group: Some("agent-browser".to_string()),
+                    object_group: Some("chrome-host".to_string()),
                 },
                 Some(effective_session_id),
             )
