@@ -77,13 +77,13 @@ fn copy_binaries(
 
     let dest = path.join(file_name);
     if dest.exists() {
-      // CHROME-HOST PATCH (vendored from 2.6.3): 上游此处 unwrap——部分
-      // CI 环境（GitHub macOS runner）对已存在目标执行 unlink 报 EPERM
-      // 直接 panic 整个构建。改为容错：删除失败不阻断，交给随后的
-      // copy_file 覆盖写（fs::copy 以写模式截断目标，不受 unlink 权限
-      // 影响）；仅当 copy 也失败时才如实报错。
-      if let Err(e) = fs::remove_file(&dest) {
-        eprintln!("[tauri-build:patched] remove_file({}) failed ({e}); falling back to copy-overwrite", dest.display());
+      // CHROME-HOST PATCH (vendored from 2.6.3): 上游此处 unwrap——dest
+      // 可能是文件（正常重拷场景）或目录（cargo build/<crate>/ 布局冲突
+      // 场景），remove_file 对目录返回 EPERM 而非 EISDIR（macOS 行为）。
+      // 统一用 remove_dir_all 兼容两种形态，失败不阻断——dest 不存在或
+      // 已清理后由 copy_file 覆盖。
+      if let Err(e) = fs::remove_dir_all(&dest) {
+        eprintln!("[tauri-build:patched] remove({}) failed ({e}); falling back to copy-overwrite", dest.display());
       }
     }
     copy_file(&src, &dest)?;
@@ -541,13 +541,22 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
   env::set_var("TAURI_ENV_TARGET_TRIPLE", &target_triple);
 
   // TODO: far from ideal, but there's no other way to get the target dir, see <https://github.com/rust-lang/cargo/issues/5457>
-  let target_dir = out_dir
+  //
+  // CHROME-HOST PATCH (vendored from 2.6.3): 上游假设 OUT_DIR 的目录层级
+  // 为 build/<pkg>-<hash>/out（三层 parent 到 release/）。Cargo 新版改为
+  // build/<pkg>/<hash>/out（多一层），三层 parent 落到 build/ 而非 release/，
+  // 导致 sidecar 拷贝目标与 cargo 自身的 build/<crate>/ 目录冲突。
+  // 修正：若三层 parent 后仍在 build/ 下，再退一层。
+  let mut target_dir = out_dir
     .parent()
     .unwrap()
     .parent()
     .unwrap()
     .parent()
     .unwrap();
+  if target_dir.file_name().map(|n| n == "build").unwrap_or(false) {
+    target_dir = target_dir.parent().unwrap();
+  }
 
   if let Some(paths) = &config.bundle.external_bin {
     copy_binaries(
