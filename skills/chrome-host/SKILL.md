@@ -1,6 +1,6 @@
 ---
 name: chrome-host
-description: chrome-host 桌面应用的完整 agent 技能：编排多环境隔离 Chrome 实例（查/建环境、实例命名锚定、启停实例、开标签页、登录态快照、hosts 注入、扩展与内核管理），并用 chrome-host page 命令族直接做页面操控（snap @eN 引用与 hover 提示、原生点击、表单填写 fill/press、hover/scroll/drag/select/check/tap 输入面、元素等待 wait、页内导航与历史回退、元素/视口截图、PDF 导出、设备仿真、eval、坐标点击、弹窗自动接管），以及排障取证（console/请求历史、脱敏响应体读取、HAR 导出）。只要用户提到"用 XX 环境打开/排查/测试"（qa、sandbox 等环境名）、需要独立 profile / hosts 注入 / 免登录的浏览器、在隔离浏览器里点按钮/填表单/提交/截图/读 DOM/看接口返回、或管理 chrome-host 的环境实例，就必须使用本 skill。与本机手动以 --remote-debugging-port 启动、与 chrome-host 无关的调试 Chrome 相关的纯页面操作不走本 skill。
+description: chrome-host 桌面应用的完整 agent 技能：编排多环境隔离 Chrome 实例（查/建环境、实例命名锚定、启停实例、开标签页、登录态快照、hosts 注入、扩展与内核管理），并用 chrome-host page 命令族直接做页面操控（snap @eN 引用与 hover 提示、原生点击、表单填写 fill/press、hover/scroll/drag/select/check/tap 输入面、元素等待 wait、页内导航与历史回退、元素/视口截图、PDF 导出、设备仿真、eval、坐标点击、弹窗自动接管、录屏 record、性能采样 profiler、快照/像素 diff 回归比对、网络拦截 mock），以及排障取证（console/请求历史、脱敏响应体读取、HAR 导出）。只要用户提到"用 XX 环境打开/排查/测试"（qa、sandbox 等环境名）、需要独立 profile / hosts 注入 / 免登录的浏览器、在隔离浏览器里点按钮/填表单/提交/截图/读 DOM/看接口返回、或管理 chrome-host 的环境实例，就必须使用本 skill。与本机手动以 --remote-debugging-port 启动、与 chrome-host 无关的调试 Chrome 相关的纯页面操作不走本 skill。
 ---
 
 # Chrome Host — 隔离 Chrome 编排 + 页面自动化
@@ -123,6 +123,8 @@ chrome-host page diff    <id> [t] [-s sel] [-c] [-d n] [--baseline-file f]  # �
 chrome-host page diff-shot <id> --baseline-file <png> [--full] [--tab t] [--out f]  # 像素 diff：基线 png ↔ 当前截图；--out 落差异图（红标+灰阶）
 chrome-host page profiler start <id> [t] [--categories "a,b"]  # 启动性能采样（Chrome tracing；不占串行锁；重复 → 409）
 chrome-host page profiler stop  <id> [--out f.json]  # 停止采样并落盘 traceEvents JSON（缺省 <id>-trace.json）
+chrome-host page record start <id> <file> [--fps n] [--cursor] [--tab t]  # 启动录屏（file 扩展名定容器 .webm/.mp4；缺 ffmpeg → 422；录制期间其他命令正常可用）
+chrome-host page record stop  <id> [--status] [--out]  # 停止录屏落盘（编码收尾数秒；--cursor 时视频含合成光标轨迹）
 chrome-host page emulate <id> --preset iphone-14|... | --viewport WxH [--user-agent UA] | --off [--tab t]  # 设备仿真（仅作用该 tab）
 chrome-host page eval    <id> <expr> [--tab t]         # 执行 JS（优先用上面的原语，eval 是逃生舱）
 chrome-host page raw     <id> <method> [json] [--tab t] [--browser]  # 任意 CDP 命令透传（最高权限逃生舱，未覆盖场景用）
@@ -182,7 +184,7 @@ chrome-host extension config set $NR '{"redirect":[{"from":"https://api.foo.com/
 ```
 要点：省略 `--env` 写全局默认；headers 注入用 `[{"url":"...","set":{"X-Debug-Uid":"42"}}]`；语法参考 `chrome-host extension get $NR` 输出的 configDocsUrl。
 
-- **会话级动态规则**（任务内即时生效，REST `POST /instances/{id}/page/intercept`，连接重建自动失效）：mock 响应（status/headers/body/delay）/ 请求头注入 / block，支持 times 次数；干预记录可查（GET 同路径）。注意：匹配 XHR/fetch 请求时**省略 resourceTypes**（Fetch 域枚举坑，详见 AGENT-API「Fetch 会话层拦截」章）；任何规则错误都不会挂起页面（无命中即放行）。适合「测一个异常分支」「注入调试头」这类一次性场景。
+- **会话级动态规则**（任务内即时生效，REST `POST /instances/{id}/page/intercept`，连接重建自动失效）：mock 响应（status/headers/body/delayMs/allowOrigin CORS 收紧，body 为 JSON 自动 Content-Type）/ 请求头注入 / block，urlPattern 支持 `*` 通配（连续 `**` 自动折叠），可选 resourceTypes 类型过滤，支持 times 次数；干预记录可查（GET 同路径）。注意：匹配 XHR/fetch 请求时**省略 resourceTypes**（Fetch 域枚举坑，详见 AGENT-API「Fetch 会话层拦截」章）；任何规则错误都不会挂起页面（无命中即放行）。适合「测一个异常分支」「注入调试头」这类一次性场景。
 
 ### 8. 收尾
 
